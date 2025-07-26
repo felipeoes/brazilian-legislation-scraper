@@ -26,6 +26,7 @@ from src.scraper.state_legislation import (
     ParaAlepaScraper,
     ParaibaAlpbScraper,
     ParanaCVScraper,
+    PernambucoAlepeScraper,
     SaoPauloAlespScraper,
     RJAlerjScraper,
     RNAlrnScraper,
@@ -341,11 +342,23 @@ if __name__ == "__main__":
             {
                 "scraper": RSAlrsScraper,
                 "params": {
-                    "year_start": 1830,  # 1830 is the earliest year available
+                    "year_start": 1950,  # 1830 is the earliest year available
                     "verbose": True,
                     "max_workers": 32,
                 },
-                "name": "RNAlrn",
+                "name": "RSAlrs",
+                "run": False,
+            },
+            {
+                "scraper": PernambucoAlepeScraper,
+                "params": {
+                    "year_start": 1965,  # 1835 is the earliest year available
+                    "verbose": True,
+                    "max_workers": 32,
+                    "use_selenium": True,  # needs to use selenium to get html content
+                    # "use_requests_session": True,  # needs to use in order to maintain aspx state
+                },
+                "name": "PEAlepe",
                 "run": True,
             },
             {

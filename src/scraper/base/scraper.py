@@ -268,13 +268,15 @@ class BaseScaper:
 
         self.openvpn_manager.change_vpn_connection()
 
-    def _get_soup(self, url: Union[str, requests.Response]) -> Optional[BeautifulSoup]:
+    def _get_soup(self, url: Union[str, requests.Response],
+                  method: str = "GET", *args, **kwargs
+                  ) -> Optional[BeautifulSoup]:
         """Get BeautifulSoup object from given url"""
 
         if isinstance(url, requests.Response):
             return BeautifulSoup(url.content, "html.parser")
 
-        res = self._make_request(url)
+        res = self._make_request(url, method=method, *args, **kwargs)
 
         if res is None:
             return None

@@ -167,9 +167,9 @@ class AmapaAlapScraper(BaseScaper):
 
                 # Get documents html links
                 documents = []
-
+                
+                current_page = 1
                 while not self.reached_end_page:
-                    current_page = 1
                     page_docs = []
 
                     with ThreadPoolExecutor(max_workers=self.max_workers) as executor:

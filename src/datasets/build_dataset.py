@@ -1,22 +1,18 @@
 import re
 import os
-import pandas as pd
 import warnings
 import sys
-import time
-
-from tqdm import tqdm
-from datasets import Dataset
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from multiprocessing import Queue, cpu_count
-from threading import Thread, Lock
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql.functions import col, udf, concat, when
+from pyspark.sql.types import StringType
 from dotenv import load_dotenv
 from markdownify import markdownify as md
 from urllib.parse import unquote
 from pathlib import Path
+from datasets import Dataset
+from tqdm import tqdm
 
 sys.setrecursionlimit(5000)
-
 
 # remove pd warning
 warnings.simplefilter(action="ignore", category=FutureWarning)
@@ -28,235 +24,136 @@ ONEDRIVE_SAVE_DIR = os.getenv("ONEDRIVE_SAVE_DIR")
 DIR_PATH = Path(ONEDRIVE_SAVE_DIR)
 
 
-class BackgroundSaver(Thread):
-    """Thread to save data in background"""
-
-    def __init__(self, queue: Queue, output_path: Path):
-        Thread.__init__(self)
-        self.queue = queue
-        self.output_path = output_path
-        self.wait_time = 10
-        self.retries = 3
-        self.stop = False
-
-    def run(self):
-        while not self.stop:
-            try:
-                # get data from queue
-                data: pd.DataFrame = self.queue.get(timeout=self.wait_time)
-
-                # save data
-                data = data.drop_duplicates(subset=["document_url"])
-                data.to_csv(self.output_path, index=False)
-
-                print(f"Saved {data.shape[0]} rows to {self.output_path}")
-                self.retries = 3  # reset retries
-
-            except Exception as e:
-                # if timeou 3 times, exit
-                print(f"Exception encountered: {e}")
-
-                self.retries -= 1
-                if self.retries == 0:
-                    self.stop = True
-                    print(f"Exception encountered, probably work is done: {e}")
-                    break
-
-
 class DatasetBuilder:
-    """Dataset builder from scrapped data in json format. The folder strucuture will be as follows:
-    - base_dir_path
-        - year
-            - norm_type
-                - norm_situation
-                    - json files
+    """Dataset builder from scrapped data in json format."""
 
-    Example:
-        - data
-            - 2020
-                - lei
-                    - aprovada
-                        - 1.json
-                        - 2.json
-                    - rejeitada
-                        - 1.json
-                        - 2.json
-                - decreto
-                    - aprovada
-                        - 1.json
-                        - 2.json
-                    - rejeitada
-                        - 1.json
-                        - 2.json
-            - 2021
-                - lei
-                    - aprovada
-                        - 1.json
-                        - 2.json
-                    - rejeitada
-                        - 1.json
-                        - 2.json
-                - decreto
-                    - aprovada
-                        - 1.json
-                        - 2.json
-                    - rejeitada
-                        - 1.json
-                        - 2.json
+    def __init__(self):
+        self.spark = (
+            SparkSession.builder.appName("DatasetBuilder")
+            .master("local[16]")
+            .getOrCreate()
+        )
 
-    Dataset must have the columns:
-        - text: the text of the norm (from raw data must come in 'html_string' or 'pdf_content' field)
-        - type: the type of the norm
-        - situation: the situation of the norm
-        - year: the year of the norm
-        - id: the id of the norm (file name)
-        - all fields in the json file (may override the previous fields)
-    """
-
-    def __init__(self, base_dir_path: Path = DIR_PATH, output_path: Path = None):
-        self.base_dir_path = base_dir_path
-        self.output_path = output_path or DIR_PATH / "dataset.csv"
-        self.queue = Queue()
-        self.lock = Lock()
-        self.data: list = []
-        self.background_saver = None
-        self._initialize_background_saver()
-        self._load_data()
-
-    def _initialize_background_saver(self):
-        """Initialize background saver"""
-
-        # initialize background saver
-        self.background_saver = BackgroundSaver(self.queue, self.output_path)
-
-        # start background saver
-        self.background_saver.start()
-
-    def _resume_from_checkpoint(self):
-        """Resume from existing dataset, if exists"""
-        if self.output_path.exists():
-            data = pd.read_csv(self.output_path, encoding="utf-8")
-            resume_from = data.shape[0]
-            self.data = data.to_dict("records")
-            return resume_from
-
-        return 0
-
-    def _read_json(self, path: str, index: int, total: int):
-        try:
-            if path:
-                data = pd.read_json(path, typ="series", encoding="utf-8").to_dict()
-
-                # check if 'html_string' or 'pdf_content' is empty
-                if "html_string" in data and not data["html_string"]:
-                    return
-
-                if "pdf_content" in data and not data["pdf_content"]:
-                    return
-
-                with self.lock:
-                    self.data.append(data)
-
-                    if index % 500 == 0 or index == total - 1:
-                        self.queue.put(pd.DataFrame(self.data))
-
-        except Exception as e:
-            print(f"Error reading {path}: {e}")
-
-    def _load_data(self):
+    def _load_data(self, base_dir_path: Path) -> DataFrame:
         """Load data from json files"""
-        # use tqdm to show progress bar
-        paths = list(tqdm(self.base_dir_path.glob("**/*.json")))
-
-        # sort paths by file name (can resume from last file)
-        paths.sort(key=lambda x: x.name)
-
-        resume_from = self._resume_from_checkpoint()
-
-        if resume_from:
-            paths = paths[resume_from:]
-
-        # load data from json files
-        # save_every = 500
-        with ThreadPoolExecutor(max_workers=(cpu_count() // 2) - 1) as executor:
-            futures = []
-
-            for index, path in enumerate(
-                tqdm(paths, desc="Loading data", total=len(paths))
-            ):
-                if path.is_file():
-                    futures.append(
-                        executor.submit(self._read_json, path, index, len(paths))
-                    )
-
-            for future in tqdm(as_completed(futures), total=len(futures)):
-                pass
+        json_files = list(tqdm(
+            base_dir_path.glob("**/*.json"),
+            desc="Loading JSON files",
+            unit="file",
+        ))
+        if not json_files:
+            raise FileNotFoundError(f"No JSON files found in {base_dir_path}")
+        
+        df = self.spark.read.json([str(file) for file in json_files], multiLine=True)
+        return df
 
     def build_dataset(
-        self, dataset_name: str, output_path: Path = DIR_PATH / "dataset.csv"
+        self,
+        base_dir_path: Path,
+        dataset_name: str,
+        output_path: Path,
     ):
         """Build dataset from json files"""
-        # wait for background saver to finish
-        while not self.queue.empty():
-            time.sleep(5)
+        df = self._load_data(base_dir_path)
+        
+        print(f"Loaded {df.count()} rows from {len(df.columns)} columns")
 
-        # drop duplicates based on 'document_url' column ( May have duplicates because of the types "{norm_type} Sem Número")
-        df_pd = pd.DataFrame(self.data).drop_duplicates(subset=["document_url"])
+        # Drop duplicates based on 'document_url' column
+        df = df.dropDuplicates(["document_url"])
 
-        print(f"Dataset shape: {df_pd.shape}")
-        print(f"Dataset columns: {df_pd.columns}")
+        print(f"Dataset shape: ({df.count()}, {len(df.columns)})")
+        print(f"Dataset columns: {df.columns}")
 
         # join 'html_string' and 'pdf_content' columns if both exists
-        if "html_string" in df_pd.columns and "pdf_content" in df_pd.columns:
-            df_pd["text"] = df_pd["html_string"] + df_pd["pdf_content"]
-            df_pd.drop(columns=["html_string", "pdf_content"], inplace=True)
-
-        elif "html_string" in df_pd.columns:
-            df_pd.rename(columns={"html_string": "text"}, inplace=True)
-
-        elif "pdf_content" in df_pd.columns:
-            df_pd.rename(columns={"pdf_content": "text"}, inplace=True)
-
-        # check progress
-        tqdm.pandas()
+        if "html_string" in df.columns and "pdf_content" in df.columns:
+            df = df.withColumn(
+                "text",
+                concat(
+                    when(col("html_string").isNotNull(), col("html_string")).otherwise(""),
+                    when(col("pdf_content").isNotNull(), col("pdf_content")).otherwise(""),
+                ),
+            ).drop("html_string", "pdf_content")
+        elif "html_string" in df.columns:
+            df = df.withColumnRenamed("html_string", "text")
+        elif "pdf_content" in df.columns:
+            df = df.withColumnRenamed("pdf_content", "text")
 
         # convert html or pdf to markdown. Remove img and a tags. Regex replaces four or more '\n' with three '\n'
-        regex = re.compile(r"\n{4,}")
-        df_pd["text"] = df_pd["text"].progress_apply(
-            lambda x: regex.sub(
-                "\n\n\n", md(x, heading_style="ATX", strip=["img", "a"])
-            ).strip()
-        )
+        def clean_text(text):
+            if not text:
+                return ""
+            regex = re.compile(r"\n{4,}")
+            markdown_text = md(str(text), heading_style="ATX", strip=["img", "a"])
+            return regex.sub("\n\n\n", markdown_text).strip()
+
+        clean_text_udf = udf(clean_text, StringType())
+        df = df.withColumn("text", clean_text_udf(col("text")))
 
         # sanitize columns
         cols = ["type", "situation", "summary"]
+        for c in cols:
+            if c in df.columns:
+                unquote_udf = udf(lambda x: unquote(x) if x else x, StringType())
+                df = df.withColumn(c, unquote_udf(col(c)))
 
-        for col in cols:
-            if col in df_pd.columns:
-                df_pd[col] = df_pd[col].apply(unquote)
-
-        df_pd["year"] = df_pd["year"].astype(int)
+        if "year" in df.columns:
+            df = df.withColumn("year", col("year").cast("long"))
 
         # save without index
-        df_pd.to_csv(output_path, index=False)
+        # Coalesce to a single partition to write a single CSV file
+        df.coalesce(1).write.mode("overwrite").option("header", "true").csv(str(output_path))
+
 
         # print first ten rows
-        print(df_pd.head(10))
+        df.show(10)
 
         # save to huggingface datasets
-        dataset = Dataset.from_pandas(df_pd)
-        dataset.push_to_hub(dataset_name, token=HUGGINGFACE_TOKEN)
+        # Converting to pandas dataframe to push to hub
+        pandas_df = df.toPandas()
+        dataset = Dataset.from_pandas(pandas_df)
+        dataset.push_to_hub(dataset_name, token=HUGGINGFACE_TOKEN, private=True)
+
+    def stop(self):
+        self.spark.stop()
 
 
 if __name__ == "__main__":
-    # test
+    builder = None
     try:
         output_dir = Path(__file__).resolve().parents[2] / "csv-datasets"
-        output_path = output_dir / "dataset.csv"
-        dir_path = DIR_PATH / "LEGISLACAO_FEDERAL"
-        builder = DatasetBuilder(dir_path, output_path)
-        dataset_name = "felipeoes/br_federal_legislation"
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-        builder.build_dataset(dataset_name, output_path=output_path)
+        builder = DatasetBuilder()
+
+        # Legislacao federal
+        federal_dir_path = DIR_PATH / "LEGISLACAO_FEDERAL"
+        federal_output_path = output_dir / "federal_dataset.csv"
+        federal_dataset_name = "felipeoes/br_federal_legislation_v3"
+        print("Building federal legislation dataset...")
+        builder.build_dataset(
+            federal_dir_path, federal_dataset_name, federal_output_path
+        )
+
+        # Legislacao especifica
+        especifica_dir_path = DIR_PATH / "LEGISLACAO_ESPECIFICA"
+        especifica_output_path = output_dir / "especifica_dataset.csv"
+        especifica_dataset_name = "felipeoes/br_environment_legislation"
+        print("Building environment legislation dataset...")
+        builder.build_dataset(
+            especifica_dir_path, especifica_dataset_name, especifica_output_path
+        )
+
+        # Legislacao estadual
+        estadual_dir_path = DIR_PATH / "LEGISLACAO_ESTADUAL"
+        estadual_output_path = output_dir / "estadual_dataset.csv"
+        estadual_dataset_name = "felipeoes/br_state_legislation"
+        print("Building state legislation dataset...")
+        builder.build_dataset(
+            estadual_dir_path, estadual_dataset_name, estadual_output_path
+        )
+
     except KeyboardInterrupt:
         print("Interrupted")
+    finally:
+        if builder:
+            builder.stop()
