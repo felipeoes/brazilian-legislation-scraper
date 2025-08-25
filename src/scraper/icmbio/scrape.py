@@ -149,13 +149,33 @@ class ICMBioScraper(BaseScaper):
 
             while not year_found and scroll_attempts < max_scroll_attempts:
                 try:
-                    year_option = self.driver.find_element(
-                        By.XPATH, f'//div[@role="option"]//span[text()="{year}"]'
-                    )
-                    year_option.click()
-                    year_found = True
-                    if self.verbose:
-                        print(f"✅ Found and selected year {year}")
+                    # Try multiple selectors for the year option
+                    year_option = None
+                    selectors = [
+                        f'//div[@role="option"]//span[text()="{year}"]',
+                        f'//span[@class="slicerText" and text()="{year}"]',
+                        f'//div[contains(@class, "slicerItemContainer")]//span[text()="{year}"]'
+                    ]
+                    
+                    for selector in selectors:
+                        try:
+                            year_option = self.driver.find_element(By.XPATH, selector)
+                            break
+                        except NoSuchElementException:
+                            continue
+                    
+                    if year_option:
+                        # Wait for element to be clickable and scroll it into view
+                        self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", year_option)
+                        time.sleep(0.5)
+                        # Use JavaScript click to avoid interception
+                        self.driver.execute_script("arguments[0].click();", year_option)
+                        year_found = True
+                        if self.verbose:
+                            print(f"✅ Found and selected year {year}")
+                    else:
+                        raise NoSuchElementException(f"Year {year} not found with any selector")
+                        
                 except NoSuchElementException:
                     if not self._scroll_ano_dropdown():
                         break
@@ -180,41 +200,49 @@ class ICMBioScraper(BaseScaper):
     def _scroll_ano_dropdown(self) -> bool:
         """Scroll the ANO dropdown. Returns True if scroll was successful."""
         try:
+            # First try to find the specific scrollable content within the ANO dropdown
             ano_slicer = self.driver.find_element(
                 By.CSS_SELECTOR, '.slicerBody[aria-label="ANO"]'
             )
-            scroll_content = ano_slicer.find_element(By.CSS_SELECTOR, ".scroll-content")
-            self.driver.execute_script("arguments[0].scrollTop += 200;", scroll_content)
-            time.sleep(1)
-            return True
-        except NoSuchElementException:
-            try:
-                ano_slicer = self.driver.find_element(
-                    By.CSS_SELECTOR, '.slicerBody[aria-label="ANO"]'
-                )
-                scroll_region = ano_slicer.find_element(
-                    By.CSS_SELECTOR, ".scrollRegion"
-                )
-                self.driver.execute_script(
-                    "arguments[0].scrollTop += 200;", scroll_region
-                )
-                time.sleep(1)
-                return True
-            except NoSuchElementException:
+            
+            # Try different scroll containers in order of preference
+            scroll_containers = [
+                ".scroll-content",
+                ".scrollRegion", 
+                ".slicerItemsContainer",
+                ".slicer-content-wrapper"
+            ]
+            
+            for container_class in scroll_containers:
                 try:
-                    ano_slicer = self.driver.find_element(
-                        By.CSS_SELECTOR, '.slicerBody[aria-label="ANO"]'
-                    )
-                    self.driver.execute_script(
-                        "arguments[0].scrollTop += 200;", ano_slicer
-                    )
+                    scroll_element = ano_slicer.find_element(By.CSS_SELECTOR, container_class)
+                    # Scroll down within the container
+                    self.driver.execute_script("arguments[0].scrollTop += 150;", scroll_element)
                     time.sleep(1)
+                    if self.verbose:
+                        print(f"✅ Scrolled using {container_class}")
                     return True
                 except NoSuchElementException:
-                    self.driver.execute_script("window.scrollBy(0, 200);")
-                    time.sleep(1)
-                    return True
-        return False
+                    continue
+            
+            # If no specific container found, scroll the slicer body itself
+            self.driver.execute_script("arguments[0].scrollTop += 150;", ano_slicer)
+            time.sleep(1)
+            if self.verbose:
+                print("✅ Scrolled using slicer body")
+            return True
+            
+        except NoSuchElementException:
+            # Fallback to window scroll
+            self.driver.execute_script("window.scrollBy(0, 150);")
+            time.sleep(1)
+            if self.verbose:
+                print("✅ Scrolled using window fallback")
+            return True
+        except Exception as e:
+            if self.verbose:
+                print(f"❌ Error during scroll: {e}")
+            return False
 
     def _select_document_type(
         self, norm_type_value: str, wait: WebDriverWait, scrollable_container

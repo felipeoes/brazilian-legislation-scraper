@@ -88,7 +88,8 @@ if __name__ == "__main__":
             {
                 "scraper": ICMBioScraper,
                 "params": {
-                    "year_start": 2007, # 2007 is the earliest year available
+                    "year_start": 2021, # 2007 is the earliest year available
+                    "year_end": 2021,
                     "use_selenium": True,
                     "docs_save_dir": ONEDRIVE_SPECIFIC_LEGISLATION_SAVE_DIR,
                     "llm_client": client,  # we have custom logic (involving llms) to extract document text
