@@ -2,6 +2,7 @@ import os
 import requests
 import time
 import fitz
+import warnings
 
 from typing import Dict, List, Optional, Union
 from PIL import Image
@@ -21,6 +22,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 from src.database.saver import OneDriveSaver
 from src.utils.openvpn import OpenVPNManager
+
+
+# supress markitdown warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="markitdown")
 
 load_dotenv()
 
@@ -56,6 +61,29 @@ def retry(max_retries: int, base_delay: int = 3):
     return decorator
 
 
+def safe_pdf_open(pdf_content: bytes) -> Optional[fitz.Document]:
+    """
+    Safely open a PDF document with error handling for common PyMuPDF issues.
+    
+    Args:
+        pdf_content (bytes): PDF content as bytes
+        
+    Returns:
+        fitz.Document or None: PyMuPDF Document object or None if failed
+    """
+    try:
+        return fitz.open("pdf", pdf_content)
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "invalid float value" in error_msg or "gray stroke color" in error_msg:
+            print(f"PDF contains invalid color definitions: {e}")
+        elif "damaged" in error_msg or "corrupt" in error_msg:
+            print(f"PDF appears to be corrupted: {e}")
+        else:
+            print(f"Failed to open PDF: {e}")
+        return None
+
+
 class BaseScaper:
     """Base class for state legislation scrapers"""
 
@@ -69,7 +97,7 @@ class BaseScaper:
         docs_save_dir: Path = Path(ONEDRIVE_STATE_LEGISLATION_SAVE_DIR),
         llm_client: Optional[OpenAI] = None,
         llm_model: Optional[str] = None,
-        llm_prompt: str = "Extraia todo  o conteúdo da imagem. Retorne somente o conteúdo extraído",
+        llm_prompt: str = "Extraia todo  o conteúdo da imagem. Não inclua nenhum outro texto ou explicação. Retorne somente o conteúdo extraído.",
         use_selenium: bool = False,
         multiple_drivers: bool = False,
         use_selenium_vpn: bool = False,
@@ -106,9 +134,7 @@ class BaseScaper:
         self.max_workers = max_workers
         self.years = list(range(self.year_start, self.year_end + 1))
         self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
-                            AppleWebKit/537.36 (KHTML, like Gecko) \
-                            Chrome/80.0.3987.149 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
         }
         self.llm_md_header = "\n# Description:\n"
         self.queue = Queue()
@@ -210,8 +236,8 @@ class BaseScaper:
         **kwargs,
     ) -> Optional[requests.Response]:
         """Make request to given url"""
-        retries = 5
-        for _ in range(retries):
+        retries = 3
+        for attempt in range(retries):
             try:
 
                 if method == "POST":
@@ -239,20 +265,20 @@ class BaseScaper:
                     in response.text
                 ):
                     print("Server error, retrying...")
-                    time.sleep(5)
+                    time.sleep(5 ** attempt)
                     continue
 
-                # check for 429 or 503 status code (right now useful for mato grosso scraper)
-                if response.status_code in [429, 503]:
+                # check for 429, 502 503 status code (right now useful for mato grosso scraper)
+                if response.status_code in [429, 502, 503]:
                     # print(f"Status code {response.status_code}, retrying...")
-                    time.sleep(5)
+                    time.sleep(5 ** attempt)
                     continue
 
                 return response
             except Exception as e:
                 print(f"Error getting response from url: {url}")
                 print(e)
-                time.sleep(5)
+                time.sleep(5 ** attempt)
 
         return None
 
@@ -311,7 +337,7 @@ class BaseScaper:
         else:
             raise RuntimeError("Selenium driver is not initialized.")
 
-    def _pdf_to_images(self, doc: fitz.Document) -> list:
+    def _pdf_to_images(self, doc: fitz.Document) -> list[Image.Image]:
         """
         Converts a PDF document to a list of images, one image per page.
 
@@ -324,18 +350,40 @@ class BaseScaper:
         image_list = []
 
         for page_num in range(doc.page_count):
-            page = doc.load_page(page_num)
-            pix = page.get_pixmap(
-                matrix=fitz.Identity,
-                dpi=None,
-                colorspace=fitz.csRGB,
-                clip=None,
-                annots=True,
-            )
+            try:
+                page = doc.load_page(page_num)
+                pix = page.get_pixmap(
+                    matrix=fitz.Identity,
+                    dpi=None,
+                    colorspace=fitz.csRGB,
+                    clip=None,
+                    annots=True,
+                )
 
-            # Convert PyMuPDF Pixmap to PIL Image
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            image_list.append(img)
+                # Convert PyMuPDF Pixmap to PIL Image
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                image_list.append(img)
+            except Exception as e:
+                # Handle errors like "Cannot set gray stroke color because /'P14' is an invalid float value"
+                print(f"Error processing page {page_num}: {e}")
+                # Try alternative approach with different settings
+                try:
+                    page = doc.load_page(page_num)
+                    # Use different pixmap settings to handle corrupted color spaces
+                    pix = page.get_pixmap(
+                        matrix=fitz.Identity,
+                        dpi=150,  # Lower DPI might help with problematic content
+                        colorspace=fitz.csGRAY,  # Use grayscale to avoid color issues
+                        clip=None,
+                        annots=False,  # Disable annotations which might contain invalid colors
+                    )
+                    img = Image.frombytes("L", [pix.width, pix.height], pix.samples)
+                    # Convert grayscale to RGB for consistency
+                    img = img.convert("RGB")
+                    image_list.append(img)
+                except Exception as e2:
+                    print(f"Failed to process page {page_num} even with fallback method: {e2}")
+                    continue
 
         return image_list
 
@@ -348,17 +396,37 @@ class BaseScaper:
             return text_markdown_raw
 
         # get images from pdf
-        pdf = fitz.open("pdf", pdf_content)
-        images = self._pdf_to_images(pdf)
+        pdf = safe_pdf_open(pdf_content)
+        if pdf is None:
+            return ""
+        
+        try:
+            images = self._pdf_to_images(pdf)
+        except Exception as e:
+            print(f"Error converting PDF to images: {e}")
+            pdf.close()
+            return ""
+        finally:
+            # Always close the PDF document to free memory
+            try:
+                pdf.close()
+            except:
+                pass
 
         # paralllel processing
         text_markdown_img = ""
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = []
             for img in images:
-                buffer = BytesIO()
-                img.save(buffer, format="PNG")
-                img = BytesIO(buffer.getvalue())
+                try:
+                    # Convert PIL Image to BytesIO stream
+                    buffer = BytesIO()
+                    img.save(buffer, format="PNG")
+                    img = BytesIO(buffer.getvalue())
+                except Exception as e:
+                    print(f"Error converting image to BytesIO: {e}")
+                    continue
+                
                 future = executor.submit(self._get_markdown, stream=img)
                 futures.append(future)
 
@@ -368,14 +436,16 @@ class BaseScaper:
                 total=len(futures),
                 disable=not self.verbose,
             ):
-                md_content = future.result()
-                text_markdown_img += md_content + "\n\n"
+                try:
+                    md_content = future.result()
+                    text_markdown_img += md_content + "\n\n"
+                except Exception as e:
+                    print(f"Error converting image to markdown: {e}")
+                    continue
 
-        if not text_markdown_img:
-            print("No images found in pdf")
-
-        if not text_markdown_raw:
-            print("No text found in pdf")
+        if not text_markdown_img and not text_markdown_raw:
+            print("No text extracted from PDF or images")
+            return ""
 
         text_markdown = text_markdown_raw + text_markdown_img
         return text_markdown
@@ -385,7 +455,7 @@ class BaseScaper:
         url: Optional[str] = None,
         response: Optional[requests.Response] = None,
         stream: Optional[BytesIO] = None,
-        retries: int = 2,
+        retries: int = 3,
     ) -> str:
         """Get markdown response from given url"""
         md_content = ""
@@ -399,6 +469,7 @@ class BaseScaper:
                     if (
                         not md_content
                     ):  # for images, sometimes the mllm struggles to process, try again
+                        retries -= 1
                         continue
 
                     return md_content.replace(self.llm_md_header, "").strip()

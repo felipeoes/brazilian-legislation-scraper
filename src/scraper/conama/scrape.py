@@ -1,4 +1,5 @@
 import urllib.parse
+import re
 from typing import Dict, List, Optional
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -50,6 +51,7 @@ class ConamaScraper(BaseScaper):
             "task": "atosnormativos.getList",
         }
         self.docs_save_dir = self.docs_save_dir / "CONAMA"
+        self._situation_regex = re.compile(r"Revogad|Revogação", re.IGNORECASE)
         self._initialize_saver()
 
     def _format_search_url(self, norm_type: str) -> str:
@@ -73,8 +75,14 @@ class ConamaScraper(BaseScaper):
         # get text markdown
         text_markdown = self._get_markdown(doc_url)
 
-        if text_markdown is None:
+        if text_markdown is None or not text_markdown.strip():
             return None
+        
+        # get situation from doc_status. If "Revogad" or "Revogação" in doc_status, situation is "Revogada", otherwise "Não consta"
+        situation = "Não consta revogação expressa"
+        if doc_status and self._situation_regex.search(doc_status):
+            situation = "Revogada"
+        
 
         # title will be like Resolução CONAMA Nº 501/2021
         return {
@@ -82,7 +90,7 @@ class ConamaScraper(BaseScaper):
             "id": doc_id,
             "number": doc_number,
             "summary": doc_description,
-            "status": doc_status,
+            "situation": situation,
             "keyword": doc_keyword,
             "origin": doc_origin,
             "text_markdown": text_markdown,

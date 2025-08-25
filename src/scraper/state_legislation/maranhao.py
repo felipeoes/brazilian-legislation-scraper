@@ -1,3 +1,5 @@
+from urllib.parse import urljoin
+
 import time
 import re
 import requests
@@ -326,7 +328,7 @@ class MaranhaoAlemaScraper(BaseScaper):
 
             for future in tqdm(
                 as_completed(futures),
-                total=len(futures),
+                total=len(documents),
                 desc="MARANHAO | Get document data",
                 disable=not self.verbose,
             ):
@@ -356,7 +358,7 @@ class MaranhaoAlemaScraper(BaseScaper):
 
     def _scrape_constitution(self, norm_type: str, norm_type_id: str):
         """Scrape state constitution"""
-        url = requests.compat.urljoin(f"{self.base_url}/ged/", norm_type_id)
+        url = urljoin(f"{self.base_url}/ged/", norm_type_id)
         soup = self._get_soup(url)
 
         # get pdf link <object class="view-pdf-constituicao" data="https://arquivos.al.ma.leg.br:8443/ged/codigos_juridicos/CE89_EC101_2025" type="application/pdf"></object>

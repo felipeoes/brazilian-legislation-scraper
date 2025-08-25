@@ -1,5 +1,7 @@
-import requests
 import re
+from urllib.parse import urljoin, urlencode
+
+import requests
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
@@ -59,7 +61,7 @@ class RSAlrsScraper(BaseScaper):
         self.params["TxtAno"] = year
         self.params["pagina"] = page
 
-        return f"{self.base_url}/legis/M010/M0100008.asp?{requests.compat.urlencode(self.params)}"
+        return f"{self.base_url}/legis/M010/M0100008.asp?{urlencode(self.params)}"
 
     def _get_docs_links(self, url: str) -> list:
         """Get documents html links from given page.

@@ -1,3 +1,5 @@
+from urllib.parse import urljoin
+
 import requests
 from bs4 import BeautifulSoup
 from io import BytesIO
@@ -107,7 +109,7 @@ class LegislaAMScraper(BaseScaper):
         # remove html_link from doc_info
         html_link = doc_info.pop("html_link")
 
-        url = requests.compat.urljoin(self.base_url, html_link)
+        url = urljoin(self.base_url, html_link)
         soup = self._get_soup(url)
 
         html_content = self._get_norm_text(soup)

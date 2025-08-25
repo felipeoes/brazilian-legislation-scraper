@@ -1,3 +1,5 @@
+from urllib.parse import urlencode
+
 import requests
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -49,7 +51,7 @@ class RNAlrnScraper(BaseScaper):
         self.params["nome"] = norm_type_id
         self.params["page"] = page
 
-        return f"{self.base_url}/legislacao/pesquisa?{requests.compat.urlencode(self.params)}"
+        return f"{self.base_url}/legislacao/pesquisa?{urlencode(self.params)}"
 
     def _get_docs_links(self, url: str) -> list:
         """Get documents html links from given page.

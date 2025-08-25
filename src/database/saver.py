@@ -4,7 +4,7 @@ import re
 from unidecode import unidecode
 from os import environ
 from pathlib import Path
-from threading import Thread, Lock
+from threading import Thread, RLock
 from multiprocessing import Queue
 from urllib.parse import unquote
 from dotenv import load_dotenv
@@ -28,7 +28,8 @@ class OneDriveSaver(Thread):
         error_queue: Queue,
         save_dir: Path = ONEDRIVE_SAVE_DIR,
         error_log_dir: str = ERROR_LOG_DIR,
-        max_path_length: int = 245,  # sinology max path length
+        max_path_length: int = 225,  # sinology max path length
+        buffer_size: int = 100,
     ):
         super().__init__(daemon=True)
         self.queue = queue
@@ -36,9 +37,11 @@ class OneDriveSaver(Thread):
         self.save_dir = save_dir
         self.error_log_dir = error_log_dir
         self.max_path_length = max_path_length
+        self.buffer_size = buffer_size
+        self.buffer = []
         self.format_regex_1 = re.compile(r"[\s]+")
         self.format_regex_2 = re.compile(r"[^\w\s-]")
-        self.lock = Lock()
+        self.lock = RLock()
         self.running = True
         self.last_year = None
         self._set_last_year()
@@ -82,62 +85,74 @@ class OneDriveSaver(Thread):
             self.save(data)
             progress.update(1)
 
+        self.flush_buffer()
+
         print(
             f"{self.__class__.__name__} stopped since queue is empty and running is {self.running}"
         )
 
-    def truncate_file_path(self, file_path: Path, max_length: int) -> Path:
-        """Truncate file path to max_length"""
-        file_length = len(str(file_path))
-        if file_length <= max_length:
-            return file_path
-
-        len_to_remove = file_length - max_length
-
-        # truncate file path. Don't remove file extension (remove length from stem only)
-        file_path = Path(
-            file_path.parent / (file_path.stem[:-len_to_remove] + file_path.suffix)
-        )
-
-        return file_path
-
     def save(self, data: dict):
-        """Save data to json file. Data will be a dict with keys 'title', 'year', 'situation', 'type', 'summary', 'html_string' and 'document_url'. Folder structure will be 'ONEDRIVE_SAVE_DIR/{year}/{type}/{situation}/{title}_{document_url}.json'"""
+        """Add data to buffer and flush if buffer is full or year changes."""
         with self.lock:
-            file_path = None
-            try:
-                save_dir = Path(self.save_dir)
-                year_dir = save_dir / str(data["year"])
-                type_dir = year_dir / data["type"]
-                situation_dir = type_dir / data["situation"]
+            if self.buffer and data.get("year") != self.buffer[-1].get("year"):
+                self.flush_buffer()
 
-                # decode path
-                situation_dir = Path(unquote(str(situation_dir)))
-                situation_dir.mkdir(parents=True, exist_ok=True)
+            # check for duplicates before appending
+            if data.get('document_url') not in {item.get('document_url') for item in self.buffer}:
+                self.buffer.append(data)
 
-                # use regex to remove invalid characters
-                title = unidecode(data["title"]).replace(" ", "_")
-                title = self.format_regex_1.sub("_", title)
-                title = self.format_regex_2.sub("", title)
+            if len(self.buffer) >= self.buffer_size:
+                self.flush_buffer()
 
-                document_url = unidecode(data["document_url"]).replace(" ", "_")
-                document_url = self.format_regex_1.sub("_", Path(document_url).stem)
-                document_url = self.format_regex_2.sub("", document_url)
+    def flush_buffer(self):
+        """Save buffered data to json files, grouped by year."""
+        with self.lock:
+            if not self.buffer:
+                return
 
-                file_path = situation_dir / f"{title}_{document_url}.json"
-                file_path = self.truncate_file_path(file_path, self.max_path_length)
+            print(f"Flushing buffer with {len(self.buffer)} items.")
+            data_by_year = {}
+            for item in self.buffer:
+                year = item.get("year")
+                if year:
+                    if year not in data_by_year:
+                        data_by_year[year] = []
+                    data_by_year[year].append(item)
 
-                # save json
-                with open(file_path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=True, indent=4)
+            for year, items in data_by_year.items():
+                file_path = None
+                try:
+                    save_dir = Path(self.save_dir)
+                    year_dir = save_dir / str(year)
+                    year_dir.mkdir(parents=True, exist_ok=True)
+                    file_path = year_dir / "data.json"
 
-            except Exception as e:
-                error_msg = f"Error saving {data['title']}"
-                if file_path:
-                    error_msg += f" to {file_path}"
-                error_msg += f": {e}"
-                print(error_msg)
-                self.save_error(data)
+                    existing_data = []
+                    if file_path.exists():
+                        try:
+                            with open(file_path, "r", encoding="utf-8") as f:
+                                existing_data = json.load(f)
+                        except (json.JSONDecodeError, FileNotFoundError):
+                            existing_data = []
+
+                    existing_urls = {item.get('document_url') for item in existing_data}
+                    new_items = [item for item in items if item.get('document_url') not in existing_urls]
+
+                    existing_data.extend(new_items)
+
+                    with open(file_path, "w", encoding="utf-8") as f:
+                        json.dump(existing_data, f, ensure_ascii=False, indent=2)
+
+                except Exception as e:
+                    error_msg = f"Error saving {len(items)} items for year {year}"
+                    if file_path:
+                        error_msg += f" to {file_path}"
+                    error_msg += f": {e}"
+                    print(error_msg)
+                    for item in items:
+                        self.save_error(item)
+
+            self.buffer.clear()
 
     def save_error(self, data: dict):
         """Save error data to txt file. Data will be a dict with keys {"title": title, "year": self.params["ano"], "situation": self.params["situacao"], "type": self.params["tipo"], "summary": summary, "html_link": document_html_link}. Folder structure will be 'ERROR_LOG_DIR/{year}/{type}/{situation}/{title}_{document_url}.json"""
@@ -163,7 +178,6 @@ class OneDriveSaver(Thread):
                 html_link = self.format_regex_2.sub("", html_link)
 
                 file_path = situation_dir / f"{title}_{html_link}.json"
-                file_path = self.truncate_file_path(file_path, self.max_path_length)
 
                 # save json
                 with open(file_path, "w", encoding="utf-8") as f:

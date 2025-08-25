@@ -15,7 +15,13 @@ from .para import ParaAlepaScraper
 from .paraiba import ParaibaAlpbScraper
 from .parana import ParanaCVScraper
 from .pernambuco import PernambucoAlepeScraper
+from .piaui import PiauiAlpbScraper
 from .sao_paulo import SaoPauloAlespScraper
 from .rio_de_janeiro import RJAlerjScraper
 from .rio_grande_do_norte import RNAlrnScraper
 from .rio_grande_do_sul import RSAlrsScraper
+from .rondonia import RondoniaCotelScraper
+from .roraima import RoraimaAlpbScraper
+from .santa_catarina import SantaCatarinaScraper
+from .sergipe import SergipeLegsonScraper
+from .tocantins import TocantinsScraper

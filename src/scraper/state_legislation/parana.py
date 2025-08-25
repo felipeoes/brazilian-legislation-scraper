@@ -1,3 +1,5 @@
+from urllib.parse import urljoin
+
 import re
 import requests
 import random
@@ -114,7 +116,10 @@ class ParanaCVScraper(BaseScaper):
         self._initialize_saver()
 
     def _format_search_url(
-        self, norm_type_id: str, year_index: int, page: int = 1
+        self,
+        norm_type_id: str,
+        year_index: int,
+        page: int = 1
     ) -> str:
         """Format url for search request"""
         self.params["tiposAtoStr"] = norm_type_id
@@ -420,7 +425,11 @@ class ParanaCVScraper(BaseScaper):
 
     @retry(max_retries=3)
     def _search_norms(
-        self, url: str, year: int, norm_type_id: int, driver: Chrome
+        self,
+        url: str,
+        year: int,
+        norm_type_id: int,
+        driver: Chrome
     ) -> str:
         """Search for norms in the given year and norm type"""
         retries = 6
@@ -460,7 +469,11 @@ class ParanaCVScraper(BaseScaper):
         return driver.page_source
 
     def _get_docs_links(
-        self, url: str, year: int, norm_type_id: int, page: int
+        self,
+        url: str,
+        year: int,
+        norm_type_id: int,
+        page: int
     ) -> list:
         """Get documents html links from given page.
         Returns a list of dicts with keys 'id', 'title', 'summary', 'date', 'html_link'
@@ -481,20 +494,6 @@ class ParanaCVScraper(BaseScaper):
                 self._search_norms(url, year, norm_type_id, driver)
 
         soup = BeautifulSoup(driver.page_source, "html.parser")
-
-        # with lock:
-        #     if page > 1:
-        #         while not f"indice={page}" in driver.current_url:
-        #             self._search_norms(url, year, norm_type_id)
-        #             self._selenium_click_page(page)
-
-        #             self._handle_blocked_access()
-        #             time.sleep(5)
-        #     else:
-        #         while not "#resultado" in driver.current_url:
-        #             self._search_norms(url, year, norm_type_id)
-
-        #     soup = BeautifulSoup(driver.page_source, "html.parser")
 
         docs = []
 
@@ -517,7 +516,7 @@ class ParanaCVScraper(BaseScaper):
             # https://www.legislacao.pr.gov.br/legislacao/pesquisarAto.do?action=exibir&codAto=234748
 
             html_link = f"/legislacao/pesquisarAto.do?action=exibir&codAto={id}"
-            html_link = requests.compat.urljoin(self.base_url, html_link)
+            html_link = urljoin(self.base_url, html_link)
 
             docs.append(
                 {
@@ -612,6 +611,7 @@ class ParanaCVScraper(BaseScaper):
         doc_info["situation"] = situation
 
         return doc_info
+
 
     def _scrape_year(self, year: int):
         """Scrape norms for a specific year"""

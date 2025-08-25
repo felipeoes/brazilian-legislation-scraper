@@ -1,3 +1,4 @@
+from urllib.parse import urljoin, urlencode
 from typing import Optional
 import requests
 from bs4 import BeautifulSoup
@@ -65,7 +66,7 @@ class BahiaLegislaScraper(BaseScaper):
         self.params["data[min]"] = f"{year}-01-01"
         self.params["data[max]"] = f"{year}-12-31"
         self.params["page"] = page
-        return f"{self.base_url}/documentos?{requests.compat.urlencode(self.params)}"
+        return f"{self.base_url}/documentos?{urlencode(self.params)}"
 
     def _get_docs_links(self, url: str) -> list:
         """Get documents html links from given page.
@@ -105,7 +106,7 @@ class BahiaLegislaScraper(BaseScaper):
         """Get document data from given document dict"""
         # remove html_link from doc_info
         html_link = doc_info.pop("html_link")
-        url = requests.compat.urljoin(self.base_url, html_link)
+        url = urljoin(self.base_url, html_link)
 
         response = self._make_request(url)
         if not response:

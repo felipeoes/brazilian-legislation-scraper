@@ -27,10 +27,16 @@ from src.scraper.state_legislation import (
     ParaibaAlpbScraper,
     ParanaCVScraper,
     PernambucoAlepeScraper,
-    SaoPauloAlespScraper,
+    PiauiAlpbScraper,
     RJAlerjScraper,
     RNAlrnScraper,
     RSAlrsScraper,
+    RondoniaCotelScraper,
+    RoraimaAlpbScraper,
+    SantaCatarinaScraper,
+    SaoPauloAlespScraper,
+    SergipeLegsonScraper,
+    TocantinsScraper
 )
 from dotenv import load_dotenv
 
@@ -61,9 +67,10 @@ if __name__ == "__main__":
             {
                 "scraper": CamaraDepScraper,
                 "params": {
-                    "verbose": False,
-                    "year_start": 1808,
-                    "max_workers": 32,
+                    "verbose": True,
+                    "year_start": 1807, # 1807 is the earliest year available
+                    "year_end": 2025,
+                    "max_workers": 48,
                 },
                 "name": "Camara dos Deputados",
                 "run": False,
@@ -81,13 +88,15 @@ if __name__ == "__main__":
             {
                 "scraper": ICMBioScraper,
                 "params": {
-                    "year_start": 1800,
+                    "year_start": 2007, # 2007 is the earliest year available
                     "use_selenium": True,
                     "docs_save_dir": ONEDRIVE_SPECIFIC_LEGISLATION_SAVE_DIR,
+                    "llm_client": client,  # we have custom logic (involving llms) to extract document text
+                    "llm_model": model,
                     "verbose": True,
                 },
                 "name": "ICMBio",
-                "run": False,
+                "run": True,
             },
             {
                 "scraper": AcreLegisScraper,
@@ -320,9 +329,33 @@ if __name__ == "__main__":
                 "run": False,
             },
             {
+                "scraper": PernambucoAlepeScraper,
+                "params": {
+                    "year_start": 1835,  # 1835 is the earliest year available
+                    "verbose": True,
+                    "max_workers": 32,
+                    "use_selenium": True,  # needs to use selenium to get html content
+                    # "use_requests_session": True,  # needs to use in order to maintain aspx state
+                },
+                "name": "PEAlepe",
+                "run": False,
+            },
+            {
+                "scraper": PiauiAlpbScraper,
+                "params": {
+                    "year_start": 2021,  # 1922 is the earliest year available
+                    "verbose": True,
+                    "max_workers": 32,
+                    "llm_client": client,  # we have pdf image extraction
+                    "llm_model": model,
+                },
+                "name": "PIAlpb",
+                "run": False,
+            },
+            {
                 "scraper": RJAlerjScraper,
                 "params": {
-                    "year_start": 1968,  # 1968 is the earliest year available
+                    "year_start": 2001,  # 1968 is the earliest year available
                     "verbose": True,
                     "max_workers": 32,
                 },
@@ -342,7 +375,7 @@ if __name__ == "__main__":
             {
                 "scraper": RSAlrsScraper,
                 "params": {
-                    "year_start": 1950,  # 1830 is the earliest year available
+                    "year_start": 1830,  # 1830 is the earliest year available
                     "verbose": True,
                     "max_workers": 32,
                 },
@@ -350,21 +383,72 @@ if __name__ == "__main__":
                 "run": False,
             },
             {
-                "scraper": PernambucoAlepeScraper,
+                "scraper": RondoniaCotelScraper,
                 "params": {
-                    "year_start": 1965,  # 1835 is the earliest year available
+                    "year_start": 1981,  # 1981 is the earliest year available
                     "verbose": True,
                     "max_workers": 32,
-                    "use_selenium": True,  # needs to use selenium to get html content
-                    # "use_requests_session": True,  # needs to use in order to maintain aspx state
+                    "llm_client": client,  # we have pdf image extraction
+                    "llm_model": model,
                 },
-                "name": "PEAlepe",
-                "run": True,
+                "name": "RondoniaCotel",
+                "run": False,
+            },
+            {
+                "scraper": RoraimaAlpbScraper,
+                "params": {
+                    "year_start": 1991,  # 1991 is the earliest year available
+                    "verbose": True,
+                    "max_workers": 32,
+                    "llm_client": client,  # we have pdf image extraction
+                    "llm_model": model,
+                },
+                "name": "RoraimaAlpb",
+                "run": False,
+            },
+            {
+                "scraper": SantaCatarinaScraper,
+                "params": {
+                    "year_start": 1946,  # 1946 is the earliest year available
+                    "verbose": True,
+                    "max_workers": 32,
+                    "use_requests_session": True,  # needs to use in order to make requests that requires session
+                },  
+                "name": "SCScraper",
+                "run": False,
             },
             {
                 "scraper": SaoPauloAlespScraper,
-                "params": {},
+                "params": {
+                    "year_start": 1835,  # 1835 is the earliest year available
+                    "verbose": True,
+                    "max_workers": 16, # low max_workers because of the website's rate limiting
+                    },
                 "name": "SPAlesp",
+                "run": False,
+            },
+            {
+                "scraper": SergipeLegsonScraper,
+                "params": {
+                    "year_start": 1940,  # 1940 is the earliest year available
+                    "verbose": True,
+                    "max_workers": 32,
+                    "llm_client": client,  # we have pdf image extraction
+                    "llm_model": model,
+                },
+                "name": "SergipeLegson",
+                "run": False,
+            },
+            {
+                "scraper": TocantinsScraper,
+                "params": {
+                    "year_start": 1989,  # 1989 is the earliest year available
+                    "verbose": True,
+                    "max_workers": 32,
+                    "llm_client": client,  # we have pdf image extraction
+                    "llm_model": model,
+                },
+                "name": "TocantinsScraper",
                 "run": False,
             },
         ]

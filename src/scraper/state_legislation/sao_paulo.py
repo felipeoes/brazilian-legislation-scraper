@@ -1,18 +1,10 @@
 import requests
-import time
+from io import BytesIO
 
-from os import environ
-from datetime import datetime
-from bs4 import BeautifulSoup
-from markitdown import MarkItDown
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
-from multiprocessing import Queue
-from src.database.saver import OneDriveSaver
-from pathlib import Path
-from dotenv import load_dotenv
+from src.scraper.base.scraper import BaseScaper
 
-load_dotenv()
 
 # We don't have situations for São Paulo, since the websitew only publishes valid documents (no invalid, no expired, no archived, no revoked, etc.)
 
@@ -50,13 +42,7 @@ TYPES = {  # dict with norm type and its id
 }
 
 
-YEAR_START = 1808  # CHECK IF NECESSARY LATER
-ONEDRIVE_STATE_LEGISLATION_SAVE_DIR = (
-    rf"{environ.get('ONEDRIVE_STATE_LEGISLATION_SAVE_DIR')}"
-)
-
-
-class SaoPauloAlespScraper:
+class SaoPauloAlespScraper(BaseScaper):
     """Webscraper for Alesp (Assembleia Legislativa do Estado de São Paulo) website (https://www.al.sp.gov.br/)
 
     Example search request url: # https://www.al.sp.gov.br/norma/resultados?page=0&size=500&tipoPesquisa=E&buscaLivreEscape=&buscaLivreDecode=&_idsTipoNorma=1&idsTipoNorma=3&nuNorma=&ano=&complemento=&dtNormaInicio=&dtNormaFim=&idTipoSituacao=1&_idsTema=1&palavraChaveEscape=&palavraChaveDecode=&_idsAutorPropositura=1&_temQuestionamentos=on&_pesquisaAvancada=on
@@ -65,23 +51,17 @@ class SaoPauloAlespScraper:
     def __init__(
         self,
         base_url: str = "https://www.al.sp.gov.br/norma/resultados",
-        types: dict = TYPES,
-        situations: dict = SITUATIONS,
-        year_start: int = YEAR_START,
-        year_end: int = datetime.now().year,
-        docs_save_dir: str = Path(ONEDRIVE_STATE_LEGISLATION_SAVE_DIR) / "SAO_PAULO",
         max_workers: int = 16,  # low max_workers bacause alesp website often returns server error
-        verbose: bool = True,
+        **kwargs,
     ):
-        self.base_url = base_url
-        self.types = types
-        self.situations = situations
-        self.year_start = year_start
-        self.year_end = year_end
-        self.verbose = verbose
-        self.docs_save_dir = docs_save_dir
-        self.max_workers = max_workers
-        self.years = [year for year in range(self.year_start, self.year_end + 1)]
+        super().__init__(
+            base_url=base_url,
+            types=TYPES,
+            situations=SITUATIONS,
+            max_workers=max_workers,
+            **kwargs,
+        )
+        self.docs_save_dir = self.docs_save_dir / "SAO_PAULO"
         self.params = {
             "size": 500,
             "tipoPesquisa": "E",
@@ -105,16 +85,13 @@ class SaoPauloAlespScraper:
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
                 (KHTML, like Gecko) Chrome/51.0.2704.103 Safari/537.36"
         }
-        self.queue = Queue()
-        self.error_queue = Queue()
-        self.saver = OneDriveSaver(self.queue, self.error_queue, self.docs_save_dir)
-        self.results = []
-        self.count = 0  # keep track of number of results
-        self.md = MarkItDown()
-        self.soup = None
+        self._initialize_saver()
 
     def _format_search_url(
-        self, year: str, norm_type_id: int, norm_situation_id
+        self,
+        year: str,
+        norm_type_id: int,
+        norm_situation_id
     ) -> str:
         """Format url for search request"""
         self.params["ano"] = year
@@ -126,48 +103,13 @@ class SaoPauloAlespScraper:
             + "&".join([f"{key}={value}" for key, value in self.params.items()])
         )
 
-    def _make_request(self, url: str) -> requests.Response:
-        """Make request to given url"""
-        retries = 5
-        for _ in range(retries):
-            try:
-                response = requests.get(url, headers=self.headers)
-
-                # check  "O servidor encontrou um erro interno, ou está sobrecarregado" error
-                if (
-                    "O servidor encontrou um erro interno, ou está sobrecarregado"
-                    in response.text
-                ):
-                    print("Server error, retrying...")
-                    time.sleep(5)
-                    continue
-
-                return response
-            except Exception as e:
-                print(f"Error getting response from url: {url}")
-                print(e)
-                time.sleep(5)
-
-        return None
-
-    def _get_soup(self, url: str) -> BeautifulSoup:
-        """Get BeautifulSoup object from given url"""
-        response = self._make_request(url)
-
-        if response is None:
-            return None
-
-        return BeautifulSoup(response.text, "html.parser")
-
-    def _get_markdown(self, url: str) -> str:
-        """Get markdown response from given url"""
-        response = self._make_request(url)
-        return self.md.convert(response).text_content
-
-    def _get_docs_html_links(self, url: str) -> list:
+    def _get_docs_links(self, url: str) -> list:
         """Get documents html links from given page.
         Returns a list of dicts with keys 'title', 'summary', 'html_link'"""
         soup = self._get_soup(url)
+
+        if not soup:
+            return []
 
         # Get all documents html links from page
         trs = soup.find_all("tr")
@@ -201,7 +143,20 @@ class SaoPauloAlespScraper:
 
     def _get_norm_data(self, norm_link: str) -> dict:
         """Get norm data from given norm link"""
-        soup = self._get_soup(norm_link)
+        
+        retries = 3
+        try:
+            soup = self._get_soup(norm_link)
+        except Exception as e:
+            if retries > 0:
+                print(f"Error fetching norm data, retrying... ({retries} retries left)")
+                return self._get_norm_data(norm_link)
+            else:
+                print(f"Failed to fetch norm data after retries: {e}")
+                return {}
+
+        if not soup:
+            return {}
 
         # get "promulgacao", "projeto", "temas", "palavras-chave" if they exist
         promulgacao = soup.find("label", text="Promulgação")
@@ -244,26 +199,43 @@ class SaoPauloAlespScraper:
         norm_data = self._get_norm_data(norm_link)
 
         # check if pdf
-        if doc_html_link.endswith(".pdf"):
-            # pdf_content = requests.get(doc_html_link).content
+        retries = 3
+        for attempt in range(retries):
+            try:
+                if doc_html_link.endswith(".pdf"):
+                    text_markdown = self._get_markdown(doc_html_link)
+                    
+                    # check if got html content
+                    if "<html>" in text_markdown or "<!DOCTYPE html>" in text_markdown:
+                        print(f"Got HTML content for PDF: {doc_html_link}")
+                        
+                        buffer = BytesIO()
+                        buffer.write(text_markdown.encode("utf-8"))
+                        buffer.seek(0)
+                        text_markdown = self._get_markdown(stream=buffer)
+                        
+                    if not text_markdown or not text_markdown.strip():
+                        print(f"Failed to get markdown for PDF: {doc_html_link}")
+                        return None
 
-            # # read pdf content
-            # doc = fitz.open(stream=pdf_content, filetype="pdf")
-            # pdf_text = ""
-            # for page in doc:
-            #     pdf_text += page.get_text()
-            text_markdown = self._get_markdown(doc_html_link)
+                    return {
+                        "title": doc_info["title"],
+                        "summary": doc_info["summary"],
+                        "html_string": "",
+                        "text_markdown": text_markdown,
+                        "document_url": doc_html_link,
+                        **norm_data,
+                    }
 
-            return {
-                "title": doc_info["title"],
-                "summary": doc_info["summary"],
-                "html_string": "",
-                "text_markdown": text_markdown,
-                "document_url": doc_html_link,
-                **norm_data,
-            }
-
-        soup = self._get_soup(doc_html_link)
+                soup = self._get_soup(doc_html_link)
+                if soup and soup.body:
+                    break
+            except Exception as e:
+                if attempt < retries - 1:
+                    print(f"Error fetching document data, retrying... ({retries - _ - 1} retries left)")
+                else:
+                    print(f"Failed to fetch document data after retries: {e}")
+                    return None
 
         # remove a tags with 'Assembleia Legislativa do Estado de São Paulo' and 'Ficha informativa'
         for a in soup.find_all("a"):
@@ -283,11 +255,18 @@ class SaoPauloAlespScraper:
         # get data
         if soup.body:
             html_string = soup.body.prettify(formatter="html")
+            html_string = "<html>" + html_string + "</html>"
         else:
             html_string = soup.prettify(formatter="html")
+            if not "<html>" in html_string:
+                html_string = "<html><body>" + html_string + "</body></html>"
 
         # get text markdown
-        text_markdown = self._get_markdown(doc_html_link)
+        buffer = BytesIO()
+        buffer.write(html_string.encode("utf-8"))
+        buffer.seek(0)
+        
+        text_markdown = self._get_markdown(stream=buffer)
 
         return {
             "title": doc_info["title"],
@@ -318,6 +297,9 @@ class SaoPauloAlespScraper:
                 url = self._format_search_url(year, norm_type_id, situation_id)
                 soup = self._get_soup(url)
 
+                if not soup:
+                    continue
+
                 # check if <div class="card cinza text-center">Nenhuma norma encontrada como os parâmetros informados</div> exists
                 if (
                     "Nenhuma norma encontrada como os parâmetros informados".lower()
@@ -329,6 +311,10 @@ class SaoPauloAlespScraper:
                 total = soup.find("span", text="página")
                 if total is None:
                     total = soup.find("span", text="páginas")
+
+                if not total:
+                    continue
+
                 total = total.previous_sibling.previous_sibling.text
                 total = int(total.strip().split()[-1])
 
@@ -347,7 +333,7 @@ class SaoPauloAlespScraper:
                     documents_html_links = []
                     futures = [
                         executor.submit(
-                            self._get_docs_html_links,
+                            self._get_docs_links,
                             url + f"&page={page}",
                         )
                         for page in range(pages)
@@ -397,29 +383,3 @@ class SaoPauloAlespScraper:
                     print(
                         f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
                     )
-
-    def scrape(self) -> list:
-        """Scrape data from all years"""
-        # start saver thread
-        self.saver.start()
-
-        # check if can resume from last scrapped year
-        resume_from = YEAR_START  # 1808
-        forced_resume = self.year_start > YEAR_START
-        if self.saver.last_year is not None and not forced_resume:
-            resume_from = int(self.saver.last_year)
-
-        # # scrape data from all years
-        for year in tqdm(self.years, desc="ALESP | Years", total=len(self.years)):
-            if year < resume_from:
-                continue
-
-            self._scrape_year(year)
-
-        # stop saver thread
-        self.saver.stop()
-
-        # wait for saver thread to finish
-        self.saver.join()
-
-        return self.results

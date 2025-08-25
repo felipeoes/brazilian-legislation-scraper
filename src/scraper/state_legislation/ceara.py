@@ -1,3 +1,5 @@
+from urllib.parse import urljoin, urlencode
+
 import requests
 import re
 from datetime import datetime
@@ -51,7 +53,7 @@ class CearaAleceScraper(BaseScaper):
         """Format url for search request"""
         self.params["categoria"] = norm_type_id
         self.params["page"] = page
-        return f"{self.base_url}/leis-e-normativos-internos?{requests.compat.urlencode(self.params)}"
+        return f"{self.base_url}/leis-e-normativos-internos?{urlencode(self.params)}"
 
     def _get_docs_links(self, norm_type: str, url: str) -> list:
         """Get documents html links from given page.
@@ -246,7 +248,7 @@ class CearaAleceScraper(BaseScaper):
         # html_link will be a link to the document page
         base_url = "https://www2.al.ce.gov.br/legislativo/legislacao5/"
         html_link = doc_info.pop("html_link")
-        url = requests.compat.urljoin(base_url, html_link)
+        url = urljoin(base_url, html_link)
         response = self._make_request(url)
         soup = BeautifulSoup(response.content, "html.parser")
 
@@ -265,6 +267,7 @@ class CearaAleceScraper(BaseScaper):
         doc_info["document_url"] = url
 
         return doc_info
+
 
     def _scrape_laws_constitution_amendments(
         self, situation: str, norm_type: str, norm_type_id: str, year: int = None

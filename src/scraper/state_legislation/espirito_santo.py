@@ -1,3 +1,5 @@
+from urllib.parse import urljoin
+
 import requests
 import re
 from io import BytesIO
@@ -45,7 +47,7 @@ class ESAlesScraper(BaseScaper):
     Example search request: https://www3.al.es.gov.br/legislacao/consulta-legislacao.aspx?tipo=7&situacao=2&ano=2000&interno=1
     """
 
-    def __init__(
+    def __init__( 
         self,
         base_url: str = "https://www3.al.es.gov.br",
         **kwargs,
@@ -57,7 +59,10 @@ class ESAlesScraper(BaseScaper):
         self._initialize_saver()
 
     def _format_search_url(
-        self, norm_type_id: str, situation_id: str, year: int
+        self,
+        norm_type_id: str,
+        situation_id: str,
+        year: int
     ) -> str:
         """Format url for search request"""
         self.params["tipo"] = norm_type_id
@@ -189,7 +194,7 @@ class ESAlesScraper(BaseScaper):
     def _get_doc_data(self, doc_info: dict) -> list:
         """Get document data from document link"""
         doc_link = doc_info.pop("doc_link")
-        url = requests.compat.urljoin(self.base_url, doc_link)
+        url = urljoin(self.base_url, doc_link)
 
         # if url ends with .pdf, get only text_markdown
         if url.endswith(".pdf"):
@@ -219,6 +224,7 @@ class ESAlesScraper(BaseScaper):
         doc_info["document_url"] = url
 
         return doc_info
+
 
     def _scrape_year(self, year: int):
         """Scrape norms for a specific year"""
