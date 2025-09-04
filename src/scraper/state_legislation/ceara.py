@@ -1,19 +1,18 @@
+from typing import Optional
 from urllib.parse import urljoin, urlencode
 
-import requests
 import re
 from datetime import datetime
 from bs4 import BeautifulSoup
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import requests.compat
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper, YEAR_START
 
 TYPES = {
-    "Ato Deliberativo": "ato-deliberativo",
-    "Ato Normativo": "ato-normativo",
-    "Emenda Constitucional": "legislacao5/const_e/ement.htm",  # lei complementar, lei ordinaria and emenda constitucional share the same scraping logic
+    #"Ato Deliberativo": "ato-deliberativo",
+    #"Ato Normativo": "ato-normativo",
+    #"Emenda Constitucional": "legislacao5/const_e/ement.htm",  # lei complementar, lei ordinaria and emenda constitucional share the same scraping logic
     "Lei Complementar": "ementario/lc.htm",
     "Lei Ordinária": "lei_ordinaria.htm",
     "Resolução": "resolucao",  # ato normativo, ato deliberativo and resolução share the same scraping logic
@@ -199,10 +198,8 @@ class CearaAleceScraper(BaseScaper):
 
             tds = item.find_all("td")
 
-            # for leis ordinarias, the table has 2 columns only
-            if norm_type == "Lei Ordinária" and len(tds) != 2:
-                continue
-            elif norm_type != "Lei Ordinária" and len(tds) != 3:
+            # for leis ordinarias, the table has at most 3 columns
+            if norm_type == "Lei Ordinária" and len(tds) > 3:
                 continue
 
             title = tds[0].text.strip()
@@ -243,16 +240,76 @@ class CearaAleceScraper(BaseScaper):
 
         return docs
 
-    def _get_laws_constitution_amendments_doc_data(self, doc_info: dict) -> dict:
+    def construct_url(self, norm_type: str, html_link: str, year: Optional[int]) -> str:
+        """Construct the full url for the document page"""
+        if "https://" in html_link:
+            # don't need to do anything, it's already a full url
+            return html_link
+
+        # file:///\\10.85.100.8\10.85.100.8\legislativo\legislacao5\leis2014\15517.htm.
+        if "file://" in html_link:
+            # get content after \legislacao5\
+            html_link = html_link.split("legislacao5")[-1].replace("\\", "/")
+            if html_link.startswith("/"):
+                html_link = html_link[1:]
+
+            base_url = "https://www2.al.ce.gov.br/legislativo/legislacao5/"
+            return urljoin(base_url, html_link)
+
+        if norm_type == "Lei Complementar":
+            base_url = "https://www2.al.ce.gov.br/legislativo/"
+            if not "ementario" in html_link:
+                html_link = f"ementario/{html_link}"
+        else:
+            base_url = "https://www2.al.ce.gov.br/legislativo/legislacao5/"
+            if norm_type == "Lei Ordinária":
+                if not "leis" in html_link:
+                    year = year if year >= 2000 else str(year)[2:]
+
+                    html_link = f"leis{year}/{html_link}"
+
+                elif (
+                    "legislacao5" in html_link
+                    or "legislativo/legislacao5/" in html_link
+                    or "/legislativo/legislacao5/" in html_link
+                ):
+                    html_link = (
+                        html_link.replace("/legislativo/legislacao5/", "")
+                        .replace("legislativo/legislacao5/", "")
+                        .replace("legislacao5/", "")
+                    )
+
+        return urljoin(base_url, html_link)
+
+    def _get_laws_constitution_amendments_doc_data(
+        self, doc_info: dict, norm_type: str, year: Optional[int] = None
+    ) -> Optional[dict]:
         """Get document data from given document dict"""
         # html_link will be a link to the document page
-        base_url = "https://www2.al.ce.gov.br/legislativo/legislacao5/"
+
         html_link = doc_info.pop("html_link")
-        url = urljoin(base_url, html_link)
+        url = self.construct_url(norm_type, html_link, year)
+
         response = self._make_request(url)
+
+        if not response:
+            print(
+                f"Error fetching document page: {url}. Year: {year}. HTML link: {html_link}"
+            )
+            return None
+
         soup = BeautifulSoup(response.content, "html.parser")
 
+        # remove <a href="javascript:%20history.back();"><b><span style="color:blue">VOLTAR</span></b></a>
+        voltar_link = soup.find("a", text=re.compile(r"^VOLTAR$", re.IGNORECASE))
+        if voltar_link:
+            voltar_link.decompose()
+
         html_string = soup.prettify().strip()
+
+        # check if invalid document
+        if "NÄO EXISTE LEI COM ESTE NÚMERO".lower() in html_string.lower():
+            return None
 
         buffer = BytesIO()
         buffer.write(soup.html.encode())
@@ -260,7 +317,11 @@ class CearaAleceScraper(BaseScaper):
 
         text_markdown = self._get_markdown(stream=buffer)
         # remove header
-        text_markdown = text_markdown.replace("\n\n**VOLTAR**", "").strip()
+        text_markdown = text_markdown.replace("**VOLTAR**", "").strip()
+
+        if not text_markdown:
+            print(f"Error converting document to markdown: {url}. Year: {year}")
+            return None
 
         doc_info["html_string"] = html_string
         doc_info["text_markdown"] = text_markdown
@@ -268,10 +329,9 @@ class CearaAleceScraper(BaseScaper):
 
         return doc_info
 
-
     def _scrape_laws_constitution_amendments(
         self, situation: str, norm_type: str, norm_type_id: str, year: int = None
-    ) -> list:
+    ):
         """Scrape constitution amendments"""
         # for laws and constitution amendments we need to scrape a different page
 
@@ -295,7 +355,12 @@ class CearaAleceScraper(BaseScaper):
         results = []
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = [
-                executor.submit(self._get_laws_constitution_amendments_doc_data, doc)
+                executor.submit(
+                    self._get_laws_constitution_amendments_doc_data,
+                    doc,
+                    norm_type,
+                    year,
+                )
                 for doc in docs
             ]
 
@@ -396,6 +461,10 @@ class CearaAleceScraper(BaseScaper):
                         total=len(self.years),
                         disable=not self.verbose,
                     ):
+                        # skip years before resume_from
+                        if year < resume_from:
+                            continue
+
                         self._scrape_laws_constitution_amendments(
                             situation, norm_type, norm_type_id, year
                         )

@@ -1,3 +1,4 @@
+from typing import Optional
 from urllib.parse import urljoin
 
 import requests
@@ -47,7 +48,7 @@ class ESAlesScraper(BaseScaper):
     Example search request: https://www3.al.es.gov.br/legislacao/consulta-legislacao.aspx?tipo=7&situacao=2&ano=2000&interno=1
     """
 
-    def __init__( 
+    def __init__(
         self,
         base_url: str = "https://www3.al.es.gov.br",
         **kwargs,
@@ -59,10 +60,7 @@ class ESAlesScraper(BaseScaper):
         self._initialize_saver()
 
     def _format_search_url(
-        self,
-        norm_type_id: str,
-        situation_id: str,
-        year: int
+        self, norm_type_id: str, situation_id: str, year: int
     ) -> str:
         """Format url for search request"""
         self.params["tipo"] = norm_type_id
@@ -179,6 +177,12 @@ class ESAlesScraper(BaseScaper):
                 continue
 
             doc_link = doc_link[0]["href"]
+
+            if "processo.aspx?" in doc_link:
+                # this is a link to a process, not a document
+                print(f"Skipping document '{title}' since it is a process link")
+                continue
+
             docs.append(
                 {
                     "title": re.sub(r"\r\n +", " ", title.strip()),
@@ -191,10 +195,14 @@ class ESAlesScraper(BaseScaper):
 
         return docs
 
-    def _get_doc_data(self, doc_info: dict) -> list:
+    def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
         """Get document data from document link"""
         doc_link = doc_info.pop("doc_link")
         url = urljoin(self.base_url, doc_link)
+
+        # some urls are malformed, e.g., they ends with .pd instead of .pdf
+        if url.endswith(".pd"):
+            url = url + "f"
 
         # if url ends with .pdf, get only text_markdown
         if url.endswith(".pdf"):
@@ -202,8 +210,12 @@ class ESAlesScraper(BaseScaper):
 
             if not text_markdown:
                 # pdf may be an image
-                pdf_content = self._make_request(url).content
-                text_markdown = self._get_pdf_image_markdown(pdf_content)
+                response = self._make_request(url)
+                if not response:
+                    print(f"Failed to download PDF from URL: {url}")
+                    return None
+
+                text_markdown = self._get_pdf_image_markdown(response.content)
 
             doc_info["html_string"] = ""
             doc_info["text_markdown"] = text_markdown
@@ -211,6 +223,10 @@ class ESAlesScraper(BaseScaper):
             return doc_info
 
         soup = self._get_soup(url)
+        if not soup:
+            print(f"Failed to get soup for URL: {url}")
+            return None
+
         html_string = soup.prettify()
 
         buffer = BytesIO()
@@ -224,7 +240,6 @@ class ESAlesScraper(BaseScaper):
         doc_info["document_url"] = url
 
         return doc_info
-
 
     def _scrape_year(self, year: int):
         """Scrape norms for a specific year"""

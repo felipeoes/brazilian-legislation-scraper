@@ -17,9 +17,9 @@ lock = Lock()
 
 
 TYPES = {
-    "Instrução Normativa": "INSTRUÇÕES NORMATIVAS",
+    # "Instrução Normativa": "INSTRUÇÕES NORMATIVAS",
     "Portaria": "PORTARIAS",
-    "Outros Atos": "OUTROS ATOS",
+    #  "Outros Atos": "OUTROS ATOS",
 }
 
 # Cant filter by situation in the powerbi interface, will get situation from the table
@@ -154,28 +154,33 @@ class ICMBioScraper(BaseScaper):
                     selectors = [
                         f'//div[@role="option"]//span[text()="{year}"]',
                         f'//span[@class="slicerText" and text()="{year}"]',
-                        f'//div[contains(@class, "slicerItemContainer")]//span[text()="{year}"]'
+                        f'//div[contains(@class, "slicerItemContainer")]//span[text()="{year}"]',
                     ]
-                    
+
                     for selector in selectors:
                         try:
                             year_option = self.driver.find_element(By.XPATH, selector)
                             break
                         except NoSuchElementException:
                             continue
-                    
+
                     if year_option:
                         # Wait for element to be clickable and scroll it into view
-                        self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", year_option)
+                        self.driver.execute_script(
+                            "arguments[0].scrollIntoView({block: 'center'});",
+                            year_option,
+                        )
                         time.sleep(0.5)
                         # Use JavaScript click to avoid interception
                         self.driver.execute_script("arguments[0].click();", year_option)
                         year_found = True
                         if self.verbose:
-                            print(f"✅ Found and selected year {year}")
+                            print(f"Found and selected year {year}")
                     else:
-                        raise NoSuchElementException(f"Year {year} not found with any selector")
-                        
+                        raise NoSuchElementException(
+                            f"Year {year} not found with any selector"
+                        )
+
                 except NoSuchElementException:
                     if not self._scroll_ano_dropdown():
                         break
@@ -204,40 +209,44 @@ class ICMBioScraper(BaseScaper):
             ano_slicer = self.driver.find_element(
                 By.CSS_SELECTOR, '.slicerBody[aria-label="ANO"]'
             )
-            
+
             # Try different scroll containers in order of preference
             scroll_containers = [
                 ".scroll-content",
-                ".scrollRegion", 
+                ".scrollRegion",
                 ".slicerItemsContainer",
-                ".slicer-content-wrapper"
+                ".slicer-content-wrapper",
             ]
-            
+
             for container_class in scroll_containers:
                 try:
-                    scroll_element = ano_slicer.find_element(By.CSS_SELECTOR, container_class)
+                    scroll_element = ano_slicer.find_element(
+                        By.CSS_SELECTOR, container_class
+                    )
                     # Scroll down within the container
-                    self.driver.execute_script("arguments[0].scrollTop += 150;", scroll_element)
+                    self.driver.execute_script(
+                        "arguments[0].scrollTop += 150;", scroll_element
+                    )
                     time.sleep(1)
                     if self.verbose:
-                        print(f"✅ Scrolled using {container_class}")
+                        print(f"Scrolled using {container_class}")
                     return True
                 except NoSuchElementException:
                     continue
-            
+
             # If no specific container found, scroll the slicer body itself
             self.driver.execute_script("arguments[0].scrollTop += 150;", ano_slicer)
             time.sleep(1)
             if self.verbose:
-                print("✅ Scrolled using slicer body")
+                print("Scrolled using slicer body")
             return True
-            
+
         except NoSuchElementException:
             # Fallback to window scroll
             self.driver.execute_script("window.scrollBy(0, 150);")
             time.sleep(1)
             if self.verbose:
-                print("✅ Scrolled using window fallback")
+                print("Scrolled using window fallback")
             return True
         except Exception as e:
             if self.verbose:
@@ -429,7 +438,7 @@ class ICMBioScraper(BaseScaper):
                     EC.presence_of_element_located(scrollable_container_selector)
                 )
                 if self.verbose:
-                    print("✅ Scrollable table container found.")
+                    print("Scrollable table container found.")
             except TimeoutException:
                 if self.verbose:
                     print("❌ Timed out waiting for the table container to load.")
@@ -517,7 +526,7 @@ class ICMBioScraper(BaseScaper):
                         f"Failed to get LLM response for document '{doc_title}', skipping document."
                     )
                 return None
-        elif "in.gov.br/web/dou" in document_url:
+        elif "web/dou" in document_url or "/materia/-/asset_publisher" in document_url:
             # need to extract html content directly to avoid unnecessary headers, footers, and other noise
             soup = self._get_soup(document_url)
 
@@ -550,13 +559,9 @@ class ICMBioScraper(BaseScaper):
 
         else:
             # Standard document processing
-            if self.verbose:
-                print(
-                    f"Fetching document text from {document_url} using standard method..."
-                )
             text_markdown = self._get_markdown(document_url)
 
-            if text_markdown is None or not text_markdown.strip():
+            if not text_markdown or not text_markdown.strip():
                 if self.verbose:
                     print(
                         f"Failed to extract text from document at {document_url}, skipping document."

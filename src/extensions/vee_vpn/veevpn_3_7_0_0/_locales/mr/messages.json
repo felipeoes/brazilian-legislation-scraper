@@ -1,0 +1,14 @@
+{
+  "app_name_chrome": {
+    "message": "क्रोमसाठी मोफत VPN - VPN प्रॉक्सी VeePN"
+  },
+  "app_name_edge": {
+    "message": "एज फॉर मोफत VPN - VPN प्रॉक्सी VeePN"
+  },
+  "app_name_firefox": {
+    "message": "मोफत VPN - VPN प्रॉक्सी VeePN"
+  },
+  "app_description": {
+    "message": "वेगवान, अत्यंत सुरक्षित आणि वापरण्यास सोपा VPN सेवा जे आपल्या गोपनीयतेचे संरक्षण करते. अमर्यादित ट्राफिक आणि बँडविड्थचा आनंद घ्या!"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "app_name_chrome": {
+    "message": "Бесплатан VPN за Chrome - VPN Proxy VeePN"
+  },
+  "app_name_edge": {
+    "message": "Бесплатан VPN за Edge - VPN Proxy VeePN"
+  },
+  "app_name_firefox": {
+    "message": "Бесплатан VPN - VPN Proxy VeePN"
+  },
+  "app_description": {
+    "message": "Брза, сигурна и једноставна VPN услуга за заштиту ваше приватности. Уживајте у неограниченом саобраћају и пропусном опсегу!"
+  }
+}

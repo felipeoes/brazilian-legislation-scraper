@@ -1,0 +1,14 @@
+{
+  "app_name_chrome": {
+    "message": "Ingyenes VPN Chrome-hoz – VPN Proxy VeePN"
+  },
+  "app_name_edge": {
+    "message": "Ingyenes VPN Edge-hez – VPN Proxy VeePN"
+  },
+  "app_name_firefox": {
+    "message": "Ingyenes VPN – VPN Proxy VeePN"
+  },
+  "app_description": {
+    "message": "Gyors, biztonságos és könnyen használható VPN az online adatvédelemhez. Élvezd a korlátlan forgalmat és sávszélességet!"
+  }
+}

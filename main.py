@@ -36,7 +36,7 @@ from src.scraper.state_legislation import (
     SantaCatarinaScraper,
     SaoPauloAlespScraper,
     SergipeLegsonScraper,
-    TocantinsScraper
+    TocantinsScraper,
 )
 from dotenv import load_dotenv
 
@@ -68,7 +68,7 @@ if __name__ == "__main__":
                 "scraper": CamaraDepScraper,
                 "params": {
                     "verbose": True,
-                    "year_start": 1807, # 1807 is the earliest year available
+                    "year_start": 1807,  # 1807 is the earliest year available
                     "year_end": 2025,
                     "max_workers": 48,
                 },
@@ -88,8 +88,8 @@ if __name__ == "__main__":
             {
                 "scraper": ICMBioScraper,
                 "params": {
-                    "year_start": 2021, # 2007 is the earliest year available
-                    "year_end": 2021,
+                    "year_start": 2017,  # 2007 is the earliest year available
+                    "year_end": 2017,
                     "use_selenium": True,
                     "docs_save_dir": ONEDRIVE_SPECIFIC_LEGISLATION_SAVE_DIR,
                     "llm_client": client,  # we have custom logic (involving llms) to extract document text
@@ -97,7 +97,7 @@ if __name__ == "__main__":
                     "verbose": True,
                 },
                 "name": "ICMBio",
-                "run": True,
+                "run": False,
             },
             {
                 "scraper": AcreLegisScraper,
@@ -158,7 +158,7 @@ if __name__ == "__main__":
                     "max_workers": 32,
                 },
                 "name": "CEAlece",
-                "run": False,
+                "run": True,
             },
             {
                 "scraper": DFSinjScraper,
@@ -186,11 +186,10 @@ if __name__ == "__main__":
             {
                 "scraper": LegislaGoias,
                 "params": {
-                    "year_start": 1887,  # 1887 is the earliest year available
-                    "use_selenium": True,  # needs to use selenium to get html content
+                    "year_start": 1930,  # 1887 is the earliest year available
                     "llm_client": client,  # we have pdf image extraction
                     "llm_model": model,
-                    "verbose": False,
+                    "verbose": True,
                 },
                 "name": "LegislaGoias",
                 "run": False,
@@ -267,7 +266,7 @@ if __name__ == "__main__":
                     "use_selenium": True,
                     "use_selenium_vpn": True,
                     "multiple_drivers": True,
-                    "vpn_extension_path": r"src\extensions\vee_vpn\veevpn_3_4_3_0.crx",
+                    "vpn_extension_path": "src/extensions/vee_vpn/veevpn_3_7_0_0",
                     "vpn_extension_page": "chrome-extension://majdfhpaihoncoakbjgbdhglocklcgno/src/popup/popup.html",
                     # "max_workers": 20,
                     # "use_openvpn": True,
@@ -414,7 +413,7 @@ if __name__ == "__main__":
                     "verbose": True,
                     "max_workers": 32,
                     "use_requests_session": True,  # needs to use in order to make requests that requires session
-                },  
+                },
                 "name": "SCScraper",
                 "run": False,
             },
@@ -423,8 +422,8 @@ if __name__ == "__main__":
                 "params": {
                     "year_start": 1835,  # 1835 is the earliest year available
                     "verbose": True,
-                    "max_workers": 16, # low max_workers because of the website's rate limiting
-                    },
+                    "max_workers": 16,  # low max_workers because of the website's rate limiting
+                },
                 "name": "SPAlesp",
                 "run": False,
             },

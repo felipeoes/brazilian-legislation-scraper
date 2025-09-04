@@ -1,0 +1,14 @@
+{
+  "app_name_chrome": {
+    "message": "VPN miễn phí cho Chrome - VPN Proxy VeePN"
+  },
+  "app_name_edge": {
+    "message": "VPN miễn phí cho Edge - VPN Proxy VeePN"
+  },
+  "app_name_firefox": {
+    "message": "VPN miễn phí - VPN Proxy VeePN"
+  },
+  "app_description": {
+    "message": "Dịch vụ VPN nhanh chóng, cực kỳ an toàn và dễ sử dụng để bảo vệ quyền riêng tư trực tuyến của bạn."
+  }
+}

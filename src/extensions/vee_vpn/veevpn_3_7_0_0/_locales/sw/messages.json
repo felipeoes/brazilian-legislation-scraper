@@ -1,0 +1,14 @@
+{
+  "app_name_chrome": {
+    "message": "VPN ya Bure kwa Chrome - VPN Proxy VeePN"
+  },
+  "app_name_edge": {
+    "message": "VPN ya Bure kwa Edge - VPN Proxy VeePN"
+  },
+  "app_name_firefox": {
+    "message": "VPN ya Bure - VPN Proxy VeePN"
+  },
+  "app_description": {
+    "message": "Huduma ya VPN haraka, salama sana na rahisi kutumia kulinda faragha yako mtandaoni. Furahiya trafiki na upana wa bendi isiyo na kikomo!"
+  }
+}

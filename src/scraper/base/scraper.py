@@ -64,10 +64,10 @@ def retry(max_retries: int, base_delay: int = 3):
 def safe_pdf_open(pdf_content: bytes) -> Optional[fitz.Document]:
     """
     Safely open a PDF document with error handling for common PyMuPDF issues.
-    
+
     Args:
         pdf_content (bytes): PDF content as bytes
-        
+
     Returns:
         fitz.Document or None: PyMuPDF Document object or None if failed
     """
@@ -163,8 +163,26 @@ class BaseScaper:
 
         if self.use_selenium and self.use_selenium_vpn and self.vpn_extension_path:
             # load the extension
-            extension_abs_path = os.path.abspath(self.vpn_extension_path)
-            options.add_extension(extension_abs_path)
+            extension_abs_path = Path(self.vpn_extension_path).resolve().as_posix()
+            # options.add_extension(extension_abs_path)
+
+            # load unpacked extension
+            options.add_argument(f"--load-extension={extension_abs_path}")
+
+            options.add_experimental_option(
+                "prefs",
+                {
+                    "extensions.ui.developer_mode": True,
+                },
+            )
+            options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            options.add_experimental_option("useAutomationExtension", False)
+
+            # Enable access to chrome-extension:// URLs
+            options.add_argument("--disable-extensions-file-access-check")
+            options.add_argument("--allow-running-insecure-content")
+            options.add_argument("--disable-web-security")
+            options.add_argument("--allow-file-access-from-files")
             print(f"Attempting to load packed extension from: {extension_abs_path}")
 
         if self.use_selenium and not self.multiple_drivers:
@@ -265,20 +283,31 @@ class BaseScaper:
                     in response.text
                 ):
                     print("Server error, retrying...")
-                    time.sleep(5 ** attempt)
+                    time.sleep(5**attempt)
                     continue
 
                 # check for 429, 502 503 status code (right now useful for mato grosso scraper)
-                if response.status_code in [429, 502, 503]:
+                if response.status_code in [
+                    400,
+                    401,
+                    403,
+                    404,
+                    408,
+                    429,
+                    500,
+                    502,
+                    503,
+                    504,
+                ]:
                     # print(f"Status code {response.status_code}, retrying...")
-                    time.sleep(5 ** attempt)
+                    time.sleep(5**attempt)
                     continue
 
                 return response
             except Exception as e:
                 print(f"Error getting response from url: {url}")
                 print(e)
-                time.sleep(5 ** attempt)
+                time.sleep(5**attempt)
 
         return None
 
@@ -294,9 +323,9 @@ class BaseScaper:
 
         self.openvpn_manager.change_vpn_connection()
 
-    def _get_soup(self, url: Union[str, requests.Response],
-                  method: str = "GET", *args, **kwargs
-                  ) -> Optional[BeautifulSoup]:
+    def _get_soup(
+        self, url: Union[str, requests.Response], method: str = "GET", *args, **kwargs
+    ) -> Optional[BeautifulSoup]:
         """Get BeautifulSoup object from given url"""
 
         if isinstance(url, requests.Response):
@@ -382,7 +411,9 @@ class BaseScaper:
                     img = img.convert("RGB")
                     image_list.append(img)
                 except Exception as e2:
-                    print(f"Failed to process page {page_num} even with fallback method: {e2}")
+                    print(
+                        f"Failed to process page {page_num} even with fallback method: {e2}"
+                    )
                     continue
 
         return image_list
@@ -399,7 +430,7 @@ class BaseScaper:
         pdf = safe_pdf_open(pdf_content)
         if pdf is None:
             return ""
-        
+
         try:
             images = self._pdf_to_images(pdf)
         except Exception as e:
@@ -426,7 +457,7 @@ class BaseScaper:
                 except Exception as e:
                     print(f"Error converting image to BytesIO: {e}")
                     continue
-                
+
                 future = executor.submit(self._get_markdown, stream=img)
                 futures.append(future)
 

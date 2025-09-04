@@ -1,0 +1,14 @@
+{
+  "app_name_chrome": {
+    "message": "ക്രോം ഫ്രീ VPN - VPN പ്രോക്സി VeePN"
+  },
+  "app_name_edge": {
+    "message": "എഡ്ജ് ഫ്രീ VPN - VPN പ്രോക്സി VeePN"
+  },
+  "app_name_firefox": {
+    "message": "ഫ്രീ VPN - VPN പ്രോക്സി VeePN"
+  },
+  "app_description": {
+    "message": "വേഗമുള്ള, സുരക്ഷിതവും എളുപ്പത്തിലുള്ള VPN സേവനം നിങ്ങളുടെ പ്രൈവസിയുമായി ഓൺലൈനിൽ സംരക്ഷിക്കുക. പരമാവധി ട്രാഫിക്, ബാന്റ്വിഡ്ത്ത്!"
+  }
+}

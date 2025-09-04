@@ -116,10 +116,7 @@ class ParanaCVScraper(BaseScaper):
         self._initialize_saver()
 
     def _format_search_url(
-        self,
-        norm_type_id: str,
-        year_index: int,
-        page: int = 1
+        self, norm_type_id: str, year_index: int, page: int = 1
     ) -> str:
         """Format url for search request"""
         self.params["tiposAtoStr"] = norm_type_id
@@ -425,11 +422,7 @@ class ParanaCVScraper(BaseScaper):
 
     @retry(max_retries=3)
     def _search_norms(
-        self,
-        url: str,
-        year: int,
-        norm_type_id: int,
-        driver: Chrome
+        self, url: str, year: int, norm_type_id: int, driver: Chrome
     ) -> str:
         """Search for norms in the given year and norm type"""
         retries = 6
@@ -469,11 +462,7 @@ class ParanaCVScraper(BaseScaper):
         return driver.page_source
 
     def _get_docs_links(
-        self,
-        url: str,
-        year: int,
-        norm_type_id: int,
-        page: int
+        self, url: str, year: int, norm_type_id: int, page: int
     ) -> list:
         """Get documents html links from given page.
         Returns a list of dicts with keys 'id', 'title', 'summary', 'date', 'html_link'
@@ -588,6 +577,9 @@ class ParanaCVScraper(BaseScaper):
 
         html_string = norm_text_tag.prettify().replace("\n ANEXOS:", "").strip()
 
+        # remove javascript:listarAssinaturas();
+        html_string = html_string.replace("javascript:listarAssinaturas();", "")
+
         # inferr situation from text
         situation = self._infer_invalid_situation(soup)
         if not situation:
@@ -611,7 +603,6 @@ class ParanaCVScraper(BaseScaper):
         doc_info["situation"] = situation
 
         return doc_info
-
 
     def _scrape_year(self, year: int):
         """Scrape norms for a specific year"""

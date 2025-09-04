@@ -1,0 +1,14 @@
+{
+  "app_name_chrome": {
+    "message": "Chrome க்கான இலவச VPN - VPN Proxy VeePN"
+  },
+  "app_name_edge": {
+    "message": "எட்ஜிற்கான இலவச VPN - VPN ப்ராக்ஸி VeePN"
+  },
+  "app_name_firefox": {
+    "message": "இலவச VPN - VPN Proxy VeePN"
+  },
+  "app_description": {
+    "message": "ஆன்லைனில் உங்கள் தனியுரிமையைப் பாதுகாக்க விரைவான, அதி பாதுகாப்பான மற்றும் VPN சேவையைப் பயன்படுத்த எளிதானது."
+  }
+}

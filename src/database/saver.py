@@ -98,7 +98,9 @@ class OneDriveSaver(Thread):
                 self.flush_buffer()
 
             # check for duplicates before appending
-            if data.get('document_url') not in {item.get('document_url') for item in self.buffer}:
+            if data.get("document_url") not in {
+                item.get("document_url") for item in self.buffer
+            }:
                 self.buffer.append(data)
 
             if len(self.buffer) >= self.buffer_size:
@@ -135,8 +137,19 @@ class OneDriveSaver(Thread):
                         except (json.JSONDecodeError, FileNotFoundError):
                             existing_data = []
 
-                    existing_urls = {item.get('document_url') for item in existing_data}
-                    new_items = [item for item in items if item.get('document_url') not in existing_urls]
+                    # overwrite existing data with new items (making sure no duplicates by removing any existing items with same document_url)
+                    existing_urls = {item.get("document_url") for item in existing_data}
+                    new_items = []
+                    for item in items:
+                        if item.get("document_url") in existing_urls:
+                            # remove existing item with same document_url
+                            existing_data = [
+                                e_item
+                                for e_item in existing_data
+                                if e_item.get("document_url")
+                                != item.get("document_url")
+                            ]
+                        new_items.append(item)
 
                     existing_data.extend(new_items)
 

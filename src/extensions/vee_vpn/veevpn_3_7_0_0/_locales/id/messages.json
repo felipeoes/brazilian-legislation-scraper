@@ -1,0 +1,14 @@
+{
+  "app_name_chrome": {
+    "message": "VPN Gratis untuk Chrome - VPN Proxy VeePN"
+  },
+  "app_name_edge": {
+    "message": "VPN Gratis untuk Edge - VPN Proxy VeePN"
+  },
+  "app_name_firefox": {
+    "message": "VPN Gratis - VPN Proxy VeePN"
+  },
+  "app_description": {
+    "message": "VPN cepat, aman, dan mudah digunakan untuk lindungi privasi online. Nikmati lalu lintas & bandwidth tanpa batas!"
+  }
+}
