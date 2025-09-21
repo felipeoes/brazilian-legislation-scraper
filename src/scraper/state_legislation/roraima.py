@@ -1,8 +1,9 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, Any, Optional, Optional
+from typing import Dict, Any, Optional, Optional, List
 
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper
+from src.database.saver import FileSaver
 
 
 # gotten from https://sapl.al.rr.leg.br/api/norma/tiponormajuridica/
@@ -41,7 +42,7 @@ class RoraimaAlpbScraper(BaseScaper):
         super().__init__(base_url, types=TYPES, situations=SITUATIONS, **kwargs)
         self.docs_save_dir = self.docs_save_dir / "RORAIMA"
         self.subjects: Dict[int, str] = {}
-        self._initialize_saver()
+        self.saver = FileSaver(self.docs_save_dir)
         self._fetch_subjects()
 
     def _format_search_url(
@@ -158,8 +159,10 @@ class RoraimaAlpbScraper(BaseScaper):
 
         self.subjects = subjects
 
-    def _scrape_year(self, year: int):
+    def _scrape_year(self, year: int) -> List[Dict]:
         """Scrape norms for a specific year"""
+        all_results = []
+        
         for norm_type, norm_type_id in tqdm(
             self.types.items() if isinstance(self.types, dict) else [],
             desc=f"RORAIMA | Year: {year} | Types",
@@ -221,9 +224,9 @@ class RoraimaAlpbScraper(BaseScaper):
                     result = future.result()
                     if result:
                         queue_item = {"year": year, "type": norm_type, **result}
-                        self.queue.put(queue_item)
                         results.append(queue_item)
 
+            all_results.extend(results)
             self.results.extend(results)
             self.count += len(results)
 
@@ -231,3 +234,5 @@ class RoraimaAlpbScraper(BaseScaper):
                 print(
                     f"Finished scraping for Year: {year}  | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
                 )
+        
+        return all_results

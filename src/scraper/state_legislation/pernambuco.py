@@ -2,7 +2,7 @@ import warnings
 import re
 import time
 from io import BytesIO
-from typing import Optional, Dict, Union
+from typing import Optional, Dict, Union, List
 from urllib.parse import urljoin, urlencode
 from bs4 import BeautifulSoup, Tag
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,6 +11,7 @@ from tqdm import tqdm
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import NoSuchElementException
 from src.scraper.base.scraper import BaseScaper
+from src.database.saver import FileSaver
 
 
 lock = Lock()
@@ -132,7 +133,8 @@ class PernambucoAlepeScraper(BaseScaper):
             "ctl00$tbxSenhaMob": ""
         }
         self.reached_end_page = False
-        self._initialize_saver()
+        # Initialize the FileSaver
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _get_form_state(self, soup: BeautifulSoup) -> Dict[str, str]:
         """Extract ASP.NET form state from page"""
@@ -394,8 +396,10 @@ class PernambucoAlepeScraper(BaseScaper):
         return doc_info
     
     
-    def _scrape_year(self, year: int):
+    def _scrape_year(self, year: int) -> List[Dict]:
         """Scrape norms for a specific year"""
+        all_results = []
+        
         for norm_type, norm_type_id in tqdm(
                 self.types.items(),
                 desc=f"PERNAMBUCO | Year: {year} | Types",
@@ -478,16 +482,16 @@ class PernambucoAlepeScraper(BaseScaper):
                 ):
                     result = future.result()
                     if result:  # Only add non-None results
-                        # save to one drive
+                        # save to results
                         queue_item = {
                                 "year": year,
                                 "type": norm_type,
                                 **result,
                         }
 
-                        self.queue.put(queue_item)
                         results.append(queue_item)
             
+            all_results.extend(results)
             self.results.extend(results)
             self.count += len(results)
 
@@ -495,5 +499,7 @@ class PernambucoAlepeScraper(BaseScaper):
                     print(
                         f"Finished scraping for Year: {year} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
                     )
+        
+        return all_results
              
             

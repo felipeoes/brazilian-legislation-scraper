@@ -5,6 +5,7 @@ from typing import Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper
+from src.database.saver import FileSaver
 
 TYPES = {
     "Resolução": 1,
@@ -52,7 +53,7 @@ class ConamaScraper(BaseScaper):
         }
         self.docs_save_dir = self.docs_save_dir / "CONAMA"
         self._situation_regex = re.compile(r"Revogad|Revogação", re.IGNORECASE)
-        self._initialize_saver()
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(self, norm_type: str) -> str:
         """Format url for search request"""
@@ -154,7 +155,7 @@ class ConamaScraper(BaseScaper):
                         if result is None:
                             continue
 
-                        # save to one drive
+                        # prepare item for saving
                         queue_item = {
                             "year": year_str,
                             "type": norm_type,
@@ -162,16 +163,14 @@ class ConamaScraper(BaseScaper):
                             **result,
                         }
 
-                        self.queue.put(queue_item)
                         type_results.append(queue_item)
 
-                    results.extend(type_results)
-                    self.results.extend(type_results)
-                    self.count += len(type_results)
+                results.extend(type_results)
+                self.count += len(type_results)
 
-                    if self.verbose:
-                        print(
-                            f"Year: {year_str} | Type: {norm_type} | Situation: {situation} | Total: {len(type_results)}"
-                        )
+                if self.verbose:
+                    print(
+                        f"Year: {year_str} | Type: {norm_type} | Situation: {situation} | Total: {len(type_results)}"
+                    )
 
         return results

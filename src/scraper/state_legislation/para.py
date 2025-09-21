@@ -1,9 +1,10 @@
 import re
-from typing import Optional
+from typing import Optional, List, Dict
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper
+from src.database.saver import FileSaver
 
 TYPES = {
     "Decreto Estadual": 2,
@@ -59,7 +60,8 @@ class ParaAlepaScraper(BaseScaper):
         }
         self.fetched_constitution = False
         self.regex_total_count = re.compile(r"Total de Registros:\s+(\d+)")
-        self._initialize_saver()
+        # Initialize the FileSaver
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(self, norm_type_id: int, year: int) -> str:
         self.params["tipo"] = norm_type_id
@@ -125,8 +127,10 @@ class ParaAlepaScraper(BaseScaper):
     def _scrape_constitution(self):
         """Scrape the constitution"""
 
-    def _scrape_year(self, year: int):
+    def _scrape_year(self, year: int) -> List[Dict]:
         """Scrape norms for a specific year"""
+        all_results = []
+        
         for situation in tqdm(
             self.situations,
             desc="PARA | Situations",
@@ -160,7 +164,7 @@ class ParaAlepaScraper(BaseScaper):
                         if result is None:
                             continue
 
-                        # save to one drive
+                        # save to results
                         queue_item = {
                             "year": year,
                             "situation": situation,
@@ -168,9 +172,9 @@ class ParaAlepaScraper(BaseScaper):
                             **result,
                         }
 
-                        self.queue.put(queue_item)
                         results.append(queue_item)
 
+                all_results.extend(results)
                 self.results.extend(results)
                 self.count += len(results)
 
@@ -178,3 +182,5 @@ class ParaAlepaScraper(BaseScaper):
                     print(
                         f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
                     )
+        
+        return all_results

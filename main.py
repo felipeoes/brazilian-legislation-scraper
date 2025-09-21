@@ -175,7 +175,7 @@ if __name__ == "__main__":
             {
                 "scraper": ESAlesScraper,
                 "params": {
-                    "year_start": 1943,  # 1943 is the earliest year available
+                    "year_start": 1958,  # 1943 is the earliest year available
                     "verbose": True,
                     "llm_client": client,  # we have pdf image extraction
                     "llm_model": model,
@@ -186,10 +186,12 @@ if __name__ == "__main__":
             {
                 "scraper": LegislaGoias,
                 "params": {
-                    "year_start": 1930,  # 1887 is the earliest year available
+                    "year_start": 1978,  # 1887 is the earliest year available
+                    "year_end": 1978, # 1965 - 199 antes
                     "llm_client": client,  # we have pdf image extraction
                     "llm_model": model,
                     "verbose": True,
+                    "max_workers": 32,
                 },
                 "name": "LegislaGoias",
                 "run": False,
@@ -218,10 +220,11 @@ if __name__ == "__main__":
             {
                 "scraper": MTAlmtScraper,
                 "params": {
-                    "year_start": 1835,  # 1835 is the earliest year available (historical data)
+                    "year_start": 1980,  # 1835 is the earliest year available (historical data)
                     "verbose": True,
                     "llm_client": client,  # we have pdf image extraction
                     "llm_model": model,
+                    "max_workers": 32,
                 },
                 "name": "MTAlmt",
                 "run": False,
@@ -230,8 +233,10 @@ if __name__ == "__main__":
                 "scraper": MGAlmgScraper,
                 "params": {
                     "year_start": 1831,  # 1831 is the earliest year available
-                    "verbose": True,
                     "max_workers": 32,
+                    "llm_client": client,  # we have pdf image extraction
+                    "llm_model": model,
+                    "verbose": True,
                 },
                 "name": "MGAlmg",
                 "run": False,
@@ -343,7 +348,7 @@ if __name__ == "__main__":
             {
                 "scraper": PiauiAlpbScraper,
                 "params": {
-                    "year_start": 2021,  # 1922 is the earliest year available
+                    "year_start": 1922,  # 1922 is the earliest year available
                     "verbose": True,
                     "max_workers": 32,
                     "llm_client": client,  # we have pdf image extraction
@@ -423,6 +428,8 @@ if __name__ == "__main__":
                     "year_start": 1835,  # 1835 is the earliest year available
                     "verbose": True,
                     "max_workers": 16,  # low max_workers because of the website's rate limiting
+                    "llm_client": client,  # we have image extraction for a type of documents (Decisão da Mesa)
+                    "llm_model": model,
                 },
                 "name": "SPAlesp",
                 "run": False,
@@ -462,10 +469,6 @@ if __name__ == "__main__":
                 print(f"Scraped {len(data)} data for {scraper['name']}")
 
     except KeyboardInterrupt:
-        for scraper in running_scrapers:
-            scraper.saver.running = False
-            scraper.saver.join()
-
         print("KeyboardInterrupt: Exiting...")
 
     print("Exiting...")

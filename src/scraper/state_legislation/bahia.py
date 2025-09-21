@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests.compat
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper
+from src.database.saver import FileSaver
 
 TYPES = {
     "Lei Complementar": 11,
@@ -58,7 +59,8 @@ class BahiaLegislaScraper(BaseScaper):
             "data[max]": "",
             "page": 0,
         }
-        self._initialize_saver()
+        # Initialize the FileSaver
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(self, norm_type_id: str, year: int, page: int) -> str:
         """Format url for search request"""
@@ -160,8 +162,10 @@ class BahiaLegislaScraper(BaseScaper):
 
         return doc_info
 
-    def _scrape_year(self, year: int):
+    def _scrape_year(self, year: int) -> list:
         """Scrape norms for a specific year"""
+        all_results = []
+        
         for situation in tqdm(
             self.situations,
             desc="BAHIA | Situations",
@@ -224,7 +228,7 @@ class BahiaLegislaScraper(BaseScaper):
                         if result is None:
                             continue
 
-                        # save to one drive
+                        # prepare item for saving
                         queue_item = {
                             "year": year,
                             # hardcode since we only get valid documents in search request
@@ -233,13 +237,14 @@ class BahiaLegislaScraper(BaseScaper):
                             **result,
                         }
 
-                        self.queue.put(queue_item)
                         results.append(queue_item)
 
-                    self.results.extend(results)
+                    all_results.extend(results)
                     self.count += len(results)
 
                     if self.verbose:
                         print(
                             f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
                         )
+
+        return all_results

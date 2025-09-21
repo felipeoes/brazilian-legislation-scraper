@@ -1,9 +1,10 @@
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Optional
+from typing import Any, Optional, List, Dict
 
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper
+from src.database.saver import FileSaver
 
 
 # Type mappings for Sergipe - these would need to be determined from the API
@@ -45,7 +46,7 @@ class SergipeLegsonScraper(BaseScaper):
         self.docs_save_dir = self.docs_save_dir / "SERGIPE"
         self.search_url = f"{self.base_url}/Public/Consulta"
         self.doc_content_url = f"{self.base_url}/Public/GetConteudoAto"
-        self._initialize_saver()
+        self.saver = FileSaver(self.docs_save_dir)
         self._fetch_constitution()
 
     def _format_search_url(self, norm_type_id: str, year: int, page: int = 1) -> str:
@@ -260,12 +261,12 @@ class SergipeLegsonScraper(BaseScaper):
                 "type": "Constituição Estadual",
                 "summary": data.get("ementa", ""),
                 "date": data.get("dataAto", ""),
-                "situation": self.situations.get(data.get("idSituacao"), "Em Vigor"),
+                "situation": self.situations.get(data.get("idSituacao"), "Em Vigor") if isinstance(self.situations, dict) else "Em Vigor",
                 "text_markdown": text_markdown,
                 "document_url": file_url
             }
             
-            self.queue.put(doc_info)
+            self.saver.save([doc_info])
             self.results.append(doc_info)
             self.count += 1
             if self.verbose:
@@ -275,8 +276,10 @@ class SergipeLegsonScraper(BaseScaper):
                 print("No constitution file found in the response.")
              
 
-    def _scrape_year(self, year: int):
+    def _scrape_year(self, year: int) -> List[Dict]:
         """Scrape norms for a specific year"""
+        all_results = []
+        
         for norm_type, norm_type_id in tqdm(
             self.types.items() if isinstance(self.types, dict) else [],
             desc=f"SERGIPE | Year: {year} | Types",
@@ -307,9 +310,9 @@ class SergipeLegsonScraper(BaseScaper):
                         result = future.result()
                         if result:
                             queue_item = {"year": year, "type": norm_type, **result}
-                            self.queue.put(queue_item)
                             results.append(queue_item)
 
+                all_results.extend(results)
                 self.results.extend(results)
                 self.count += len(results)
 
@@ -322,3 +325,5 @@ class SergipeLegsonScraper(BaseScaper):
                 if self.verbose:
                     print(f"Error scraping Year: {year} | Type: {norm_type} | Error: {e}")
                 continue
+        
+        return all_results

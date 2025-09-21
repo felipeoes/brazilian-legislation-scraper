@@ -2,6 +2,7 @@ from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from urllib.parse import urlencode, urljoin
+from typing import List, Dict
 from src.scraper.base.scraper import BaseScaper, YEAR_START
 
 TYPES = {
@@ -144,7 +145,7 @@ class MSAlemsScraper(BaseScaper):
         norm_type: str,
         norm_type_id: str,
         situation: str,
-    ):
+    ) -> List[Dict]:
         url = self._format_search_url(norm_type_id, year_index)
         docs = self._get_docs_links(url)
 
@@ -159,21 +160,24 @@ class MSAlemsScraper(BaseScaper):
                 desc="MATO GROSSO DO SUL | Get document data",
                 disable=not self.verbose,
             ):
-                result = future.result()
-                if result is None:
+                try:
+                    result = future.result()
+                    if result is None:
+                        continue
+
+                    # prepare item for saving
+                    queue_item = {
+                        "year": year,
+                        # hardcode since it seems we only get valid documents in search request
+                        "situation": situation,
+                        "type": norm_type,
+                        **result,
+                    }
+
+                    results.append(queue_item)
+                except Exception as e:
+                    print(f"Error getting document data: {e}")
                     continue
-
-                # save to one drive
-                queue_item = {
-                    "year": year,
-                    # hardcode since it seems we only get valid documents in search request
-                    "situation": situation,
-                    "type": norm_type,
-                    **result,
-                }
-
-                self.queue.put(queue_item)
-                results.append(queue_item)
 
             self.results.extend(results)
             self.count += len(results)
@@ -183,15 +187,14 @@ class MSAlemsScraper(BaseScaper):
                     f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
                 )
 
+        return results
+
     def scrape(self) -> list:
         """Scrape data from all years"""
         if not self.saver:
             raise ValueError(
                 "Saver is not initialized. Call _initialize_saver() first."
             )
-
-        # start saver thread
-        self.saver.start()
 
         # check if can resume from last scrapped year
         resume_from = self.year_start  # 1808
@@ -231,8 +234,10 @@ class MSAlemsScraper(BaseScaper):
                         continue
 
                     # scrape year
-                    self._scrape_year(
+                    results = self._scrape_year(
                         year, year_index + 1, norm_type, norm_type_id, situation
                     )
+                    if results:
+                        self.saver.save(results)
 
         return self.results

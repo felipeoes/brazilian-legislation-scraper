@@ -1,10 +1,12 @@
-from typing import Optional, Union
+import re
+from typing import Optional, List, Dict
 from io import BytesIO
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
-from urllib.parse import urlencode, urljoin
+from tqdm.auto import tqdm
+from urllib.parse import urlencode
 from src.scraper.base.scraper import BaseScaper
+from src.database.saver import FileSaver
 
 TYPES = {
     "Constituição Estadual": {"id": 12, "url_suffix": "constituicao-estadual"},
@@ -15,7 +17,7 @@ TYPES = {
     "Decreto Lei": {"id": 8, "url_suffix": "decreto-lei"},
     "Decreto Numerado": {"id": 3, "url_suffix": "decreto"},
     "Decreto Orçamentário": {"id": 5, "url_suffix": "decreto-orcamentario"},
-    "Portaria Orçaentária": {"id": 6, "url_suffix": "portaria-orcamentaria"},
+    "Portaria Orçamentária": {"id": 6, "url_suffix": "portaria-orcamentaria"},
     "Resolução": {"id": 7, "url_suffix": "resolucao"},
 }
 
@@ -49,13 +51,44 @@ class LegislaGoias(BaseScaper):
             "page": 1,
         }
         self.docs_save_dir = self.docs_save_dir / "GOIAS"
-        self._initialize_saver()
+        self._special_regex = re.compile(r"[^a-zA-ZÀ-ÿ\s]")
+        self._space_regex = re.compile(r"\s+")
+        # Initialize the FileSaver
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(self, norm_type_id: str, year: int, page: int = 1) -> str:
         self.params["ano"] = year
         self.params["tipo_legislacao"] = norm_type_id
         self.params["page"] = page
         return f"{self.base_url}?{urlencode(self.params)}"
+
+    def _clean_markdown(self, text_markdown: str) -> str:
+        """Clean markdown text"""
+
+        return text_markdown.replace("javascript:print()", "").strip()
+
+    def _process_pdf_link(
+        self, link: str, doc_id: str, doc_info: dict
+    ) -> Optional[dict]:
+        response = self._make_request(link)
+        if not response:
+            print(f"Error fetching PDF for doc ID: {doc_id} | Link: {link}")
+            return None
+
+        text_markdown = self._get_pdf_image_markdown(response.content)
+        if text_markdown:
+            doc_info["text_markdown"] = text_markdown
+            if not doc_info.get("document_url"):
+                doc_info["document_url"] = link
+            else:
+                doc_info["pdf_link"] = link
+        else:
+            print(f"Failed to extract text from PDF for doc ID: {doc_id}")
+            return None
+
+        doc_info["text_markdown"] = self._clean_markdown(doc_info["text_markdown"])
+
+        return doc_info
 
     def _get_doc_info(self, doc: dict, norm_url_suffix: str) -> Optional[dict]:
         """Get document info from given doc data using API"""
@@ -79,7 +112,7 @@ class LegislaGoias(BaseScaper):
             "situation": doc_detail.get("estado_legislacao", {}).get("nome", ""),
             "date": doc_detail["data_legislacao"],
             "title": f'{doc_detail["tipo_legislacao"]["nome"]} {doc_detail["numero"]} de {doc_detail["ano"]}',
-            "summary": doc_detail["ementa"],
+            "summary": doc_detail["ementa"].strip(),
         }
 
         # Check if we have formatted content (HTML)
@@ -88,6 +121,13 @@ class LegislaGoias(BaseScaper):
 
             # Parse HTML with BeautifulSoup to clean it up
             soup = BeautifulSoup(html_content, "html.parser")
+
+            # check if "Clique no link abaixo para acessar a:" in soup and skip document
+            if (
+                "Clique no link abaixo para acessar a:".lower()
+                in str(soup.prettify()).lower()
+            ):
+                return None
 
             # remove header table, if it contains GOVERNO DO ESTADO DE GOIÁS
             header_table = soup.find("table")
@@ -99,7 +139,7 @@ class LegislaGoias(BaseScaper):
 
             pdf_link = ""
 
-            # remove a tag it it has <img src="/assets/ver_lei.jpg">
+            # remove a tag if it has <img src="/assets/ver_lei.jpg">
             for a_tag in soup.find_all("a"):
                 img = a_tag.find("img", src="/assets/ver_lei.jpg")
                 if img:
@@ -115,6 +155,19 @@ class LegislaGoias(BaseScaper):
 
             doc_info["html_string"] = html_string
 
+            # check if botao-baixar in soup
+            baixar_div = soup.find("div", class_="botao-baixar")
+            if baixar_div:
+                a_tag = baixar_div.find("a", href=True)
+                pdf_link = a_tag["href"]
+
+                doc_info = self._process_pdf_link(pdf_link, doc_id, doc_info)
+
+                if not doc_info:
+                    return None
+
+                return doc_info
+
             # Convert HTML to markdown using BytesIO buffer
             buffer = BytesIO()
             buffer.write(html_string.encode("utf-8"))
@@ -122,24 +175,17 @@ class LegislaGoias(BaseScaper):
 
             text_markdown = self._get_markdown(stream=buffer)
             if text_markdown:
+                text_markdown = text_markdown.strip()
                 doc_info["text_markdown"] = text_markdown
 
-                # check if text_markdown has substantial content after removing summary and possible error msg, if not, fetch text from PDF
-
-                error_msg = "We're sorry but legisla\\_publico\\_vue doesn't work properly without JavaScript enabled. Please enable it to continue."
-
-                new_text = (
-                    text_markdown.lower().replace(error_msg.lower(), "")
-                ).strip()
-                if len(new_text) < 50:  # threshold for substantial content
-                    print(f"Invalid  doc ID: {doc_id}. Year: {doc_detail['ano']}")
-                    return None
-
-                new_text = (
-                    text_markdown.lower()
-                    .replace(doc_info["summary"].lower(), "")
-                    .strip()
+                new_text = self._special_regex.sub("", text_markdown.lower())
+                new_text = self._space_regex.sub("", new_text).strip()
+                compare_summary = self._special_regex.sub(
+                    "", doc_info["summary"].lower()
                 )
+                compare_summary = self._space_regex.sub("", compare_summary).strip()
+
+                new_text = new_text.replace(compare_summary, "").strip()
                 if (
                     len(new_text) < 150
                 ):  # threshold for substantial content (based on experimentation with goias norms)
@@ -156,25 +202,19 @@ class LegislaGoias(BaseScaper):
 
         # If we don't have HTML content or markdown conversion failed, try PDF
         if not doc_info.get("text_markdown"):
-            print(
-                f"Falling back to PDF for doc ID: {doc_id} | Year: {doc_detail['ano']}"
-            )
-            response = self._make_request(pdf_link)
-            text_markdown = self._get_pdf_image_markdown(response.content)
-            if text_markdown:
-                doc_info["text_markdown"] = text_markdown
-                if not doc_info.get("document_url"):
-                    doc_info["document_url"] = pdf_link
-                else:
-                    doc_info["pdf_link"] = pdf_link
-            else:
-                print(f"Failed to extract text from PDF for doc ID: {doc_id}")
+            doc_info = self._process_pdf_link(pdf_link, doc_id, doc_info)
+            if not doc_info:
+                print(f"Failed to process PDF for doc ID: {doc_id}")
                 return None
 
         # clean text_markdown (some docs may have the "javascript:print()" string at the end of the document)
-        doc_info["text_markdown"] = (
-            doc_info["text_markdown"].replace("javascript:print()", "").strip()
-        )
+        doc_info["text_markdown"] = self._clean_markdown(doc_info["text_markdown"])
+
+        # check for error msg
+        error_msg = "doesn't work properly without JavaScript enabled"
+        if error_msg.lower() in doc_info["text_markdown"].lower():
+            print(f"Invalid  doc ID: {doc_id}. Year: {doc_detail['ano']}")
+            return None
 
         return doc_info
 
@@ -215,8 +255,10 @@ class LegislaGoias(BaseScaper):
 
         return docs
 
-    def _scrape_year(self, year: int):
+    def _scrape_year(self, year: int) -> List[Dict]:
         """Scrape norms for a specific year"""
+        all_results = []
+
         for norm_type, norm_type_data in tqdm(
             self.types.items(),
             desc=f"GOIAS | Year: {year} | Types",
@@ -264,23 +306,18 @@ class LegislaGoias(BaseScaper):
                             continue
 
                         for norm in norms:
-                            # save to one drive
+                            # save to results
                             queue_item = {
                                 "year": year,
                                 "type": norm_type,
                                 **norm,
                             }
-
-                            self.queue.put(queue_item)
                             results.append(queue_item)
 
                     except Exception as e:
                         print(f"Error getting document data | Error: {e}")
 
+            all_results.extend(results)
             self.results.extend(results)
-            self.count += len(results)
 
-            if self.verbose:
-                print(
-                    f"Finished scraping for Year: {year} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
-                )
+        return all_results

@@ -8,6 +8,7 @@ from io import BytesIO
 from bs4 import BeautifulSoup, Tag
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper
+from src.database.saver import FileSaver
 
 
 TYPES = {
@@ -40,7 +41,7 @@ class SantaCatarinaScraper(BaseScaper):
     ):
         super().__init__(base_url, types=TYPES, situations=SITUATIONS, **kwargs)
         self.docs_save_dir = self.docs_save_dir / "SANTA_CATARINA"
-        self._initialize_saver()
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(self, norm_type_id: str, year: int) -> str:
         """Format url for search request - returns base URL since we use POST"""
@@ -268,8 +269,10 @@ class SantaCatarinaScraper(BaseScaper):
         
         return doc_info
 
-    def _scrape_year(self, year: int):
+    def _scrape_year(self, year: int) -> List[Dict]:
         """Scrape norms for a specific year"""
+        all_results = []
+        
         for norm_type, norm_type_id in tqdm(
             self.types.items() if isinstance(self.types, dict) else [],
             desc=f"SANTA CATARINA | Year: {year} | Types",
@@ -299,9 +302,9 @@ class SantaCatarinaScraper(BaseScaper):
                         result = future.result()
                         if result:
                             queue_item = {"year": year, "type": norm_type, **result}
-                            self.queue.put(queue_item)
                             results.append(queue_item)
 
+                all_results.extend(results)
                 self.results.extend(results)
                 self.count += len(results)
 
@@ -314,3 +317,5 @@ class SantaCatarinaScraper(BaseScaper):
                 if self.verbose:
                     print(f"Error scraping Year: {year} | Type: {norm_type} | Error: {e}")
                 continue
+        
+        return all_results

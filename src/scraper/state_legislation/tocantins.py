@@ -1,10 +1,11 @@
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Dict
 
 from bs4 import BeautifulSoup, Tag
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper
+from src.database.saver import FileSaver
 
 
 # Type mappings for Tocantins
@@ -37,7 +38,7 @@ class TocantinsScraper(BaseScaper):
         super().__init__(base_url, types=TYPES, situations=SITUATIONS, **kwargs)
         self.docs_save_dir = self.docs_save_dir / "TOCANTINS"
         self.search_url = f"{self.base_url}/legislacaoEstadual"
-        self._initialize_saver()
+        self.saver = FileSaver(self.docs_save_dir)
         self._fetch_constitution()
 
     def _format_search_url(self, norm_type_id: str, year: int, page: int = 1) -> str:
@@ -261,15 +262,17 @@ class TocantinsScraper(BaseScaper):
             "document_url": pdf_link,
         }
          
-        self.queue.put(doc_info)
+        self.saver.save([doc_info])
         self.results.append(doc_info)
         self.count += 1
         print("Fetched Tocantins constitution successfully")
         
 
 
-    def _scrape_year(self, year: int):
+    def _scrape_year(self, year: int) -> List[Dict]:
         """Scrape norms for a specific year"""
+        all_results = []
+        
         for norm_type, norm_type_id in tqdm(
             self.types.items() if isinstance(self.types, dict) else [],
             desc=f"TOCANTINS | Year: {year} | Types",
@@ -300,9 +303,9 @@ class TocantinsScraper(BaseScaper):
                         result = future.result()
                         if result:
                             queue_item = {"year": year, "type": norm_type, **result}
-                            self.queue.put(queue_item)
                             results.append(queue_item)
 
+                all_results.extend(results)
                 self.results.extend(results)
                 self.count += len(results)
 
@@ -315,3 +318,5 @@ class TocantinsScraper(BaseScaper):
                 if self.verbose:
                     print(f"Error scraping Year: {year} | Type: {norm_type} | Error: {e}")
                 continue
+        
+        return all_results

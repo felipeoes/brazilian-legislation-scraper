@@ -7,13 +7,14 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup, Tag
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper
+from src.database.saver import FileSaver
 
 
 TYPES = {
     "Decreto-Lei": "declei",
     "Lei Complementar": "leicomp",
     "Lei Ordinária": "leiord",
-    'Decreto Numerado': "decnum",
+    "Decreto Numerado": "decnum",
 }
 
 # Cannot determine revocation status from the website, so the situation is hardcoded as "Não consta"
@@ -33,7 +34,7 @@ class RondoniaCotelScraper(BaseScaper):
     ):
         super().__init__(base_url, types=TYPES, situations=SITUATIONS, **kwargs)
         self.docs_save_dir = self.docs_save_dir / "RONDONIA"
-        self._initialize_saver()
+        self.saver = FileSaver(self.docs_save_dir)
         self._fetch_constitution()
 
     def _format_search_url(self, norm_type_id: str, year: int) -> str:
@@ -58,11 +59,11 @@ class RondoniaCotelScraper(BaseScaper):
             rows = tbody.find_all("tr")
         else:
             rows = table.find_all("tr")
-        
+
         for row in rows:
             if not isinstance(row, Tag):
                 continue
-                
+
             cell = row.find("td")
             if not cell or not isinstance(cell, Tag):
                 continue
@@ -75,11 +76,11 @@ class RondoniaCotelScraper(BaseScaper):
             title_links = div.find_all("a")
             title_link = None
             pdf_link = None
-            
+
             for link in title_links:
                 if not isinstance(link, Tag):
                     continue
-                    
+
                 href = link.get("href")
                 if href and isinstance(href, str):
                     if "detalhes.aspx" in href:
@@ -91,7 +92,7 @@ class RondoniaCotelScraper(BaseScaper):
                 continue
 
             title = title_link.get_text(strip=True)
-            
+
             pdf_href = pdf_link.get("href")
             if pdf_href and isinstance(pdf_href, str):
                 if not pdf_href.startswith("http"):
@@ -103,11 +104,11 @@ class RondoniaCotelScraper(BaseScaper):
             summary_spans = div.find_all("span")
             summary = ""
             doc_id = ""
-            
+
             for span in summary_spans:
                 if not isinstance(span, Tag):
                     continue
-                    
+
                 span_id = span.get("id")
                 if span_id and isinstance(span_id, str):
                     if "ementadoc" in span_id:
@@ -115,12 +116,16 @@ class RondoniaCotelScraper(BaseScaper):
                     elif "coddocLabel" in span_id:
                         doc_id = span.get_text(strip=True)
 
+            # remove invalid docs (summary equals NÃO UTILIZADO)
+            if summary.lower() == "não utilizado":
+                continue
+
             # get last part of pdf (filename) to join
             pdf_href = pdf_href.split("/")[-1]
             doc = {
                 "id": doc_id,
                 "title": title,
-                "situation": "Não consta", # we cannot determine revocation status
+                "situation": "Não consta",  # we cannot determine revocation status
                 "summary": summary,
                 "pdf_link": f"{self.base_url}/Livros/Files/{pdf_href}",
             }
@@ -128,24 +133,27 @@ class RondoniaCotelScraper(BaseScaper):
 
         return docs
 
-    def _process_pdf(self, pdf_link: str) -> Optional[dict]:
+    def _process_pdf(
+        self, pdf_link: str, pdf_len_threshold: int = 99
+    ) -> Optional[dict]:
         """Process PDF and return text markdown."""
         response = self._make_request(pdf_link)
         if not response or not response.content:
             return None
-        
-        text_markdown = self._get_markdown(response=response)
-        
-        if text_markdown and text_markdown.strip():
-            return {
-                "text_markdown": text_markdown,
-                "document_url": pdf_link,
-            }
-        
-        if not text_markdown or not text_markdown.strip():
-                text_markdown = self._get_pdf_image_markdown(response.content)
 
-        if not text_markdown or not text_markdown.strip():
+        text_markdown = self._get_markdown(response=response)
+
+        if text_markdown:
+            text_markdown = text_markdown.strip()
+            if len(text_markdown) > pdf_len_threshold:
+                return {
+                    "text_markdown": text_markdown,
+                    "document_url": pdf_link,
+                }
+
+        text_markdown = self._get_pdf_image_markdown(response.content)
+        text_markdown = text_markdown.strip() if text_markdown else ""
+        if not text_markdown or not len(text_markdown) > pdf_len_threshold:
             return None
 
         return {
@@ -163,13 +171,13 @@ class RondoniaCotelScraper(BaseScaper):
 
         doc_info.update(processed_pdf)
         return doc_info
-    
+
     def _fetch_constitution(self):
         """Fetch the state constitution if available."""
         pdf_url = f"{self.base_url}/Livros/CE1989-2014.pdf"
-        
+
         text_markdown = self._get_markdown(url=pdf_url)
-        
+
         doc_info = {
             "year": datetime.now().year,
             "type": "Constituição Estadual",
@@ -180,15 +188,16 @@ class RondoniaCotelScraper(BaseScaper):
             "text_markdown": text_markdown,
             "document_url": pdf_url,
         }
-        
-        self.queue.put(doc_info)
+
+        self.saver.save([doc_info])
         self.results.append(doc_info)
         self.count += 1
         print("Scraped state constitution")
-         
 
-    def _scrape_year(self, year: int):
+    def _scrape_year(self, year: int) -> List[Dict]:
         """Scrape norms for a specific year"""
+        all_results = []
+        
         for norm_type, norm_type_id in tqdm(
             self.types.items() if isinstance(self.types, dict) else [],
             desc=f"RONDONIA | Year: {year} | Types",
@@ -196,10 +205,10 @@ class RondoniaCotelScraper(BaseScaper):
             disable=not self.verbose,
         ):
             url = self._format_search_url(norm_type_id, year)
-            
+
             try:
                 documents = self._get_docs_links(url)
-                
+
                 if not documents:
                     continue
 
@@ -220,9 +229,9 @@ class RondoniaCotelScraper(BaseScaper):
                         result = future.result()
                         if result:
                             queue_item = {"year": year, "type": norm_type, **result}
-                            self.queue.put(queue_item)
                             results.append(queue_item)
 
+                all_results.extend(results)
                 self.results.extend(results)
                 self.count += len(results)
 
@@ -230,8 +239,12 @@ class RondoniaCotelScraper(BaseScaper):
                     print(
                         f"Finished scraping for Year: {year} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
                     )
-                    
+
             except Exception as e:
                 if self.verbose:
-                    print(f"Error scraping Year: {year} | Type: {norm_type} | Error: {e}")
+                    print(
+                        f"Error scraping Year: {year} | Type: {norm_type} | Error: {e}"
+                    )
                 continue
+        
+        return all_results

@@ -8,7 +8,7 @@ from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper
-from src.database.saver import ONEDRIVE_SAVE_DIR
+from src.database.saver import SAVE_DIR, FileSaver
 
 VALID_SITUATIONS = [
     "Não%20consta%20revogação%20expressa",
@@ -72,7 +72,7 @@ class CamaraDepScraper(BaseScaper):
     def __init__(
         self,
         base_url: str = "https://www.camara.leg.br/legislacao/",
-        docs_save_dir: str = ONEDRIVE_SAVE_DIR.resolve().as_posix(),
+        docs_save_dir: str = SAVE_DIR.resolve().as_posix(),
         **kwargs,
     ):
         super().__init__(base_url, types=TYPES, situations=SITUATIONS, **kwargs)
@@ -89,7 +89,7 @@ class CamaraDepScraper(BaseScaper):
             "numero": "",
             "ordenacao": "",
         }
-        self._initialize_saver()
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(self, year: str, situation: str, type: str) -> str:
         """Format search url with given year"""
@@ -338,6 +338,8 @@ class CamaraDepScraper(BaseScaper):
 
     def _scrape_year(self, year: int) -> list:
         """Scrape data from given year"""
+        all_results = []
+        
         for situation in tqdm(
             self.situations,
             desc="CamaraDEP | Situations",
@@ -448,21 +450,20 @@ class CamaraDepScraper(BaseScaper):
                         if result is None:
                             continue
 
-                        # save to onedrive
+                        # prepare item for saving
                         queue_item = {
                             "year": year,
                             "situation": situation,
                             "type": type,
                             **result,
                         }
-                        self.queue.put(queue_item)
                         results.append(queue_item)
 
-                self.results.extend(results)
+                all_results.extend(results)
                 self.count += len(results)
 
                 print(
                     f"Finished scraping for Year: {year} | Situation: {situation} | Type: {type} | Results: {len(results)} | Total: {self.count}"
                 )
 
-        return self.results
+        return all_results

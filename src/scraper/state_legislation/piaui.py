@@ -1,8 +1,9 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper
+from src.database.saver import FileSaver
 
 
 # gotten from https://sapl.al.pi.leg.br/api/norma/tiponormajuridica/
@@ -17,6 +18,7 @@ TYPES = {
 }
 
 SITUATIONS = []
+
 
 class PiauiAlpbScraper(BaseScaper):
     """Webscraper for Piauí state legislation website (https://sapl.al.pi.leg.br/)
@@ -38,7 +40,8 @@ class PiauiAlpbScraper(BaseScaper):
         super().__init__(base_url, types=TYPES, situations=SITUATIONS, **kwargs)
         self.docs_save_dir = self.docs_save_dir / "PIAUI"
         self.subjects: Dict[int, str] = {}
-        self._initialize_saver()
+        # Initialize the FileSaver
+        self.saver = FileSaver(self.docs_save_dir)
         self._fetch_subjects()
 
     def _format_search_url(
@@ -82,27 +85,27 @@ class PiauiAlpbScraper(BaseScaper):
 
         return docs
 
-    def _process_pdf(self, pdf_link: str, year: int) -> Optional[dict]:
+    def _process_pdf(
+        self, pdf_link: str, pdf_len_threshold: int = 149
+    ) -> Optional[dict]:
         """Process PDF and return text markdown."""
         response = self._make_request(pdf_link)
         if not response or not response.content:
             return None
 
         text_markdown = self._get_markdown(response=response)
-        if text_markdown and text_markdown.strip():
-            return {
-                "text_markdown": text_markdown,
-                "document_url": pdf_link,
-            }
-            
-        if not text_markdown or not text_markdown.strip():
-            try:
-                text_markdown = self._get_pdf_image_markdown(response.content)
-            except Exception as e:
-                print(f"Error processing PDF: {e}")
-                return None
 
-        if not text_markdown or not text_markdown.strip():
+        if text_markdown:
+            text_markdown = text_markdown.strip()
+            if len(text_markdown) > pdf_len_threshold:
+                return {
+                    "text_markdown": text_markdown,
+                    "document_url": pdf_link,
+                }
+
+        text_markdown = self._get_pdf_image_markdown(response.content)
+        text_markdown = text_markdown.strip() if text_markdown else ""
+        if not text_markdown or not len(text_markdown) > pdf_len_threshold:
             return None
 
         return {
@@ -110,10 +113,10 @@ class PiauiAlpbScraper(BaseScaper):
             "document_url": pdf_link,
         }
 
-    def _get_doc_data(self, doc_info: dict, year: int) -> dict:
+    def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
         """Get document data"""
         pdf_link = doc_info.pop("pdf_link")
-        processed_pdf = self._process_pdf(pdf_link, year)
+        processed_pdf = self._process_pdf(pdf_link)
 
         if processed_pdf is None:
             return None
@@ -141,14 +144,13 @@ class PiauiAlpbScraper(BaseScaper):
         ):
             response = self._make_request(f"{subjects_url}?page={page}")
             data = response.json()
-            subjects.update(
-                {item["id"]: item["assunto"] for item in data["results"]}
-            )
+            subjects.update({item["id"]: item["assunto"] for item in data["results"]})
 
         self.subjects = subjects
 
-    def _scrape_year(self, year: int):
+    def _scrape_year(self, year: int) -> List[Dict]:
         """Scrape norms for a specific year"""
+        all_results = []
 
         for norm_type, norm_type_id in tqdm(
             self.types.items(),
@@ -170,7 +172,7 @@ class PiauiAlpbScraper(BaseScaper):
                 continue
 
             total_pages = data["pagination"]["total_pages"]
-            
+
             data_futures = []
             results = []
             with ThreadPoolExecutor() as executor:
@@ -192,15 +194,12 @@ class PiauiAlpbScraper(BaseScaper):
                     doc_info = future.result()
                     if not doc_info:
                         continue
-                    
+
                     documents.extend(doc_info)
 
                     for doc in doc_info:
-                        data_futures.append(
-                        executor.submit(self._get_doc_data, doc, year))
-                    
+                        data_futures.append(executor.submit(self._get_doc_data, doc))
 
-                
                 for future in tqdm(
                     as_completed(data_futures),
                     desc="PIAUI | Get document data",
@@ -210,9 +209,9 @@ class PiauiAlpbScraper(BaseScaper):
                     result = future.result()
                     if result:
                         queue_item = {"year": year, "type": norm_type, **result}
-                        self.queue.put(queue_item)
                         results.append(queue_item)
 
+            all_results.extend(results)
             self.results.extend(results)
             self.count += len(results)
 
@@ -220,3 +219,5 @@ class PiauiAlpbScraper(BaseScaper):
                 print(
                     f"Finished scraping for Year: {year}  | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
                 )
+        
+        return all_results

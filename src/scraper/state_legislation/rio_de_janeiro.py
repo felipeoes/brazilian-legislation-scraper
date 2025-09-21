@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from tqdm import tqdm
 
 from src.scraper.base.scraper import BaseScaper
+from src.database.saver import FileSaver
 
 load_dotenv()
 
@@ -54,7 +55,8 @@ class RJAlerjScraper(BaseScaper):
         }
         self.docs_save_dir = self.docs_save_dir / "RIO_DE_JANEIRO"
         self.fetched_constitution = False
-        self._initialize_saver()
+        # Initialize the FileSaver
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(self, norm_type: str) -> str:
         """Format url for search request"""
@@ -200,8 +202,10 @@ class RJAlerjScraper(BaseScaper):
         self.count += 1
         self.fetched_constitution = True
 
-    def _scrape_year(self, year: str):
+    def _scrape_year(self, year: str) -> List[Dict]:
         """Scrape data from given year"""
+        all_results = []
+        
         for norm_type in tqdm(
             self.types, desc=f"RJ - ALERJ | {year} | Types", total=len(self.types)
         ):
@@ -244,9 +248,9 @@ class RJAlerjScraper(BaseScaper):
                     result = future.result()
                     if result:
                         queue_item = {"year": year, "type": norm_type, **result}
-                        self.queue.put(queue_item)
                         scraped_docs.append(queue_item)
 
+            all_results.extend(scraped_docs)
             self.results.extend(scraped_docs)
             self.count += len(scraped_docs)
 
@@ -254,3 +258,5 @@ class RJAlerjScraper(BaseScaper):
                 print(
                     f"Scraped {len(scraped_docs)} {norm_type} documents in {year}"
                 )
+        
+        return all_results

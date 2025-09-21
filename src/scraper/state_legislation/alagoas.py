@@ -5,6 +5,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper
+from src.database.saver import FileSaver
 
 TYPES = {
     "Consituição Estadual": "TIP080",
@@ -63,7 +64,8 @@ class AlagoasSefazScraper(BaseScaper):
         }
         self.docs_save_dir = self.docs_save_dir / "ALAGOAS"
         self.view_doc_url = "https://gcs2.sefaz.al.gov.br/sfz-gcs-api/api/documentos/visualizarDocumento?"
-        self._initialize_saver()
+        # Initialize the FileSaver
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(self, norm_type_id: str, year: int, page: int = 1) -> str:
         """Format url for search request"""
@@ -124,8 +126,10 @@ class AlagoasSefazScraper(BaseScaper):
             "document_url": doc_link,
         }
 
-    def _scrape_year(self, year: str):
+    def _scrape_year(self, year: str) -> List[dict]:
         """Scrape norms for a specific year"""
+        all_results = []
+        
         for situation in tqdm(
             self.situations,
             desc="SEFAZ - ALAGOAS | Situations",
@@ -160,9 +164,9 @@ class AlagoasSefazScraper(BaseScaper):
                 with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                     futures = [
                         executor.submit(
-                            self._get_docs_links(
-                                self._format_search_url(norm_type_id, year, page), norms
-                            )
+                            self._get_docs_links,
+                            self._format_search_url(norm_type_id, year, page), 
+                            norms
                         )
                         for page in range(2, pages)
                     ]
@@ -202,7 +206,7 @@ class AlagoasSefazScraper(BaseScaper):
                             if result is None:
                                 continue
 
-                            # save to one drive
+                            # prepare item for saving
                             queue_item = {
                                 "year": year,
                                 "type": norm_type,
@@ -210,16 +214,17 @@ class AlagoasSefazScraper(BaseScaper):
                                 **result,
                             }
 
-                            self.queue.put(queue_item)
                             results.append(queue_item)
 
                         except Exception as e:
                             print(f"Error getting document data | Error: {e}")
 
-                    self.results.extend(results)
+                    all_results.extend(results)
                     self.count += len(results)
 
                     if self.verbose:
                         print(
                             f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
                         )
+        
+        return all_results

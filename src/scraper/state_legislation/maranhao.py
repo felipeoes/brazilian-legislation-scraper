@@ -1,4 +1,5 @@
 from urllib.parse import urljoin
+from typing import List, Dict, Optional
 
 import time
 import re
@@ -11,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper
+from src.database.saver import FileSaver
 
 lock = Lock()
 
@@ -109,7 +111,8 @@ class MaranhaoAlemaScraper(BaseScaper):
             "javax.faces.ClientWindow": 1381,
         }
         self.scraped_constitution: bool = False
-        self._initialize_saver()
+        # Initialize the FileSaver
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(
         self, norm_type_id: str, year: int, page: int, subtype_id=""
@@ -275,7 +278,7 @@ class MaranhaoAlemaScraper(BaseScaper):
         situation: str,
         subtype: str = None,
         subtype_id: str = None,
-    ):
+    ) -> List[Dict]:
         """Scrape norms for a specific year, type and situation"""
         # url = self._format_search_url(norm_type_id, year, 0, subtype_id)
 
@@ -288,7 +291,7 @@ class MaranhaoAlemaScraper(BaseScaper):
             "div", class_="ui-datatable-header ui-widget-header ui-corner-top"
         )
         if not total_docs:  # no documents found for the given year, type and situation
-            return
+            return []
 
         total_docs_regex = re.search(
             r"(\d+) registro\(s\) encontrado\(s\)", total_docs.text
@@ -336,7 +339,7 @@ class MaranhaoAlemaScraper(BaseScaper):
                 if result is None:
                     continue
 
-                # save to one drive
+                # save to results
                 queue_item = {
                     "year": year,
                     # hardcode since it seems we only get valid documents in search request
@@ -345,7 +348,6 @@ class MaranhaoAlemaScraper(BaseScaper):
                     **result,
                 }
 
-                self.queue.put(queue_item)
                 results.append(queue_item)
 
             self.results.extend(results)
@@ -356,7 +358,8 @@ class MaranhaoAlemaScraper(BaseScaper):
                     f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
                 )
 
-    def _scrape_constitution(self, norm_type: str, norm_type_id: str):
+        return results
+    def _scrape_constitution(self, norm_type: str, norm_type_id: str) -> Optional[Dict]:
         """Scrape state constitution"""
         url = urljoin(f"{self.base_url}/ged/", norm_type_id)
         soup = self._get_soup(url)
@@ -379,11 +382,13 @@ class MaranhaoAlemaScraper(BaseScaper):
             "document_url": pdf_link,
         }
 
-        self.queue.put(queue_item)
         self.scraped_constitution = True
+        return queue_item
 
-    def _scrape_year(self, year: int):
+    def _scrape_year(self, year: int) -> List[Dict]:
         """Scrape norms for a specific year"""
+        all_results = []
+        
         for situation in tqdm(
             self.situations,
             desc="MARANHAO | Situations",
@@ -400,14 +405,16 @@ class MaranhaoAlemaScraper(BaseScaper):
                     norm_type == "Constituição Estadual"
                     and not self.scraped_constitution
                 ):
-                    self._scrape_constitution(norm_type, norm_type_id)
+                    result = self._scrape_constitution(norm_type, norm_type_id)
+                    if result:
+                        all_results.append(result)
                     continue
 
                 if isinstance(norm_type_id, dict):
                     subtypes = norm_type_id["subtypes"]
                     norm_type_id = norm_type_id["id"]
                     for subtype, subtype_id in subtypes.items():
-                        self._scrape_norms(
+                        results = self._scrape_norms(
                             norm_type,
                             norm_type_id,
                             year,
@@ -415,5 +422,9 @@ class MaranhaoAlemaScraper(BaseScaper):
                             subtype=subtype,
                             subtype_id=subtype_id,
                         )
+                        all_results.extend(results)
                 else:
-                    self._scrape_norms(norm_type, norm_type_id, year, situation)
+                    results = self._scrape_norms(norm_type, norm_type_id, year, situation)
+                    all_results.extend(results)
+        
+        return all_results

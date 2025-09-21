@@ -1,8 +1,8 @@
-import os
 import requests
 import time
 import fitz
 import warnings
+import logging
 
 from typing import Dict, List, Optional, Union
 from PIL import Image
@@ -17,15 +17,18 @@ from selenium.webdriver.chrome.options import Options
 from markitdown import MarkItDown, UnsupportedFormatException, FileConversionException
 from tqdm.auto import tqdm
 from concurrent.futures import ThreadPoolExecutor
-from multiprocessing import Queue
 from pathlib import Path
 from dotenv import load_dotenv
-from src.database.saver import OneDriveSaver
+from src.database.saver import FileSaver
 from src.utils.openvpn import OpenVPNManager
 
 
 # supress markitdown warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="markitdown")
+
+# suppress httpx and urllib3 logging
+logging.getLogger("httpx").setLevel(logging.ERROR)
+logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 load_dotenv()
 
@@ -97,7 +100,7 @@ class BaseScaper:
         docs_save_dir: Path = Path(ONEDRIVE_STATE_LEGISLATION_SAVE_DIR),
         llm_client: Optional[OpenAI] = None,
         llm_model: Optional[str] = None,
-        llm_prompt: str = "Extraia todo  o conteúdo da imagem. Não inclua nenhum outro texto ou explicação. Retorne somente o conteúdo extraído.",
+        llm_prompt: str = "Extraia todo o conteúdo da imagem, em formato markdown. Não inclua a tag ```markdown. Não inclua nenhum outro texto ou explicação. Retorne somente o conteúdo extraído.",
         use_selenium: bool = False,
         multiple_drivers: bool = False,
         use_selenium_vpn: bool = False,
@@ -137,8 +140,6 @@ class BaseScaper:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
         }
         self.llm_md_header = "\n# Description:\n"
-        self.queue = Queue()
-        self.error_queue = Queue()
         self.results = []
         self.count = 0  # keep track of number of results
         self.md = MarkItDown(llm_client=llm_client, llm_model=llm_model)
@@ -146,7 +147,7 @@ class BaseScaper:
         self.session: requests.Session = requests.Session()
         self.driver: Optional[Chrome] = None
         self.drivers: list[Chrome] = []
-        self.saver: Optional[OneDriveSaver] = None
+        self.saver: Optional[FileSaver] = None
         self.openvpn_manager: Optional[OpenVPNManager] = None
         self.initialize_selenium()
         self.initialize_requests_session()
@@ -216,7 +217,7 @@ class BaseScaper:
 
     def _initialize_saver(self):
         """Initialize saver class. The child class should call this method in its __init__ method, after setting the docs_save_dir attribute."""
-        self.saver = OneDriveSaver(self.queue, self.error_queue, self.docs_save_dir)
+        self.saver = FileSaver(self.docs_save_dir)
 
     def initialize_openvpn_manager(self):
         """Initialize openvpn manager"""
@@ -256,6 +257,7 @@ class BaseScaper:
         """Make request to given url"""
         retries = 3
         for attempt in range(retries):
+            sleep_time = 5**attempt
             try:
 
                 if method == "POST":
@@ -283,15 +285,19 @@ class BaseScaper:
                     in response.text
                 ):
                     print("Server error, retrying...")
-                    time.sleep(5**attempt)
+                    time.sleep(sleep_time)
                     continue
+
+                # for 404 error just return None
+                if response.status_code == 404:
+                    print(f"404 Not Found: {url}")
+                    return None
 
                 # check for 429, 502 503 status code (right now useful for mato grosso scraper)
                 if response.status_code in [
                     400,
                     401,
                     403,
-                    404,
                     408,
                     429,
                     500,
@@ -299,15 +305,18 @@ class BaseScaper:
                     503,
                     504,
                 ]:
-                    # print(f"Status code {response.status_code}, retrying...")
-                    time.sleep(5**attempt)
+
+                    print(
+                        f"Status code {response.status_code}, retrying... | URL: {url} | Sleeping for {sleep_time} seconds"
+                    )
+                    time.sleep(sleep_time)
                     continue
 
                 return response
             except Exception as e:
                 print(f"Error getting response from url: {url}")
                 print(e)
-                time.sleep(5**attempt)
+                time.sleep(sleep_time)
 
         return None
 
@@ -418,6 +427,15 @@ class BaseScaper:
 
         return image_list
 
+    def _clean_md_tag(self, md_content: str) -> str:
+        """Clean '```markdown' tags from markdown content"""
+        if md_content.startswith("```markdown"):
+            md_content = md_content.replace("```markdown", "").strip()
+        if md_content.endswith("```"):
+            md_content = md_content.replace("```", "").strip()
+
+        return md_content
+
     def _get_pdf_image_markdown(self, pdf_content: bytes) -> str:
         """Get markdown response from given pdf content"""
         pdf_file_stream = BytesIO(pdf_content)
@@ -469,6 +487,7 @@ class BaseScaper:
             ):
                 try:
                     md_content = future.result()
+                    md_content = self._clean_md_tag(md_content.strip())
                     text_markdown_img += md_content + "\n\n"
                 except Exception as e:
                     print(f"Error converting image to markdown: {e}")
@@ -503,7 +522,9 @@ class BaseScaper:
                         retries -= 1
                         continue
 
-                    return md_content.replace(self.llm_md_header, "").strip()
+                    return self._clean_md_tag(
+                        md_content.replace(self.llm_md_header, "").strip()
+                    )
 
                 if response is None and url:
                     response = self._make_request(url)
@@ -553,7 +574,7 @@ class BaseScaper:
             "This method should be implemented in the child class."
         )
 
-    def _scrape_year(self, year: int, *args, **kwargs) -> None:
+    def _scrape_year(self, year: int, *args, **kwargs) -> List[Dict]:
         """Scrape norms for a specific year"""
         raise NotImplementedError(
             "This method should be implemented in the child class."
@@ -562,13 +583,11 @@ class BaseScaper:
     def scrape(self) -> list:
         """Scrape data from all years"""
 
-        # start saver thread
+        # Check saver initialization
         if not self.saver:
             raise RuntimeError(
                 "Saver is not initialized. Call _initialize_saver() in the child class __init__ method."
             )
-
-        self.saver.start()
 
         # check if can resume from last scrapped year
         resume_from = self.year_start  # 1808
@@ -579,19 +598,17 @@ class BaseScaper:
         else:
             print(f"Starting from {resume_from}")
 
-        # # scrape data from all years
+        # scrape data from all years
         for year in tqdm(
             self.years, desc=f"{self.__class__.__name__} | Years", total=len(self.years)
         ):
             if year < resume_from:
                 continue
 
-            self._scrape_year(year)
-
-        # stop saver thread
-        self.saver.stop()
-
-        # wait for saver thread to finish
-        self.saver.join()
+            year_results = self._scrape_year(year)
+            if year_results:
+                # Save results for this year
+                self.saver.save(year_results)
+                # Note: self.results is already extended in _scrape_year method
 
         return self.results

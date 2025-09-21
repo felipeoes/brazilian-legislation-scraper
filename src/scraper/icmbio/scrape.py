@@ -11,6 +11,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from src.scraper.base.scraper import BaseScaper
+from src.database.saver import FileSaver
 from threading import Lock
 
 lock = Lock()
@@ -42,7 +43,7 @@ class ICMBioScraper(BaseScaper):
     ):
         super().__init__(base_url, types=TYPES, situations=SITUATIONS, **kwargs)
         self.docs_save_dir = self.docs_save_dir / "ICMBIO"
-        self._initialize_saver()
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _extract_retry_delay(self, error_message: str) -> int:
         """Extract retry delay from error message"""
@@ -582,6 +583,7 @@ class ICMBioScraper(BaseScaper):
     def _scrape_year(self, year: str):
         """Scrape norms for a specific year from PowerBI interface"""
         year_int = int(year)
+        all_results = []
 
         # Ensure types is a dict
         if not isinstance(self.types, dict):
@@ -623,23 +625,24 @@ class ICMBioScraper(BaseScaper):
                         if result is None:
                             continue
 
-                        # Save to queue
+                        # prepare item for saving
                         queue_item = {
                             "year": year,
                             "type": norm_type,
                             **result,
                         }
 
-                        self.queue.put(queue_item)
                         results.append(queue_item)
                     except Exception as e:
                         print(f"Error processing document: {e}")
                         continue
 
-                self.results.extend(results)
-                self.count += len(results)
+            all_results.extend(results)
+            self.count += len(results)
 
-                if self.verbose:
-                    print(
-                        f"Finished scraping for Year: {year} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
-                    )
+            if self.verbose:
+                print(
+                    f"Finished scraping for Year: {year} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
+                )
+
+        return all_results

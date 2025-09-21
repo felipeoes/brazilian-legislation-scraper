@@ -4,6 +4,7 @@ import re
 import requests
 import random
 from io import BytesIO
+from typing import List, Dict
 from bs4 import BeautifulSoup
 from selenium.webdriver import Chrome
 from selenium.webdriver.common.by import By
@@ -19,6 +20,7 @@ from src.scraper.base.scraper import (
     DEFAULT_INVALID_SITUATION,
     retry,
 )
+from src.database.saver import FileSaver
 
 TYPES = {
     "Lei": 1,
@@ -113,7 +115,7 @@ class ParanaCVScraper(BaseScaper):
         )
         self._regex_total_pages = re.compile(r"Página \d+ de (\d+)")
         self._regex_total_records = re.compile(r"Total de (\d+) registros")
-        self._initialize_saver()
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(
         self, norm_type_id: str, year_index: int, page: int = 1
@@ -604,8 +606,10 @@ class ParanaCVScraper(BaseScaper):
 
         return doc_info
 
-    def _scrape_year(self, year: int):
+    def _scrape_year(self, year: int) -> List[Dict]:
         """Scrape norms for a specific year"""
+        all_results = []
+        
         for norm_type, norm_type_id in tqdm(
             self.types.items(),
             desc=f"PARANA | Year: {year} | Types",
@@ -674,9 +678,9 @@ class ParanaCVScraper(BaseScaper):
                     # save to one drive
                     queue_item = {"year": year, "type": norm_type, **norm}
 
-                    self.queue.put(queue_item)
                     results.append(queue_item)
 
+            all_results.extend(results)
             self.results.extend(results)
             self.count += len(results)
 
@@ -684,3 +688,5 @@ class ParanaCVScraper(BaseScaper):
                 print(
                     f"Finished scraping for Year: {year} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
                 )
+        
+        return all_results
