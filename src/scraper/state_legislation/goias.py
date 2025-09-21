@@ -1,10 +1,12 @@
-from typing import Optional, Union
-from bs4 import BeautifulSoup, Tag, NavigableString
+import re
+from typing import Optional, List, Dict
+from io import BytesIO
+from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
-from tqdm import tqdm
-from urllib.parse import urlencode, urljoin
+from tqdm.auto import tqdm
+from urllib.parse import urlencode
 from src.scraper.base.scraper import BaseScaper
+from src.database.saver import FileSaver
 
 TYPES = {
     "Constituição Estadual": {"id": 12, "url_suffix": "constituicao-estadual"},
@@ -15,7 +17,7 @@ TYPES = {
     "Decreto Lei": {"id": 8, "url_suffix": "decreto-lei"},
     "Decreto Numerado": {"id": 3, "url_suffix": "decreto"},
     "Decreto Orçamentário": {"id": 5, "url_suffix": "decreto-orcamentario"},
-    "Portaria Orçaentária": {"id": 6, "url_suffix": "portaria-orcamentaria"},
+    "Portaria Orçamentária": {"id": 6, "url_suffix": "portaria-orcamentaria"},
     "Resolução": {"id": 7, "url_suffix": "resolucao"},
 }
 
@@ -27,8 +29,6 @@ INVALID_SITUATIONS = (
 
 # the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
-
-lock = Lock()
 
 
 class LegislaGoias(BaseScaper):
@@ -51,7 +51,10 @@ class LegislaGoias(BaseScaper):
             "page": 1,
         }
         self.docs_save_dir = self.docs_save_dir / "GOIAS"
-        self._initialize_saver()
+        self._special_regex = re.compile(r"[^a-zA-ZÀ-ÿ\s]")
+        self._space_regex = re.compile(r"\s+")
+        # Initialize the FileSaver
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(self, norm_type_id: str, year: int, page: int = 1) -> str:
         self.params["ano"] = year
@@ -59,83 +62,159 @@ class LegislaGoias(BaseScaper):
         self.params["page"] = page
         return f"{self.base_url}?{urlencode(self.params)}"
 
-    def _get_norm_text_tag(
-        self, soup: BeautifulSoup
-    ) -> Optional[Union[Tag, NavigableString]]:
-        """Get the tag containing the norm text. Currently there are 3 possible classes for the tag"""
-        norm_text_tag = soup.find("div", class_="folha")
-        if norm_text_tag:
-            return norm_text_tag
+    def _clean_markdown(self, text_markdown: str) -> str:
+        """Clean markdown text"""
 
-        norm_text_tag = soup.find("div", class_="Section1")
-        if norm_text_tag:
-            return norm_text_tag
+        return text_markdown.replace("javascript:print()", "").strip()
 
-        norm_text_tag = soup.find("div", class_="layout-antigo")
-        if norm_text_tag:
-            return norm_text_tag
+    def _process_pdf_link(
+        self, link: str, doc_id: str, doc_info: dict
+    ) -> Optional[dict]:
+        response = self._make_request(link)
+        if not response:
+            print(f"Error fetching PDF for doc ID: {doc_id} | Link: {link}")
+            return None
 
-        return None
+        text_markdown = self._get_pdf_image_markdown(response.content)
+        if text_markdown:
+            doc_info["text_markdown"] = text_markdown
+            if not doc_info.get("document_url"):
+                doc_info["document_url"] = link
+            else:
+                doc_info["pdf_link"] = link
+        else:
+            print(f"Failed to extract text from PDF for doc ID: {doc_id}")
+            return None
 
-    def _get_doc_info(self, doc: dict, norm_url_suffix: str) -> dict:
-        """Get document info from given doc data"""
+        doc_info["text_markdown"] = self._clean_markdown(doc_info["text_markdown"])
+
+        return doc_info
+
+    def _get_doc_info(self, doc: dict, norm_url_suffix: str) -> Optional[dict]:
+        """Get document info from given doc data using API"""
+        doc_id = doc["id"]
+
+        # Use the API endpoint to get detailed document information
+        api_url = (
+            f"https://legisla.casacivil.go.gov.br/api/v2/pesquisa/legislacoes/{doc_id}"
+        )
+        response = self._make_request(api_url)
+
+        if not response:
+            print(f"Error getting detailed data for doc ID: {doc_id}")
+            return {}
+
+        doc_detail = response.json()
+
         doc_info = {
-            "id": doc["id"],
-            "norm_number": doc["numero"],
-            "situation": doc["estado_legislacao"]["nome"],
-            "date": doc["data_legislacao"],
-            "title": f'{doc["tipo_legislacao"]} {doc["numero"]} de {doc["ano"]}',
-            "summary": doc["ementa"],
+            "id": doc_detail["id"],
+            "norm_number": doc_detail["numero"],
+            "situation": doc_detail.get("estado_legislacao", {}).get("nome", ""),
+            "date": doc_detail["data_legislacao"],
+            "title": f'{doc_detail["tipo_legislacao"]["nome"]} {doc_detail["numero"]} de {doc_detail["ano"]}',
+            "summary": doc_detail["ementa"].strip(),
         }
 
-        # html link will be in the format https://legisla.casacivil.go.gov.br/pesquisa_legislacao/{doc_id}/lei-{doc_number}
+        # Check if we have formatted content (HTML)
+        if doc_detail.get("conteudo"):
+            html_content = doc_detail["conteudo"]
 
-        if norm_url_suffix == "constituicao-estadual":
-            html_link = f'https://legisla.casacivil.go.gov.br/pesquisa_legislacao/{doc["id"]}/{norm_url_suffix}'
-        else:
-            html_link = f'https://legisla.casacivil.go.gov.br/pesquisa_legislacao/{doc["id"]}/{norm_url_suffix}-{doc["numero"]}'
+            # Parse HTML with BeautifulSoup to clean it up
+            soup = BeautifulSoup(html_content, "html.parser")
 
-        # using lock to avoid issues with using selenium in multiple threads and mixing up the results
-        with lock:
-            soup = self._selenium_get_soup(html_link)
+            # check if "Clique no link abaixo para acessar a:" in soup and skip document
+            if (
+                "Clique no link abaixo para acessar a:".lower()
+                in str(soup.prettify()).lower()
+            ):
+                return None
 
-        # first check if norm is only available in pdf format ( will containg img tag with src="/assets/ver_lei.jpg")
-        if soup.find("img", src="/assets/ver_lei.jpg"):
-            # check for <a href="https://legisla.casacivil.go.gov.br/api/v1/arquivos/8095" target="_blank"><img alt="" border="0" src="/assets/ver_lei.jpg"></a> and download pdf
-            pdf_link = soup.find("a", href=True)
-            if pdf_link:
-                pdf_link = pdf_link["href"]
+            # remove header table, if it contains GOVERNO DO ESTADO DE GOIÁS
+            header_table = soup.find("table")
+            if (
+                header_table
+                and "GOVERNO DO ESTADO DE GOIÁS".lower() in header_table.text.lower()
+            ):
+                header_table.decompose()
 
-                # if not schema in pdf link, add it
-                if not pdf_link.startswith("http"):
-                    pdf_link = urljoin(self.base_url, pdf_link)
+            pdf_link = ""
 
-                pdf_content = self._make_request(pdf_link).content
-                text_markdown = self._get_pdf_image_markdown(pdf_content)
+            # remove a tag if it has <img src="/assets/ver_lei.jpg">
+            for a_tag in soup.find_all("a"):
+                img = a_tag.find("img", src="/assets/ver_lei.jpg")
+                if img:
+                    # get pdf link because we will need it later if html content is insufficient
+                    pdf_link = a_tag["href"]
+                    a_tag.decompose()
 
-                doc_info["text_markdown"] = text_markdown
-                doc_info["document_url"] = pdf_link
+            html_string = soup.prettify().strip()
+
+            # Ensure we have a complete HTML document for markitdown
+            if not html_string.startswith("<html"):
+                html_string = f"<html><body>{html_string}</body></html>"
+
+            doc_info["html_string"] = html_string
+
+            # check if botao-baixar in soup
+            baixar_div = soup.find("div", class_="botao-baixar")
+            if baixar_div:
+                a_tag = baixar_div.find("a", href=True)
+                pdf_link = a_tag["href"]
+
+                doc_info = self._process_pdf_link(pdf_link, doc_id, doc_info)
+
+                if not doc_info:
+                    return None
 
                 return doc_info
-        else:
 
-            # 3 possible classes for the norm text
-            norm_text_tag = self._get_norm_text_tag(soup)
+            # Convert HTML to markdown using BytesIO buffer
+            buffer = BytesIO()
+            buffer.write(html_string.encode("utf-8"))
+            buffer.seek(0)
 
-            if norm_text_tag:
-                html_string = norm_text_tag.prettify()
-                doc_info["html_string"] = html_string
-                doc_info["document_url"] = html_link
+            text_markdown = self._get_markdown(stream=buffer)
+            if text_markdown:
+                text_markdown = text_markdown.strip()
+                doc_info["text_markdown"] = text_markdown
 
-        # pdf link will be in the format https://legisla.casacivil.go.gov.br/api/v2/pesquisa/legislacoes/{doc_id}/pdf
-        pdf_link = f'{self.base_url}/{doc_info["id"]}/pdf'
-        text_markdown = self._get_markdown(pdf_link)
+                new_text = self._special_regex.sub("", text_markdown.lower())
+                new_text = self._space_regex.sub("", new_text).strip()
+                compare_summary = self._special_regex.sub(
+                    "", doc_info["summary"].lower()
+                )
+                compare_summary = self._space_regex.sub("", compare_summary).strip()
 
-        doc_info["text_markdown"] = text_markdown
-        if not doc_info.get("document_url"):
-            doc_info["document_url"] = pdf_link
-        else:
-            doc_info["pdf_link"] = pdf_link
+                new_text = new_text.replace(compare_summary, "").strip()
+                if (
+                    len(new_text) < 150
+                ):  # threshold for substantial content (based on experimentation with goias norms)
+                    # set text_markdown to None so that we can fall back to PDF fetching below
+                    doc_info["text_markdown"] = None
+
+            # Build the HTML link for reference
+            if norm_url_suffix == "constituicao-estadual":
+                html_link = f"https://legisla.casacivil.go.gov.br/pesquisa_legislacao/{doc_id}/{norm_url_suffix}"
+            else:
+                html_link = f'https://legisla.casacivil.go.gov.br/pesquisa_legislacao/{doc_id}/{norm_url_suffix}-{doc_detail["numero"]}'
+
+            doc_info["document_url"] = html_link
+
+        # If we don't have HTML content or markdown conversion failed, try PDF
+        if not doc_info.get("text_markdown"):
+            doc_info = self._process_pdf_link(pdf_link, doc_id, doc_info)
+            if not doc_info:
+                print(f"Failed to process PDF for doc ID: {doc_id}")
+                return None
+
+        # clean text_markdown (some docs may have the "javascript:print()" string at the end of the document)
+        doc_info["text_markdown"] = self._clean_markdown(doc_info["text_markdown"])
+
+        # check for error msg
+        error_msg = "doesn't work properly without JavaScript enabled"
+        if error_msg.lower() in doc_info["text_markdown"].lower():
+            print(f"Invalid  doc ID: {doc_id}. Year: {doc_detail['ano']}")
+            return None
 
         return doc_info
 
@@ -171,12 +250,15 @@ class LegislaGoias(BaseScaper):
                 disable=not self.verbose,
             ):
                 doc_info = future.result()
-                docs.append(doc_info)
+                if doc_info:
+                    docs.append(doc_info)
 
         return docs
 
-    def _scrape_year(self, year: int):
+    def _scrape_year(self, year: int) -> List[Dict]:
         """Scrape norms for a specific year"""
+        all_results = []
+
         for norm_type, norm_type_data in tqdm(
             self.types.items(),
             desc=f"GOIAS | Year: {year} | Types",
@@ -224,23 +306,18 @@ class LegislaGoias(BaseScaper):
                             continue
 
                         for norm in norms:
-                            # save to one drive
+                            # save to results
                             queue_item = {
                                 "year": year,
                                 "type": norm_type,
                                 **norm,
                             }
-
-                            self.queue.put(queue_item)
                             results.append(queue_item)
 
                     except Exception as e:
                         print(f"Error getting document data | Error: {e}")
 
+            all_results.extend(results)
             self.results.extend(results)
-            self.count += len(results)
 
-            if self.verbose:
-                print(
-                    f"Finished scraping for Year: {year} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
-                )
+        return all_results

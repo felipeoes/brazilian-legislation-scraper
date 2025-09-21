@@ -1,0 +1,14 @@
+{
+  "app_name_chrome": {
+    "message": "VPN ฟรีสำหรับ Chrome - VPN Proxy VeePN"
+  },
+  "app_name_edge": {
+    "message": "VPN ฟรีสำหรับ Edge - VPN Proxy VeePN"
+  },
+  "app_name_firefox": {
+    "message": "VPN ฟรี - VPN Proxy VeePN"
+  },
+  "app_description": {
+    "message": "บริการ VPN รวดเร็ว ปลอดภัย และใช้งานง่ายเพื่อปกป้องความเป็นส่วนตัวของคุณ เพลิดเพลินกับการรับส่งข้อมูลและแบนด์วิดท์ไม่จำกัด!"
+  }
+}

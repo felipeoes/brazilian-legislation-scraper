@@ -1,11 +1,14 @@
 from io import BytesIO
+import time
+import json
+import re
 from typing import Optional
 from pathlib import Path
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper
-from src.database.saver import ONEDRIVE_SAVE_DIR
+from src.database.saver import SAVE_DIR, FileSaver
 
 VALID_SITUATIONS = [
     "Não%20consta%20revogação%20expressa",
@@ -36,6 +39,8 @@ TYPES = [
     "Constitui%C3%A7%C3%A3o",
     "Decisão",
     "Decreto",
+    "Decreto+Sem+N%C3%BAmero",
+    "Decreto-Lei",
     "Emenda+Constitucional",
     "Instrução",
     "Lei",
@@ -67,7 +72,7 @@ class CamaraDepScraper(BaseScaper):
     def __init__(
         self,
         base_url: str = "https://www.camara.leg.br/legislacao/",
-        docs_save_dir: str = ONEDRIVE_SAVE_DIR.resolve().as_posix(),
+        docs_save_dir: str = SAVE_DIR.resolve().as_posix(),
         **kwargs,
     ):
         super().__init__(base_url, types=TYPES, situations=SITUATIONS, **kwargs)
@@ -84,7 +89,7 @@ class CamaraDepScraper(BaseScaper):
             "numero": "",
             "ordenacao": "",
         }
-        self._initialize_saver()
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(self, year: str, situation: str, type: str) -> str:
         """Format search url with given year"""
@@ -108,24 +113,47 @@ class CamaraDepScraper(BaseScaper):
             "summary": str,
             "html_link": str
         }"""
-        soup = self._get_soup(url)
-
-        if soup is None:
-            return []
-
-        # Get all documents html links from page
-        documents = soup.find_all("li", class_="busca-resultados__item")
+        retries = 5
         documents_html_links_info = []
-        for document in documents:
-            a_tag = document.find("h3", class_="busca-resultados__cabecalho").find("a")
-            document_html_link = a_tag["href"]
-            title = a_tag.text.strip()
-            summary = document.find(
-                "p", class_="busca-resultados__descricao js-fade-read-more"
-            ).text.strip()
-            documents_html_links_info.append(
-                {"title": title, "summary": summary, "html_link": document_html_link}
-            )
+        for attempt in range(retries):
+            try:
+                # Get soup from url
+                soup = self._get_soup(url)
+
+                if soup is None:
+                    return documents_html_links_info
+
+                # Get all documents html links from page
+                documents = soup.find_all("li", class_="busca-resultados__item")
+                for document in documents:
+                    a_tag = document.find(
+                        "h3", class_="busca-resultados__cabecalho"
+                    ).find("a")
+                    document_html_link = a_tag["href"]
+                    title = a_tag.text.strip()
+                    summary = document.find(
+                        "p", class_="busca-resultados__descricao js-fade-read-more"
+                    ).text.strip()
+                    documents_html_links_info.append(
+                        {
+                            "title": title,
+                            "summary": summary,
+                            "html_link": document_html_link,
+                        }
+                    )
+                if not documents_html_links_info:
+                    print(f"No documents found for url: {url}")
+                    return documents_html_links_info
+                 
+                break  # Exit the retry loop if successful
+
+            except Exception as e:
+                if attempt < retries - 1:
+                    print(f"Error fetching {url}: {e}. Retrying...")
+                    time.sleep(2 ** (attempt + 1))
+                else:
+                    print(f"Failed to fetch {url} after {retries} attempts.")
+                    return []
 
         return documents_html_links_info
 
@@ -147,6 +175,21 @@ class CamaraDepScraper(BaseScaper):
             }
             self.error_queue.put(error_data)
             return None
+        
+        # check if not found (text not available)
+        not_found = soup.find("h1", text="Not Found")
+        if not_found:
+            print(f"Document not found: {title}")
+            # error_data = {
+            #     "title": title,
+            #     "year": self.params["ano"],
+            #     "situation": self.params["situacao"],
+            #     "type": self.params["tipo"],
+            #     "summary": summary,
+            #     "html_link": document_html_link,
+            # }
+            # self.error_queue.put(error_data)
+            return None
 
         document_text_links = soup.find("div", class_="sessao")
         if not document_text_links:
@@ -159,27 +202,62 @@ class CamaraDepScraper(BaseScaper):
                 "type": self.params["tipo"],
                 "summary": summary,
                 "html_link": document_html_link,
+                "soup": str(soup.prettify()),  # include soup for debugging
             }
             self.error_queue.put(error_data)
+            json.dump(
+                error_data, open("error_log.json", "a"), ensure_ascii=False, indent=2
+            )
             return None
 
-        document_text_links_list = []
-        if document_text_links and hasattr(document_text_links, "find_all"):
-            try:
-                document_text_links_list = document_text_links.find_all("a")  # type: ignore
-            except AttributeError:
-                document_text_links_list = []
+        # document_text_links_list = []
+        # if document_text_links and hasattr(document_text_links, "find_all"):
+        #     try:
+        #         document_text_links_list = document_text_links.find_all("a")  # type: ignore
+        #     except AttributeError:
+        #         document_text_links_list = []
 
         document_text_link = None
-        for link in document_text_links_list:
-            if "texto - publicação original" in link.text.strip().lower():
-                url = link["href"]
-                # get full url
-                document_text_link = urljoin(document_html_link, url)
-                break
+        
+        if document_text_links and hasattr(document_text_links, "find_all"):
+            original_doc_text_links = []
+            repub_doc_text_links = []
+            doc_text_links_list = []
+            
+            for link in document_text_links.find_all("a"):
+                link_text = link.text.strip().lower()
+                if "texto - publicação original" in link_text:
+                    original_doc_text_links.append(link)
+                elif "texto - republicação" in link_text:
+                    repub_doc_text_links.append(link)
+                elif "texto -" in link_text:
+                    doc_text_links_list.append(link)
 
+            if original_doc_text_links:
+                # if there is a link with "texto - publicação original" text, use it
+                document_text_link = original_doc_text_links[-1]["href"]
+                document_text_link = urljoin(document_html_link, document_text_link)
+            elif repub_doc_text_links:
+                # if there is a link with "texto - republicação" text, use it
+                document_text_link = repub_doc_text_links[-1]["href"]
+                document_text_link = urljoin(document_html_link, document_text_link)
+            elif doc_text_links_list:
+                # if there is a link with "texto -" text, use it
+                document_text_link = doc_text_links_list[-1]["href"]
+                document_text_link = urljoin(document_html_link, document_text_link)
+                
         if document_text_link is None:
             print(f"Could not find text link for document: {title}")
+            error_data = {
+                "title": title,
+                "year": self.params["ano"],
+                "situation": self.params["situacao"],
+                "type": self.params["tipo"],
+                "summary": summary,
+                "html_link": document_html_link,
+                "soup": str(soup.prettify()),  # include soup for debugging
+            }
+            self.error_queue.put(error_data)
             return None
 
         return {"title": title, "summary": summary, "html_link": document_text_link}
@@ -214,6 +292,20 @@ class CamaraDepScraper(BaseScaper):
             texto_norma = soup.find("div", class_="textoNorma")
             if texto_norma is None:
                 raise Exception("Could not find textoNorma div")
+            
+            # check if the text is empty
+            if not texto_norma.text.strip():
+                print(f"Document text is empty: {title}")
+                error_data = {
+                    "title": title,
+                    "year": self.params["ano"],
+                    "situation": self.params["situacao"],
+                    "type": self.params["tipo"],
+                    "summary": summary,
+                    "html_link": document_text_link,
+                }
+                self.error_queue.put(error_data)
+                return None
 
             html_string = f"<html>{texto_norma.prettify()}</html>"  # type: ignore
 
@@ -246,15 +338,17 @@ class CamaraDepScraper(BaseScaper):
 
     def _scrape_year(self, year: int) -> list:
         """Scrape data from given year"""
+        all_results = []
+        
         for situation in tqdm(
             self.situations,
             desc="CamaraDEP | Situations",
             total=len(self.situations),
             disable=not self.verbose,
         ):
-            results = []
-
             for type in self.types:
+                results = []
+                
                 url = self._format_search_url(str(year), situation, type)
                 # Each page has 20 results, find the total and calculate the number of pages
                 per_page = 20
@@ -277,10 +371,10 @@ class CamaraDepScraper(BaseScaper):
                 total = int(total.strip().split()[-1])
 
                 if total == 0:
-                    if self.verbose:
-                        print(
-                            f"No results for Year: {year} | Situation: {situation} | Type: {type}"
-                        )
+                    # if self.verbose:
+                    #     print(
+                    #         f"No results for Year: {year} | Situation: {situation} | Type: {type}"
+                    #     )
                     continue
                 pages = total // per_page + 1
 
@@ -299,8 +393,14 @@ class CamaraDepScraper(BaseScaper):
                         disable=not self.verbose,
                         total=len(futures),
                     ):
-                        documents_html_links_info.extend(future.result())
-
+                        result = future.result()
+                        if result is not None:
+                            # filter out None results
+                            if isinstance(result, list):
+                                documents_html_links_info.extend(result)
+                            else:
+                                print(f"Unexpected result type: {type(result)}")
+                                print(f"Result: {result}")
                 # Get proper document text link from each document html link
                 with ThreadPoolExecutor() as executor:
                     futures = []
@@ -328,7 +428,6 @@ class CamaraDepScraper(BaseScaper):
 
                 # Get data from all  documents text links using ThreadPoolExecutor
                 with ThreadPoolExecutor() as executor:
-                    results = []
                     futures = [
                         executor.submit(
                             self._get_document_data,
@@ -351,21 +450,20 @@ class CamaraDepScraper(BaseScaper):
                         if result is None:
                             continue
 
-                        # save to onedrive
+                        # prepare item for saving
                         queue_item = {
                             "year": year,
                             "situation": situation,
                             "type": type,
                             **result,
                         }
-                        self.queue.put(queue_item)
                         results.append(queue_item)
 
-                self.results.extend(results)
+                all_results.extend(results)
                 self.count += len(results)
 
                 print(
                     f"Finished scraping for Year: {year} | Situation: {situation} | Type: {type} | Results: {len(results)} | Total: {self.count}"
                 )
 
-        return self.results
+        return all_results

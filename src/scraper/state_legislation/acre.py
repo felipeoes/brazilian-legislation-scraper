@@ -6,6 +6,7 @@ from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper
+from src.database.saver import FileSaver
 
 warnings.filterwarnings("ignore")
 
@@ -44,7 +45,7 @@ class AcreLegisScraper(BaseScaper):
         self.year_regex = re.compile(r"\d{4}")
         self.remove_markdown_header = """\n\n# Reportar Erro\n\nNome\n\nEmail\n\nDescrição\n\nEnviar\nCancelar\n\n# Informações de Contato\n\nNome\n\nEmail\n\nAssunto\n\nDescrição\n\nEnviar\nCancelar\n\n[![](https://legis.ac.gov.br/assets/img/logo.svg)](https://legis.ac.gov.br/)\n\n* ac.gov.br\n* Diário Oficial\n* Notícias\n* Sobre\n* [Normas Covid-19](https://legis.ac.gov.br/covid19)\n\n* LEIS ORDINÁRIAS\n* LEIS COMPLEMENTARES\n* [CONSTITUIÇÃO ESTADUAL](https://legis.ac.gov.br/detalhar_constituicao)\n* DECRETOS\n\nTodos\nDecretos\nLei Complementar\nLei Ordinária\nConstituição Estadual\nEmendas Constitucionais\n\nEscolha a autoria\nAssembleia Legislativa do Estado do Acre\nDefensoria Pública do Estado do Acre\nMinistério Público do Estado do Acre\nPoder Executivo do Estado do Acre\nTribunal de Contas do Estado do Acre\nTribunal de Justiça do Estado do Acre\n\n**PESQUISAR**\n\n![](https://legis.ac.gov.br/assets/img/logo2.svg)\n\n* [INÍCIO](https://legis.ac.gov.br/)\n* LEIS ORDINÁRIAS\n* LEIS COMPLEMENTARES\n* [CONSTITUIÇÃO ESTADUAL](https://legis.ac.gov.br/detalhar_constituicao)\n* DECRETOS\n* [NORMAS COVID-19](https://legis.ac.gov.br/covid19)\n\n* PDF\n* INFORMAÇÃO\n\n"""
         self.remove_markdown_footer = """\n\n| NOME DO ARQUIVO | LINK PARA DOWNLOAD |\n| --- | --- |\n\n#### Informações sobre a legislação\n\n# Relacionados\n\n* [Governo do Estado do Acre](https://www.ac.gov.br/)\n* [Secretaria de Estado da Casa Civil](https://www.casacivil.ac.gov.br/)\n* [Diário Oficial do Estado do Acre](diario.ac.gov.br/)\n* [Assembleia Legislativa do Estado do Acre](http://www.al.ac.leg.br/)\n\n# Serviços\n\n* [Perguntas Frequentes](https://legis.ac.gov.br/perguntas_frequentes)\n* Reporte um erro\n* Fale Conosco\n* [Mapa do Site](https://legis.ac.gov.br/mapa_site)\n\n# Links Externos\n\n* [Procuradoria Geral do Estado do Acre](http://www.pge.ac.gov.br/)\n* [Ministério Público do Estado do Acre](https://www.mpac.mp.br/)\n* [Defensoria Pública do Estado do Acre](http://defensoria.ac.gov.br/)\n* [Ministério Público de Contas do Acre](http://mpc.tce.ac.gov.br/)\n* [Tribunal de Contas do Estado do Acre](http://www.tce.ac.gov.br/)\n\nSecretaria de Estado da Casa Civil | CASA CIVIL\nAv. Brasil, 307-447 - Centro, Rio Branco - AC\n\n2025 Governo do Estado do Acre\nCopyright Todos os direitos reservados\n\nSecretaria de Estado da Casa Civil\nDiretoria de Modernização\n\n"""
-        self._initialize_saver()
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(self, norm_type_id: str) -> str:
         """Format url for search request"""
@@ -145,9 +146,6 @@ class AcreLegisScraper(BaseScaper):
     def scrape(self):
         """Scrape norms"""
 
-        # start saver thread
-        self.saver.start()
-
         for situation in tqdm(
             self.situations,
             desc="ACRE | Situations",
@@ -170,8 +168,9 @@ class AcreLegisScraper(BaseScaper):
                     doc_info["situation"] = situation
                     doc_info["type"] = norm_type
 
-                    self.queue.put(doc_info)
+                    all_results.append(doc_info)
                     self.results.append(doc_info)
+                    self.count += 1
                     continue
 
                 html_links = self._get_docs_links(soup, norm_type_id)
@@ -194,7 +193,7 @@ class AcreLegisScraper(BaseScaper):
                         if result is None:
                             continue
 
-                        # save to one drive
+                        # prepare item for saving
                         queue_item = {
                             # "year": year, # getting year from document title because Legis does not have a search by year
                             # website only shows documents without any revocation
@@ -203,21 +202,16 @@ class AcreLegisScraper(BaseScaper):
                             **result,
                         }
 
-                        self.queue.put(queue_item)
-                        self.results.append(queue_item)
+                        results.append(queue_item)
 
+                if results:
+                    self.saver.save(results)
                     self.results.extend(results)
                     self.count += len(results)
 
-                    if self.verbose:
-                        print(
-                            f"Type: {norm_type} | Situation: {situation} | Total: {len(results)}"
-                        )
-
-        # stop saver thread
-        self.saver.stop()
-
-        # wait for saver thread to finish
-        self.saver.join()
+                if self.verbose:
+                    print(
+                        f"Type: {norm_type} | Situation: {situation} | Total: {len(results)}"
+                    )
 
         return self.results

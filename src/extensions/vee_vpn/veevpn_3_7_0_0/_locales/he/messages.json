@@ -1,0 +1,14 @@
+{
+  "app_name_chrome": {
+    "message": "VPN בחינם לכרום - VPN Proxy VeePN"
+  },
+  "app_name_edge": {
+    "message": "VPN בחינם עבור Edge - VPN Proxy VeePN"
+  },
+  "app_name_firefox": {
+    "message": "VPN בחינם - VPN Proxy VeePN"
+  },
+  "app_description": {
+    "message": "שירות VPN מהיר, מאובטח במיוחד וקל לשימוש כדי להגן על הפרטיות שלך באינטרנט."
+  }
+}

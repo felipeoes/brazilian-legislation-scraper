@@ -1,0 +1,14 @@
+{
+  "app_name_chrome": {
+    "message": "適用於 Chrome 的免費 VPN - VPN 代理 VeePN"
+  },
+  "app_name_edge": {
+    "message": "適用於 Edge 的免費 VPN - VPN 代理 VeePN"
+  },
+  "app_name_firefox": {
+    "message": "免費 VPN - VPN 代理 VeePN"
+  },
+  "app_description": {
+    "message": "快速、超安全且易於使用的VPN服務，保護您的在線隱私。享受無限制的流量和帶寬！"
+  }
+}

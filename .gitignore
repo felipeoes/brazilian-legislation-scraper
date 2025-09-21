@@ -171,3 +171,5 @@ csv-datasets/*
 logs/*
 *.ipynb
 test.py
+error_log.json
+artifacts/

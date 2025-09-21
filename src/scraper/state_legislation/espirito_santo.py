@@ -1,3 +1,6 @@
+from typing import Optional
+from urllib.parse import urljoin
+
 import requests
 import re
 from io import BytesIO
@@ -5,6 +8,7 @@ from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper
+from src.database.saver import FileSaver
 
 TYPES = {
     "Acórdão do Colegiado da Procuradoria": 18,
@@ -54,7 +58,8 @@ class ESAlesScraper(BaseScaper):
         self.docs_save_dir = self.docs_save_dir / "ESPIRITO_SANTO"
         self.params = {"tipo": "", "situacao": "", "ano": "", "interno": 1}
         self.reached_end_page = False
-        self._initialize_saver()
+        # Initialize the FileSaver
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(
         self, norm_type_id: str, situation_id: str, year: int
@@ -80,7 +85,21 @@ class ESAlesScraper(BaseScaper):
         session = (
             requests.Session()
         )  # need to create a new session for each request in order to make the logic work
-        response = session.get(url, verify=False)
+
+        retries = 3
+        for attempt in range(retries):
+            try:
+                response = session.get(url, verify=False)
+                response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+
+                if response:
+                    break  # If the request is successful, exit the loop
+            except requests.exceptions.RequestException as e:
+                print(f"Attempt {attempt + 1} failed: {e}")
+                if attempt == retries - 1:
+                    print("Max retries reached. Exiting.")
+                    return None
+
         soup = BeautifulSoup(response.content, "html.parser")
 
         if page_number == 1:  # don't need to post back for page 1
@@ -174,6 +193,17 @@ class ESAlesScraper(BaseScaper):
                 continue
 
             doc_link = doc_link[0]["href"]
+
+            if "processo.aspx?" in doc_link:
+                # this is a link to a process, not a document
+                print(f"Skipping '{title}' since it is a process link")
+                continue
+
+            # skip docx links
+            if doc_link.endswith(".docx"):
+                print(f"Skipping '{title}' since it is a docx document")
+                continue
+
             docs.append(
                 {
                     "title": re.sub(r"\r\n +", " ", title.strip()),
@@ -186,10 +216,14 @@ class ESAlesScraper(BaseScaper):
 
         return docs
 
-    def _get_doc_data(self, doc_info: dict) -> list:
+    def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
         """Get document data from document link"""
         doc_link = doc_info.pop("doc_link")
-        url = requests.compat.urljoin(self.base_url, doc_link)
+        url = urljoin(self.base_url, doc_link)
+
+        # some urls are malformed, e.g., they ends with .pd instead of .pdf
+        if url.endswith(".pd"):
+            url = url + "f"
 
         # if url ends with .pdf, get only text_markdown
         if url.endswith(".pdf"):
@@ -197,8 +231,12 @@ class ESAlesScraper(BaseScaper):
 
             if not text_markdown:
                 # pdf may be an image
-                pdf_content = self._make_request(url).content
-                text_markdown = self._get_pdf_image_markdown(pdf_content)
+                response = self._make_request(url)
+                if not response:
+                    print(f"Failed to download PDF from URL: {url}")
+                    return None
+
+                text_markdown = self._get_pdf_image_markdown(response.content)
 
             doc_info["html_string"] = ""
             doc_info["text_markdown"] = text_markdown
@@ -206,6 +244,10 @@ class ESAlesScraper(BaseScaper):
             return doc_info
 
         soup = self._get_soup(url)
+        if not soup:
+            print(f"Failed to get soup for URL: {url}")
+            return None
+
         html_string = soup.prettify()
 
         buffer = BytesIO()
@@ -220,8 +262,10 @@ class ESAlesScraper(BaseScaper):
 
         return doc_info
 
-    def _scrape_year(self, year: int):
+    def _scrape_year(self, year: int) -> list:
         """Scrape norms for a specific year"""
+        all_results = []
+
         for situation, situation_id in tqdm(
             self.situations.items(),
             desc="ESPIRITO SANTO | Situations",
@@ -285,7 +329,7 @@ class ESAlesScraper(BaseScaper):
                         if result is None:
                             continue
 
-                        # save to one drive
+                        # prepare item for saving
                         queue_item = {
                             "year": year,
                             # hardcode since we only get valid documents in search request
@@ -294,13 +338,14 @@ class ESAlesScraper(BaseScaper):
                             **result,
                         }
 
-                        self.queue.put(queue_item)
                         results.append(queue_item)
 
-                self.results.extend(results)
+                all_results.extend(results)
                 self.count += len(results)
 
                 if self.verbose:
                     print(
                         f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
                     )
+
+        return all_results

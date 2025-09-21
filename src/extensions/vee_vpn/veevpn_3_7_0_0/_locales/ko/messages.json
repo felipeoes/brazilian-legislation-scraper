@@ -1,0 +1,14 @@
+{
+  "app_name_chrome": {
+    "message": "무료 VPN 크롬용 - VPN 프록시 VeePN"
+  },
+  "app_name_edge": {
+    "message": "무료 VPN 엣지용 - VPN 프록시 VeePN"
+  },
+  "app_name_firefox": {
+    "message": "무료 VPN - VPN 프록시 VeePN"
+  },
+  "app_description": {
+    "message": "빠르고, 초강력 보안이 적용된 사용하기 쉬운 VPN 서비스로 온라인 개인 정보를 보호하세요. 무제한 트래픽과 대역폭을 즐기세요!"
+  }
+}

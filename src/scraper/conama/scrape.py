@@ -1,9 +1,11 @@
 import urllib.parse
+import re
 from typing import Dict, List, Optional
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper
+from src.database.saver import FileSaver
 
 TYPES = {
     "Resolução": 1,
@@ -50,7 +52,8 @@ class ConamaScraper(BaseScaper):
             "task": "atosnormativos.getList",
         }
         self.docs_save_dir = self.docs_save_dir / "CONAMA"
-        self._initialize_saver()
+        self._situation_regex = re.compile(r"Revogad|Revogação", re.IGNORECASE)
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(self, norm_type: str) -> str:
         """Format url for search request"""
@@ -73,8 +76,14 @@ class ConamaScraper(BaseScaper):
         # get text markdown
         text_markdown = self._get_markdown(doc_url)
 
-        if text_markdown is None:
+        if text_markdown is None or not text_markdown.strip():
             return None
+        
+        # get situation from doc_status. If "Revogad" or "Revogação" in doc_status, situation is "Revogada", otherwise "Não consta"
+        situation = "Não consta revogação expressa"
+        if doc_status and self._situation_regex.search(doc_status):
+            situation = "Revogada"
+        
 
         # title will be like Resolução CONAMA Nº 501/2021
         return {
@@ -82,7 +91,7 @@ class ConamaScraper(BaseScaper):
             "id": doc_id,
             "number": doc_number,
             "summary": doc_description,
-            "status": doc_status,
+            "situation": situation,
             "keyword": doc_keyword,
             "origin": doc_origin,
             "text_markdown": text_markdown,
@@ -146,7 +155,7 @@ class ConamaScraper(BaseScaper):
                         if result is None:
                             continue
 
-                        # save to one drive
+                        # prepare item for saving
                         queue_item = {
                             "year": year_str,
                             "type": norm_type,
@@ -154,16 +163,14 @@ class ConamaScraper(BaseScaper):
                             **result,
                         }
 
-                        self.queue.put(queue_item)
                         type_results.append(queue_item)
 
-                    results.extend(type_results)
-                    self.results.extend(type_results)
-                    self.count += len(type_results)
+                results.extend(type_results)
+                self.count += len(type_results)
 
-                    if self.verbose:
-                        print(
-                            f"Year: {year_str} | Type: {norm_type} | Situation: {situation} | Total: {len(type_results)}"
-                        )
+                if self.verbose:
+                    print(
+                        f"Year: {year_str} | Type: {norm_type} | Situation: {situation} | Total: {len(type_results)}"
+                    )
 
         return results

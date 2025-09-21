@@ -1,10 +1,11 @@
-import requests
+from typing import Optional
+from urllib.parse import urljoin, urlencode
+
 import re
 from datetime import datetime
 from bs4 import BeautifulSoup
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import requests.compat
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper, YEAR_START
 
@@ -51,14 +52,14 @@ class CearaAleceScraper(BaseScaper):
         """Format url for search request"""
         self.params["categoria"] = norm_type_id
         self.params["page"] = page
-        return f"{self.base_url}/leis-e-normativos-internos?{requests.compat.urlencode(self.params)}"
+        return f"{self.base_url}/leis-e-normativos-internos?{urlencode(self.params)}"
 
     def _get_docs_links(self, norm_type: str, url: str) -> list:
         """Get documents html links from given page.
         Returns a list of dicts with keys 'title', 'year', 'norm_number', 'summary', 'document_url'
         """
 
-        soup = self._get_soup(url)
+        soup = self._get_soup(url, timeout=60)
         docs = []
 
         # check if the page is empty
@@ -106,7 +107,7 @@ class CearaAleceScraper(BaseScaper):
     def _scrape_norms(self, situation: str, norm_type: str, norm_type_id: str) -> list:
         """Scrape laws and norms from given situation and norm type"""
         url = self._format_search_url(norm_type_id, 1)
-        soup = self._get_soup(url)
+        soup = self._get_soup(url, timeout=60)
 
         # get total pages
         pagination = soup.find("ul", class_="pagination")
@@ -135,9 +136,13 @@ class CearaAleceScraper(BaseScaper):
                 desc="CEARA | Get document link",
                 disable=not self.verbose,
             ):
-                docs = future.result()
-                if docs:
-                    documents.extend(docs)
+                try:
+                    docs = future.result()
+                    if docs:
+                        documents.extend(docs)
+                except Exception as e:
+                    print(f"Error getting document links: {e}")
+                    continue
 
         # Get document data
         results = []
@@ -150,20 +155,23 @@ class CearaAleceScraper(BaseScaper):
                 desc="CEARA | Get document data",
                 disable=not self.verbose,
             ):
-                result = future.result()
-                if result is None:
+                try:
+                    result = future.result()
+                    if result is None:
+                        continue
+
+                    # prepare item for saving
+                    queue_item = {
+                        # hardcode since we only get valid documents in search request
+                        "situation": situation,
+                        "type": norm_type,
+                        **result,
+                    }
+
+                    results.append(queue_item)
+                except Exception as e:
+                    print(f"Error getting document data: {e}")
                     continue
-
-                # save to one drive
-                queue_item = {
-                    # hardcode since we only get valid documents in search request
-                    "situation": situation,
-                    "type": norm_type,
-                    **result,
-                }
-
-                self.queue.put(queue_item)
-                results.append(queue_item)
 
             self.results.extend(results)
             self.count += len(results)
@@ -172,6 +180,8 @@ class CearaAleceScraper(BaseScaper):
                 print(
                     f"Finished scraping for | Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
                 )
+
+        return results
 
     def _get_laws_constitution_amendments_docs_links(
         self, url: str, norm_type: str
@@ -197,10 +207,8 @@ class CearaAleceScraper(BaseScaper):
 
             tds = item.find_all("td")
 
-            # for leis ordinarias, the table has 2 columns only
-            if norm_type == "Lei Ordinária" and len(tds) != 2:
-                continue
-            elif norm_type != "Lei Ordinária" and len(tds) != 3:
+            # for leis ordinarias, the table has at most 3 columns
+            if norm_type == "Lei Ordinária" and len(tds) > 3:
                 continue
 
             title = tds[0].text.strip()
@@ -241,16 +249,76 @@ class CearaAleceScraper(BaseScaper):
 
         return docs
 
-    def _get_laws_constitution_amendments_doc_data(self, doc_info: dict) -> dict:
+    def construct_url(self, norm_type: str, html_link: str, year: Optional[int]) -> str:
+        """Construct the full url for the document page"""
+        if "https://" in html_link:
+            # don't need to do anything, it's already a full url
+            return html_link
+
+        # file:///\\10.85.100.8\10.85.100.8\legislativo\legislacao5\leis2014\15517.htm.
+        if "file://" in html_link:
+            # get content after \legislacao5\
+            html_link = html_link.split("legislacao5")[-1].replace("\\", "/")
+            if html_link.startswith("/"):
+                html_link = html_link[1:]
+
+            base_url = "https://www2.al.ce.gov.br/legislativo/legislacao5/"
+            return urljoin(base_url, html_link)
+
+        if norm_type == "Lei Complementar":
+            base_url = "https://www2.al.ce.gov.br/legislativo/"
+            if not "ementario" in html_link:
+                html_link = f"ementario/{html_link}"
+        else:
+            base_url = "https://www2.al.ce.gov.br/legislativo/legislacao5/"
+            if norm_type == "Lei Ordinária":
+                if not "leis" in html_link:
+                    year = year if year >= 2000 else str(year)[2:]
+
+                    html_link = f"leis{year}/{html_link}"
+
+                elif (
+                    "legislacao5" in html_link
+                    or "legislativo/legislacao5/" in html_link
+                    or "/legislativo/legislacao5/" in html_link
+                ):
+                    html_link = (
+                        html_link.replace("/legislativo/legislacao5/", "")
+                        .replace("legislativo/legislacao5/", "")
+                        .replace("legislacao5/", "")
+                    )
+
+        return urljoin(base_url, html_link)
+
+    def _get_laws_constitution_amendments_doc_data(
+        self, doc_info: dict, norm_type: str, year: Optional[int] = None
+    ) -> Optional[dict]:
         """Get document data from given document dict"""
         # html_link will be a link to the document page
-        base_url = "https://www2.al.ce.gov.br/legislativo/legislacao5/"
+
         html_link = doc_info.pop("html_link")
-        url = requests.compat.urljoin(base_url, html_link)
+        url = self.construct_url(norm_type, html_link, year)
+
         response = self._make_request(url)
+
+        if not response:
+            print(
+                f"Error fetching document page: {url}. Year: {year}. HTML link: {html_link}"
+            )
+            return None
+
         soup = BeautifulSoup(response.content, "html.parser")
 
+        # remove <a href="javascript:%20history.back();"><b><span style="color:blue">VOLTAR</span></b></a>
+        voltar_link = soup.find("a", text=re.compile(r"^VOLTAR$", re.IGNORECASE))
+        if voltar_link:
+            voltar_link.decompose()
+
         html_string = soup.prettify().strip()
+
+        # check if invalid document
+        if "NÄO EXISTE LEI COM ESTE NÚMERO".lower() in html_string.lower():
+            return None
 
         buffer = BytesIO()
         buffer.write(soup.html.encode())
@@ -258,7 +326,11 @@ class CearaAleceScraper(BaseScaper):
 
         text_markdown = self._get_markdown(stream=buffer)
         # remove header
-        text_markdown = text_markdown.replace("\n\n**VOLTAR**", "").strip()
+        text_markdown = text_markdown.replace("**VOLTAR**", "").strip()
+
+        if not text_markdown:
+            print(f"Error converting document to markdown: {url}. Year: {year}")
+            return None
 
         doc_info["html_string"] = html_string
         doc_info["text_markdown"] = text_markdown
@@ -268,7 +340,7 @@ class CearaAleceScraper(BaseScaper):
 
     def _scrape_laws_constitution_amendments(
         self, situation: str, norm_type: str, norm_type_id: str, year: int = None
-    ) -> list:
+    ):
         """Scrape constitution amendments"""
         # for laws and constitution amendments we need to scrape a different page
 
@@ -292,7 +364,12 @@ class CearaAleceScraper(BaseScaper):
         results = []
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = [
-                executor.submit(self._get_laws_constitution_amendments_doc_data, doc)
+                executor.submit(
+                    self._get_laws_constitution_amendments_doc_data,
+                    doc,
+                    norm_type,
+                    year,
+                )
                 for doc in docs
             ]
 
@@ -306,7 +383,7 @@ class CearaAleceScraper(BaseScaper):
                 if result is None:
                     continue
 
-                # save to one drive
+                # prepare item for saving
                 queue_item = {
                     # hardcode since we only get valid documents in search request
                     "situation": situation,
@@ -317,7 +394,6 @@ class CearaAleceScraper(BaseScaper):
                 if queue_item["year"] is None:
                     queue_item["year"] = year
 
-                self.queue.put(queue_item)
                 results.append(queue_item)
 
             self.results.extend(results)
@@ -328,15 +404,19 @@ class CearaAleceScraper(BaseScaper):
                     f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
                 )
 
+        return results
+
+    def _save_results(self, results: list):
+        if results:
+            self.saver.save(results)
+
     def scrape(self) -> list:
         """Scrape data from all years"""
-        # start saver thread
-        self.saver.start()
 
         # check if can resume from last scrapped year
         resume_from = self.year_start  # 1808
         forced_resume = self.year_start != YEAR_START
-        if self.saver.last_year is not None and not forced_resume:
+        if self.saver and self.saver.last_year is not None and not forced_resume:
             print(f"Resuming from {self.saver.last_year}")
             resume_from = int(self.saver.last_year)
         else:
@@ -357,14 +437,16 @@ class CearaAleceScraper(BaseScaper):
             ):
 
                 if norm_type in ["Ato Deliberativo", "Ato Normativo", "Resolução"]:
-                    self._scrape_norms(situation, norm_type, norm_type_id)
+                    results = self._scrape_norms(situation, norm_type, norm_type_id)
+                    self._save_results(results)
                 elif norm_type in [
                     "Emenda Constitucional",
                     "Lei Complementar",
                 ]:
-                    self._scrape_laws_constitution_amendments(
+                    results = self._scrape_laws_constitution_amendments(
                         situation, norm_type, norm_type_id
                     )
+                    self._save_results(results)
                 else:
                     # get available years
                     url = f"https://www2.al.ce.gov.br/legislativo/{norm_type_id}"
@@ -393,8 +475,13 @@ class CearaAleceScraper(BaseScaper):
                         total=len(self.years),
                         disable=not self.verbose,
                     ):
-                        self._scrape_laws_constitution_amendments(
+                        # skip years before resume_from
+                        if year < resume_from:
+                            continue
+
+                        results = self._scrape_laws_constitution_amendments(
                             situation, norm_type, norm_type_id, year
                         )
+                        self._save_results(results)
 
         return self.results

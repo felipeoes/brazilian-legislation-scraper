@@ -1,8 +1,12 @@
+from typing import Optional
+from urllib.parse import urlencode
+
 import requests
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper, YEAR_START
+from src.database.saver import FileSaver
 
 TYPES = {
     "Lei Ordinária": "lei ord",
@@ -43,13 +47,14 @@ class RNAlrnScraper(BaseScaper):
             "nome": "",
             "page": 1,
         }
-        self._initialize_saver()
+        # Initialize the FileSaver
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(self, norm_type_id: int, page: int) -> str:
         self.params["nome"] = norm_type_id
         self.params["page"] = page
 
-        return f"{self.base_url}/legislacao/pesquisa?{requests.compat.urlencode(self.params)}"
+        return f"{self.base_url}/legislacao/pesquisa?{urlencode(self.params)}"
 
     def _get_docs_links(self, url: str) -> list:
         """Get documents html links from given page.
@@ -89,15 +94,24 @@ class RNAlrnScraper(BaseScaper):
 
         return docs
 
-    def _get_doc_data(self, doc_info: dict) -> dict:
+    def _get_doc_data(
+        self, doc_info: dict, pdf_len_threshold: int = 200
+    ) -> Optional[dict]:
         """Get document data from given document dict"""
         # remove pdf_link from doc_info
         pdf_link = doc_info.pop("pdf_link")
         response = self._make_request(pdf_link)
 
+        if not response:
+            return None
+
         text_markdown = self._get_markdown(response=response)
 
-        if not text_markdown or not text_markdown.strip():
+        if (
+            not text_markdown
+            or not text_markdown.strip()
+            or len(text_markdown.strip()) < pdf_len_threshold
+        ):
             # probably image pdf
             text_markdown = self._get_pdf_image_markdown(response.content)
 
@@ -111,7 +125,7 @@ class RNAlrnScraper(BaseScaper):
 
         return doc_info
 
-    def _scrape_norms(self, norm_type: str, norm_type_id: str, situation: str):
+    def _scrape_norms(self, norm_type: str, norm_type_id: str, situation: str) -> list:
         url = self._format_search_url(norm_type_id, 1)
         soup = self._get_soup(url)
 
@@ -161,7 +175,7 @@ class RNAlrnScraper(BaseScaper):
                     result = future.result()
 
                     if result:
-                        # save to one drive
+                        # prepare item for saving
                         queue_item = {
                             # hardcode since we only get valid documents in search request
                             "situation": situation,
@@ -169,7 +183,6 @@ class RNAlrnScraper(BaseScaper):
                             **result,
                         }
 
-                        self.queue.put(queue_item)
                         results.append(queue_item)
                     else:
                         print("Invalid document returned from get_doc_data")
@@ -184,21 +197,13 @@ class RNAlrnScraper(BaseScaper):
                 f"Finished scraping for Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
             )
 
+        return results
+
     def scrape(self) -> list:
         """Scrape data from all years"""
 
-        # start saver thread
-        self.saver.start()
-
-        # check if can resume from last scrapped year
-        resume_from = self.year_start  # 1808
-        forced_resume = self.year_start != YEAR_START
-        if self.saver.last_year is not None and not forced_resume:
-            print(f"Resuming from {self.saver.last_year}")
-            resume_from = int(self.saver.last_year)
-        else:
-            print(f"Starting from {resume_from}")
-
+        all_results = []
+        
         # scrape data
         for situation in tqdm(
             self.situations,
@@ -212,12 +217,11 @@ class RNAlrnScraper(BaseScaper):
                 total=len(self.types),
                 disable=not self.verbose,
             ):
-                self._scrape_norms(norm_type, norm_type_id, situation)
+                norms_results = self._scrape_norms(norm_type, norm_type_id, situation)
+                all_results.extend(norms_results)
 
-        # stop saver thread
-        self.saver.stop()
+        # Save all results at the end
+        if all_results:
+            self.saver.save(all_results)
 
-        # wait for saver thread to finish
-        self.saver.join()
-
-        return self.results
+        return all_results

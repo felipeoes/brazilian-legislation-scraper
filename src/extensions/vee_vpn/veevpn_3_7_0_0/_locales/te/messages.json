@@ -1,0 +1,14 @@
+{
+  "app_name_chrome": {
+    "message": "క్రోమ్ కోసం ఉచిత VPN - VPN ప్రాక్సీ VeePN"
+  },
+  "app_name_edge": {
+    "message": "ఎడ్జ్ కోసం ఉచిత VPN - VPN ప్రాక్సీ VeePN"
+  },
+  "app_name_firefox": {
+    "message": "ఉచిత VPN - VPN ప్రాక్సీ VeePN"
+  },
+  "app_description": {
+    "message": "వేగవంతమైన, సురక్షితమైన VPN సేవ మీ గోప్యతను రక్షించడానికి. పరిమితి లేని ట్రాఫిక్ మరియు బ్యాండ్‌విడ్త్‌ను ఆస్వాదించండి!"
+  }
+}

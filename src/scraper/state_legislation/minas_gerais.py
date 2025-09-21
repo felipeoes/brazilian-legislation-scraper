@@ -1,10 +1,11 @@
 import re
 from io import BytesIO
-from typing import Optional
+from typing import Optional, List, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper
-from urllib.parse import urlencode, urljoin 
+from src.database.saver import FileSaver
+from urllib.parse import urlencode, urljoin
 
 TYPES = {
     "Constituição Estadual": 2,
@@ -62,7 +63,8 @@ class MGAlmgScraper(BaseScaper):
             "dataInicio": "",  # not using situation parameter because it is not working properly
         }
         self.reached_end_page = False
-        self._initialize_saver()
+        # Initialize the FileSaver
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(self, norm_type_id: str, year: int, page: int) -> str:
         """Format url for search request"""
@@ -76,10 +78,10 @@ class MGAlmgScraper(BaseScaper):
         Returns a list of dicts with keys 'title', 'summary', 'html_link'
         """
         soup = self._get_soup(url)
-        
+
         if soup is None:
             return []
-            
+
         docs = []
 
         items = soup.find_all("article") if soup else []
@@ -103,7 +105,7 @@ class MGAlmgScraper(BaseScaper):
         url = urljoin(self.base_url, html_link)
 
         soup_data = self._get_soup(url)
-        
+
         if soup_data is None:
             return None
 
@@ -121,7 +123,11 @@ class MGAlmgScraper(BaseScaper):
 
         situation = soup_data.find("span", text="Situação")
         situation_text = ""
-        if situation and situation.next_sibling and hasattr(situation.next_sibling, "text"):
+        if (
+            situation
+            and situation.next_sibling
+            and hasattr(situation.next_sibling, "text")
+        ):
             situation_text = situation.next_sibling.text.strip().capitalize()
 
         publication = soup_data.find("span", text="Fonte")
@@ -143,9 +149,11 @@ class MGAlmgScraper(BaseScaper):
 
         # get link for real html (first look for Text atualizado, if not found, look for Texto original)
         html_link_text = None
-        
+
         # Look for texts that could contain the link
-        for elem in soup_data.find_all(text=re.compile('|'.join(["Texto atualizado", "Texto original"]))):
+        for elem in soup_data.find_all(
+            text=re.compile("|".join(["Texto atualizado", "Texto original"]))
+        ):
             parent = elem.parent
             if parent:
                 # Find the nearest a tag that has an href attribute
@@ -153,35 +161,69 @@ class MGAlmgScraper(BaseScaper):
                 if a_tag and a_tag.has_attr("href"):
                     html_link_text = a_tag["href"]
                     break
-        
+
         if not html_link_text:
             return None
-        
+
         html_link = urljoin(self.base_url, html_link_text)
-        if html_link == self.base_url:  # norm is invalid because it does not have a link to the document text
+        if (
+            html_link == self.base_url
+        ):  # norm is invalid because it does not have a link to the document text
             return None
 
         soup = self._get_soup(html_link)
         if soup is None:
             return None
-            
+
         text_norm_span = soup.find("span", class_="textNorma")
         if text_norm_span is None:
             return None
-            
+
+        data = {
+            **doc_info,
+            "origin": origin_text,
+            "situation": situation_text,
+            "publication": publication_text,
+            "tags": tags_text,
+            "subject": subject_text,
+        }
+
+        # <p>OBSERVAÇÃO: A imagem da lei está disponível em:</p>
+        # <a href="https://mediaserver.almg.gov.br/acervo/191/945/1191945.pdf">https://mediaserver.almg.gov.br/acervo/191/945/1191945.pdf</a>
+
+        # check if "A imagem da lei está disponível em" is in the text, in that case get link to pdf
+        a_tag = text_norm_span.find("a", href=re.compile("mediaserver"))
+        if a_tag:
+            print(
+                f"Document {data.get('title', '')} is an image PDF, extracting text from image. URL: {html_link}"
+            )
+            pdf_link = a_tag["href"]
+            pdf_content = self._make_request(pdf_link).content
+            text_markdown = self._get_pdf_image_markdown(pdf_content)
+
+            if not text_markdown.replace(".", "").strip():
+                return None
+
+            return {
+                **data,
+                "html_string": "",
+                "text_markdown": text_markdown,
+                "document_url": pdf_link,
+            }
+
         # Use str() if prettify() is not available
         # Use string representation for all elements to avoid prettify issues
-        norm_text_tag = str(text_norm_span)
+        norm_text = str(text_norm_span)
 
         # remove Data da última atualização: 14/09/2007 from text
-        norm_text_tag = re.sub(
-            r"Data da última atualização: \d{2}/\d{2}/\d{4}", "", norm_text_tag
+        norm_text = re.sub(
+            r"Data da última atualização: \d{2}/\d{2}/\d{4}", "", norm_text
         )
 
-        if not norm_text_tag:  # some documents are not available, so we skip them
+        if not norm_text:  # some documents are not available, so we skip them
             return None
 
-        html_string = f"<html><body>{norm_text_tag}</body></html>"
+        html_string = f"<html><body>{norm_text}</body></html>"
 
         buffer = BytesIO()
         buffer.write(html_string.encode())
@@ -189,20 +231,21 @@ class MGAlmgScraper(BaseScaper):
 
         text_markdown = self._get_markdown(stream=buffer)
 
+        # some invalid documents have only a '.' as text
+        if not text_markdown.replace(".", "").strip():
+            return None
+
         return {
-            **doc_info,
-            "origin": origin_text,
-            "situation": situation_text,
-            "publication": publication_text,
-            "tags": tags_text,
-            "subject": subject_text,
+            **data,
             "html_string": html_string,
             "text_markdown": text_markdown,
             "document_url": html_link,
         }
 
-    def _scrape_year(self, year: int):
+    def _scrape_year(self, year: int) -> List[Dict]:
         """Scrape norms for a specific year"""
+        all_results = []
+        
         for situation in tqdm(
             self.situations,
             desc="MINAS GERAIS | Situations",
@@ -210,8 +253,12 @@ class MGAlmgScraper(BaseScaper):
             disable=not self.verbose,
         ):
             # Convert self.types to a dictionary if it's not already
-            types_dict = self.types if isinstance(self.types, dict) else {k: i for i, k in enumerate(self.types)}
-            
+            types_dict = (
+                self.types
+                if isinstance(self.types, dict)
+                else {k: i for i, k in enumerate(self.types)}
+            )
+
             for norm_type, norm_type_id in tqdm(
                 types_dict.items(),
                 desc=f"MINAS GERAIS | Year: {year} | Types",
@@ -272,16 +319,16 @@ class MGAlmgScraper(BaseScaper):
                         if not result["situation"]:
                             result["situation"] = situation
 
-                        # save to one drive
+                        # save to results
                         queue_item = {
                             "year": year,
                             "type": norm_type,
                             **result,
                         }
 
-                        self.queue.put(queue_item)
                         results.append(queue_item)
 
+                all_results.extend(results)
                 self.results.extend(results)
                 self.count += len(results)
 
@@ -289,3 +336,5 @@ class MGAlmgScraper(BaseScaper):
                     print(
                         f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
                     )
+        
+        return all_results

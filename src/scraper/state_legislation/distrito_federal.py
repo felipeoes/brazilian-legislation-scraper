@@ -3,6 +3,7 @@ from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper
+from src.database.saver import FileSaver
 
 TYPES = {
     "Ato da Mesa Diretora": 17000000,
@@ -209,7 +210,8 @@ class DFSinjScraper(BaseScaper):
         }
         self.total_pages_url = "https://www.sinj.df.gov.br/sinj/ashx/Consulta/TotalConsulta.ashx?bbusca=sinj_norma"
         self.session_id_created = False
-        self._initialize_saver()
+        # Initialize the FileSaver
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(
         self,
@@ -328,8 +330,10 @@ class DFSinjScraper(BaseScaper):
             print(f"Error getting document data: {e}")
             return False
 
-    def _scrape_year(self, year: int):
+    def _scrape_year(self, year: int) -> list:
         """Scrape norms for a specific year"""
+        all_results = []
+        
         for situation, situation_id in tqdm(
             self.situations.items(),
             desc="DISTRITO FEDERAL | Situations",
@@ -423,7 +427,7 @@ class DFSinjScraper(BaseScaper):
 
                         if result:
 
-                            # save to one drive
+                            # prepare item for saving
                             queue_item = {
                                 "year": year,
                                 "type": norm_type,
@@ -431,13 +435,14 @@ class DFSinjScraper(BaseScaper):
                                 **result,
                             }
 
-                            self.queue.put(queue_item)
                             results.append(queue_item)
 
-                self.results.extend(results)
+                all_results.extend(results)
                 self.count += len(results)
 
                 if self.verbose:
                     print(
                         f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
                     )
+
+        return all_results

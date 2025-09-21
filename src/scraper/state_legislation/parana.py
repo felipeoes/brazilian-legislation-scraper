@@ -1,7 +1,10 @@
+from urllib.parse import urljoin
+
 import re
 import requests
 import random
 from io import BytesIO
+from typing import List, Dict
 from bs4 import BeautifulSoup
 from selenium.webdriver import Chrome
 from selenium.webdriver.common.by import By
@@ -17,6 +20,7 @@ from src.scraper.base.scraper import (
     DEFAULT_INVALID_SITUATION,
     retry,
 )
+from src.database.saver import FileSaver
 
 TYPES = {
     "Lei": 1,
@@ -111,7 +115,7 @@ class ParanaCVScraper(BaseScaper):
         )
         self._regex_total_pages = re.compile(r"Página \d+ de (\d+)")
         self._regex_total_records = re.compile(r"Total de (\d+) registros")
-        self._initialize_saver()
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(
         self, norm_type_id: str, year_index: int, page: int = 1
@@ -482,20 +486,6 @@ class ParanaCVScraper(BaseScaper):
 
         soup = BeautifulSoup(driver.page_source, "html.parser")
 
-        # with lock:
-        #     if page > 1:
-        #         while not f"indice={page}" in driver.current_url:
-        #             self._search_norms(url, year, norm_type_id)
-        #             self._selenium_click_page(page)
-
-        #             self._handle_blocked_access()
-        #             time.sleep(5)
-        #     else:
-        #         while not "#resultado" in driver.current_url:
-        #             self._search_norms(url, year, norm_type_id)
-
-        #     soup = BeautifulSoup(driver.page_source, "html.parser")
-
         docs = []
 
         table = soup.find("table", id="list_tabela")
@@ -517,7 +507,7 @@ class ParanaCVScraper(BaseScaper):
             # https://www.legislacao.pr.gov.br/legislacao/pesquisarAto.do?action=exibir&codAto=234748
 
             html_link = f"/legislacao/pesquisarAto.do?action=exibir&codAto={id}"
-            html_link = requests.compat.urljoin(self.base_url, html_link)
+            html_link = urljoin(self.base_url, html_link)
 
             docs.append(
                 {
@@ -589,6 +579,9 @@ class ParanaCVScraper(BaseScaper):
 
         html_string = norm_text_tag.prettify().replace("\n ANEXOS:", "").strip()
 
+        # remove javascript:listarAssinaturas();
+        html_string = html_string.replace("javascript:listarAssinaturas();", "")
+
         # inferr situation from text
         situation = self._infer_invalid_situation(soup)
         if not situation:
@@ -613,8 +606,10 @@ class ParanaCVScraper(BaseScaper):
 
         return doc_info
 
-    def _scrape_year(self, year: int):
+    def _scrape_year(self, year: int) -> List[Dict]:
         """Scrape norms for a specific year"""
+        all_results = []
+        
         for norm_type, norm_type_id in tqdm(
             self.types.items(),
             desc=f"PARANA | Year: {year} | Types",
@@ -683,9 +678,9 @@ class ParanaCVScraper(BaseScaper):
                     # save to one drive
                     queue_item = {"year": year, "type": norm_type, **norm}
 
-                    self.queue.put(queue_item)
                     results.append(queue_item)
 
+            all_results.extend(results)
             self.results.extend(results)
             self.count += len(results)
 
@@ -693,3 +688,5 @@ class ParanaCVScraper(BaseScaper):
                 print(
                     f"Finished scraping for Year: {year} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
                 )
+        
+        return all_results

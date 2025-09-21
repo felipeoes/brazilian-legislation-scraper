@@ -1,3 +1,4 @@
+from urllib.parse import urljoin, urlencode
 from typing import Optional
 import requests
 from bs4 import BeautifulSoup
@@ -6,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests.compat
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper
+from src.database.saver import FileSaver
 
 TYPES = {
     "Lei Complementar": 11,
@@ -57,7 +59,8 @@ class BahiaLegislaScraper(BaseScaper):
             "data[max]": "",
             "page": 0,
         }
-        self._initialize_saver()
+        # Initialize the FileSaver
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(self, norm_type_id: str, year: int, page: int) -> str:
         """Format url for search request"""
@@ -65,7 +68,7 @@ class BahiaLegislaScraper(BaseScaper):
         self.params["data[min]"] = f"{year}-01-01"
         self.params["data[max]"] = f"{year}-12-31"
         self.params["page"] = page
-        return f"{self.base_url}/documentos?{requests.compat.urlencode(self.params)}"
+        return f"{self.base_url}/documentos?{urlencode(self.params)}"
 
     def _get_docs_links(self, url: str) -> list:
         """Get documents html links from given page.
@@ -105,7 +108,7 @@ class BahiaLegislaScraper(BaseScaper):
         """Get document data from given document dict"""
         # remove html_link from doc_info
         html_link = doc_info.pop("html_link")
-        url = requests.compat.urljoin(self.base_url, html_link)
+        url = urljoin(self.base_url, html_link)
 
         response = self._make_request(url)
         if not response:
@@ -159,8 +162,10 @@ class BahiaLegislaScraper(BaseScaper):
 
         return doc_info
 
-    def _scrape_year(self, year: int):
+    def _scrape_year(self, year: int) -> list:
         """Scrape norms for a specific year"""
+        all_results = []
+        
         for situation in tqdm(
             self.situations,
             desc="BAHIA | Situations",
@@ -223,7 +228,7 @@ class BahiaLegislaScraper(BaseScaper):
                         if result is None:
                             continue
 
-                        # save to one drive
+                        # prepare item for saving
                         queue_item = {
                             "year": year,
                             # hardcode since we only get valid documents in search request
@@ -232,13 +237,14 @@ class BahiaLegislaScraper(BaseScaper):
                             **result,
                         }
 
-                        self.queue.put(queue_item)
                         results.append(queue_item)
 
-                    self.results.extend(results)
+                    all_results.extend(results)
                     self.count += len(results)
 
                     if self.verbose:
                         print(
                             f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
                         )
+
+        return all_results

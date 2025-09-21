@@ -1,9 +1,13 @@
-import requests
 import re
+from typing import Optional, List, Dict
+from urllib.parse import urljoin, urlencode
+
+import requests
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper
+from src.database.saver import FileSaver
 from io import BytesIO
 
 # ALRS does not have a type field, norm type is gotten while scraping
@@ -53,13 +57,14 @@ class RSAlrsScraper(BaseScaper):
             "pagina": 1,
         }
         self.fetched_constitution = False
-        self._initialize_saver()
+        # Initialize the FileSaver
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(self, year: int, page: int) -> str:
         self.params["TxtAno"] = year
         self.params["pagina"] = page
 
-        return f"{self.base_url}/legis/M010/M0100008.asp?{requests.compat.urlencode(self.params)}"
+        return f"{self.base_url}/legis/M010/M0100008.asp?{urlencode(self.params)}"
 
     def _get_docs_links(self, url: str) -> list:
         """Get documents html links from given page.
@@ -111,7 +116,11 @@ class RSAlrsScraper(BaseScaper):
         table = soup.find("table")
         if not table:
             return ""
-        items = table.find_all("tr")
+
+        table = table.find("tbody")
+
+        # setting recursive to false to avoid getting tr from nested tables within text
+        items = table.find_all("tr", recursive=False)
 
         html_string = ""
         if len(items) > 5:
@@ -122,7 +131,7 @@ class RSAlrsScraper(BaseScaper):
 
         return html_string
 
-    def _get_doc_data(self, doc_info: dict) -> dict:
+    def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
         """Get document data from given document dict"""
 
         # remove html_link from doc_info
@@ -130,8 +139,7 @@ class RSAlrsScraper(BaseScaper):
         soup = self._get_soup(html_link)
 
         # check for error (some documents are not available)
-        # A página não pode ser exibida
-        if "a página não pode ser exibida" in soup.prettify().lower():
+        if not soup or "a página não pode ser exibida" in soup.prettify().lower():
             print(f"Error getting document data: {html_link}")
             return None
 
@@ -159,7 +167,8 @@ class RSAlrsScraper(BaseScaper):
 
         # invalid norm
         if (
-            "norma sem texto" in soup.prettify().lower()
+            not soup
+            or "norma sem texto" in soup.prettify().lower()
             or "sem texto para exibi" in soup.prettify().lower()
         ):
             return None
@@ -224,8 +233,10 @@ class RSAlrsScraper(BaseScaper):
 
         self.fetched_constitution = True
 
-    def _scrape_year(self, year: int):
+    def _scrape_year(self, year: int) -> List[Dict]:
         """Scrape norms for a specific year"""
+        all_results = []
+        
         for situation in tqdm(
             self.situations,
             desc="RIO GRANDE DO SUL | Situations",
@@ -293,7 +304,7 @@ class RSAlrsScraper(BaseScaper):
                     if not norm:
                         continue
 
-                    # save to one drive
+                    # save to results
                     queue_item = {
                         **norm,
                         "year": year,
@@ -302,9 +313,9 @@ class RSAlrsScraper(BaseScaper):
                         ),
                     }
 
-                    self.queue.put(queue_item)
                     results.append(queue_item)
 
+            all_results.extend(results)
             self.results.extend(results)
             self.count += len(results)
 
@@ -312,3 +323,5 @@ class RSAlrsScraper(BaseScaper):
                 print(
                     f"Finished scraping for Year: {year} | Results: {len(results)} | Total: {self.count}"
                 )
+        
+        return all_results

@@ -1,0 +1,14 @@
+{
+  "app_name_chrome": {
+    "message": "VPN Grátis para Chrome - VPN Proxy VeePN"
+  },
+  "app_name_edge": {
+    "message": "VPN Grátis para Edge - VPN Proxy VeePN"
+  },
+  "app_name_firefox": {
+    "message": "VPN Grátis - VPN Proxy VeePN"
+  },
+  "app_description": {
+    "message": "VPN rápido, seguro e fácil de usar para proteger sua privacidade online. Aproveite tráfego e largura de banda ilimitados!"
+  }
+}

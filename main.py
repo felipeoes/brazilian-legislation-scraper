@@ -26,10 +26,17 @@ from src.scraper.state_legislation import (
     ParaAlepaScraper,
     ParaibaAlpbScraper,
     ParanaCVScraper,
-    SaoPauloAlespScraper,
+    PernambucoAlepeScraper,
+    PiauiAlpbScraper,
     RJAlerjScraper,
     RNAlrnScraper,
     RSAlrsScraper,
+    RondoniaCotelScraper,
+    RoraimaAlpbScraper,
+    SantaCatarinaScraper,
+    SaoPauloAlespScraper,
+    SergipeLegsonScraper,
+    TocantinsScraper,
 )
 from dotenv import load_dotenv
 
@@ -60,9 +67,10 @@ if __name__ == "__main__":
             {
                 "scraper": CamaraDepScraper,
                 "params": {
-                    "verbose": False,
-                    "year_start": 1808,
-                    "max_workers": 32,
+                    "verbose": True,
+                    "year_start": 1807,  # 1807 is the earliest year available
+                    "year_end": 2025,
+                    "max_workers": 48,
                 },
                 "name": "Camara dos Deputados",
                 "run": False,
@@ -80,9 +88,12 @@ if __name__ == "__main__":
             {
                 "scraper": ICMBioScraper,
                 "params": {
-                    "year_start": 1800,
+                    "year_start": 2017,  # 2007 is the earliest year available
+                    "year_end": 2017,
                     "use_selenium": True,
                     "docs_save_dir": ONEDRIVE_SPECIFIC_LEGISLATION_SAVE_DIR,
+                    "llm_client": client,  # we have custom logic (involving llms) to extract document text
+                    "llm_model": model,
                     "verbose": True,
                 },
                 "name": "ICMBio",
@@ -147,7 +158,7 @@ if __name__ == "__main__":
                     "max_workers": 32,
                 },
                 "name": "CEAlece",
-                "run": False,
+                "run": True,
             },
             {
                 "scraper": DFSinjScraper,
@@ -164,7 +175,7 @@ if __name__ == "__main__":
             {
                 "scraper": ESAlesScraper,
                 "params": {
-                    "year_start": 1943,  # 1943 is the earliest year available
+                    "year_start": 1958,  # 1943 is the earliest year available
                     "verbose": True,
                     "llm_client": client,  # we have pdf image extraction
                     "llm_model": model,
@@ -175,11 +186,12 @@ if __name__ == "__main__":
             {
                 "scraper": LegislaGoias,
                 "params": {
-                    "year_start": 1887,  # 1887 is the earliest year available
-                    "use_selenium": True,  # needs to use selenium to get html content
+                    "year_start": 1978,  # 1887 is the earliest year available
+                    "year_end": 1978, # 1965 - 199 antes
                     "llm_client": client,  # we have pdf image extraction
                     "llm_model": model,
-                    "verbose": False,
+                    "verbose": True,
+                    "max_workers": 32,
                 },
                 "name": "LegislaGoias",
                 "run": False,
@@ -208,10 +220,11 @@ if __name__ == "__main__":
             {
                 "scraper": MTAlmtScraper,
                 "params": {
-                    "year_start": 1835,  # 1835 is the earliest year available (historical data)
+                    "year_start": 1980,  # 1835 is the earliest year available (historical data)
                     "verbose": True,
                     "llm_client": client,  # we have pdf image extraction
                     "llm_model": model,
+                    "max_workers": 32,
                 },
                 "name": "MTAlmt",
                 "run": False,
@@ -220,8 +233,10 @@ if __name__ == "__main__":
                 "scraper": MGAlmgScraper,
                 "params": {
                     "year_start": 1831,  # 1831 is the earliest year available
-                    "verbose": True,
                     "max_workers": 32,
+                    "llm_client": client,  # we have pdf image extraction
+                    "llm_model": model,
+                    "verbose": True,
                 },
                 "name": "MGAlmg",
                 "run": False,
@@ -256,7 +271,7 @@ if __name__ == "__main__":
                     "use_selenium": True,
                     "use_selenium_vpn": True,
                     "multiple_drivers": True,
-                    "vpn_extension_path": r"src\extensions\vee_vpn\veevpn_3_4_3_0.crx",
+                    "vpn_extension_path": "src/extensions/vee_vpn/veevpn_3_7_0_0",
                     "vpn_extension_page": "chrome-extension://majdfhpaihoncoakbjgbdhglocklcgno/src/popup/popup.html",
                     # "max_workers": 20,
                     # "use_openvpn": True,
@@ -319,9 +334,33 @@ if __name__ == "__main__":
                 "run": False,
             },
             {
+                "scraper": PernambucoAlepeScraper,
+                "params": {
+                    "year_start": 1835,  # 1835 is the earliest year available
+                    "verbose": True,
+                    "max_workers": 32,
+                    "use_selenium": True,  # needs to use selenium to get html content
+                    # "use_requests_session": True,  # needs to use in order to maintain aspx state
+                },
+                "name": "PEAlepe",
+                "run": False,
+            },
+            {
+                "scraper": PiauiAlpbScraper,
+                "params": {
+                    "year_start": 1922,  # 1922 is the earliest year available
+                    "verbose": True,
+                    "max_workers": 32,
+                    "llm_client": client,  # we have pdf image extraction
+                    "llm_model": model,
+                },
+                "name": "PIAlpb",
+                "run": False,
+            },
+            {
                 "scraper": RJAlerjScraper,
                 "params": {
-                    "year_start": 1968,  # 1968 is the earliest year available
+                    "year_start": 2001,  # 1968 is the earliest year available
                     "verbose": True,
                     "max_workers": 32,
                 },
@@ -345,13 +384,78 @@ if __name__ == "__main__":
                     "verbose": True,
                     "max_workers": 32,
                 },
-                "name": "RNAlrn",
-                "run": True,
+                "name": "RSAlrs",
+                "run": False,
+            },
+            {
+                "scraper": RondoniaCotelScraper,
+                "params": {
+                    "year_start": 1981,  # 1981 is the earliest year available
+                    "verbose": True,
+                    "max_workers": 32,
+                    "llm_client": client,  # we have pdf image extraction
+                    "llm_model": model,
+                },
+                "name": "RondoniaCotel",
+                "run": False,
+            },
+            {
+                "scraper": RoraimaAlpbScraper,
+                "params": {
+                    "year_start": 1991,  # 1991 is the earliest year available
+                    "verbose": True,
+                    "max_workers": 32,
+                    "llm_client": client,  # we have pdf image extraction
+                    "llm_model": model,
+                },
+                "name": "RoraimaAlpb",
+                "run": False,
+            },
+            {
+                "scraper": SantaCatarinaScraper,
+                "params": {
+                    "year_start": 1946,  # 1946 is the earliest year available
+                    "verbose": True,
+                    "max_workers": 32,
+                    "use_requests_session": True,  # needs to use in order to make requests that requires session
+                },
+                "name": "SCScraper",
+                "run": False,
             },
             {
                 "scraper": SaoPauloAlespScraper,
-                "params": {},
+                "params": {
+                    "year_start": 1835,  # 1835 is the earliest year available
+                    "verbose": True,
+                    "max_workers": 16,  # low max_workers because of the website's rate limiting
+                    "llm_client": client,  # we have image extraction for a type of documents (Decisão da Mesa)
+                    "llm_model": model,
+                },
                 "name": "SPAlesp",
+                "run": False,
+            },
+            {
+                "scraper": SergipeLegsonScraper,
+                "params": {
+                    "year_start": 1940,  # 1940 is the earliest year available
+                    "verbose": True,
+                    "max_workers": 32,
+                    "llm_client": client,  # we have pdf image extraction
+                    "llm_model": model,
+                },
+                "name": "SergipeLegson",
+                "run": False,
+            },
+            {
+                "scraper": TocantinsScraper,
+                "params": {
+                    "year_start": 1989,  # 1989 is the earliest year available
+                    "verbose": True,
+                    "max_workers": 32,
+                    "llm_client": client,  # we have pdf image extraction
+                    "llm_model": model,
+                },
+                "name": "TocantinsScraper",
                 "run": False,
             },
         ]
@@ -365,10 +469,6 @@ if __name__ == "__main__":
                 print(f"Scraped {len(data)} data for {scraper['name']}")
 
     except KeyboardInterrupt:
-        for scraper in running_scrapers:
-            scraper.saver.running = False
-            scraper.saver.join()
-
         print("KeyboardInterrupt: Exiting...")
 
     print("Exiting...")

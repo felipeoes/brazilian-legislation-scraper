@@ -1,10 +1,12 @@
 import time
 import re
+from typing import List, Dict
 from urllib.parse import urljoin, urlencode
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper
+from src.database.saver import FileSaver
 
 
 TYPES = {
@@ -129,7 +131,8 @@ class MTAlmtScraper(BaseScaper):
         self.header_remove_regex = re.compile(
             r"http://www.al.mt.gov.br/TNX/viewLegislacao.php\?cod=\d+"
         )
-        self._initialize_saver()
+        # Initialize the FileSaver
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _set_token(self):
         """Get token for search request"""
@@ -174,6 +177,10 @@ class MTAlmtScraper(BaseScaper):
             return f"{self.base_url}/norma-juridica?{urlencode(self.params)}"
 
     def _get_total_norms(self, soup: BeautifulSoup) -> int:
+
+        if not soup:
+            return 0
+
         """Get total number of norms from search page"""
         total_items = self.regex_total_items.search(soup.prettify())
         if total_items:
@@ -245,7 +252,7 @@ class MTAlmtScraper(BaseScaper):
         while not soup:
             # try again, MT website is really unstable
             time.sleep(3)
-            soup = self._get_soup(url)
+            soup = self._get_soup(url, timeout=30)
             retries -= 1
             if retries <= 0:
                 print(f"Error getting soup for {url}")
@@ -284,7 +291,8 @@ class MTAlmtScraper(BaseScaper):
             )
 
         pdf_content = self._make_request(
-            doc_info["document_url"]
+            doc_info["document_url"],
+            timeout=30,
         )  # need to make a request to get pdf content first, using directly _get_markdown will not work
         if not pdf_content:
             print(f"Error getting pdf content for {doc_info['document_url']}")
@@ -298,7 +306,11 @@ class MTAlmtScraper(BaseScaper):
 
         text_markdown = self.header_remove_regex.sub("", text_markdown).strip()
 
-        if "Powered by TCPDF".lower() in text_markdown.lower():
+        # 150 comes from empirical results. Docs with less than this length are usually pdf images
+        if (
+            "Powered by TCPDF".lower() in text_markdown.lower()
+            or len(text_markdown) < 150
+        ):
             # probably pdf is an image
 
             pdf_content = self._make_request(doc_info["document_url"]).content
@@ -327,9 +339,8 @@ class MTAlmtScraper(BaseScaper):
 
         return doc_data
 
-    def _scrape_year(self, year: int):
+    def _scrape_year(self, year: int) -> List[Dict]:
         """Scrape norms for a specific year"""
-
         all_types = []
         for norm_type, norm_type_id in self.types.items():
             all_types.append(
@@ -417,27 +428,34 @@ class MTAlmtScraper(BaseScaper):
                     total=len(futures),
                     disable=not self.verbose,
                 ):
-                    norm = future.result()
-                    if not norm:
+                    try:
+                        norm = future.result()
+                        if not norm:
+                            continue
+
+                        # save to results
+                        queue_item = {
+                            **norm,
+                            "year": year,
+                            "type": norm_type,
+                            "situation": (
+                                norm["situation"] if norm.get("situation") else "Não consta"
+                            ),
+                        }
+
+                        results.append(queue_item)
+                    except Exception as e:
+                        print(f"Error getting norm data: {e}")
                         continue
 
-                    # save to one drive
-                    queue_item = {
-                        **norm,
-                        "year": year,
-                        "type": norm_type,
-                        "situation": (
-                            norm["situation"] if norm.get("situation") else "Não consta"
-                        ),
-                    }
-
-                    self.queue.put(queue_item)
-                    results.append(queue_item)
-
-            self.results.extend(results)
-            self.count += len(results)
+            if results:
+                self.saver.save(results)
+                self.results.extend(results)
+                self.count += len(results)
 
             if self.verbose:
                 print(
                     f"Finished scraping for Year: {year} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
                 )
+
+        return self.results

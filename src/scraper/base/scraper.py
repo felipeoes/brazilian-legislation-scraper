@@ -1,7 +1,8 @@
-import os
 import requests
 import time
 import fitz
+import warnings
+import logging
 
 from typing import Dict, List, Optional, Union
 from PIL import Image
@@ -16,11 +17,18 @@ from selenium.webdriver.chrome.options import Options
 from markitdown import MarkItDown, UnsupportedFormatException, FileConversionException
 from tqdm.auto import tqdm
 from concurrent.futures import ThreadPoolExecutor
-from multiprocessing import Queue
 from pathlib import Path
 from dotenv import load_dotenv
-from src.database.saver import OneDriveSaver
+from src.database.saver import FileSaver
 from src.utils.openvpn import OpenVPNManager
+
+
+# supress markitdown warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="markitdown")
+
+# suppress httpx and urllib3 logging
+logging.getLogger("httpx").setLevel(logging.ERROR)
+logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 load_dotenv()
 
@@ -56,6 +64,29 @@ def retry(max_retries: int, base_delay: int = 3):
     return decorator
 
 
+def safe_pdf_open(pdf_content: bytes) -> Optional[fitz.Document]:
+    """
+    Safely open a PDF document with error handling for common PyMuPDF issues.
+
+    Args:
+        pdf_content (bytes): PDF content as bytes
+
+    Returns:
+        fitz.Document or None: PyMuPDF Document object or None if failed
+    """
+    try:
+        return fitz.open("pdf", pdf_content)
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "invalid float value" in error_msg or "gray stroke color" in error_msg:
+            print(f"PDF contains invalid color definitions: {e}")
+        elif "damaged" in error_msg or "corrupt" in error_msg:
+            print(f"PDF appears to be corrupted: {e}")
+        else:
+            print(f"Failed to open PDF: {e}")
+        return None
+
+
 class BaseScaper:
     """Base class for state legislation scrapers"""
 
@@ -69,7 +100,7 @@ class BaseScaper:
         docs_save_dir: Path = Path(ONEDRIVE_STATE_LEGISLATION_SAVE_DIR),
         llm_client: Optional[OpenAI] = None,
         llm_model: Optional[str] = None,
-        llm_prompt: str = "Extraia todo  o conteúdo da imagem. Retorne somente o conteúdo extraído",
+        llm_prompt: str = "Extraia todo o conteúdo da imagem, em formato markdown. Não inclua a tag ```markdown. Não inclua nenhum outro texto ou explicação. Retorne somente o conteúdo extraído.",
         use_selenium: bool = False,
         multiple_drivers: bool = False,
         use_selenium_vpn: bool = False,
@@ -106,13 +137,9 @@ class BaseScaper:
         self.max_workers = max_workers
         self.years = list(range(self.year_start, self.year_end + 1))
         self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
-                            AppleWebKit/537.36 (KHTML, like Gecko) \
-                            Chrome/80.0.3987.149 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
         }
         self.llm_md_header = "\n# Description:\n"
-        self.queue = Queue()
-        self.error_queue = Queue()
         self.results = []
         self.count = 0  # keep track of number of results
         self.md = MarkItDown(llm_client=llm_client, llm_model=llm_model)
@@ -120,7 +147,7 @@ class BaseScaper:
         self.session: requests.Session = requests.Session()
         self.driver: Optional[Chrome] = None
         self.drivers: list[Chrome] = []
-        self.saver: Optional[OneDriveSaver] = None
+        self.saver: Optional[FileSaver] = None
         self.openvpn_manager: Optional[OpenVPNManager] = None
         self.initialize_selenium()
         self.initialize_requests_session()
@@ -137,8 +164,26 @@ class BaseScaper:
 
         if self.use_selenium and self.use_selenium_vpn and self.vpn_extension_path:
             # load the extension
-            extension_abs_path = os.path.abspath(self.vpn_extension_path)
-            options.add_extension(extension_abs_path)
+            extension_abs_path = Path(self.vpn_extension_path).resolve().as_posix()
+            # options.add_extension(extension_abs_path)
+
+            # load unpacked extension
+            options.add_argument(f"--load-extension={extension_abs_path}")
+
+            options.add_experimental_option(
+                "prefs",
+                {
+                    "extensions.ui.developer_mode": True,
+                },
+            )
+            options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            options.add_experimental_option("useAutomationExtension", False)
+
+            # Enable access to chrome-extension:// URLs
+            options.add_argument("--disable-extensions-file-access-check")
+            options.add_argument("--allow-running-insecure-content")
+            options.add_argument("--disable-web-security")
+            options.add_argument("--allow-file-access-from-files")
             print(f"Attempting to load packed extension from: {extension_abs_path}")
 
         if self.use_selenium and not self.multiple_drivers:
@@ -172,7 +217,7 @@ class BaseScaper:
 
     def _initialize_saver(self):
         """Initialize saver class. The child class should call this method in its __init__ method, after setting the docs_save_dir attribute."""
-        self.saver = OneDriveSaver(self.queue, self.error_queue, self.docs_save_dir)
+        self.saver = FileSaver(self.docs_save_dir)
 
     def initialize_openvpn_manager(self):
         """Initialize openvpn manager"""
@@ -210,8 +255,9 @@ class BaseScaper:
         **kwargs,
     ) -> Optional[requests.Response]:
         """Make request to given url"""
-        retries = 5
-        for _ in range(retries):
+        retries = 3
+        for attempt in range(retries):
+            sleep_time = 5**attempt
             try:
 
                 if method == "POST":
@@ -239,20 +285,38 @@ class BaseScaper:
                     in response.text
                 ):
                     print("Server error, retrying...")
-                    time.sleep(5)
+                    time.sleep(sleep_time)
                     continue
 
-                # check for 429 or 503 status code (right now useful for mato grosso scraper)
-                if response.status_code in [429, 503]:
-                    # print(f"Status code {response.status_code}, retrying...")
-                    time.sleep(5)
+                # for 404 error just return None
+                if response.status_code == 404:
+                    print(f"404 Not Found: {url}")
+                    return None
+
+                # check for 429, 502 503 status code (right now useful for mato grosso scraper)
+                if response.status_code in [
+                    400,
+                    401,
+                    403,
+                    408,
+                    429,
+                    500,
+                    502,
+                    503,
+                    504,
+                ]:
+
+                    print(
+                        f"Status code {response.status_code}, retrying... | URL: {url} | Sleeping for {sleep_time} seconds"
+                    )
+                    time.sleep(sleep_time)
                     continue
 
                 return response
             except Exception as e:
                 print(f"Error getting response from url: {url}")
                 print(e)
-                time.sleep(5)
+                time.sleep(sleep_time)
 
         return None
 
@@ -268,13 +332,15 @@ class BaseScaper:
 
         self.openvpn_manager.change_vpn_connection()
 
-    def _get_soup(self, url: Union[str, requests.Response]) -> Optional[BeautifulSoup]:
+    def _get_soup(
+        self, url: Union[str, requests.Response], method: str = "GET", *args, **kwargs
+    ) -> Optional[BeautifulSoup]:
         """Get BeautifulSoup object from given url"""
 
         if isinstance(url, requests.Response):
             return BeautifulSoup(url.content, "html.parser")
 
-        res = self._make_request(url)
+        res = self._make_request(url, method=method, *args, **kwargs)
 
         if res is None:
             return None
@@ -309,7 +375,7 @@ class BaseScaper:
         else:
             raise RuntimeError("Selenium driver is not initialized.")
 
-    def _pdf_to_images(self, doc: fitz.Document) -> list:
+    def _pdf_to_images(self, doc: fitz.Document) -> list[Image.Image]:
         """
         Converts a PDF document to a list of images, one image per page.
 
@@ -322,20 +388,53 @@ class BaseScaper:
         image_list = []
 
         for page_num in range(doc.page_count):
-            page = doc.load_page(page_num)
-            pix = page.get_pixmap(
-                matrix=fitz.Identity,
-                dpi=None,
-                colorspace=fitz.csRGB,
-                clip=None,
-                annots=True,
-            )
+            try:
+                page = doc.load_page(page_num)
+                pix = page.get_pixmap(
+                    matrix=fitz.Identity,
+                    dpi=None,
+                    colorspace=fitz.csRGB,
+                    clip=None,
+                    annots=True,
+                )
 
-            # Convert PyMuPDF Pixmap to PIL Image
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            image_list.append(img)
+                # Convert PyMuPDF Pixmap to PIL Image
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                image_list.append(img)
+            except Exception as e:
+                # Handle errors like "Cannot set gray stroke color because /'P14' is an invalid float value"
+                print(f"Error processing page {page_num}: {e}")
+                # Try alternative approach with different settings
+                try:
+                    page = doc.load_page(page_num)
+                    # Use different pixmap settings to handle corrupted color spaces
+                    pix = page.get_pixmap(
+                        matrix=fitz.Identity,
+                        dpi=150,  # Lower DPI might help with problematic content
+                        colorspace=fitz.csGRAY,  # Use grayscale to avoid color issues
+                        clip=None,
+                        annots=False,  # Disable annotations which might contain invalid colors
+                    )
+                    img = Image.frombytes("L", [pix.width, pix.height], pix.samples)
+                    # Convert grayscale to RGB for consistency
+                    img = img.convert("RGB")
+                    image_list.append(img)
+                except Exception as e2:
+                    print(
+                        f"Failed to process page {page_num} even with fallback method: {e2}"
+                    )
+                    continue
 
         return image_list
+
+    def _clean_md_tag(self, md_content: str) -> str:
+        """Clean '```markdown' tags from markdown content"""
+        if md_content.startswith("```markdown"):
+            md_content = md_content.replace("```markdown", "").strip()
+        if md_content.endswith("```"):
+            md_content = md_content.replace("```", "").strip()
+
+        return md_content
 
     def _get_pdf_image_markdown(self, pdf_content: bytes) -> str:
         """Get markdown response from given pdf content"""
@@ -346,17 +445,37 @@ class BaseScaper:
             return text_markdown_raw
 
         # get images from pdf
-        pdf = fitz.open("pdf", pdf_content)
-        images = self._pdf_to_images(pdf)
+        pdf = safe_pdf_open(pdf_content)
+        if pdf is None:
+            return ""
+
+        try:
+            images = self._pdf_to_images(pdf)
+        except Exception as e:
+            print(f"Error converting PDF to images: {e}")
+            pdf.close()
+            return ""
+        finally:
+            # Always close the PDF document to free memory
+            try:
+                pdf.close()
+            except:
+                pass
 
         # paralllel processing
         text_markdown_img = ""
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = []
             for img in images:
-                buffer = BytesIO()
-                img.save(buffer, format="PNG")
-                img = BytesIO(buffer.getvalue())
+                try:
+                    # Convert PIL Image to BytesIO stream
+                    buffer = BytesIO()
+                    img.save(buffer, format="PNG")
+                    img = BytesIO(buffer.getvalue())
+                except Exception as e:
+                    print(f"Error converting image to BytesIO: {e}")
+                    continue
+
                 future = executor.submit(self._get_markdown, stream=img)
                 futures.append(future)
 
@@ -366,14 +485,17 @@ class BaseScaper:
                 total=len(futures),
                 disable=not self.verbose,
             ):
-                md_content = future.result()
-                text_markdown_img += md_content + "\n\n"
+                try:
+                    md_content = future.result()
+                    md_content = self._clean_md_tag(md_content.strip())
+                    text_markdown_img += md_content + "\n\n"
+                except Exception as e:
+                    print(f"Error converting image to markdown: {e}")
+                    continue
 
-        if not text_markdown_img:
-            print("No images found in pdf")
-
-        if not text_markdown_raw:
-            print("No text found in pdf")
+        if not text_markdown_img and not text_markdown_raw:
+            print("No text extracted from PDF or images")
+            return ""
 
         text_markdown = text_markdown_raw + text_markdown_img
         return text_markdown
@@ -383,7 +505,7 @@ class BaseScaper:
         url: Optional[str] = None,
         response: Optional[requests.Response] = None,
         stream: Optional[BytesIO] = None,
-        retries: int = 2,
+        retries: int = 3,
     ) -> str:
         """Get markdown response from given url"""
         md_content = ""
@@ -397,9 +519,12 @@ class BaseScaper:
                     if (
                         not md_content
                     ):  # for images, sometimes the mllm struggles to process, try again
+                        retries -= 1
                         continue
 
-                    return md_content.replace(self.llm_md_header, "").strip()
+                    return self._clean_md_tag(
+                        md_content.replace(self.llm_md_header, "").strip()
+                    )
 
                 if response is None and url:
                     response = self._make_request(url)
@@ -449,7 +574,7 @@ class BaseScaper:
             "This method should be implemented in the child class."
         )
 
-    def _scrape_year(self, year: int, *args, **kwargs) -> None:
+    def _scrape_year(self, year: int, *args, **kwargs) -> List[Dict]:
         """Scrape norms for a specific year"""
         raise NotImplementedError(
             "This method should be implemented in the child class."
@@ -458,13 +583,11 @@ class BaseScaper:
     def scrape(self) -> list:
         """Scrape data from all years"""
 
-        # start saver thread
+        # Check saver initialization
         if not self.saver:
             raise RuntimeError(
                 "Saver is not initialized. Call _initialize_saver() in the child class __init__ method."
             )
-
-        self.saver.start()
 
         # check if can resume from last scrapped year
         resume_from = self.year_start  # 1808
@@ -475,19 +598,17 @@ class BaseScaper:
         else:
             print(f"Starting from {resume_from}")
 
-        # # scrape data from all years
+        # scrape data from all years
         for year in tqdm(
             self.years, desc=f"{self.__class__.__name__} | Years", total=len(self.years)
         ):
             if year < resume_from:
                 continue
 
-            self._scrape_year(year)
-
-        # stop saver thread
-        self.saver.stop()
-
-        # wait for saver thread to finish
-        self.saver.join()
+            year_results = self._scrape_year(year)
+            if year_results:
+                # Save results for this year
+                self.saver.save(year_results)
+                # Note: self.results is already extended in _scrape_year method
 
         return self.results

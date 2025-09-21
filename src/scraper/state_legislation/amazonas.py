@@ -1,3 +1,5 @@
+from urllib.parse import urljoin
+
 import requests
 from bs4 import BeautifulSoup
 from io import BytesIO
@@ -5,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests.compat
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper
+from src.database.saver import FileSaver
 
 TYPES = {
     "Decreto Legislativo": 41535,
@@ -47,7 +50,8 @@ class LegislaAMScraper(BaseScaper):
         self.docs_save_dir = self.docs_save_dir / "AMAZONAS"
         self.reached_end_page = False
         self.fetched_constitution = False
-        self._initialize_saver()
+        # Initialize the FileSaver
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(self, norm_type_id: str, year: int, page: int) -> str:
         """Format url for search request"""
@@ -107,7 +111,7 @@ class LegislaAMScraper(BaseScaper):
         # remove html_link from doc_info
         html_link = doc_info.pop("html_link")
 
-        url = requests.compat.urljoin(self.base_url, html_link)
+        url = urljoin(self.base_url, html_link)
         soup = self._get_soup(url)
 
         html_content = self._get_norm_text(soup)
@@ -127,8 +131,9 @@ class LegislaAMScraper(BaseScaper):
 
         return doc_info
 
-    def _scrape_year(self, year: str):
+    def _scrape_year(self, year: str) -> list:
         """Scrape norms for a specific year"""
+        all_results = []
 
         for situation in tqdm(
             self.situations,
@@ -161,8 +166,7 @@ class LegislaAMScraper(BaseScaper):
 
                     doc_info = self._get_doc_data(doc_info)
 
-                    self.queue.put(doc_info)
-                    self.results.append(doc_info)
+                    all_results.append(doc_info)
                     self.count += 1
                     self.fetched_constitution = True
                     print("Scraped state constitution")
@@ -218,7 +222,7 @@ class LegislaAMScraper(BaseScaper):
                         if result is None:
                             continue
 
-                        # save to one drive
+                        # prepare item for saving
                         queue_item = {
                             "year": year,
                             # hardcode since we only get valid documents in search request
@@ -231,13 +235,14 @@ class LegislaAMScraper(BaseScaper):
                             **result,
                         }
 
-                        self.queue.put(queue_item)
                         results.append(queue_item)
 
-                self.results.extend(results)
+                all_results.extend(results)
                 self.count += len(results)
 
                 if self.verbose:
                     print(
                         f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
                     )
+
+        return all_results

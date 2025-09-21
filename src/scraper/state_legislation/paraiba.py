@@ -3,6 +3,7 @@ from typing import Dict, Any, List
 
 from tqdm import tqdm
 from src.scraper.base.scraper import BaseScaper
+from src.database.saver import FileSaver
 
 
 # gotten from https://sapl3.al.pb.leg.br/api/norma/tiponormajuridica/
@@ -43,7 +44,8 @@ class ParaibaAlpbScraper(BaseScaper):
         super().__init__(base_url, types=TYPES, situations=SITUATIONS, **kwargs)
         self.docs_save_dir = self.docs_save_dir / "PARAIBA"
         self.subjects: Dict[int, str] = {}
-        self._initialize_saver()
+        # Initialize the FileSaver
+        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(
         self,
@@ -144,8 +146,9 @@ class ParaibaAlpbScraper(BaseScaper):
 
         self.subjects = subjects
 
-    def _scrape_year(self, year: int):
+    def _scrape_year(self, year: int) -> list:
         """Scrape norms for a specific year"""
+        all_results = []
         self._fetch_subjects()
 
         for norm_type, norm_type_id in tqdm(
@@ -199,13 +202,14 @@ class ParaibaAlpbScraper(BaseScaper):
                     result = future.result()
                     if result:
                         queue_item = {"year": year, "type": norm_type, **result}
-                        self.queue.put(queue_item)
                         results.append(queue_item)
 
-            self.results.extend(results)
+            all_results.extend(results)
             self.count += len(results)
 
             if self.verbose:
                 print(
                     f"Finished scraping for Year: {year}  | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
                 )
+                
+        return all_results
