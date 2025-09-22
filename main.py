@@ -158,7 +158,7 @@ if __name__ == "__main__":
                     "max_workers": 32,
                 },
                 "name": "CEAlece",
-                "run": True,
+                "run": False,
             },
             {
                 "scraper": DFSinjScraper,
@@ -187,7 +187,7 @@ if __name__ == "__main__":
                 "scraper": LegislaGoias,
                 "params": {
                     "year_start": 1978,  # 1887 is the earliest year available
-                    "year_end": 1978, # 1965 - 199 antes
+                    "year_end": 1978,  # 1965 - 199 antes
                     "llm_client": client,  # we have pdf image extraction
                     "llm_model": model,
                     "verbose": True,
@@ -220,14 +220,14 @@ if __name__ == "__main__":
             {
                 "scraper": MTAlmtScraper,
                 "params": {
-                    "year_start": 1980,  # 1835 is the earliest year available (historical data)
+                    "year_start": 2017,  # 1835 is the earliest year available (historical data)
                     "verbose": True,
                     "llm_client": client,  # we have pdf image extraction
                     "llm_model": model,
-                    "max_workers": 32,
+                    "max_workers": 16,  # lower max_workers because MT website is really unstable
                 },
                 "name": "MTAlmt",
-                "run": False,
+                "run": True,
             },
             {
                 "scraper": MGAlmgScraper,

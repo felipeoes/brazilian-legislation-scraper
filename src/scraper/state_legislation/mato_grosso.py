@@ -1,6 +1,6 @@
 import time
 import re
-from typing import List, Dict
+from typing import List, Dict, Optional
 from urllib.parse import urljoin, urlencode
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -237,7 +237,9 @@ class MTAlmtScraper(BaseScaper):
 
         return docs
 
-    def _get_doc_data(self, doc_info: dict, is_historic: bool = False) -> dict:
+    def _get_doc_data(
+        self, doc_info: dict, is_historic: bool = False
+    ) -> Optional[dict]:
         """Get document data from given document dict"""
         norm_link = doc_info.pop("norm_link")
 
@@ -252,7 +254,7 @@ class MTAlmtScraper(BaseScaper):
         while not soup:
             # try again, MT website is really unstable
             time.sleep(3)
-            soup = self._get_soup(url, timeout=30)
+            soup = self._get_soup(url)
             retries -= 1
             if retries <= 0:
                 print(f"Error getting soup for {url}")
@@ -291,8 +293,7 @@ class MTAlmtScraper(BaseScaper):
             )
 
         pdf_content = self._make_request(
-            doc_info["document_url"],
-            timeout=30,
+            doc_info["document_url"]
         )  # need to make a request to get pdf content first, using directly _get_markdown will not work
         if not pdf_content:
             print(f"Error getting pdf content for {doc_info['document_url']}")
@@ -439,7 +440,9 @@ class MTAlmtScraper(BaseScaper):
                             "year": year,
                             "type": norm_type,
                             "situation": (
-                                norm["situation"] if norm.get("situation") else "Não consta"
+                                norm["situation"]
+                                if norm.get("situation")
+                                else "Não consta"
                             ),
                         }
 

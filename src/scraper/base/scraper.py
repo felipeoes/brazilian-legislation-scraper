@@ -251,11 +251,13 @@ class BaseScaper:
         method: str = "GET",
         json: dict = {},
         payload: list | dict = {},
+        timeout: int = 60,
         *args,
         **kwargs,
     ) -> Optional[requests.Response]:
         """Make request to given url"""
         retries = 3
+        error = None
         for attempt in range(retries):
             sleep_time = 5**attempt
             try:
@@ -267,6 +269,7 @@ class BaseScaper:
                         data=payload,  # payload will be used for form data in POST requests, useful when have files or duplicate keys
                         headers=self.headers,
                         verify=False,
+                        timeout=timeout,
                         *args,
                         **kwargs,
                     )
@@ -275,6 +278,7 @@ class BaseScaper:
                         url,
                         headers=self.headers,
                         verify=False,
+                        timeout=timeout,
                         *args,
                         **kwargs,
                     )
@@ -286,6 +290,7 @@ class BaseScaper:
                 ):
                     print("Server error, retrying...")
                     time.sleep(sleep_time)
+                    error = "Server error"
                     continue
 
                 # for 404 error just return None
@@ -305,19 +310,16 @@ class BaseScaper:
                     503,
                     504,
                 ]:
-
-                    print(
-                        f"Status code {response.status_code}, retrying... | URL: {url} | Sleeping for {sleep_time} seconds"
-                    )
                     time.sleep(sleep_time)
+                    error = f"HTTP {response.status_code}"
                     continue
 
                 return response
             except Exception as e:
-                print(f"Error getting response from url: {url}")
-                print(e)
+                error = e
                 time.sleep(sleep_time)
 
+        print(f"Error getting response from url: {url} | Error: {error}")
         return None
 
     def _change_vpn_connection(self, *args, **kwargs):
