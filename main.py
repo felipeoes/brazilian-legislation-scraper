@@ -9,6 +9,7 @@ import os
 from dataclasses import dataclass, field
 from openai import AsyncOpenAI
 from loguru import logger
+from src.scraper.base.concurrency import RateLimiter
 from src.scraper.base.scraper import BaseScraper
 from src.scraper.federal_legislation.scrape import CamaraDepScraper
 from src.scraper.conama.scrape import ConamaScraper
@@ -73,9 +74,9 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
                 "year_start": 1807,
                 "year_end": 2026,
                 "rps": 200,
-                "verbose": True,
+                # "verbose": True,
             },
-            run=False,
+            run=True,
         ),
         ScraperConfig(
             scraper=ConamaScraper,
@@ -90,7 +91,7 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
             scraper=ICMBioScraper,
             params={
                 "year_start": 2016,  # starts from 2016
-                "headless": False,
+                "headless": True,
                 "docs_save_dir": SPECIFIC_LEGISLATION_SAVE_DIR,
                 "verbose": True,
                 "max_workers": 4,  # using 4 workers only to avoid 403 errors from in.gov.br
@@ -102,7 +103,7 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
             params={
                 "year_start": 1963,  # starts from 1963
             },
-            run=False
+            run=True,
         ),
         ScraperConfig(
             scraper=AlagoasSefazScraper,
@@ -112,7 +113,7 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
                 "rps": 5,
                 "verbose": True,
             },
-            run=True,
+            run=False,
         ),
         ScraperConfig(
             scraper=LegislaAMScraper,
@@ -134,7 +135,7 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
             scraper=BahiaLegislaScraper,
             params={
                 "year_start": 1891,  # starts from 1891
-                "rps": 1,  # lower RPS to avoid 500 and 504 errors from https://www.legislabahia.ba.gov.br
+                "rps": 5,  # lower RPS to avoid 500 and 504 errors from https://www.legislabahia.ba.gov.br
             },
             run=False,
         ),
@@ -307,7 +308,7 @@ def parse_args() -> argparse.Namespace:
         "--scrapers",
         "-s",
         nargs="+",
-        help="Names of scrapers to run (e.g., MTAlmt CONAMA). If not specified, runs scrapers with run=True in config.",
+        help="Names of scrapers to run (e.g., MTAlmt CONAMA). If not specified, runs enabled scrapers in config.",
     )
     parser.add_argument(
         "--list",
@@ -354,10 +355,12 @@ async def main():
                 f"Using Bedrock provider | Model: {model} | Base URL: {base_url}"
             )
 
+            llm_rps = 1
             llm_config = {
                 "llm_client": bedrock_client,
                 "llm_model": model,
-                "llm_rps": 1,
+                "llm_rps": llm_rps,
+                "llm_rate_limiter": RateLimiter(llm_rps),
                 "llm_raw": True,  # send PDF bytes directly; handled by BedrockClient
             }
 
@@ -367,10 +370,12 @@ async def main():
                 f"Using OpenAI provider | Model: {model} | Base URL: {client.base_url}"
             )
 
+            llm_rps = 2
             llm_config = {
                 "llm_client": client,
                 "llm_model": model,
-                "llm_rps": 2,
+                "llm_rps": llm_rps,
+                "llm_rate_limiter": RateLimiter(llm_rps),
                 "llm_kwargs": {
                     "max_completion_tokens": 32768,
                     "extra_body": {"media_resolution": "MEDIA_RESOLUTION_HIGH"},

@@ -148,9 +148,7 @@ class RNAlrnScraper(BaseScraper):
 
         return doc_info
 
-    async def _prefetch_type_links(
-        self, norm_type: str, norm_type_id: str
-    ) -> None:
+    async def _prefetch_type_links(self, norm_type: str, norm_type_id: str) -> None:
         """Fetch all pages for a norm type and group doc links by year."""
         url = self._build_search_url(norm_type_id, 1)
         soup = await self.request_service.get_soup(url)
@@ -215,9 +213,7 @@ class RNAlrnScraper(BaseScraper):
         ]
 
         if self.verbose:
-            logger.info(
-                f"Year: {year} | Type: {norm_type} | Results: {len(results)}"
-            )
+            logger.info(f"Year: {year} | Type: {norm_type} | Results: {len(results)}")
 
         return results
 

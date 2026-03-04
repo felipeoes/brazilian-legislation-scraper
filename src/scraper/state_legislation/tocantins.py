@@ -236,8 +236,8 @@ class TocantinsScraper(BaseScraper):
 
             if not text_markdown or not text_markdown.strip():
                 # Try image extraction if regular PDF extraction fails
-                text_markdown = await self._get_markdown(stream=BytesIO(
-                    await pdf_response.read())
+                text_markdown = await self._get_markdown(
+                    stream=BytesIO(await pdf_response.read())
                 )
 
             if not text_markdown or not text_markdown.strip():

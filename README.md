@@ -9,9 +9,12 @@ Web scraper for legal documents regarding Brazilian legislation — federal, sta
 - **27 state scrapers** — covering all Brazilian states with dedicated scrapers for each state legislature website
 - **Federal legislation** — scrapes Câmara dos Deputados
 - **Regulatory bodies** — CONAMA and ICMBio scrapers
-- **Async concurrency** — built on `asyncio` + `aiohttp` for non-blocking I/O with sliding-window rate limiting (`rps` for HTTP, `llm_rps` for LLM API calls)
+- **Async concurrency** — built on `asyncio` + `aiohttp` for non-blocking I/O with independent per-scraper rate limiting for HTTP and shared rate limiting for LLM API calls
+- **LLM providers** — supports OpenAI-compatible APIs and AWS Bedrock Converse for OCR
 - **PDF & image extraction** — converts PDFs to Markdown, with optional LLM-powered OCR for image-based documents
 - **Playwright support** — async Chromium automation for JavaScript-rendered pages, with optional VPN extension integration
+- **Proxy rotation** — optional proxy support from a file or HTTP endpoint
+- **SAPL integration** — dedicated base class for state legislatures using the SAPL REST API
 - **Structured output** — saves scraped data as JSON files grouped by year via `FileSaver`
 - **CLI interface** — select scrapers by name, list available scrapers
 
@@ -50,13 +53,16 @@ Copy `.env.example` to `.env` and configure the following variables:
 
 | Variable | Description | Default |
 |---|---|---|
+| `LLM_PROVIDER` | LLM provider to use (`openai` or `bedrock`) | `openai` |
 | `LLM_API_KEY` | API key for the LLM provider (used for OCR on image-based PDFs) | — |
-| `LLM_MODEL` | Model name (e.g. `gpt-4o`) | — |
-| `PROVIDER_BASE_URL` | LLM provider base URL | `https://api.openai.com/v1` |
+| `LLM_MODEL` | Model name (e.g. `gpt-4o`); comma-separated for multiple models | — |
+| `PROVIDER_BASE_URL` | LLM provider base URL | `https://openrouter.ai/api/v1` |
 | `SAVE_DIR` | Base directory for scraped JSON output | `outputs/legislation` |
 | `STATE_LEGISLATION_SAVE_DIR` | Directory for state legislation documents | — |
 | `SPECIFIC_LEGISLATION_SAVE_DIR` | Directory for CONAMA/ICMBio documents | — |
 | `ERROR_LOG_DIR` | Directory for error logs | `logs/legislation` |
+| `PROXY_FILE_PATH` | Path to a file containing proxy URLs (one per line) | — |
+| `PROXY_ENDPOINT` | HTTP endpoint that returns proxy URLs | — |
 
 ## Usage
 
@@ -104,6 +110,7 @@ uv run main.py --list
 │   ├── scraper/
 │   │   ├── base/
 │   │   │   ├── scraper.py           # BaseScraper — async HTTP via aiohttp
+│   │   │   ├── sapl_scraper.py      # SAPLBaseScraper — base for SAPL REST API sites
 │   │   │   └── concurrency.py       # RateLimiter, bounded_gather(), run_in_thread()
 │   │   ├── federal_legislation/
 │   │   │   └── scrape.py            # CamaraDepScraper
@@ -116,6 +123,16 @@ uv run main.py --list
 │   │       ├── alagoas.py
 │   │       ├── ...
 │   │       └── tocantins.py
+│   ├── services/
+│   │   ├── browser/
+│   │   │   └── playwright.py        # BrowserService — Playwright page pool & VPN support
+│   │   ├── ocr/
+│   │   │   ├── llm.py               # LLMOCRService — PDF/image-to-Markdown via LLM vision
+│   │   │   └── bedrock.py           # BedrockClient — AWS Bedrock Converse API adapter
+│   │   ├── proxy/
+│   │   │   └── service.py           # ProxyService — proxy rotation from file or endpoint
+│   │   └── request/
+│   │       └── service.py           # RequestService — async HTTP with rate limiting & retries
 │   └── utils/
 │       └── openvpn.py               # OpenVPN manager (used by Paraná scraper)
 ```
@@ -136,12 +153,18 @@ The project uses an **async-first** concurrency model with optimized parallelism
 - **Pages** — scraped **concurrently** via `asyncio.gather()`
 - **Documents** — scraped **concurrently** via `asyncio.gather()`
 
+### Rate Limiting
+- **HTTP requests** — each scraper has its own `RateLimiter` (via `RequestService`), configured independently with its `rps` parameter. Scrapers targeting different websites do not interfere with each other.
+- **LLM requests** — all scrapers share a single `RateLimiter` instance for LLM API calls, since they all query the same LLM endpoint. This prevents exceeding the provider's rate limit when multiple scrapers run in parallel.
+
 ### Technology Stack
-- **HTTP I/O** — `aiohttp.ClientSession` for non-blocking requests with sliding-window rate limiting (`rps`)
+- **HTTP I/O** — `aiohttp.ClientSession` for non-blocking requests with per-scraper sliding-window rate limiting
+- **LLM OCR** — vision model-based PDF/image extraction via OpenAI-compatible API or AWS Bedrock Converse API
 - **File I/O** — `aiofiles` for non-blocking JSON writes
 - **Browser automation** (4 scrapers) — Playwright async API (natively async, no thread wrappers)
 - **CPU-bound work** (PDF/image conversion) — offloaded via `asyncio.to_thread()`
 - **Retries** — `tenacity` for async retry logic with exponential backoff
+- **Proxy support** — optional proxy rotation from a file or HTTP endpoint
 
 ## Development
 

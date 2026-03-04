@@ -1,7 +1,6 @@
 import asyncio
 from typing import Optional
 from urllib.parse import urljoin
-from bs4 import BeautifulSoup
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
 from src.scraper.base.scraper import BaseScraper

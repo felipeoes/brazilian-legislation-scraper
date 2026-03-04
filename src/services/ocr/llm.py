@@ -69,7 +69,9 @@ class LLMOCRService:
         self.timeout = timeout
 
         effective_rps = self.llm_config.get("llm_rps", 10)
-        self._rate_limiter = RateLimiter(effective_rps)
+        self._rate_limiter = self.llm_config.get("llm_rate_limiter") or RateLimiter(
+            effective_rps
+        )
         self.batch_size = self.llm_config.get("llm_batch_size", 5)
         self.raw = self.llm_config.get("llm_raw", False)
         if verbose:

@@ -17,9 +17,7 @@ VALID_SITUATIONS = [
     "Não consta"
 ]  # Alap does not have a situation field, invalid norms will have an indication in the document text
 
-INVALID_SITUATIONS = (
-    []
-)  # norms with these situations are invalid norms (no longer have legal effect)
+INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no longer have legal effect)
 
 # the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS

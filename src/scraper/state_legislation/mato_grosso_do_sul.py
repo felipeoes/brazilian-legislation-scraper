@@ -178,9 +178,7 @@ class MSAlemsScraper(BaseScraper):
         ]
 
         if self.verbose:
-            logger.info(
-                f"Year: {year} | Type: {norm_type} | Results: {len(results)}"
-            )
+            logger.info(f"Year: {year} | Type: {norm_type} | Results: {len(results)}")
 
         return results
 

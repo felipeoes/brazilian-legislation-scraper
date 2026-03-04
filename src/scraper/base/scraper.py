@@ -886,12 +886,14 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         for doc in self.results:
             doc_type = doc.get("type", "Unknown")
             doc_situation = doc.get("situation", "Unknown")
-            
+
             if doc_type not in types_summary:
                 types_summary[doc_type] = {"total": 0, "situations": {}}
-                
+
             types_summary[doc_type]["total"] += 1
-            types_summary[doc_type]["situations"][doc_situation] = types_summary[doc_type]["situations"].get(doc_situation, 0) + 1
+            types_summary[doc_type]["situations"][doc_situation] = (
+                types_summary[doc_type]["situations"].get(doc_situation, 0) + 1
+            )
 
         summary = {
             "scraper": self.__class__.__name__,

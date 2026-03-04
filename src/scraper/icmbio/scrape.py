@@ -21,14 +21,12 @@ TYPES = {
     "Outros Atos": "OUTROS ATOS",
 }
 
-# Cant filter by situation in the powerbi interface, will get situation from the table
 VALID_SITUATIONS = [
     "em vigência",
-    "alterado",
-    "retificação",
-    "não consta",  # obs: for this we need to match (Blank) in the powerbi filter
+    "em vigência com alteração",
+    "não consta",  # obs: for this we need to match (Blank) or (Em branco) in the powerbi filter
 ]
-INVALID_SITUATIONS = ["revogado", "vencido"]
+INVALID_SITUATIONS = ["revogado", "vencido", "sem efeito"]
 
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
@@ -71,7 +69,10 @@ class ICMBioScraper(BaseScraper):
             date_header = None
             for header in headers:
                 text = await header.inner_text()
-                if text.strip() == "Data Publicação":
+                if (
+                    "publicacao" in text.strip().lower()
+                    or "data publicação" in text.strip().lower()
+                ):
                     date_header = header
                     break
 
@@ -112,12 +113,12 @@ class ICMBioScraper(BaseScraper):
             # The visual-modern container that houses the ato_situacao slicer
             # (includes both the header with "Clear selections" and the dropdown)
             slicer_container = page.locator(
-                'visual-modern:has(div[aria-label="ato_situacao"])'
+                'visual-modern:has(div[aria-label="condicao"])'
             )
             await slicer_container.wait_for(state="visible")
 
             # The dropdown element inside the slicer. Hover to expose the "Clear selections" button and click it to reset filter
-            slicer_visual = slicer_container.locator('div[aria-label="ato_situacao"]')
+            slicer_visual = slicer_container.locator('div[aria-label="condicao"]')
             await slicer_container.hover()
             clear_button = slicer_container.locator(
                 'span[aria-label="Clear selections"]'
@@ -194,20 +195,24 @@ class ICMBioScraper(BaseScraper):
             for row in rows:
                 try:
                     cells = await row.locator('[role="gridcell"]').all()
-                    if len(cells) < 8:
+                    if len(cells) < 12:
                         logger.warning(
-                            f"Row with insufficient cells found (expected at least 8, got {len(cells)}). Skipping row."
+                            f"Row with insufficient cells found (expected at least 12, got {len(cells)}). Skipping row."
                         )
                         continue
 
-                    # Row 0: Select Row (checkbox)
-                    # Row 1: Situação
-                    # Row 2: Data Publicação
-                    # Row 3: Classificação/Origem
-                    # Row 4: Assunto/Instrumento
-                    # Row 5: Ementa
-                    # Row 6: Título
-                    # Row 7: Link
+                    # 0: Row Selection
+                    # 1: Situação
+                    # 2: Ato (Title)
+                    # 3: Ementa (Summary)
+                    # 4: Condicionador
+                    # 5: Assunto
+                    # 6: Objeto
+                    # 7: UORG
+                    # 8: publicacao (Date)
+                    # 9: instrumento
+                    # 10: Processo SEI
+                    # 11: Link DOU
 
                     situation_text = await cells[1].inner_text()
                     situation_text = situation_text.strip()
@@ -217,10 +222,10 @@ class ICMBioScraper(BaseScraper):
                     ]:
                         situation_text = "não consta"
 
-                    date_text = await cells[2].inner_text()
-                    subject_text = await cells[4].inner_text()
-                    summary_text = await cells[5].inner_text()
-                    title_text = await cells[6].inner_text()
+                    date_text = await cells[8].inner_text()
+                    subject_text = await cells[5].inner_text()
+                    summary_text = await cells[3].inner_text()
+                    title_text = await cells[2].inner_text()
 
                     row_key = f"{date_text}|{title_text}"
 
@@ -251,11 +256,17 @@ class ICMBioScraper(BaseScraper):
                         reached_boundary = True
                         break
 
-                    link_element = cells[7].locator("a")
+                    link_element = cells[11].locator("a")
                     if await link_element.count() > 0:
                         document_url = await link_element.get_attribute("href")
                     else:
-                        document_url = await cells[7].inner_text()
+                        document_url = await cells[11].inner_text()
+
+                    # Also try checking text from the HTML fallback since innerHTML can sometimes contain the raw URL text.
+                    # As sometimes the url is printed directly as text instead of an anchor tag.
+                    if not document_url or "http" not in document_url:
+                        document_url = await cells[11].inner_text()
+                        document_url = document_url.strip()
 
                     if not document_url:
                         logger.warning(
@@ -320,6 +331,7 @@ class ICMBioScraper(BaseScraper):
             raise RuntimeError("Browser service is not initialized.")
 
         page = await self.browser_service.get_available_page()
+        await page.set_viewport_size({"width": 4000, "height": 1080})
         try:
             # Stagger startup to avoid overwhelming PowerBI and the local Chromium instance
             await asyncio.sleep(random.uniform(0.5, 5.0))
@@ -345,6 +357,7 @@ class ICMBioScraper(BaseScraper):
             sort_ascending = year <= midpoint
 
             if not await self._wait_and_sort_table(page, sort_ascending=sort_ascending):
+                logger.error("Failed to wait and sort table.")
                 return []
 
             # Scrape the table rows

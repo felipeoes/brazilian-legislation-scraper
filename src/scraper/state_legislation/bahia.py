@@ -3,6 +3,7 @@ from urllib.parse import urljoin, urlencode
 from typing import Optional
 from bs4 import BeautifulSoup
 from loguru import logger
+from tenacity import retry, stop_after_attempt, wait_random_exponential
 from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
 
 TYPES = {
@@ -26,9 +27,7 @@ VALID_SITUATIONS = [
     "Não consta"
 ]  # BahiaLegisla does not have a situation field, invalid norms will have an indication in the document text
 
-INVALID_SITUATIONS = (
-    []
-)  # norms with these situations are invalid norms (no longer have legal effect)
+INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no longer have legal effect)
 
 # the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
@@ -66,14 +65,35 @@ class BahiaLegislaScraper(BaseScraper):
         }
         return f"{self.base_url}/documentos?{urlencode(params)}"
 
+    @retry(
+        stop=stop_after_attempt(7),
+        wait=wait_random_exponential(multiplier=2, max=30),
+        reraise=True,
+    )
+    async def _fetch_soup_with_retry(
+        self, url: str, timeout: int = 120
+    ) -> BeautifulSoup:
+        soup = await self.request_service.get_soup(url, timeout=timeout)
+        if not soup:
+            raise ValueError(f"Failed to get soup for URL: {url}")
+        return soup
+
+    @retry(
+        stop=stop_after_attempt(7),
+        wait=wait_random_exponential(multiplier=2, max=30),
+        reraise=True,
+    )
+    async def _fetch_request_with_retry(self, url: str, timeout: int = 120):
+        response = await self.request_service.make_request(url, timeout=timeout)
+        if not response:
+            raise ValueError(f"Failed to fetch document page: {url}")
+        return response
+
     async def _get_docs_links(self, url: str) -> list:
         """Get documents html links from given page.
         Returns a list of dicts with keys 'title', 'html_link'
         """
-        soup = await self.request_service.get_soup(url)
-
-        if not soup:
-            raise ValueError(f"Failed to get soup for URL: {url}")
+        soup = await self._fetch_soup_with_retry(url)
 
         docs = []
 
@@ -110,16 +130,17 @@ class BahiaLegislaScraper(BaseScraper):
         html_link = doc_info.pop("html_link")
         url = urljoin(self.base_url, html_link)
 
-        response = await self.request_service.make_request(url)
-        if not response:
-            logger.error(f"Failed to get document data from URL: {url}")
+        try:
+            response = await self._fetch_request_with_retry(url)
+        except Exception as e:
+            logger.error(f"Failed to get document data from URL: {url} | Error: {e}")
             await self._save_doc_error(
                 title=doc_info.get("title", "Unknown"),
                 year="",
                 situation="",
                 norm_type="",
                 html_link=url,
-                error_message="Failed to fetch document page",
+                error_message="Failed to fetch document page after multiple attempts",
             )
             return None
 
@@ -197,10 +218,8 @@ class BahiaLegislaScraper(BaseScraper):
     ) -> list:
         """Scrape norms for a specific situation and type"""
         url = self._build_search_url(norm_type_id, year, 0)
-        soup = await self.request_service.get_soup(url)
 
-        if not soup:
-            raise ValueError(f"Failed to get soup for URL: {url}")
+        soup = await self._fetch_soup_with_retry(url)
 
         # get total pages
         total_pages = 1
