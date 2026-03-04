@@ -289,10 +289,6 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         """Strip markdown code block wrappers if present."""
         return clean_md_tag(md_content)
 
-    def _check_text_length(self, text: str, min_length: int = 50) -> bool:
-        """Return True if *text* meets the minimum character threshold."""
-        return len(text.strip()) >= min_length
-
     @staticmethod
     def _wrap_html(content: str) -> str:
         """Wrap HTML fragment in <html><body> tags for markitdown conversion."""

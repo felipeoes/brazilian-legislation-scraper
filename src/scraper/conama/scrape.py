@@ -19,9 +19,7 @@ VALID_SITUATIONS = [
     "Não consta"
 ]  # Conama does not have a situation field, invalid norms will have an indication in the document text
 
-INVALID_SITUATIONS = (
-    []
-)  # norms with these situations are invalid norms (no longer have legal effect)
+INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no longer have legal effect)
 
 # the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
@@ -191,9 +189,10 @@ class ConamaScraper(BaseScraper):
             ],
         )
 
-        if not self._check_text_length(text_markdown, 200):
+        is_valid, reason = self._valid_markdown(text_markdown, 200)
+        if not is_valid:
             logger.warning(
-                f"Markdown text for {doc_type} CONAMA Nº {doc_number}/{doc_info['ano']} is very short. Length: {len(text_markdown)} chars."
+                f"Markdown text for {doc_type} CONAMA Nº {doc_number}/{doc_info['ano']} is invalid: {reason}. Length: {len(text_markdown) if text_markdown else 0} chars."
             )
             await self.saver.save_error(
                 {
