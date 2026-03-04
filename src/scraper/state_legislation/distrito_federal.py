@@ -1,9 +1,6 @@
-from io import BytesIO
 from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
-from src.scraper.base.scraper import BaseScaper
-from src.database.saver import FileSaver
+from loguru import logger
+from src.scraper.base.scraper import BaseScraper
 
 TYPES = {
     "Ato da Mesa Diretora": 17000000,
@@ -26,7 +23,6 @@ TYPES = {
     "Lei": 46000000,
     "Lei Complementar": 47000000,
     "Norma Técnica": 52000000,
-    "Portaria": 59000000,
     "Ordem de Serviço": 53000000,
     "Ordem de Serviço Conjunta": 54000000,
     "Parecer Normativo": 57000000,
@@ -72,7 +68,7 @@ INVALID_SITUATIONS = {
 SITUATIONS = VALID_SITUATIONS | INVALID_SITUATIONS
 
 
-class DFSinjScraper(BaseScaper):
+class DFSinjScraper(BaseScraper):
     """Webscraper for Distrito Federal state legislation website (https://www.sinj.df.gov.br/sinj/)
 
     Example search request: https://www.sinj.df.gov.br/sinj/ashx/Datatable/ResultadoDePesquisaNormaDatatable.ashx
@@ -145,14 +141,21 @@ class DFSinjScraper(BaseScaper):
         base_url: str = "https://www.sinj.df.gov.br/sinj",
         **kwargs,
     ):
-        super().__init__(base_url, types=TYPES, situations=SITUATIONS, **kwargs)
-        self.docs_save_dir = self.docs_save_dir / "DISTRITO_FEDERAL"
-        self.params = {
+        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
+
+        if STATE_LEGISLATION_SAVE_DIR:
+            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
+        super().__init__(
+            base_url,
+            name="DISTRITO_FEDERAL",
+            types=TYPES,
+            situations=SITUATIONS,
+            **kwargs,
+        )
+        self._base_params = {
             "bbusca": "sinj_norma",
             "iColumns": 9,
             "sColumns": ",,,,,,,,",
-            "iDisplayStart": 0,
-            "iDisplayLength": 100,
             "mDataProp_0": "_score",
             "sSearch_0": "",
             "bRegex_0": False,
@@ -204,46 +207,44 @@ class DFSinjScraper(BaseScaper):
             "sSortDir_0": "desc",
             "iSortingCols": 1,
             "tipo_pesquisa": "avancada",
-            "argumento": "autocomplete#ch_situacao#Situação#igual#igual a#semrevogacaoexpressa#Sem Revogação Expressa#E",
-            "argumento_situation": "number#ano_assinatura#Ano de Assinatura#igual#igual a#1960#1960#E",
-            "ch_tipo_norma": 27000000,
         }
+        self._display_length = 100
         self.total_pages_url = "https://www.sinj.df.gov.br/sinj/ashx/Consulta/TotalConsulta.ashx?bbusca=sinj_norma"
         self.session_id_created = False
-        # Initialize the FileSaver
-        self.saver = FileSaver(self.docs_save_dir)
 
-    def _format_search_url(
+    def _build_payload(
         self,
         situation: str,
         situation_id: str,
         norm_type_id: str,
         year: int,
         page: int = 1,
-    ) -> str:
-        """Format url for search request"""
-        self.params["argumento"] = (
-            f"number#ano_assinatura#Ano de Assinatura#igual#igual a#{year}#{year}#E"
+    ) -> list[tuple]:
+        """Build a fresh POST payload for a specific query (no shared state mutation)."""
+        display_start = (page - 1) * self._display_length
+        # Start with base params (immutable keys)
+        payload = [(key, value) for key, value in self._base_params.items()]
+        # Add mutable fields
+        payload.append(("iDisplayStart", display_start))
+        payload.append(("iDisplayLength", self._display_length))
+        payload.append(("ch_tipo_norma", norm_type_id))
+        payload.append(
+            (
+                "argumento",
+                f"number#ano_assinatura#Ano de Assinatura#igual#igual a#{year}#{year}#E",
+            )
         )
-        self.params["argumento_situation"] = (
-            f"autocomplete#ch_situacao#Situação#igual#igual a#{situation_id}#{situation}#E"
+        payload.append(
+            (
+                "argumento",
+                f"autocomplete#ch_situacao#Situ\u00e7\u00e3o#igual#igual a#{situation_id}#{situation}#E",
+            )
         )
-        self.params["ch_tipo_norma"] = norm_type_id
+        return payload
 
-        self.params["iDisplayLength"] = 100
-        self.params["iDisplayStart"] = (page - 1) * self.params["iDisplayLength"]
-
-        return f"{self.base_url}/ashx/Datatable/ResultadoDePesquisaNormaDatatable.ashx"
-
-    def _get_docs_links(self, url: str) -> list:
+    async def _get_docs_links(self, url: str, payload: list[tuple]) -> list:
         """Get document links from search request. Returns a list of dicts with keys 'title', 'summary', 'date', 'html_link'"""
-        payload = [
-            (key, value) for key, value in self.params.items() if key != "argumento"
-        ]
-        payload.append(("argumento", self.params["argumento"]))
-        payload.append(("argumento", self.params["argumento_situation"]))
-
-        response = self._make_request(
+        response = await self.request_service.make_request(
             url,
             method="POST",
             payload=payload,
@@ -262,7 +263,7 @@ class DFSinjScraper(BaseScaper):
 
             return "".join(new_chars)
 
-        data = response.json()
+        data = await response.json()
 
         docs = []
         for item in data["aaData"]:
@@ -287,35 +288,49 @@ class DFSinjScraper(BaseScaper):
 
         return docs
 
-    def _get_doc_data(self, doc_info: dict) -> dict:
+    async def _get_doc_data(self, doc_info: dict) -> dict:
         """Get document data from html link"""
 
         try:
             # remove html link from doc_info
             html_link = doc_info.pop("html_link")
-            response = self._make_request(html_link)
+            response = await self.request_service.make_request(html_link)
+            if response is None:
+                raise RuntimeError(f"No response for {html_link}")
 
-            soup = BeautifulSoup(response.content, "html.parser")
+            body = await response.read()
+            soup = BeautifulSoup(body, "html.parser")
 
             # get id="div_texto"
             norm_text_tag = soup.find("div", id="div_texto")
             text_markdown = None
             if not norm_text_tag:
                 # it may be a pdf file, try to get text markdown instead (without using LLM for image extraction)
-                text_markdown = self._get_markdown(response=response)
+                text_markdown = await self._get_markdown(response=response)
 
                 if not text_markdown:
+                    await self._save_doc_error(
+                        title=doc_info.get("title", "Unknown"),
+                        year="",
+                        situation="",
+                        norm_type="",
+                        html_link=html_link,
+                        error_message="Could not find div_texto and markdown extraction failed",
+                    )
                     return False  # invalid norm, not applying image extraction for distrito federal for now
             else:
-                html_string = f"<html>{norm_text_tag.prettify()}</html>"
+                # Remove the "Este texto não substitui..." footer disclaimer
+                for tag in norm_text_tag.find_all(
+                    "p", style=lambda s: s and "text-align:right" in s
+                ):
+                    if tag.find("a", href=lambda h: h and "BaixarArquivoDiario" in h):
+                        tag.decompose()
 
-                buffer = BytesIO()
-                buffer.write(html_string.encode())
-                buffer.seek(0)
+                html_string = f"<html>{norm_text_tag.prettify()}</html>"
 
                 # get markdown text
                 text_markdown = (
-                    self._get_markdown(stream=buffer)
+                    await self._get_markdown(html_content=html_string)
                     if not text_markdown
                     else text_markdown
                 )
@@ -327,122 +342,129 @@ class DFSinjScraper(BaseScaper):
 
             return doc_info
         except Exception as e:
-            print(f"Error getting document data: {e}")
+            logger.error(f"Error getting document data: {e}")
+            await self._save_doc_error(
+                title=doc_info.get("title", "Unknown"),
+                year="",
+                situation="",
+                norm_type="",
+                html_link=doc_info.get("html_link", ""),
+                error_message=str(e),
+            )
             return False
 
-    def _scrape_year(self, year: int) -> list:
+    async def _scrape_situation_type(
+        self,
+        situation: str,
+        situation_id: str,
+        norm_type: str,
+        norm_type_id: str,
+        year: int,
+    ) -> list:
+        """Scrape norms for a specific situation and type"""
+        # need to make a get request first to create the session ID ( will be used in all subsequent requests)
+        if not self.session_id_created:
+            get_url = (
+                self.base_url
+                + "/ashx/Cadastro/HistoricoDePesquisaIncluir.ashx?tipo_pesquisa=avancada&argumento=autocomplete%23ch_situacao%23Situa%C3%A7%C3%A3o%23igual%23igual+a%23semrevogacaoexpressa%23Sem+Revoga%C3%A7%C3%A3o+Expressa%23E&ch_tipo_norma=46000000&consulta=tipo_pesquisa=avancada&consulta=argumento=autocomplete%23ch_situacao%23Situa%C3%A7%C3%A3o%23igual%23igual+a%23semrevogacaoexpressa%23Sem+Revoga%C3%A7%C3%A3o+Expressa%23E&consulta=ch_tipo_norma=46000000&chave=6c31e2b0c76d4aa227cd6804bc4fc59f&total={%22nm_base%22:%22sinj_norma%22,%22ds_base%22:%22Normas%22,%22nr_total%22:6008}&_=1741738478078"
+            )
+            await self.request_service.make_request(get_url)
+            self.session_id_created = True
+
+        # try using payload tuples
+        total_pages_request_params = [
+            ("tipo_pesquisa", "avancada"),
+            (
+                "argumento",
+                f"number#ano_assinatura#Ano de Assinatura#igual#igual a#{year}#{year}#E",
+            ),
+            (
+                "argumento",
+                f"autocomplete#ch_situacao#Situação#igual#igual a#{situation_id}#{situation}#E",
+            ),
+            ("ch_tipo_norma", norm_type_id),
+        ]
+
+        response = await self.request_service.make_request(
+            self.total_pages_url,
+            method="POST",
+            payload=total_pages_request_params,
+        )
+        if response is None:
+            return []
+
+        data = await response.json()
+
+        total_norms = data["counts"][0]["count"]
+        # if count is 0, skip
+        if total_norms == 0:
+            return []
+
+        pages = total_norms // self._display_length
+        if total_norms % self._display_length:
+            pages += 1
+
+        norms = []
+        search_url = (
+            f"{self.base_url}/ashx/Datatable/ResultadoDePesquisaNormaDatatable.ashx"
+        )
+
+        # get all norms
+        tasks = [
+            self._get_docs_links(
+                search_url,
+                self._build_payload(situation, situation_id, norm_type_id, year, page),
+            )
+            for page in range(1, pages + 1)
+        ]
+        valid_results = await self._gather_results(
+            tasks,
+            context={"year": year, "type": norm_type, "situation": situation},
+            desc=f"DISTRITO FEDERAL | {norm_type} | get_docs_links",
+        )
+        for result in valid_results:
+            norms.extend(result)
+
+        results = []
+
+        # get all norm data
+        tasks = [self._get_doc_data(norm) for norm in norms]
+        valid_results = await self._gather_results(
+            tasks,
+            context={"year": year, "type": norm_type, "situation": situation},
+            desc=f"DISTRITO FEDERAL | {norm_type}",
+        )
+        for result in valid_results:
+            if result:
+                queue_item = {
+                    "year": year,
+                    "type": norm_type,
+                    "situation": situation,
+                    **result,
+                }
+                results.append(queue_item)
+
+        if self.verbose:
+            logger.info(
+                f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)}"
+            )
+
+        return results
+
+    async def _scrape_year(self, year: int) -> list:
         """Scrape norms for a specific year"""
-        all_results = []
-        
-        for situation, situation_id in tqdm(
-            self.situations.items(),
-            desc="DISTRITO FEDERAL | Situations",
-            total=len(self.situations),
-            disable=not self.verbose,
-        ):
-            for norm_type, norm_type_id in tqdm(
-                self.types.items(),
-                desc=f"DISTRITO FEDERAL | Year: {year} | Types",
-                total=len(self.types),
-                disable=not self.verbose,
-            ):
-                # need to make a get request first to create the session ID ( will be used in all subsequent requests)
-                if not self.session_id_created:
-                    get_url = (
-                        self.base_url
-                        + "/ashx/Cadastro/HistoricoDePesquisaIncluir.ashx?tipo_pesquisa=avancada&argumento=autocomplete%23ch_situacao%23Situa%C3%A7%C3%A3o%23igual%23igual+a%23semrevogacaoexpressa%23Sem+Revoga%C3%A7%C3%A3o+Expressa%23E&ch_tipo_norma=46000000&consulta=tipo_pesquisa=avancada&consulta=argumento=autocomplete%23ch_situacao%23Situa%C3%A7%C3%A3o%23igual%23igual+a%23semrevogacaoexpressa%23Sem+Revoga%C3%A7%C3%A3o+Expressa%23E&consulta=ch_tipo_norma=46000000&chave=6c31e2b0c76d4aa227cd6804bc4fc59f&total={%22nm_base%22:%22sinj_norma%22,%22ds_base%22:%22Normas%22,%22nr_total%22:6008}&_=1741738478078"
-                    )
-                    self._make_request(get_url)
-                    self.session_id_created = True
-
-                # try using payload tuples
-                total_pages_request_params = [
-                    ("tipo_pesquisa", "avancada"),
-                    (
-                        "argumento",
-                        f"number#ano_assinatura#Ano de Assinatura#igual#igual a#{year}#{year}#E",
-                    ),
-                    (
-                        "argumento",
-                        f"autocomplete#ch_situacao#Situação#igual#igual a#{situation_id}#{situation}#E",
-                    ),
-                    ("ch_tipo_norma", norm_type_id),
-                ]
-
-                response = self._make_request(
-                    self.total_pages_url,
-                    method="POST",
-                    payload=total_pages_request_params,
-                )
-
-                data = response.json()
-
-                total_norms = data["counts"][0]["count"]
-                # if count is 0, skip
-                if total_norms == 0:
-                    continue
-
-                pages = total_norms // self.params["iDisplayLength"]
-                if total_norms % self.params["iDisplayLength"]:
-                    pages += 1
-
-                norms = []
-
-                # get all norms
-                with ThreadPoolExecutor() as executor:
-                    futures = [
-                        executor.submit(
-                            self._get_docs_links,
-                            self._format_search_url(
-                                situation, situation_id, norm_type_id, year, page
-                            ),
-                        )
-                        for page in range(1, pages + 1)
-                    ]
-
-                    for future in tqdm(
-                        as_completed(futures),
-                        desc="DISTRITO FEDERAL | Get document links",
-                        total=len(futures),
-                        disable=not self.verbose,
-                    ):
-                        result = future.result()
-                        norms.extend(result)
-
-                results = []
-
-                # get all norm data
-                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                    futures = [
-                        executor.submit(self._get_doc_data, norm) for norm in norms
-                    ]
-
-                    for future in tqdm(
-                        as_completed(futures),
-                        desc="DISTRITO FEDERAL | Get document data",
-                        total=len(norms),
-                        disable=not self.verbose,
-                    ):
-                        result = future.result()
-
-                        if result:
-
-                            # prepare item for saving
-                            queue_item = {
-                                "year": year,
-                                "type": norm_type,
-                                "situation": situation,
-                                **result,
-                            }
-
-                            results.append(queue_item)
-
-                all_results.extend(results)
-                self.count += len(results)
-
-                if self.verbose:
-                    print(
-                        f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
-                    )
-
-        return all_results
+        tasks = [
+            self._scrape_situation_type(sit, sit_id, nt, nt_id, year)
+            for sit, sit_id in self.situations.items()
+            for nt, nt_id in self.types.items()
+        ]
+        valid = await self._gather_results(
+            tasks,
+            context={"year": year, "type": "NA", "situation": "NA"},
+            desc=f"{self.name} | Year {year}",
+        )
+        return [
+            item
+            for result in valid
+            for item in (result if isinstance(result, list) else [result])
+        ]

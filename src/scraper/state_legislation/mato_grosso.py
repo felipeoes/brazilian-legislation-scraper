@@ -1,12 +1,11 @@
-import time
 import re
-from typing import List, Dict, Optional
+from typing import Optional
 from urllib.parse import urljoin, urlencode
 from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
-from src.scraper.base.scraper import BaseScaper
-from src.database.saver import FileSaver
+import asyncio
+from loguru import logger
+from tenacity import retry, stop_after_attempt, wait_exponential
+from src.scraper.base.scraper import BaseScraper
 
 
 TYPES = {
@@ -32,15 +31,13 @@ HISTORIC_TYPES = {
 
 # situations are gotten from doc data while scraping
 VALID_SITUATIONS = []
-INVALID_SITUATIONS = (
-    []
-)  # norms with these situations are invalid norms (no longer have legal effect)
+INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no longer have legal effect)
 
 # the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class MTAlmtScraper(BaseScaper):
+class MTAlmtScraper(BaseScraper):
     """Webscraper for Mato Grosso state legislation website (https://www.al.mt.gov.br/norma-juridica)
 
     Example search request: https://www.al.mt.gov.br/norma-juridica
@@ -86,44 +83,14 @@ class MTAlmtScraper(BaseScaper):
     """
 
     def __init__(self, base_url: str = "https://www.al.mt.gov.br", **kwargs):
-        super().__init__(base_url, types=TYPES, situations=SITUATIONS, **kwargs)
+        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
+
+        if STATE_LEGISLATION_SAVE_DIR:
+            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
+        super().__init__(
+            base_url, types=TYPES, situations=SITUATIONS, name="MATO_GROSSO", **kwargs
+        )
         self.historic_types = HISTORIC_TYPES
-        self.docs_save_dir = self.docs_save_dir / "MATO_GROSSO"
-        self.params = {
-            "almt_form_norma_juridica_ato_busca_avancada[atoTipo][autocomplete]": "",
-            "almt_form_norma_juridica_ato_busca_avancada[conteudoDispositivo]": "",
-            "almt_form_norma_juridica_ato_busca_avancada[ementa]": "",
-            "almt_form_norma_juridica_ato_busca_avancada[numero]": "",
-            "almt_form_norma_juridica_ato_busca_avancada[ano]": "",
-            "almt_form_norma_juridica_ato_busca_avancada[autor][autocomplete]": "",
-            "almt_form_norma_juridica_ato_busca_avancada[apelido]": "",
-            "almt_form_norma_juridica_ato_busca_avancada[tagCondicao]": "e",
-            "almt_form_norma_juridica_ato_busca_avancada[dataPublicacaoDe]": "",
-            "almt_form_norma_juridica_ato_busca_avancada[dataPublicacaoAte]": "",
-            "almt_form_norma_juridica_ato_busca_avancada[dataPromulgacaoDe]": "",
-            "almt_form_norma_juridica_ato_busca_avancada[dataPromulgacaoAte]": "",
-            "almt_form_norma_juridica_ato_busca_avancada[dataInicioVigenciaDe]": "",
-            "almt_form_norma_juridica_ato_busca_avancada[dataInicioVigenciaAte]": "",
-            "almt_form_norma_juridica_ato_busca_avancada[dataFimVigenciaDe]": "",
-            "almt_form_norma_juridica_ato_busca_avancada[dataFimVigenciaAte]": "",
-            "almt_form_norma_juridica_ato_busca_avancada[revogarNormaJuridica]": "nao",
-            "almt_form_norma_juridica_ato_busca_avancada[possuiVeto]": "",
-            "almt_form_norma_juridica_ato_busca_avancada[possuiRemissao]": "",
-            "almt_form_norma_juridica_ato_busca_avancada[_token]": "",
-            "page": 1,
-        }
-        self.params_historic = {
-            "almt_form_norma_juridica_pesquisa_historica[tipo]": "",
-            "almt_form_norma_juridica_pesquisa_historica[restringeBusca]": "c",
-            "almt_form_norma_juridica_pesquisa_historica[palavraChave]": "",
-            "almt_form_norma_juridica_pesquisa_historica[numero]": "",
-            "almt_form_norma_juridica_pesquisa_historica[ano]": "",
-            "almt_form_norma_juridica_pesquisa_historica[observacao]": "",
-            "almt_form_norma_juridica_pesquisa_historica[dataInicio]": "",
-            "almt_form_norma_juridica_pesquisa_historica[dataFim]": "",
-            "almt_form_norma_juridica_pesquisa_historica[_token]": "",
-            "page": 1,
-        }
         self.max_year_historic = 1978
         self.min_year = 1979
         self.token = None
@@ -131,13 +98,16 @@ class MTAlmtScraper(BaseScaper):
         self.header_remove_regex = re.compile(
             r"http://www.al.mt.gov.br/TNX/viewLegislacao.php\?cod=\d+"
         )
-        # Initialize the FileSaver
-        self.saver = FileSaver(self.docs_save_dir)
 
-    def _set_token(self):
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=2, min=2, max=30),
+        reraise=True,
+    )
+    async def _set_token(self):
         """Get token for search request"""
         url = f"{self.base_url}/norma-juridica"
-        soup = self._get_soup(url)
+        soup = await self.request_service.get_soup(url)
         token_element = soup.find(
             "input", {"name": "almt_form_norma_juridica_ato_busca_avancada[_token]"}
         )
@@ -147,37 +117,53 @@ class MTAlmtScraper(BaseScaper):
         token = token_element["value"]
         self.token = token
 
-    def _format_search_url(
+    def _build_search_url(
         self, norm_type_id: str, year: int, page: int, is_historic: bool = False
-    ):
-        """Format url for search request"""
-
+    ) -> str:
+        """Build search URL from arguments (no shared state mutation)."""
         if is_historic:
-            self.params_historic["almt_form_norma_juridica_pesquisa_historica[ano]"] = (
-                year
+            params = {
+                "almt_form_norma_juridica_pesquisa_historica[tipo]": norm_type_id,
+                "almt_form_norma_juridica_pesquisa_historica[restringeBusca]": "c",
+                "almt_form_norma_juridica_pesquisa_historica[palavraChave]": "",
+                "almt_form_norma_juridica_pesquisa_historica[numero]": "",
+                "almt_form_norma_juridica_pesquisa_historica[ano]": year,
+                "almt_form_norma_juridica_pesquisa_historica[observacao]": "",
+                "almt_form_norma_juridica_pesquisa_historica[dataInicio]": "",
+                "almt_form_norma_juridica_pesquisa_historica[dataFim]": "",
+                "almt_form_norma_juridica_pesquisa_historica[_token]": self.token or "",
+                "page": page,
+            }
+            return (
+                f"{self.base_url}/norma-juridica/pesquisa-historica?{urlencode(params)}"
             )
-            self.params_historic[
-                "almt_form_norma_juridica_pesquisa_historica[tipo]"
-            ] = norm_type_id
-            self.params_historic[
-                "almt_form_norma_juridica_ato_busca_avancada[_token]"
-            ] = self.token
-            self.params_historic["page"] = page
-            return f"{self.base_url}/norma-juridica/pesquisa-historica?{urlencode(self.params_historic)}"
         else:
-            self.params["almt_form_norma_juridica_ato_busca_avancada[ano]"] = year
-            self.params[
-                "almt_form_norma_juridica_ato_busca_avancada[atoTipo][autocomplete]"
-            ] = norm_type_id
-            self.params["almt_form_norma_juridica_ato_busca_avancada[_token]"] = (
-                self.token
-            )
-            self.params["page"] = page
-
-            return f"{self.base_url}/norma-juridica?{urlencode(self.params)}"
+            params = {
+                "almt_form_norma_juridica_ato_busca_avancada[atoTipo][autocomplete]": norm_type_id,
+                "almt_form_norma_juridica_ato_busca_avancada[conteudoDispositivo]": "",
+                "almt_form_norma_juridica_ato_busca_avancada[ementa]": "",
+                "almt_form_norma_juridica_ato_busca_avancada[numero]": "",
+                "almt_form_norma_juridica_ato_busca_avancada[ano]": year,
+                "almt_form_norma_juridica_ato_busca_avancada[autor][autocomplete]": "",
+                "almt_form_norma_juridica_ato_busca_avancada[apelido]": "",
+                "almt_form_norma_juridica_ato_busca_avancada[tagCondicao]": "e",
+                "almt_form_norma_juridica_ato_busca_avancada[dataPublicacaoDe]": "",
+                "almt_form_norma_juridica_ato_busca_avancada[dataPublicacaoAte]": "",
+                "almt_form_norma_juridica_ato_busca_avancada[dataPromulgacaoDe]": "",
+                "almt_form_norma_juridica_ato_busca_avancada[dataPromulgacaoAte]": "",
+                "almt_form_norma_juridica_ato_busca_avancada[dataInicioVigenciaDe]": "",
+                "almt_form_norma_juridica_ato_busca_avancada[dataInicioVigenciaAte]": "",
+                "almt_form_norma_juridica_ato_busca_avancada[dataFimVigenciaDe]": "",
+                "almt_form_norma_juridica_ato_busca_avancada[dataFimVigenciaAte]": "",
+                "almt_form_norma_juridica_ato_busca_avancada[revogarNormaJuridica]": "nao",
+                "almt_form_norma_juridica_ato_busca_avancada[possuiVeto]": "",
+                "almt_form_norma_juridica_ato_busca_avancada[possuiRemissao]": "",
+                "almt_form_norma_juridica_ato_busca_avancada[_token]": self.token or "",
+                "page": page,
+            }
+            return f"{self.base_url}/norma-juridica?{urlencode(params)}"
 
     def _get_total_norms(self, soup: BeautifulSoup) -> int:
-
         if not soup:
             return 0
 
@@ -188,14 +174,14 @@ class MTAlmtScraper(BaseScaper):
 
         return 0
 
-    def _get_docs_links(self, url: str, is_historic: bool = False) -> list:
+    async def _get_docs_links(self, url: str, is_historic: bool = False) -> list:
         """Get documents html links from given page.
         Returns a list of dicts with keys 'title', 'summary', 'norm_link', 'document_url'
         """
-        soup = self._get_soup(url)
+        soup = await self.request_service.get_soup(url)
 
         if not soup:
-            print(f"Failed to get soup for url: {url}")
+            logger.error(f"Failed to get soup for url: {url}")
             return []
 
         # check if the page is empty (no norms found for the given search)
@@ -237,7 +223,7 @@ class MTAlmtScraper(BaseScaper):
 
         return docs
 
-    def _get_doc_data(
+    async def _get_doc_data(
         self, doc_info: dict, is_historic: bool = False
     ) -> Optional[dict]:
         """Get document data from given document dict"""
@@ -249,16 +235,16 @@ class MTAlmtScraper(BaseScaper):
             url = f"{urljoin(self.base_url, norm_link)}/ficha-tecnica?exibirAnotacao=1"
             url = f"{urljoin(self.base_url, norm_link)}/ficha-tecnica?exibirAnotacao=1"
 
-        soup = self._get_soup(url)
-        retries = 5
-        while not soup:
-            # try again, MT website is really unstable
-            time.sleep(3)
-            soup = self._get_soup(url)
-            retries -= 1
-            if retries <= 0:
-                print(f"Error getting soup for {url}")
-                return None
+        soup = await self.request_service.get_soup(url)
+        if not soup:
+            logger.error(f"Error getting soup for {url}")
+            await self._save_doc_error(
+                title=doc_info.get("title", ""),
+                year=doc_info.get("year", ""),
+                html_link=url,
+                error_message="Failed to get document page",
+            )
+            return None
 
         # autor or autores
         author = soup.find("strong", text=re.compile(r"Autor:|Autores:"))
@@ -292,14 +278,20 @@ class MTAlmtScraper(BaseScaper):
                 situation.find_parent("li").text.replace("Situação:", "").strip()
             )
 
-        pdf_content = self._make_request(
+        pdf_content = await self.request_service.make_request(
             doc_info["document_url"]
         )  # need to make a request to get pdf content first, using directly _get_markdown will not work
         if not pdf_content:
-            print(f"Error getting pdf content for {doc_info['document_url']}")
+            logger.error(f"Error getting pdf content for {doc_info['document_url']}")
+            await self._save_doc_error(
+                title=doc_info.get("title", ""),
+                year=doc_info.get("year", ""),
+                html_link=doc_info.get("document_url", url),
+                error_message="Failed to download PDF content",
+            )
             return
 
-        text_markdown = self._get_markdown(response=pdf_content)
+        text_markdown = await self._get_markdown(response=pdf_content)
 
         # text_markdown = self._get_markdown(doc_info["document_url"])
         # remove header with link at beginning of document
@@ -314,17 +306,33 @@ class MTAlmtScraper(BaseScaper):
         ):
             # probably pdf is an image
 
-            pdf_content = self._make_request(doc_info["document_url"]).content
-            if not pdf_content:
+            pdf_content_response = await self.request_service.make_request(
+                doc_info["document_url"]
+            )
+            if not pdf_content_response:
+                await self._save_doc_error(
+                    title=doc_info.get("title", ""),
+                    year=doc_info.get("year", ""),
+                    html_link=doc_info.get("document_url", url),
+                    error_message="Failed to download PDF for image extraction",
+                )
                 return
 
+            pdf_content = await pdf_content_response.read()
+
             text_markdown = (
-                self._get_pdf_image_markdown(pdf_content)
+                (await self._get_pdf_image_markdown(pdf_content))
                 .replace("Powered by TCPDF (www.tcpdf.org)", "")
                 .strip()
             )
 
         if not text_markdown:
+            await self._save_doc_error(
+                title=doc_info.get("title", ""),
+                year=doc_info.get("year", ""),
+                html_link=doc_info.get("document_url", url),
+                error_message="Empty markdown after processing",
+            )
             return None
 
         doc_data = {
@@ -340,8 +348,9 @@ class MTAlmtScraper(BaseScaper):
 
         return doc_data
 
-    def _scrape_year(self, year: int) -> List[Dict]:
+    async def _scrape_year(self, year: int) -> list[dict]:
         """Scrape norms for a specific year"""
+        # Build list of all types (regular + historic)
         all_types = []
         for norm_type, norm_type_id in self.types.items():
             all_types.append(
@@ -361,104 +370,85 @@ class MTAlmtScraper(BaseScaper):
                 }
             )
 
-        for norm_type_data in tqdm(
-            all_types,
-            desc=f"MATO GROSSO | Year: {year} | Types",
-            total=len(all_types),
-            disable=not self.verbose,
-        ):
+        async def _scrape_type(norm_type_data: dict) -> list[dict]:
+            """Scrape a single type (historic or regular) for the given year."""
             is_historic = norm_type_data["is_historic"]
 
             if is_historic and year > self.max_year_historic:
-                continue
+                return []
             elif not is_historic and year < self.min_year:
-                continue
+                return []
 
             if not self.token:
-                self._set_token()
+                await self._set_token()
 
             norm_type = norm_type_data["norm_type"]
             norm_type_id = norm_type_data["id"]
-            url = self._format_search_url(norm_type_id, year, 1, is_historic)
-            soup = self._get_soup(url)
+            url = self._build_search_url(norm_type_id, year, 1, is_historic)
+            soup = await self.request_service.get_soup(url)
 
             # get total pages (always 10 records per page)
             total_items = self._get_total_norms(soup)
             if total_items == 0:
-                continue
+                return []
 
             pages = total_items // 10 + 1
 
-            # Get documents html links
             documents = []
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                futures = [
-                    executor.submit(
-                        self._get_docs_links,
-                        self._format_search_url(norm_type_id, year, page, is_historic),
-                        is_historic,
-                    )
-                    for page in range(1, pages + 1)
-                ]
+            tasks = [
+                self._get_docs_links(
+                    self._build_search_url(norm_type_id, year, page, is_historic),
+                    is_historic,
+                )
+                for page in range(1, pages + 1)
+            ]
+            valid_results = await self._gather_results(
+                tasks,
+                context={"year": year, "type": norm_type, "situation": "N/A"},
+                desc=f"MATO GROSSO | {norm_type} | get_docs_links",
+            )
+            for result in valid_results:
+                if result:
+                    documents.extend(result)
 
-                for future in tqdm(
-                    as_completed(futures),
-                    total=len(futures),
-                    desc="MATO GROSSO | Get document link",
-                    disable=not self.verbose,
-                ):
-                    docs = future.result()
-                    if docs:
-                        documents.extend(docs)
-
-            # get all norms
             results = []
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                futures = [
-                    executor.submit(
-                        self._get_doc_data,
-                        doc_info,
-                        is_historic=is_historic,
-                    )
-                    for doc_info in documents
-                ]
-
-                for future in tqdm(
-                    as_completed(futures),
-                    desc="MATO GROSSO | Get document data",
-                    total=len(futures),
-                    disable=not self.verbose,
-                ):
-                    try:
-                        norm = future.result()
-                        if not norm:
-                            continue
-
-                        # save to results
-                        queue_item = {
-                            **norm,
-                            "year": year,
-                            "type": norm_type,
-                            "situation": (
-                                norm["situation"]
-                                if norm.get("situation")
-                                else "Não consta"
-                            ),
-                        }
-
-                        results.append(queue_item)
-                    except Exception as e:
-                        print(f"Error getting norm data: {e}")
-                        continue
-
-            if results:
-                self.saver.save(results)
-                self.results.extend(results)
-                self.count += len(results)
+            tasks = [
+                self._get_doc_data(doc_info, is_historic=is_historic)
+                for doc_info in documents
+            ]
+            valid_results = await self._gather_results(
+                tasks,
+                context={"year": year, "type": norm_type, "situation": "N/A"},
+                desc=f"MATO GROSSO | {norm_type}",
+            )
+            for norm in valid_results:
+                queue_item = {
+                    **norm,
+                    "year": year,
+                    "type": norm_type,
+                    "situation": (
+                        norm["situation"] if norm.get("situation") else "Não consta"
+                    ),
+                }
+                results.append(queue_item)
 
             if self.verbose:
-                print(
-                    f"Finished scraping for Year: {year} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
+                logger.info(
+                    f"Finished scraping for Year: {year} | Type: {norm_type} | Results: {len(results)}"
                 )
 
-        return self.results
+            return results
+
+        # Scrape all types concurrently
+        tasks = [_scrape_type(type_data) for type_data in all_types]
+        all_type_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Flatten results and handle errors
+        all_results = []
+        for type_result in all_type_results:
+            if isinstance(type_result, Exception):
+                logger.error(f"Error scraping type for year {year}: {type_result}")
+                continue
+            all_results.extend(type_result)
+
+        return all_results

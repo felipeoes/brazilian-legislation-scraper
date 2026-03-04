@@ -1,13 +1,9 @@
+import re
 from urllib.parse import urljoin, urlencode
 from typing import Optional
-import requests
 from bs4 import BeautifulSoup
-from io import BytesIO
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import requests.compat
-from tqdm import tqdm
-from src.scraper.base.scraper import BaseScaper
-from src.database.saver import FileSaver
+from loguru import logger
+from src.scraper.base.scraper import BaseScraper
 
 TYPES = {
     "Lei Complementar": 11,
@@ -19,7 +15,6 @@ TYPES = {
     "Decreto Financeiro": 1,
     "Decreto Simples": 3,
     "Emenda Constitucional": 4,
-    "Lei Complementar": 5,
     "Lei Delegada": 6,
     "Lei Ordinária": 7,
     "Portaria Casa Civil": 19,
@@ -31,50 +26,51 @@ VALID_SITUATIONS = [
     "Não consta"
 ]  # BahiaLegisla does not have a situation field, invalid norms will have an indication in the document text
 
-INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no lon
+INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no longer have legal effect)
 
 # the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class BahiaLegislaScraper(BaseScaper):
+class BahiaLegislaScraper(BaseScraper):
     """Webscraper for Bahia state legislation website (https://www.legislabahia.ba.gov.br/)
 
     Example search request: https://www.legislabahia.ba.gov.br/documentos?categoria%5B%5D=7&num=&ementa=&exp=&data%5Bmin%5D=2025-01-01&data%5Bmax%5D=2025-12-31&page=0
     """
+
+    _REVOGADO_RE = re.compile(r"\brevogad[ao]\b", re.IGNORECASE)
 
     def __init__(
         self,
         base_url: str = "https://www.legislabahia.ba.gov.br",
         **kwargs,
     ):
-        super().__init__(base_url, types=TYPES, situations=SITUATIONS, **kwargs)
-        self.docs_save_dir = self.docs_save_dir / "BAHIA"
-        self.params = {
-            "categoria[]": "",
+        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
+
+        if STATE_LEGISLATION_SAVE_DIR:
+            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
+        super().__init__(
+            base_url, name="BAHIA", types=TYPES, situations=SITUATIONS, **kwargs
+        )
+
+    def _build_search_url(self, norm_type_id: str, year: int, page: int) -> str:
+        """Build search URL from arguments (no shared state mutation)."""
+        params = {
+            "categoria[]": norm_type_id,
             "num": "",
             "ementa": "",
             "exp": "",
-            "data[min]": "",
-            "data[max]": "",
-            "page": 0,
+            "data[min]": f"{year}-01-01",
+            "data[max]": f"{year}-12-31",
+            "page": page,
         }
-        # Initialize the FileSaver
-        self.saver = FileSaver(self.docs_save_dir)
+        return f"{self.base_url}/documentos?{urlencode(params)}"
 
-    def _format_search_url(self, norm_type_id: str, year: int, page: int) -> str:
-        """Format url for search request"""
-        self.params["categoria[]"] = norm_type_id
-        self.params["data[min]"] = f"{year}-01-01"
-        self.params["data[max]"] = f"{year}-12-31"
-        self.params["page"] = page
-        return f"{self.base_url}/documentos?{urlencode(self.params)}"
-
-    def _get_docs_links(self, url: str) -> list:
+    async def _get_docs_links(self, url: str) -> list:
         """Get documents html links from given page.
         Returns a list of dicts with keys 'title', 'html_link'
         """
-        soup = self._get_soup(url)
+        soup = await self.request_service.get_soup(url)
 
         if not soup:
             raise ValueError(f"Failed to get soup for URL: {url}")
@@ -85,7 +81,11 @@ class BahiaLegislaScraper(BaseScaper):
         if soup.find("td", class_="views-empty"):
             return []
 
-        items = soup.find("tbody").find_all("tr")
+        tbody = soup.find("tbody")
+        if not tbody:
+            return []
+
+        items = tbody.find_all("tr")
 
         for item in items:
             tds = item.find_all("td")
@@ -104,18 +104,27 @@ class BahiaLegislaScraper(BaseScaper):
 
         return docs
 
-    def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
+    async def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
         """Get document data from given document dict"""
         # remove html_link from doc_info
         html_link = doc_info.pop("html_link")
         url = urljoin(self.base_url, html_link)
 
-        response = self._make_request(url)
+        response = await self.request_service.make_request(url)
         if not response:
-            print(f"Failed to get document data from URL: {url}")
+            logger.error(f"Failed to get document data from URL: {url}")
+            await self._save_doc_error(
+                title=doc_info.get("title", "Unknown"),
+                year="",
+                situation="",
+                norm_type="",
+                html_link=url,
+                error_message="Failed to fetch document page",
+            )
             return None
 
-        soup = BeautifulSoup(response.content, "html.parser")
+        content = await response.read()
+        soup = BeautifulSoup(content, "html.parser")
 
         # get norm_number, date, publication_date and summary
         norm_number = soup.find("div", class_="field--name-field-numero-doc")
@@ -140,15 +149,38 @@ class BahiaLegislaScraper(BaseScaper):
         # class="visivel-separador field field--name-body field--type-text-with-summary field--label-hidden field--item"
         norm_text_tag = soup.find("div", class_="field--name-body")
         if not norm_text_tag:
+            await self._save_doc_error(
+                title=doc_info.get("title", "Unknown"),
+                year="",
+                situation="",
+                norm_type="",
+                html_link=url,
+                error_message="Could not find div.field--name-body in document page",
+            )
             return None  # invalid norm
 
-        html_string = f"<html>{norm_text_tag.prettify()}</html>"
+        # Remove empty heading tags — Word HTML exports often end with <h2></h2>.
+        # Docling treats any <h2>/<h3>/… as a section boundary and discards
+        # all <p> elements that precede it, so these artifacts must be stripped.
+        for heading in norm_text_tag.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
+            if not heading.get_text(strip=True):
+                heading.decompose()
 
-        buffer = BytesIO()
-        buffer.write(html_string.encode())
-        buffer.seek(0)
+        html_string = f"<html><body>{norm_text_tag.prettify()}</body></html>"
 
-        text_markdown = self._get_markdown(stream=buffer)
+        # Detect revogado/revogada via regex: <span class="revogado"> or
+        # <div class="alteracao"> whose text starts with "revogado/a".
+        is_revogado = bool(
+            norm_text_tag.find("span", class_=self._REVOGADO_RE)
+        ) or any(
+            self._REVOGADO_RE.match(div.get_text(strip=True))
+            for div in norm_text_tag.find_all("div", class_="alteracao")
+        )
+        if is_revogado:
+            doc_info["situation"] = "Revogado"
+
+        # Use direct HTML content conversion instead of BytesIO stream
+        text_markdown = await self._get_markdown(html_content=html_string)
 
         doc_info["norm_number"] = norm_number.text.strip() if norm_number else ""
         doc_info["date"] = date.text.strip() if date else ""
@@ -162,89 +194,82 @@ class BahiaLegislaScraper(BaseScaper):
 
         return doc_info
 
-    def _scrape_year(self, year: int) -> list:
+    async def _scrape_situation_type(
+        self, year: int, situation: str, norm_type: str, norm_type_id: int
+    ) -> list:
+        """Scrape norms for a specific situation and type"""
+        url = self._build_search_url(norm_type_id, year, 0)
+        soup = await self.request_service.get_soup(url)
+
+        if not soup:
+            raise ValueError(f"Failed to get soup for URL: {url}")
+
+        # get total pages
+        total_pages = 1
+        pagination = soup.find("ul", class_="pagination js-pager__items")
+        if pagination:
+            pages = pagination.find_all("li")
+            # pages[-1] is the "last page" nav button whose href=page=N (0-indexed).
+            # range(N+1) gives pages 0..N inclusive.
+            last_li_a = pages[-1].find("a")
+            if last_li_a:
+                total_pages = int(last_li_a["href"].split("page=")[-1]) + 1
+
+        # Get documents html links
+        documents = []
+        tasks = [
+            self._get_docs_links(
+                self._build_search_url(norm_type_id, year, page),
+            )
+            for page in range(total_pages)
+        ]
+        valid_results = await self._gather_results(
+            tasks,
+            context={"year": year, "type": norm_type, "situation": situation},
+            desc=f"BAHIA | {norm_type} | get_docs_links",
+        )
+        for result in valid_results:
+            if result:
+                documents.extend(result)
+
+        # Get document data
+        results = []
+        tasks = [self._get_doc_data(doc) for doc in documents]
+        valid_results = await self._gather_results(
+            tasks,
+            context={"year": year, "type": norm_type, "situation": situation},
+            desc=f"BAHIA | {norm_type}",
+        )
+        for result in valid_results:
+            queue_item = {
+                "year": year,
+                "situation": situation,
+                "type": norm_type,
+                **result,
+            }
+            results.append(queue_item)
+
+        if self.verbose:
+            logger.info(
+                f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)}"
+            )
+
+        return results
+
+    async def _scrape_year(self, year: int) -> list:
         """Scrape norms for a specific year"""
-        all_results = []
-        
-        for situation in tqdm(
-            self.situations,
-            desc="BAHIA | Situations",
-            total=len(self.situations),
-            disable=not self.verbose,
-        ):
-            for norm_type, norm_type_id in tqdm(
-                self.types.items(),
-                desc=f"BAHIA | Year: {year} | Types",
-                total=len(self.types),
-                disable=not self.verbose,
-            ):
-                url = self._format_search_url(norm_type_id, year, 0)
-                soup = self._get_soup(url)
-
-                # get total pages
-                pagination = soup.find("ul", class_="pagination js-pager__items")
-                if pagination:
-                    pages = pagination.find_all("li")
-                    last_page = pages[-1].find("a")["href"]
-                    total_pages = int(last_page.split("page=")[-1])
-                else:
-                    total_pages = 1
-
-                # Get documents html links
-                documents = []
-                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                    futures = [
-                        executor.submit(
-                            self._get_docs_links,
-                            self._format_search_url(norm_type_id, year, page),
-                        )
-                        for page in range(total_pages)
-                    ]
-
-                    for future in tqdm(
-                        as_completed(futures),
-                        total=total_pages,
-                        desc="BAHIA | Get document link",
-                        disable=not self.verbose,
-                    ):
-                        docs = future.result()
-                        if docs:
-                            documents.extend(docs)
-
-                # Get document data
-                results = []
-                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                    futures = [
-                        executor.submit(self._get_doc_data, doc) for doc in documents
-                    ]
-
-                    for future in tqdm(
-                        as_completed(futures),
-                        total=len(documents),
-                        desc="BAHIA | Get document data",
-                        disable=not self.verbose,
-                    ):
-                        result = future.result()
-                        if result is None:
-                            continue
-
-                        # prepare item for saving
-                        queue_item = {
-                            "year": year,
-                            # hardcode since we only get valid documents in search request
-                            "situation": situation,
-                            "type": norm_type,
-                            **result,
-                        }
-
-                        results.append(queue_item)
-
-                    all_results.extend(results)
-                    self.count += len(results)
-
-                    if self.verbose:
-                        print(
-                            f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
-                        )
-
-        return all_results
+        tasks = [
+            self._scrape_situation_type(year, situation, norm_type, norm_type_id)
+            for situation in self.situations
+            for norm_type, norm_type_id in self.types.items()
+        ]
+        valid = await self._gather_results(
+            tasks,
+            context={"year": year, "type": "NA", "situation": "NA"},
+            desc=f"{self.name} | Year {year}",
+        )
+        return [
+            item
+            for result in valid
+            for item in (result if isinstance(result, list) else [result])
+        ]

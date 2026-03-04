@@ -1,11 +1,9 @@
-from typing import List, Optional
-import requests
+from typing import Optional
 import base64
+from urllib.parse import quote
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
-from src.scraper.base.scraper import BaseScaper
-from src.database.saver import FileSaver
+from loguru import logger
+from src.scraper.base.scraper import BaseScraper
 
 TYPES = {
     "Consituição Estadual": "TIP080",
@@ -30,7 +28,7 @@ INVALID_SITUATIONS = (
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class AlagoasSefazScraper(BaseScaper):
+class AlagoasSefazScraper(BaseScraper):
     """Webscraper for Alagoas Sefaz website (https://gcs2.sefaz.al.gov.br/#/administrativo/documentos/consultar-gabinete)
 
     Example search request: https://gcs2.sefaz.al.gov.br/sfz-gcs-api/api/administrativo/documento/consultar?pagina=1
@@ -53,67 +51,81 @@ class AlagoasSefazScraper(BaseScaper):
         base_url: str = "https://gcs2.sefaz.al.gov.br/sfz-gcs-api/api/administrativo/documento/consultar",
         **kwargs,
     ):
-        super().__init__(base_url, types=TYPES, situations=SITUATIONS, **kwargs)
-        self.params = {
-            "periodoInicial": "2025-02-01T00:00:00.000-0300",
-            "periodoFinal": "2025-12-31T00:00:00.000-0300",
+        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
+
+        if STATE_LEGISLATION_SAVE_DIR:
+            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
+        super().__init__(
+            base_url, name="ALAGOAS", types=TYPES, situations=SITUATIONS, **kwargs
+        )
+        self.view_doc_url = "https://gcs2.sefaz.al.gov.br/sfz-gcs-api/api/documentos/visualizarDocumento?"
+
+    def _build_params(self, norm_type_id: str, year: int) -> dict:
+        """Build a fresh params dict for a specific type/year query (no shared state)."""
+        return {
+            "periodoInicial": f"{year}-01-01T00:00:00.000-0300",
+            "periodoFinal": f"{year}-12-31T00:00:00.000-0300",
             "numero": None,
-            "especieLegislativa": TYPES["Consituição Estadual"],
+            "especieLegislativa": norm_type_id,
             "codigoCategoria": "CAT017",
             "codigoSetor": None,
         }
-        self.docs_save_dir = self.docs_save_dir / "ALAGOAS"
-        self.view_doc_url = "https://gcs2.sefaz.al.gov.br/sfz-gcs-api/api/documentos/visualizarDocumento?"
-        # Initialize the FileSaver
-        self.saver = FileSaver(self.docs_save_dir)
 
-    def _format_search_url(self, norm_type_id: str, year: int, page: int = 1) -> str:
-        """Format url for search request"""
-        self.params["especieLegislativa"] = norm_type_id
-        self.params["periodoInicial"] = f"{year}-01-01T00:00:00.000-0300"
-        self.params["periodoFinal"] = f"{year}-12-31T00:00:00.000-0300"
-
-        if page is not None and page > 1:
+    def _build_url(self, page: int = 1) -> str:
+        """Build the request URL, adding pagination query param when needed."""
+        if page > 1:
             return self.base_url + f"?pagina={page}"
-
         return self.base_url
 
-    def _get_docs_links(self, url: str, norms: list) -> Optional[List[dict]]:
+    async def _get_docs_links(
+        self, url: str, params: dict, norms: list
+    ) -> Optional[list[dict]]:
         """Get document links from search request"""
         try:
-            response = self._make_request(url, method="POST", json=self.params)
+            response = await self.request_service.make_request(
+                url, method="POST", json=params
+            )
 
             if response is None:
                 return
 
-            data = response.json()
+            data = await response.json()
             norms.extend(data["documentos"])
 
         except Exception as e:
-            print(f"Error getting document links from url: {url} | Error: {e}")
+            logger.error(f"Error getting document links from url: {url} | Error: {e}")
 
-    def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
+    async def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
         """Get document data from norm dict. Download url for pdf will follow the pattern: ttps://gcs2.sefaz.al.gov.br/#/documentos/visualizar-documento?acess={acess}&key={key}"""
 
-        key = requests.utils.quote(
-            requests.utils.quote(doc_info["link"]["key"])
+        key = quote(
+            quote(doc_info["link"]["key"])
         )  # need to double encode otherwise it will return 404
         doc_link = f"{self.view_doc_url}acess={doc_info['link']['acess']}&key={key}"
         filename = ""
         try:
             # get text markdown
-            response = self._make_request(doc_link).json()
+            response = await self.request_service.make_request(doc_link)
+            if response is None:
+                raise RuntimeError(f"No response received for {doc_link}")
+            response = await response.json()
             base64_data = response["arquivo"]["base64"]
             filename = ".".join(response["arquivo"]["nomeArquivo"].split(".")[:-1])
 
             pdf_bytes = base64.b64decode(base64_data)
-            text_markdown = self._get_pdf_image_markdown(pdf_bytes)
+            text_markdown = await self._get_pdf_image_markdown(pdf_bytes)
 
         except Exception as e:
-            print(f"Error getting markdown from url: {doc_link} | Error: {e}")
+            logger.error(f"Error getting markdown from url: {doc_link} | Error: {e}")
             text_markdown = None
 
         if text_markdown is None:
+            await self._save_doc_error(
+                title=doc_info.get("title", filename),
+                year=doc_info.get("year", ""),
+                html_link=doc_link,
+                error_message="Failed to extract markdown from PDF",
+            )
             return None
 
         return {
@@ -126,105 +138,87 @@ class AlagoasSefazScraper(BaseScaper):
             "document_url": doc_link,
         }
 
-    def _scrape_year(self, year: str) -> List[dict]:
+    async def _scrape_situation_type(
+        self, situation: str, norm_type: str, norm_type_id: str, year: str
+    ) -> list:
+        """Scrape norms for a specific situation and type"""
+        params = self._build_params(norm_type_id, year)
+        url = self._build_url()
+
+        response = await self.request_service.make_request(
+            url, method="POST", json=params
+        )
+
+        if response is None:
+            return []
+
+        data = await response.json()
+        total_norms = data["registrosTotais"]
+
+        if not total_norms:
+            return []
+
+        import math
+
+        pages = math.ceil(total_norms / 10)
+
+        norms = []
+        norms.extend(data["documentos"])
+
+        # get all norms (page 1 already fetched above; fetch pages 2…pages)
+        tasks = [
+            self._get_docs_links(
+                self._build_url(page),
+                params,
+                norms,
+            )
+            for page in range(2, pages + 1)
+        ]
+        await self._gather_results(
+            tasks,
+            context={"year": year, "type": norm_type, "situation": situation},
+            desc=f"ALAGOAS | {norm_type} | get_docs_links",
+        )
+
+        results = []
+
+        # get all norm data
+        tasks = [self._get_doc_data(norm) for norm in norms]
+        valid_results = await self._gather_results(
+            tasks,
+            context={"year": year, "type": norm_type, "situation": situation},
+            desc=f"ALAGOAS | {norm_type}",
+        )
+        for result in valid_results:
+            queue_item = {
+                "year": year,
+                "type": norm_type,
+                "situation": situation,
+                **result,
+            }
+            results.append(queue_item)
+
+        if self.verbose:
+            logger.info(
+                f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)}"
+            )
+
+        return results
+
+    async def _scrape_year(self, year: str) -> list[dict]:
         """Scrape norms for a specific year"""
-        all_results = []
-        
-        for situation in tqdm(
-            self.situations,
-            desc="SEFAZ - ALAGOAS | Situations",
-            total=len(self.situations),
-            disable=not self.verbose,
-        ):
-            for norm_type, norm_type_id in tqdm(
-                self.types.items(),
-                desc=f"SEFAZ - ALAGOAS Year: {year} | Types",
-                total=len(self.types),
-                disable=not self.verbose,
-            ):
-                url = self._format_search_url(norm_type_id, year)
-
-                response = self._make_request(url, method="POST", json=self.params)
-
-                if response is None:
-                    continue
-
-                data = response.json()
-                total_norms = data["registrosTotais"]
-
-                if total_norms is None:
-                    continue
-
-                pages = total_norms // 10 + 1
-
-                norms = []
-                norms.extend(data["documentos"])
-
-                # get all norms
-                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                    futures = [
-                        executor.submit(
-                            self._get_docs_links,
-                            self._format_search_url(norm_type_id, year, page), 
-                            norms
-                        )
-                        for page in range(2, pages)
-                    ]
-
-                    for future in tqdm(
-                        as_completed(futures),
-                        desc="SEFAZ - ALAGOAS | Get document links",
-                        total=len(futures),
-                        disable=not self.verbose,
-                    ):
-                        try:
-                            result = future.result()
-                            if result is None:
-                                continue
-
-                            # norms.extend(result)
-                        except Exception as e:
-                            print(f"Error getting document links | Error: {e}")
-
-                results = []
-
-                # get all norm data
-                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                    futures = [
-                        executor.submit(self._get_doc_data, norm) for norm in norms
-                    ]
-
-                    for future in tqdm(
-                        as_completed(futures),
-                        desc="SEFAZ - ALAGOAS | Get document data",
-                        total=len(norms),
-                        disable=not self.verbose,
-                    ):
-
-                        try:
-                            result = future.result()
-                            if result is None:
-                                continue
-
-                            # prepare item for saving
-                            queue_item = {
-                                "year": year,
-                                "type": norm_type,
-                                "situation": situation,
-                                **result,
-                            }
-
-                            results.append(queue_item)
-
-                        except Exception as e:
-                            print(f"Error getting document data | Error: {e}")
-
-                    all_results.extend(results)
-                    self.count += len(results)
-
-                    if self.verbose:
-                        print(
-                            f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
-                        )
-        
-        return all_results
+        tasks = [
+            self._scrape_situation_type(sit, nt, ntid, year)
+            for sit in self.situations
+            for nt, ntid in self.types.items()
+        ]
+        valid = await self._gather_results(
+            tasks,
+            context={"year": year, "type": "NA", "situation": "NA"},
+            desc=f"{self.name} | Year {year}",
+        )
+        return [
+            item
+            for result in valid
+            for item in (result if isinstance(result, list) else [result])
+        ]

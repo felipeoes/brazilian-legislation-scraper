@@ -6,11 +6,10 @@ import shutil
 import sys
 import threading
 from pathlib import Path
-from typing import List, Dict, Union, Optional, Tuple
+from typing import Optional
 import psutil
 import random
 
-# Import deque
 from collections import deque
 
 
@@ -33,9 +32,9 @@ class OpenVPNManager:
 
     def __init__(
         self,
-        config_files: List[Union[str, Path]],
-        default_credentials: Optional[Tuple[str, str]] = None,
-        credentials_map: Optional[Dict[str, Tuple[str, str]]] = None,
+        config_files: list[str | Path],
+        default_credentials: Optional[tuple[str, str]] = None,
+        credentials_map: Optional[dict[str, tuple[str, str]]] = None,
         initial_queue_order: str = "random",
     ):
         """
@@ -81,9 +80,9 @@ class OpenVPNManager:
                 "OpenVPN executable not found in PATH or standard locations."
             )
 
-        self.available_configs: Dict[str, Path] = {}  # {config_name: config_path}
+        self.available_configs: dict[str, Path] = {}  # {config_name: config_path}
         # {config_name: {'process': psutil.Process, 'stdout_thread': T, 'stderr_thread': T, 'log_capture': bool}}
-        self.active_connections: Dict[str, Dict] = {}
+        self.active_connections: dict[str, dict] = {}
         self._log_lock = threading.Lock()
         self._queue_lock = threading.Lock()  # Lock specific to queue operations
 
@@ -128,7 +127,6 @@ class OpenVPNManager:
 
         # The deque stores the order: front=least_recently_used, back=most_recently_used
         self._connection_queue: deque[str] = deque(initial_queue_items)
-        # self._log(f"Initialized connection queue: {list(self._connection_queue)}") # Debug log
 
         self._update_connection_state()  # Populate initial state
 
@@ -290,11 +288,11 @@ class OpenVPNManager:
         self._update_connection_state()
         # self._log("Refresh complete.")
 
-    def list_managed(self) -> List[str]:
+    def list_managed(self) -> list[str]:
         """Returns a sorted list of managed configuration names."""
         return sorted(list(self.available_configs.keys()))
 
-    def get_status(self) -> Dict:
+    def get_status(self) -> dict:
         """Checks current connection status for managed files."""
         self.refresh()  # Ensure state is up-to-date
         status = {
@@ -474,7 +472,6 @@ class OpenVPNManager:
             # Wait remaining time for stability, polling intermittently
             wait_interval = 0.5
             elapsed_wait = 1.0
-            process_stable = False
             while elapsed_wait < timeout_sec:
                 exit_code = popen_process.poll()
                 if exit_code is not None:
@@ -540,9 +537,6 @@ class OpenVPNManager:
                     popen_process.terminate()
                 except Exception:
                     pass
-            # Ensure reader threads finish (usually automatic as pipe closes)
-            # if stdout_thread and stdout_thread.is_alive(): stdout_thread.join(timeout=1) # May block
-            # if stderr_thread and stderr_thread.is_alive(): stderr_thread.join(timeout=1) # May block
             return False
         except FileNotFoundError:
             self._log(
@@ -705,7 +699,7 @@ class OpenVPNManager:
                 del self.active_connections[config_name]
             return False
 
-    def disconnect_all(self, kill_timeout_sec: int = 5) -> Dict[str, bool]:
+    def disconnect_all(self, kill_timeout_sec: int = 5) -> dict[str, bool]:
         """
         Attempts to disconnect all currently active managed connections (tracked or found).
 
@@ -750,17 +744,6 @@ class OpenVPNManager:
             elif not is_success:
                 self._log(f"Disconnect All: Failed for '{config_name}'.")
 
-        # Optional: Summary Log
-        success_count = sum(1 for success in results.values() if success)
-        fail_count = len(results) - success_count  # Counts only attempted ones
-        # self._log("\n--- Disconnect All Summary ---")
-        # self._log(f"Attempted disconnect for {len(results)} managed configs.")
-        # self._log(f"Successful stops/already stopped: {success_count}")
-        # self._log(f"Failures (permission issue, kill failed, etc.): {fail_count}")
-        # if fail_count > 0:
-        #     failed_names = [name for name, success in results.items() if not success]
-        #     self._log(f"Disconnect All: Failed connections: {', '.join(failed_names)}")
-
         return results
 
     def change_vpn_connection(self, timeout_sec: int = 15) -> bool:
@@ -801,7 +784,7 @@ class OpenVPNManager:
         # The connect method will automatically update the queue on success.
         return self.connect(next_config_name, timeout_sec)
 
-    def get_connection_queue(self) -> List[str]:
+    def get_connection_queue(self) -> list[str]:
         """Returns a copy of the current connection queue order (least to most recent)."""
         with self._queue_lock:
             return list(self._connection_queue)

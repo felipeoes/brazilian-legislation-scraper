@@ -1,10 +1,8 @@
 import re
-from typing import Optional, List, Dict
+from typing import Optional
 from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
-from src.scraper.base.scraper import BaseScaper
-from src.database.saver import FileSaver
+from loguru import logger
+from src.scraper.base.scraper import BaseScraper
 
 TYPES = {
     "Decreto Estadual": 2,
@@ -19,15 +17,13 @@ VALID_SITUATIONS = [
     "Não consta"
 ]  # Alepa does not have a situation field, invalid norms will have an indication in the document text
 
-INVALID_SITUATIONS = (
-    []
-)  # norms with these situations are invalid norms (no longer in effect)
+INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no longer in effect)
 
 # the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class ParaAlepaScraper(BaseScaper):
+class ParaAlepaScraper(BaseScraper):
     """Webscraper for Para state legislation website (http://bancodeleis.alepa.pa.gov.br)
 
     Example search request: http://bancodeleis.alepa.pa.gov.br/index.php
@@ -48,37 +44,39 @@ class ParaAlepaScraper(BaseScaper):
         base_url: str = "http://bancodeleis.alepa.pa.gov.br",
         **kwargs,
     ):
-        super().__init__(base_url, types=TYPES, situations=SITUATIONS, **kwargs)
-        self.docs_save_dir = self.docs_save_dir / "PARA"
-        self.params = {
+        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
+
+        if STATE_LEGISLATION_SAVE_DIR:
+            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
+        super().__init__(
+            base_url, types=TYPES, situations=SITUATIONS, name="PARA", **kwargs
+        )
+        self.fetched_constitution = False
+        self.regex_total_count = re.compile(r"Total de Registros:\s+(\d+)")
+
+    def _build_params(self, norm_type_id: int, year: int) -> dict:
+        """Build a fresh params dict for a specific type/year query (no shared state)."""
+        return {
             "numero": "",
-            "anoLei": "",
-            "tipo": "",
+            "anoLei": year,
+            "tipo": norm_type_id,
             "pChave": "",
             "verifica": 1,
             "button": "Buscar",
         }
-        self.fetched_constitution = False
-        self.regex_total_count = re.compile(r"Total de Registros:\s+(\d+)")
-        # Initialize the FileSaver
-        self.saver = FileSaver(self.docs_save_dir)
 
-    def _format_search_url(self, norm_type_id: int, year: int) -> str:
-        self.params["tipo"] = norm_type_id
-        self.params["anoLei"] = year
-
-        return f"{self.base_url}/index.php"
-
-    def _get_docs_links(self, url: str, norm_type: str) -> list:
+    async def _get_docs_links(self, url: str, params: dict, norm_type: str) -> list:
         """Get documents html links from given page.
         Returns a list of dicts with keys 'title', 'summary', 'pdf_link'
         """
-        response = self._make_request(url, method="POST", payload=self.params)
+        response = await self.request_service.make_request(
+            url, method="POST", payload=params
+        )
         if not response:
-            print(f"Error fetching page: {url}")
+            logger.error(f"Error fetching page: {url}")
             return []
-        
-        soup = BeautifulSoup(response.content, "html.parser")
+
+        soup = BeautifulSoup(await response.read(), "html.parser")
 
         #   Total de Registros:                      0
         # check if empty page
@@ -110,14 +108,20 @@ class ParaAlepaScraper(BaseScaper):
 
         return docs
 
-    def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
+    async def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
         """Get document data from given document dict"""
         # remove pdf_link from doc_info
         pdf_link = doc_info.pop("pdf_link")
-        text_markdown = self._get_markdown(pdf_link)
+        text_markdown = await self._get_markdown(url=pdf_link)
 
         if not text_markdown or not text_markdown.strip():
-            print(f"Error getting markdown from pdf: {pdf_link}")
+            logger.error(f"Error getting markdown from pdf: {pdf_link}")
+            await self._save_doc_error(
+                title=doc_info.get("title", ""),
+                year=doc_info.get("year", ""),
+                html_link=pdf_link,
+                error_message="Empty markdown from PDF",
+            )
             return None
 
         doc_info["text_markdown"] = text_markdown
@@ -127,60 +131,52 @@ class ParaAlepaScraper(BaseScaper):
     def _scrape_constitution(self):
         """Scrape the constitution"""
 
-    def _scrape_year(self, year: int) -> List[Dict]:
+    async def _scrape_situation_type(
+        self, situation: str, norm_type: str, norm_type_id: int, year: int
+    ) -> list:
+        """Scrape norms for a specific situation and type"""
+        # all docs are fetched in one single page
+        params = self._build_params(norm_type_id, year)
+        url = f"{self.base_url}/index.php"
+        docs = await self._get_docs_links(url, params, norm_type)
+
+        results = []
+        tasks = [self._get_doc_data(doc_info) for doc_info in docs]
+        valid_results = await self._gather_results(
+            tasks,
+            context={"year": year, "type": norm_type, "situation": situation},
+            desc=f"PARA | {norm_type}",
+        )
+        for result in valid_results:
+            queue_item = {
+                "year": year,
+                "situation": situation,
+                "type": norm_type,
+                **result,
+            }
+            results.append(queue_item)
+
+        if self.verbose:
+            logger.info(
+                f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)}"
+            )
+
+        return results
+
+    async def _scrape_year(self, year: int) -> list[dict]:
         """Scrape norms for a specific year"""
-        all_results = []
-        
-        for situation in tqdm(
-            self.situations,
-            desc="PARA | Situations",
-            total=len(self.situations),
-            disable=not self.verbose,
-        ):
-            for norm_type, norm_type_id in tqdm(
-                self.types.items(),
-                desc=f"PARA | Year: {year} | Types",
-                total=len(self.types),
-                disable=not self.verbose,
-            ):
-                # all docs are fetched in one single page
-                url = self._format_search_url(norm_type_id, year)
-                docs = self._get_docs_links(url, norm_type)
-
-                results = []
-                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                    futures = [
-                        executor.submit(self._get_doc_data, doc_info)
-                        for doc_info in docs
-                    ]
-
-                    for future in tqdm(
-                        as_completed(futures),
-                        total=len(futures),
-                        desc=f"PARA | Year: {year} | {norm_type}",
-                        disable=not self.verbose,
-                    ):
-                        result = future.result()
-                        if result is None:
-                            continue
-
-                        # save to results
-                        queue_item = {
-                            "year": year,
-                            "situation": situation,
-                            "type": norm_type,
-                            **result,
-                        }
-
-                        results.append(queue_item)
-
-                all_results.extend(results)
-                self.results.extend(results)
-                self.count += len(results)
-
-                if self.verbose:
-                    print(
-                        f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
-                    )
-        
-        return all_results
+        tasks = [
+            self._scrape_situation_type(sit, nt, ntid, year)
+            for sit in self.situations
+            for nt, ntid in self.types.items()
+        ]
+        valid = await self._gather_results(
+            tasks,
+            context={"year": year, "type": "N/A", "situation": "N/A"},
+            desc=f"{self.name} | Year {year}",
+        )
+        return [
+            item
+            for result in valid
+            for item in (result if isinstance(result, list) else [result])
+        ]

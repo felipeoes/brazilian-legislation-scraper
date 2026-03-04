@@ -1,14 +1,11 @@
-import warnings
 import re
+import time
 
 from datetime import datetime
 from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from loguru import logger
 from tqdm import tqdm
-from src.scraper.base.scraper import BaseScaper
-from src.database.saver import FileSaver
-
-warnings.filterwarnings("ignore")
+from src.scraper.base.scraper import BaseScraper
 
 TYPES = {
     "Lei Ordinária": "lei_ordinarias",
@@ -29,7 +26,7 @@ INVALID_SITUATIONS = (
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class AcreLegisScraper(BaseScaper):
+class AcreLegisScraper(BaseScraper):
     """Webscraper for Legis - Acre website (https://legis.ac.gov.br)
 
     Example search request: https://legis.ac.gov.br/principal/1
@@ -40,18 +37,20 @@ class AcreLegisScraper(BaseScaper):
         base_url: str = "https://legis.ac.gov.br/principal",
         **kwargs,
     ):
-        super().__init__(base_url, types=TYPES, situations=SITUATIONS, **kwargs)
-        self.docs_save_dir = self.docs_save_dir / "ACRE"
+        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
+
+        if STATE_LEGISLATION_SAVE_DIR:
+            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
+        super().__init__(
+            base_url, name="ACRE", types=TYPES, situations=SITUATIONS, **kwargs
+        )
         self.year_regex = re.compile(r"\d{4}")
-        self.remove_markdown_header = """\n\n# Reportar Erro\n\nNome\n\nEmail\n\nDescrição\n\nEnviar\nCancelar\n\n# Informações de Contato\n\nNome\n\nEmail\n\nAssunto\n\nDescrição\n\nEnviar\nCancelar\n\n[![](https://legis.ac.gov.br/assets/img/logo.svg)](https://legis.ac.gov.br/)\n\n* ac.gov.br\n* Diário Oficial\n* Notícias\n* Sobre\n* [Normas Covid-19](https://legis.ac.gov.br/covid19)\n\n* LEIS ORDINÁRIAS\n* LEIS COMPLEMENTARES\n* [CONSTITUIÇÃO ESTADUAL](https://legis.ac.gov.br/detalhar_constituicao)\n* DECRETOS\n\nTodos\nDecretos\nLei Complementar\nLei Ordinária\nConstituição Estadual\nEmendas Constitucionais\n\nEscolha a autoria\nAssembleia Legislativa do Estado do Acre\nDefensoria Pública do Estado do Acre\nMinistério Público do Estado do Acre\nPoder Executivo do Estado do Acre\nTribunal de Contas do Estado do Acre\nTribunal de Justiça do Estado do Acre\n\n**PESQUISAR**\n\n![](https://legis.ac.gov.br/assets/img/logo2.svg)\n\n* [INÍCIO](https://legis.ac.gov.br/)\n* LEIS ORDINÁRIAS\n* LEIS COMPLEMENTARES\n* [CONSTITUIÇÃO ESTADUAL](https://legis.ac.gov.br/detalhar_constituicao)\n* DECRETOS\n* [NORMAS COVID-19](https://legis.ac.gov.br/covid19)\n\n* PDF\n* INFORMAÇÃO\n\n"""
-        self.remove_markdown_footer = """\n\n| NOME DO ARQUIVO | LINK PARA DOWNLOAD |\n| --- | --- |\n\n#### Informações sobre a legislação\n\n# Relacionados\n\n* [Governo do Estado do Acre](https://www.ac.gov.br/)\n* [Secretaria de Estado da Casa Civil](https://www.casacivil.ac.gov.br/)\n* [Diário Oficial do Estado do Acre](diario.ac.gov.br/)\n* [Assembleia Legislativa do Estado do Acre](http://www.al.ac.leg.br/)\n\n# Serviços\n\n* [Perguntas Frequentes](https://legis.ac.gov.br/perguntas_frequentes)\n* Reporte um erro\n* Fale Conosco\n* [Mapa do Site](https://legis.ac.gov.br/mapa_site)\n\n# Links Externos\n\n* [Procuradoria Geral do Estado do Acre](http://www.pge.ac.gov.br/)\n* [Ministério Público do Estado do Acre](https://www.mpac.mp.br/)\n* [Defensoria Pública do Estado do Acre](http://defensoria.ac.gov.br/)\n* [Ministério Público de Contas do Acre](http://mpc.tce.ac.gov.br/)\n* [Tribunal de Contas do Estado do Acre](http://www.tce.ac.gov.br/)\n\nSecretaria de Estado da Casa Civil | CASA CIVIL\nAv. Brasil, 307-447 - Centro, Rio Branco - AC\n\n2025 Governo do Estado do Acre\nCopyright Todos os direitos reservados\n\nSecretaria de Estado da Casa Civil\nDiretoria de Modernização\n\n"""
-        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(self, norm_type_id: str) -> str:
         """Format url for search request"""
         return f"{self.base_url}/{norm_type_id}"
 
-    def _get_docs_links(self, soup: BeautifulSoup, norm_type_id: str) -> list:
+    async def _get_docs_links(self, soup: BeautifulSoup, norm_type_id: str) -> list:
         """Get documents html links from soup object.
         Returns a list of dicts with keys 'title', 'year', 'summary' and 'html_link'
         """
@@ -82,33 +81,52 @@ class AcreLegisScraper(BaseScaper):
 
         return html_links
 
-    def _get_doc_data(self, doc_info: dict) -> dict:
+    async def _get_doc_data(self, doc_info: dict) -> dict:
         """Get document data from given html link"""
         doc_html_link = doc_info["html_link"]
         doc_title = doc_info["title"]
         doc_year = doc_info["year"]
         doc_summary = doc_info["summary"]
 
-        response = self._make_request(doc_html_link)
+        response = await self.request_service.make_request(doc_html_link)
         if response is None:
+            await self._save_doc_error(
+                title=doc_title,
+                year=doc_year,
+                html_link=doc_html_link,
+                error_message="Failed to fetch document page",
+            )
             return None
 
-        soup = BeautifulSoup(response.text, "html.parser")
+        soup = BeautifulSoup(await response.text(), "html.parser")
         html_string = soup.find("div", id="body-law")
         if not html_string:
-            soup.find("div", id="exportacao")
+            html_string = soup.find("div", id="exportacao")
+
+        if html_string:
+            # Remove attachments table
+            for row in html_string.find_all("div", class_="row"):
+                row.decompose()
+            # Remove the "texto_publicado_doe" span
+            doe_span = html_string.find("span", id="texto_publicado_doe")
+            if doe_span:
+                doe_span.decompose()
 
         html_string = html_string.prettify() if html_string else ""
 
-        # get text markdown
-        text_markdown = self._get_markdown(response=response)
+        # get text markdown from extracted HTML
+        text_markdown = await self._get_markdown(
+            html_content=html_string, remove_hyperlinks=True
+        )
 
         if text_markdown is None:
+            await self._save_doc_error(
+                title=doc_title,
+                year=doc_year,
+                html_link=doc_html_link,
+                error_message="Failed to convert document to markdown",
+            )
             return None
-        else:
-            text_markdown = text_markdown.replace(
-                self.remove_markdown_header, ""
-            ).replace(self.remove_markdown_footer, "")
 
         return {
             "title": doc_title,
@@ -119,19 +137,35 @@ class AcreLegisScraper(BaseScaper):
             "document_url": doc_html_link,
         }
 
-    def _get_state_constitution(self, norm_type_id: str) -> dict:
+    async def _get_state_constitution(self, norm_type_id: str) -> dict:
         """Get state constitution data"""
         document_url = f"{self.base_url.replace('/principal', '')}/{norm_type_id}"
-        response = self._make_request(document_url)
+        response = await self.request_service.make_request(document_url)
+        if response is None:
+            return {
+                "title": "Constituição Estadual",
+                "year": datetime.now().year,
+                "summary": "Constituição Estadual do Estado do Acre",
+                "html_string": "",
+                "text_markdown": None,
+                "document_url": document_url,
+            }
 
-        soup = BeautifulSoup(response.text, "html.parser")
-        html_string = soup.find("div", id="exportacao").prettify()
+        soup = BeautifulSoup(await response.text(), "html.parser")
+        html_string = soup.find("div", id="exportacao")
+
+        if html_string:
+            for row in html_string.find_all("div", class_="row"):
+                row.decompose()
+            doe_span = html_string.find("span", id="texto_publicado_doe")
+            if doe_span:
+                doe_span.decompose()
+
+        html_string = html_string.prettify() if html_string else ""
 
         # get text markdown
-        text_markdown = self._get_markdown(response=response)
-
-        text_markdown = text_markdown.replace(self.remove_markdown_header, "").replace(
-            self.remove_markdown_footer, ""
+        text_markdown = await self._get_markdown(
+            html_content=html_string, remove_hyperlinks=True
         )
 
         return {
@@ -143,75 +177,74 @@ class AcreLegisScraper(BaseScaper):
             "document_url": document_url,
         }
 
-    def scrape(self):
+    async def _scrape_situation_type(
+        self, situation: str, norm_type: str, norm_type_id: str
+    ) -> list:
+        """Scrape norms for a specific situation and type"""
+        # if it's state constitution, we need to change logic. All the text is within div class="exportacao"
+        if norm_type == "Constituição Estadual":
+            doc_info = await self._get_state_constitution(norm_type_id)
+            doc_info["situation"] = situation
+            doc_info["type"] = norm_type
+            return [doc_info]
+
+        url = self._format_search_url(1)
+        soup = await self.request_service.get_soup(url)
+        if soup is None:
+            return []
+
+        html_links = await self._get_docs_links(soup, norm_type_id)
+        results = []
+
+        # Get data from all documents text links using asyncio.gather with progress tracking
+        tasks = [self._get_doc_data(doc) for doc in html_links]
+
+        valid_results = await self._gather_results(
+            tasks,
+            context={"year": "NA", "type": norm_type, "situation": situation},
+            desc=f"ACRE | {norm_type}",
+        )
+
+        for result in valid_results:
+            # prepare item for saving
+            queue_item = {
+                # "year": year, # getting year from document title because Legis does not have a search by year
+                # website only shows documents without any revocation
+                "situation": situation,
+                "type": norm_type,
+                **result,
+            }
+            results.append(queue_item)
+
+        if self.verbose:
+            logger.info(
+                f"Type: {norm_type} | Situation: {situation} | Total: {len(results)}"
+            )
+
+        return results
+
+    async def scrape(self):
         """Scrape norms"""
 
-        for situation in tqdm(
-            self.situations,
-            desc="ACRE | Situations",
-            total=len(self.situations),
-            disable=not self.verbose,
-        ):
+        self._scrape_start = time.time()
 
-            # all the norms and types are in the same page, so we just need to make one request to get html links
+        # Collect all tasks for concurrent execution with progress tracking
+        task_configs = [
+            (situation, norm_type, norm_type_id)
+            for situation in self.situations
+            for norm_type, norm_type_id in self.types.items()
+        ]
 
-            url = self._format_search_url(1)
-            soup = self._get_soup(url)
-            if soup is None:
-                continue
+        all_results = []
+        for situation, norm_type, norm_type_id in tqdm(task_configs, desc="ACRE"):
+            results = await self._scrape_situation_type(
+                situation, norm_type, norm_type_id
+            )
+            if results:
+                await self.saver.save(results)
+                all_results.extend(results)
 
-            for norm_type, norm_type_id in self.types.items():
-
-                # if it's state constitution, we need to change logic. All the text is within div class="exportacao"
-                if norm_type == "Constituição Estadual":
-                    doc_info = self._get_state_constitution(norm_type_id)
-                    doc_info["situation"] = situation
-                    doc_info["type"] = norm_type
-
-                    all_results.append(doc_info)
-                    self.results.append(doc_info)
-                    self.count += 1
-                    continue
-
-                html_links = self._get_docs_links(soup, norm_type_id)
-                results = []
-
-                # Get data from all  documents text links using ThreadPoolExecutor
-                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                    futures = [
-                        executor.submit(self._get_doc_data, doc) for doc in html_links
-                    ]
-
-                    for future in tqdm(
-                        as_completed(futures),
-                        desc=f"ACRE | Type: {norm_type}",
-                        total=len(html_links),
-                        disable=not self.verbose,
-                    ):
-                        result = future.result()
-
-                        if result is None:
-                            continue
-
-                        # prepare item for saving
-                        queue_item = {
-                            # "year": year, # getting year from document title because Legis does not have a search by year
-                            # website only shows documents without any revocation
-                            "situation": situation,
-                            "type": norm_type,
-                            **result,
-                        }
-
-                        results.append(queue_item)
-
-                if results:
-                    self.saver.save(results)
-                    self.results.extend(results)
-                    self.count += len(results)
-
-                if self.verbose:
-                    print(
-                        f"Type: {norm_type} | Situation: {situation} | Total: {len(results)}"
-                    )
-
+        self.results = all_results
+        self.count = len(all_results)
+        await self._save_summary()
         return self.results

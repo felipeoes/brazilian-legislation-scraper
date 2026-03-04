@@ -1,12 +1,8 @@
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
-from io import BytesIO
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
-from src.scraper.base.scraper import BaseScaper
-from src.database.saver import FileSaver
-from typing import Union, Dict
+from loguru import logger
+from src.scraper.base.scraper import BaseScraper
 
 
 TYPES = {
@@ -29,7 +25,7 @@ INVALID_SITUATIONS = (
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class AmapaAlapScraper(BaseScaper):
+class AmapaAlapScraper(BaseScraper):
     """Webscraper for Amapa state legislation website (https://al.ap.leg.br)
 
     Example search request: https://al.ap.leg.br/pagina.php?pg=buscar_legislacao&aba=legislacao&submenu=listar_legislacao&especie_documento=13&ano=2020&pesquisa=&n_doeB=&n_leiB=&data_inicial=&data_final=&orgaoB=&autor=&legislaturaB=&pagina=2
@@ -40,14 +36,22 @@ class AmapaAlapScraper(BaseScaper):
         base_url: str = "https://al.ap.leg.br",
         **kwargs,
     ):
-        super().__init__(base_url, types=TYPES, situations=SITUATIONS, **kwargs)
-        self.docs_save_dir = self.docs_save_dir / "AMAPA"
-        self.params: Dict[str, Union[str, int]] = {
+        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
+
+        if STATE_LEGISLATION_SAVE_DIR:
+            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
+        super().__init__(
+            base_url, name="AMAPA", types=TYPES, situations=SITUATIONS, **kwargs
+        )
+
+    def _build_search_url(self, norm_type_id: str, year: int, page: int) -> str:
+        """Build search URL from arguments (no shared state mutation)."""
+        params = {
             "pg": "buscar_legislacao",
             "aba": "legislacao",
             "submenu": "listar_legislacao",
-            "especie_documento": "",
-            "ano": "",
+            "especie_documento": norm_type_id,
+            "ano": year,
             "pesquisa": "",
             "n_doeB": "",
             "n_leiB": "",
@@ -56,24 +60,16 @@ class AmapaAlapScraper(BaseScaper):
             "orgaoB": "",
             "autor": "",
             "legislaturaB": "",
+            "pagina": page,
         }
-        self.reached_end_page = False
-        # Initialize the FileSaver
-        self.saver = FileSaver(self.docs_save_dir)
+        return f"{self.base_url}/pagina.php?{'&'.join([f'{key}={value}' for key, value in params.items()])}"
 
-    def _format_search_url(self, norm_type_id: str, year: int, page: int) -> str:
-        """Format url for search request"""
-        self.params["especie_documento"] = norm_type_id
-        self.params["ano"] = year
-        self.params["pagina"] = page
-
-        return f"{self.base_url}/pagina.php?{'&'.join([f'{key}={value}' for key, value in self.params.items()])}"
-
-    def _get_docs_links(self, url: str) -> list:
+    async def _get_docs_links(self, url: str) -> tuple[list, bool]:
         """Get documents html links from given page.
-        Returns a list of dicts with keys 'title', 'summary', 'doe_number', 'date',  'proposition_number', 'html_link'
+        Returns (docs, reached_end) where docs is a list of dicts and
+        reached_end indicates there are no more pages.
         """
-        soup = self._get_soup(url)
+        soup = await self.request_service.get_soup(url)
         if not soup:
             raise ValueError(f"Failed to get soup for URL: {url}")
 
@@ -82,8 +78,7 @@ class AmapaAlapScraper(BaseScaper):
 
         # check if the page is empty (tbody is empty)
         if len(items) == 0:
-            self.reached_end_page = True
-            return []
+            return [], True
 
         for item in items:
             tds = item.find_all("td")
@@ -96,13 +91,13 @@ class AmapaAlapScraper(BaseScaper):
             date = tds[3].text.strip()
             proposition_number = tds[4].text.strip()
 
-            try:
-                html_link = tds[5].find("a")["href"]
-            except Exception as e:
-                print(
-                    f"Error getting html link: {e}"
-                )  # some documents are not available, so we skip them
+            a_tag = tds[5].find("a")
+            if not a_tag:
+                logger.warning(
+                    f"No link found for document '{title}' — skipping"
+                )
                 continue
+            html_link = a_tag["href"]
 
             docs.append(
                 {
@@ -115,31 +110,85 @@ class AmapaAlapScraper(BaseScaper):
                 }
             )
 
-        return docs
+        return docs, False
 
-    def _get_doc_data(self, doc_info: dict) -> dict:
+    async def _get_doc_data(self, doc_info: dict) -> dict:
         """Get document data from given document dict"""
-        # remove html_link from doc_info
         html_link = doc_info.pop("html_link")
         url = urljoin(self.base_url, html_link)
 
-        response = self._make_request(url)
-        soup = BeautifulSoup(response.content, "html.parser")
+        response = await self.request_service.make_request(url)
+        if response is None:
+            doc_info["html_string"] = ""
+            doc_info["text_markdown"] = None
+            doc_info["document_url"] = url
+            return doc_info
+        soup = BeautifulSoup(await response.read(), "html.parser")
 
-        # remove header containing print link
-        header = soup.find("a", class_="texto_noticia3")
-        if header:
-            header.decompose()
+        # The page always has two header tables to remove:
+        #   Table 1 — print-version link  (contains <a class="texto_noticia3">)
+        #   Table 2 — coat of arms logo + "ESTADO DO AMAPÁ / ASSEMBLEIA LEGISLATIVA"
+        #             (identified by the <img src="brasaoamapa.jpg">)
+        # Everything else is the norm body.
 
-        # this website won't return the <html> tag, so we need to add it
-        html_string = f"<html>{soup.prettify()}</html>"
-        soup = BeautifulSoup(html_string, "html.parser")
+        # Remove print-link table
+        for a in soup.find_all("a", class_="texto_noticia3"):
+            tbl = a.find_parent("table")
+            if tbl:
+                tbl.decompose()
 
-        buffer = BytesIO()
-        buffer.write(soup.html.encode())
-        buffer.seek(0)
+        # Remove coat-of-arms header table
+        for img in soup.find_all("img", src=lambda s: s and "brasao" in s.lower()):
+            tbl = img.find_parent("table")
+            if tbl:
+                tbl.decompose()
 
-        text_markdown = self._get_markdown(stream=buffer)
+        # After header removal the remaining table is the content wrapper.
+        # Pass only the inner <td> contents (the <p> tags) to docling — without
+        # the outer <table> wrapper — so paragraph breaks are preserved.
+        remaining_table = soup.find("table")
+        if remaining_table:
+            # The law text is in the innermost <td>: outer table → inner table → td
+            inner_table = remaining_table.find("table")
+            content_td = (
+                inner_table.find("td") if inner_table else remaining_table.find("td")
+            )
+            container = content_td or remaining_table
+
+            # Unwrap <font> tags — docling's HTML parser silently discards all
+            # <p> content nested inside <font> wrappers, only retaining heading
+            # tags (<h3>/<h1>) which are why only the signature block was returned.
+            for font in container.find_all("font"):
+                font.unwrap()
+
+            # Strip inline style attributes so docling doesn't skip paragraphs.
+            for tag in container.find_all(style=True):
+                del tag["style"]
+
+            html_string = f"<html><body>{container.decode_contents()}</body></html>"
+        else:
+            html_string = f"<html>{soup.prettify()}</html>"
+            container = None
+
+        text_markdown = await self._get_markdown(html_content=html_string)
+
+        # Fallback: docling cannot parse <p><span>…</span></p> from old ALAP docs
+        # (only heading tags survive). Build plain markdown directly from the
+        # BeautifulSoup <p> tags when the result is suspiciously short.
+        if container is not None and len((text_markdown or "").strip()) < 100:
+            lines = []
+            for p in container.find_all("p"):
+                text = p.get_text(" ", strip=True)
+                if not text:
+                    continue
+                # Preserve bold for paragraphs that were fully inside <strong>
+                if p.find("strong") and len(p.find_all("strong")) == 1:
+                    inner = p.find("strong").get_text(" ", strip=True)
+                    if inner == text:
+                        text = f"**{text}**"
+                lines.append(text)
+            if lines:
+                text_markdown = "\n\n".join(lines)
 
         doc_info["html_string"] = html_string
         doc_info["text_markdown"] = text_markdown
@@ -147,103 +196,104 @@ class AmapaAlapScraper(BaseScaper):
 
         return doc_info
 
-    def _scrape_year(self, year: int) -> list:
+    async def _scrape_situation_type(
+        self, situation: str, norm_type: str, norm_type_id: int, year: int
+    ) -> list:
+        """Scrape norms for a specific situation and type"""
+        total_pages = (
+            1  # just to start and avoid making a lot of requests for empty pages
+        )
+        reached_end_page = False
+
+        # Get documents html links
+        documents = []
+
+        current_page = 1
+        while not reached_end_page:
+            page_docs = []
+
+            tasks = [
+                self._get_docs_links(
+                    self._build_search_url(norm_type_id, year, page),
+                )
+                for page in range(current_page, current_page + total_pages)
+            ]
+            valid_results = await self._gather_results(
+                tasks,
+                context={
+                    "year": year,
+                    "type": norm_type,
+                    "situation": situation,
+                },
+                desc=f"AMAPA | {norm_type} | get_docs_links",
+            )
+            for result in valid_results:
+                docs, ended = result
+                if ended:
+                    reached_end_page = True
+                if docs:
+                    page_docs.extend(docs)
+
+            # If we didn't get any docs or reached the end page, break the loop
+            if not page_docs or reached_end_page:
+                break
+
+            # Add the documents from this batch to our total documents list
+            documents.extend(page_docs)
+
+            # Move to the next batch of pages
+            current_page += total_pages
+            total_pages = min(
+                total_pages + 2, self.max_workers
+            )  # Gradually increase pages but don't exceed max_workers
+
+        # Only process documents if we found any
+        if documents:
+            # Get document data
+            results = []
+            tasks = [self._get_doc_data(doc_info) for doc_info in documents]
+            valid_results = await self._gather_results(
+                tasks,
+                context={
+                    "year": year,
+                    "type": norm_type,
+                    "situation": situation,
+                },
+                desc=f"AMAPA | {norm_type}",
+                min_length=100,
+            )
+            for result in valid_results:
+                queue_item = {
+                    "year": year,
+                    "situation": situation,
+                    "type": norm_type,
+                    **result,
+                }
+                results.append(queue_item)
+
+            if self.verbose:
+                logger.info(
+                    f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)}"
+                )
+
+            return results
+
+        return []
+
+    async def _scrape_year(self, year: int) -> list:
         """Scrape norms for a specific year"""
-        all_results = []
-        
-        for situation in tqdm(
-            self.situations,
-            desc="AMAPA | Situations",
-            total=len(self.situations),
-            disable=not self.verbose,
-        ):
-            for norm_type, norm_type_id in tqdm(
-                self.types.items(),
-                desc=f"AMAPA | Year: {year} | Types",
-                total=len(self.types),
-                disable=not self.verbose,
-            ):
-
-                # total pages info is not available, so we need to check if the page is empty. In order to make parallel calls, we will assume an initial number of pages and increase if needed. We will know that all the pages were scraped when we request a page and it shows a error message
-
-                total_pages = 1  # just to start and avoid making a lot of requests for empty pages
-                self.reached_end_page = False
-
-                # Get documents html links
-                documents = []
-                
-                current_page = 1
-                while not self.reached_end_page:
-                    page_docs = []
-
-                    with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                        futures = [
-                            executor.submit(
-                                self._get_docs_links,
-                                self._format_search_url(norm_type_id, year, page),
-                            )
-                            for page in range(current_page, current_page + total_pages)
-                        ]
-
-                        for future in tqdm(
-                            as_completed(futures),
-                            total=len(futures),
-                            desc="AMAPA | Get document link",
-                            disable=not self.verbose,
-                        ):
-                            docs = future.result()
-                            if docs:
-                                page_docs.extend(docs)
-
-                    # If we didn't get any docs or reached the end page, break the loop
-                    if not page_docs or self.reached_end_page:
-                        break
-
-                    # Add the documents from this batch to our total documents list
-                    documents.extend(page_docs)
-
-                    # Move to the next batch of pages
-                    current_page += total_pages
-                    total_pages = min(
-                        total_pages + 2, self.max_workers
-                    )  # Gradually increase pages but don't exceed max_workers
-
-                # Only process documents if we found any
-                if documents:
-                    # Get document data
-                    results = []
-                    with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                        futures = [
-                            executor.submit(self._get_doc_data, doc_info)
-                            for doc_info in documents
-                        ]
-                        for future in tqdm(
-                            as_completed(futures),
-                            total=len(documents),
-                            desc="AMAPA | Get document data",
-                            disable=not self.verbose,
-                        ):
-                            result = future.result()
-                            if result is None:
-                                continue
-
-                            # prepare item for saving
-                            queue_item = {
-                                "year": year,
-                                # hardcode since we only get valid documents in search request
-                                "situation": situation,
-                                "type": norm_type,
-                                **result,
-                            }
-
-                            results.append(queue_item)
-
-                    all_results.extend(results)
-                    self.count += len(results)
-
-                    if self.verbose:
-                        print(
-                            f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
-                        )
-
-        return all_results
+        tasks = [
+            self._scrape_situation_type(sit, nt, ntid, year)
+            for sit in self.situations
+            for nt, ntid in self.types.items()
+        ]
+        valid = await self._gather_results(
+            tasks,
+            context={"year": year, "type": "NA", "situation": "NA"},
+            desc=f"{self.name} | Year {year}",
+        )
+        return [
+            item
+            for result in valid
+            for item in (result if isinstance(result, list) else [result])
+        ]

@@ -1,0 +1,247 @@
+"""Amazon Bedrock Converse API client for LLM-based OCR.
+
+Translates OpenAI-style messages into Bedrock Converse content blocks and
+makes HTTP requests via the shared ``RequestService``.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Any, Optional
+
+from loguru import logger
+from ..request.service import RequestService
+
+
+class BedrockClient:
+    """Async client for the Amazon Bedrock Converse API.
+
+    Uses ``RequestService`` for all HTTP traffic so that rate-limiting,
+    retries, and proxy support are inherited automatically.
+
+    Args:
+        base_url: Bedrock runtime base URL, e.g.
+            ``https://bedrock-runtime.us-east-2.amazonaws.com``.
+        model_id: Full model ARN or inference-profile ARN (will be
+            URL-encoded automatically).
+        api_key: Bearer token for ``Authorization`` header.
+        request_service: Shared ``RequestService`` instance.
+        inference_config: Dict forwarded as ``inferenceConfig``, e.g.
+            ``{"maxTokens": 32000, "stopSequences": []}``.
+        additional_request_fields: Dict forwarded as
+            ``additionalModelRequestFields``, e.g. ``{"top_k": 250}``.
+        performance_config: Dict forwarded as ``performanceConfig``,
+            e.g. ``{"latency": "standard"}``.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        request_service: RequestService,
+        inference_config: Optional[dict] = None,
+        additional_request_fields: Optional[dict] = None,
+        performance_config: Optional[dict] = None,
+    ) -> None:
+
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.request_service = request_service
+
+        # Default inference config
+        self.inference_config = inference_config or {
+            "maxTokens": 65536,
+            "stopSequences": [],
+        }
+        self.additional_request_fields = additional_request_fields or {}
+        self.performance_config = performance_config or {"latency": "standard"}
+
+    # ------------------------------------------------------------------
+    # Message translation: OpenAI format → Bedrock Converse format
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _translate_content_block(block: dict) -> dict:
+        """Convert a single OpenAI content block to a Bedrock content block.
+
+        If the block is already in Bedrock format, it is returned as-is.
+
+        OpenAI format examples:
+            {"type": "text", "text": "hello"}
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+
+        Bedrock format examples:
+            {"text": "hello"}
+            {"image": {"format": "png", "source": {"bytes": "<base64>"}}}
+        """
+        if "type" not in block and any(
+            k in block
+            for k in (
+                "text",
+                "image",
+                "document",
+                "toolUse",
+                "toolResult",
+                "guardContent",
+            )
+        ):
+            return block
+
+        block_type = block.get("type", "")
+
+        if block_type == "text":
+            return {"text": block["text"]}
+
+        if block_type == "image_url":
+            data_url = block["image_url"]["url"]
+            # Parse data URI: data:image/<format>;base64,<data>
+            match = re.match(
+                r"data:image/([a-zA-Z0-9]+);base64,(.+)", data_url, re.DOTALL
+            )
+            if match:
+                img_format = match.group(1).lower()
+                img_b64 = match.group(2)
+            else:
+                # Fallback: treat the whole thing as base64 PNG
+                img_format = "png"
+                img_b64 = data_url
+
+            return {
+                "image": {
+                    "format": img_format,
+                    "source": {"bytes": img_b64},
+                }
+            }
+
+        if block_type == "document":
+            doc_data = block["document"]
+            return {
+                "document": {
+                    "name": doc_data.get("name", "document"),
+                    "format": doc_data.get("format", "pdf"),
+                    "source": {"bytes": doc_data["source"]["bytes"]},
+                }
+            }
+
+        # Unknown block type — pass text if available
+        if "text" in block:
+            return {"text": block["text"]}
+
+        raise ValueError(f"Unsupported content block type: {block_type}")
+
+    @classmethod
+    def _translate_messages(cls, messages: list[dict]) -> list[dict]:
+        """Convert a list of OpenAI-format messages to Bedrock Converse format.
+
+        Handles both:
+        - Simple messages: {"role": "user", "content": "hello"}
+        - Multimodal messages: {"role": "user", "content": [{"type": "text", ...}, ...]}
+        """
+        bedrock_messages = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+
+            if isinstance(content, str):
+                # Simple text message
+                bedrock_messages.append({"role": role, "content": [{"text": content}]})
+            elif isinstance(content, list):
+                # Multimodal content blocks
+                bedrock_content = [
+                    cls._translate_content_block(block) for block in content
+                ]
+                bedrock_messages.append({"role": role, "content": bedrock_content})
+            else:
+                raise ValueError(f"Unsupported content type: {type(content)}")
+
+        return bedrock_messages
+
+    # ------------------------------------------------------------------
+    # API call
+    # ------------------------------------------------------------------
+
+    async def generate(
+        self, messages: list[dict], model_id: str, timeout: int | None = None
+    ) -> str:
+        """Send messages to the Bedrock Converse API and return the text response.
+
+        Args:
+            messages: List of OpenAI-format message dicts.
+            model_id: Full model ARN or inference-profile ARN.
+
+        Returns:
+            The model's text response.
+
+        Raises:
+            RuntimeError: If the API call fails or the response is malformed.
+        """
+        from urllib.parse import quote
+
+        encoded_model_id = quote(model_id, safe=":")
+        endpoint_url = f"{self.base_url}/model/{encoded_model_id}/converse"
+
+        bedrock_messages = self._translate_messages(messages)
+
+        payload = {
+            "messages": bedrock_messages,
+            "inferenceConfig": self.inference_config,
+        }
+
+        if self.additional_request_fields:
+            payload["additionalModelRequestFields"] = self.additional_request_fields
+
+        if self.performance_config:
+            payload["performanceConfig"] = self.performance_config
+
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+
+        kwargs = {
+            "url": endpoint_url,
+            "method": "POST",
+            "json": payload,
+            "headers": headers,
+        }
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+
+        response = await self.request_service.make_request(**kwargs)
+
+        if response is None:
+            raise RuntimeError(
+                f"Bedrock Converse API returned no response for {endpoint_url}"
+            )
+
+        if response.status != 200:
+            body = await response.text()
+            raise RuntimeError(f"Bedrock Converse API error {response.status}: {body}")
+
+        data = await response.json()
+        return self._extract_text(data)
+
+    @staticmethod
+    def _extract_text(data: dict) -> str:
+        """Extract the text content from a Bedrock Converse response.
+
+        Response structure:
+            {
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"text": "..."}]
+                    }
+                },
+                ...
+            }
+        """
+        try:
+            message = data["output"]["message"]
+            content_blocks = message.get("content", [])
+            text_parts = [block["text"] for block in content_blocks if "text" in block]
+            return "\n".join(text_parts)
+        except (KeyError, TypeError) as e:
+            logger.error(f"Failed to parse Bedrock response: {e} | Data: {data}")
+            raise RuntimeError(f"Malformed Bedrock Converse response: {e}") from e

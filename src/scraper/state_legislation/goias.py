@@ -1,12 +1,10 @@
 import re
-from typing import Optional, List, Dict
-from io import BytesIO
+from typing import Optional
 from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm.auto import tqdm
+import asyncio
 from urllib.parse import urlencode
-from src.scraper.base.scraper import BaseScaper
-from src.database.saver import FileSaver
+from loguru import logger
+from src.scraper.base.scraper import BaseScraper
 
 TYPES = {
     "Constituição Estadual": {"id": 12, "url_suffix": "constituicao-estadual"},
@@ -23,15 +21,13 @@ TYPES = {
 
 # situations are gotten from doc data while scraping
 VALID_SITUATIONS = []
-INVALID_SITUATIONS = (
-    []
-)  # norms with these situations are invalid norms (no longer have legal effect)
+INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no longer have legal effect)
 
 # the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class LegislaGoias(BaseScaper):
+class LegislaGoias(BaseScraper):
     """Webscraper for Espirito Santo state legislation website (https://legisla.casacivil.go.gov.br)
 
     Example search request: https://legisla.casacivil.go.gov.br/api/v2/pesquisa/legislacoes?ano=1798&ordenarPor=data&page=1&qtd_por_pagina=10&tipo_legislacao=7
@@ -42,40 +38,41 @@ class LegislaGoias(BaseScaper):
         base_url: str = "https://legisla.casacivil.go.gov.br/api/v2/pesquisa/legislacoes",
         **kwargs,
     ):
-        super().__init__(base_url, types=TYPES, situations=SITUATIONS, **kwargs)
-        self.params = {
-            "ano": 1800,
-            "ordenarPor": "data",
-            "qtd_por_pagina": 100,
-            "tipo_legislacao": "",
-            "page": 1,
-        }
-        self.docs_save_dir = self.docs_save_dir / "GOIAS"
+        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
+
+        if STATE_LEGISLATION_SAVE_DIR:
+            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
+        super().__init__(
+            base_url, name="GOIAS", types=TYPES, situations=SITUATIONS, **kwargs
+        )
         self._special_regex = re.compile(r"[^a-zA-ZÀ-ÿ\s]")
         self._space_regex = re.compile(r"\s+")
-        # Initialize the FileSaver
-        self.saver = FileSaver(self.docs_save_dir)
 
-    def _format_search_url(self, norm_type_id: str, year: int, page: int = 1) -> str:
-        self.params["ano"] = year
-        self.params["tipo_legislacao"] = norm_type_id
-        self.params["page"] = page
-        return f"{self.base_url}?{urlencode(self.params)}"
+    def _build_search_url(self, norm_type_id: str, year: int, page: int = 1) -> str:
+        """Build search URL from arguments (no shared state mutation)."""
+        params = {
+            "ano": year,
+            "ordenarPor": "data",
+            "qtd_por_pagina": 100,
+            "tipo_legislacao": norm_type_id,
+            "page": page,
+        }
+        return f"{self.base_url}?{urlencode(params)}"
 
     def _clean_markdown(self, text_markdown: str) -> str:
         """Clean markdown text"""
 
         return text_markdown.replace("javascript:print()", "").strip()
 
-    def _process_pdf_link(
+    async def _process_pdf_link(
         self, link: str, doc_id: str, doc_info: dict
     ) -> Optional[dict]:
-        response = self._make_request(link)
+        response = await self.request_service.make_request(link)
         if not response:
-            print(f"Error fetching PDF for doc ID: {doc_id} | Link: {link}")
+            logger.error(f"Error fetching PDF for doc ID: {doc_id} | Link: {link}")
             return None
 
-        text_markdown = self._get_pdf_image_markdown(response.content)
+        text_markdown = await self._get_pdf_image_markdown(await response.read())
         if text_markdown:
             doc_info["text_markdown"] = text_markdown
             if not doc_info.get("document_url"):
@@ -83,14 +80,14 @@ class LegislaGoias(BaseScaper):
             else:
                 doc_info["pdf_link"] = link
         else:
-            print(f"Failed to extract text from PDF for doc ID: {doc_id}")
+            logger.error(f"Failed to extract text from PDF for doc ID: {doc_id}")
             return None
 
         doc_info["text_markdown"] = self._clean_markdown(doc_info["text_markdown"])
 
         return doc_info
 
-    def _get_doc_info(self, doc: dict, norm_url_suffix: str) -> Optional[dict]:
+    async def _get_doc_info(self, doc: dict, norm_url_suffix: str) -> Optional[dict]:
         """Get document info from given doc data using API"""
         doc_id = doc["id"]
 
@@ -98,20 +95,28 @@ class LegislaGoias(BaseScaper):
         api_url = (
             f"https://legisla.casacivil.go.gov.br/api/v2/pesquisa/legislacoes/{doc_id}"
         )
-        response = self._make_request(api_url)
+        response = await self.request_service.make_request(api_url)
 
         if not response:
-            print(f"Error getting detailed data for doc ID: {doc_id}")
+            logger.error(f"Error getting detailed data for doc ID: {doc_id}")
+            await self._save_doc_error(
+                title=f"Doc ID {doc_id}",
+                year="",
+                situation="",
+                norm_type="",
+                html_link=api_url,
+                error_message="Failed to fetch document detail from API",
+            )
             return {}
 
-        doc_detail = response.json()
+        doc_detail = await response.json()
 
         doc_info = {
             "id": doc_detail["id"],
             "norm_number": doc_detail["numero"],
             "situation": doc_detail.get("estado_legislacao", {}).get("nome", ""),
             "date": doc_detail["data_legislacao"],
-            "title": f'{doc_detail["tipo_legislacao"]["nome"]} {doc_detail["numero"]} de {doc_detail["ano"]}',
+            "title": f"{doc_detail['tipo_legislacao']['nome']} {doc_detail['numero']} de {doc_detail['ano']}",
             "summary": doc_detail["ementa"].strip(),
         }
 
@@ -127,6 +132,14 @@ class LegislaGoias(BaseScaper):
                 "Clique no link abaixo para acessar a:".lower()
                 in str(soup.prettify()).lower()
             ):
+                await self._save_doc_error(
+                    title=doc_info.get("title", f"Doc ID {doc_id}"),
+                    year=doc_detail.get("ano", ""),
+                    situation=doc_info.get("situation", ""),
+                    norm_type=doc_detail.get("tipo_legislacao", {}).get("nome", ""),
+                    html_link=api_url,
+                    error_message="Document redirects via 'Clique no link abaixo' (content not inline)",
+                )
                 return None
 
             # remove header table, if it contains GOVERNO DO ESTADO DE GOIÁS
@@ -161,19 +174,23 @@ class LegislaGoias(BaseScaper):
                 a_tag = baixar_div.find("a", href=True)
                 pdf_link = a_tag["href"]
 
-                doc_info = self._process_pdf_link(pdf_link, doc_id, doc_info)
+                doc_info = await self._process_pdf_link(pdf_link, doc_id, doc_info)
 
                 if not doc_info:
+                    await self._save_doc_error(
+                        title=f"Doc ID {doc_id}",
+                        year=doc_detail.get("ano", ""),
+                        situation="",
+                        norm_type=doc_detail.get("tipo_legislacao", {}).get("nome", ""),
+                        html_link=pdf_link,
+                        error_message="PDF processing failed (botao-baixar)",
+                    )
                     return None
 
                 return doc_info
 
-            # Convert HTML to markdown using BytesIO buffer
-            buffer = BytesIO()
-            buffer.write(html_string.encode("utf-8"))
-            buffer.seek(0)
-
-            text_markdown = self._get_markdown(stream=buffer)
+            # Convert HTML to markdown using direct HTML content
+            text_markdown = await self._get_markdown(html_content=html_string)
             if text_markdown:
                 text_markdown = text_markdown.strip()
                 doc_info["text_markdown"] = text_markdown
@@ -196,15 +213,23 @@ class LegislaGoias(BaseScaper):
             if norm_url_suffix == "constituicao-estadual":
                 html_link = f"https://legisla.casacivil.go.gov.br/pesquisa_legislacao/{doc_id}/{norm_url_suffix}"
             else:
-                html_link = f'https://legisla.casacivil.go.gov.br/pesquisa_legislacao/{doc_id}/{norm_url_suffix}-{doc_detail["numero"]}'
+                html_link = f"https://legisla.casacivil.go.gov.br/pesquisa_legislacao/{doc_id}/{norm_url_suffix}-{doc_detail['numero']}"
 
             doc_info["document_url"] = html_link
 
         # If we don't have HTML content or markdown conversion failed, try PDF
         if not doc_info.get("text_markdown"):
-            doc_info = self._process_pdf_link(pdf_link, doc_id, doc_info)
+            doc_info = await self._process_pdf_link(pdf_link, doc_id, doc_info)
             if not doc_info:
-                print(f"Failed to process PDF for doc ID: {doc_id}")
+                logger.error(f"Failed to process PDF for doc ID: {doc_id}")
+                await self._save_doc_error(
+                    title=f"Doc ID {doc_id}",
+                    year=doc_detail.get("ano", ""),
+                    situation="",
+                    norm_type=doc_detail.get("tipo_legislacao", {}).get("nome", ""),
+                    html_link=pdf_link if pdf_link else api_url,
+                    error_message="PDF processing failed (fallback)",
+                )
                 return None
 
         # clean text_markdown (some docs may have the "javascript:print()" string at the end of the document)
@@ -213,20 +238,28 @@ class LegislaGoias(BaseScaper):
         # check for error msg
         error_msg = "doesn't work properly without JavaScript enabled"
         if error_msg.lower() in doc_info["text_markdown"].lower():
-            print(f"Invalid  doc ID: {doc_id}. Year: {doc_detail['ano']}")
+            logger.warning(f"Invalid  doc ID: {doc_id}. Year: {doc_detail['ano']}")
+            await self._save_doc_error(
+                title=doc_info.get("title", f"Doc ID {doc_id}"),
+                year=doc_detail.get("ano", ""),
+                situation=doc_info.get("situation", ""),
+                norm_type=doc_detail.get("tipo_legislacao", {}).get("nome", ""),
+                html_link=doc_info.get("document_url", api_url),
+                error_message="Document contains JavaScript error message",
+            )
             return None
 
         return doc_info
 
-    def _get_doc_data(self, url: str, norm_url_suffix: str) -> list[dict]:
+    async def _get_doc_data(self, url: str, norm_url_suffix: str) -> list[dict]:
         """Get document data from given url"""
-        response = self._make_request(url)
+        response = await self.request_service.make_request(url)
 
         if not response:
-            print(f"Error getting data from URL: {url}")
+            logger.error(f"Error getting data from URL: {url}")
             return []
 
-        response = response.json()
+        response = await response.json()
 
         total_results = response["total_resultados"]
         if total_results == 0:
@@ -235,89 +268,72 @@ class LegislaGoias(BaseScaper):
         data = response["resultados"]
         docs = []
 
-        # concurrent processing
-
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = [
-                executor.submit(self._get_doc_info, doc, norm_url_suffix)
-                for doc in data
-            ]
-
-            for future in tqdm(
-                as_completed(futures),
-                desc="GOIAS | Get document info",
-                total=len(futures),
-                disable=not self.verbose,
-            ):
-                doc_info = future.result()
-                if doc_info:
-                    docs.append(doc_info)
+        tasks = [self._get_doc_info(doc, norm_url_suffix) for doc in data]
+        valid_results = await self._gather_results(
+            tasks,
+            context={"year": "N/A", "type": "N/A", "situation": "N/A"},
+            desc="GOIAS | get_doc_info",
+        )
+        for result in valid_results:
+            if result:
+                docs.append(result)
 
         return docs
 
-    def _scrape_year(self, year: int) -> List[Dict]:
+    async def _scrape_year(self, year: int) -> list[dict]:
         """Scrape norms for a specific year"""
-        all_results = []
 
-        for norm_type, norm_type_data in tqdm(
-            self.types.items(),
-            desc=f"GOIAS | Year: {year} | Types",
-            total=len(self.types),
-            disable=not self.verbose,
-        ):
+        async def _scrape_type(norm_type: str, norm_type_data: dict) -> list[dict]:
+            """Scrape a single document type for the given year."""
             norm_type_id = norm_type_data["id"]
-            url = self._format_search_url(norm_type_id, year, 0)
-            response = self._make_request(url)
+            url = self._build_search_url(norm_type_id, year, 0)
+            response = await self.request_service.make_request(url)
 
             if not response:
-                print(f"Error getting data for Year: {year} | Type: {norm_type}")
-                continue
+                logger.error(f"Error getting data for Year: {year} | Type: {norm_type}")
+                return []
 
-            data = response.json()
+            data = await response.json()
             total_results = data["total_resultados"]
 
             if total_results == 0:
-                continue
+                return []
 
             pages = total_results // 100 + 1
 
             # get all norms
             results = []
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                futures = [
-                    executor.submit(
-                        self._get_doc_data,
-                        self._format_search_url(norm_type_id, year, page),
-                        norm_type_data["url_suffix"],
-                    )
-                    for page in range(1, pages + 1)
-                ]
+            tasks = [
+                self._get_doc_data(
+                    self._build_search_url(norm_type_id, year, page),
+                    norm_type_data["url_suffix"],
+                )
+                for page in range(1, pages + 1)
+            ]
+            valid_results = await self._gather_results(
+                tasks,
+                context={"year": year, "type": norm_type, "situation": "N/A"},
+                desc=f"GOIAS | {norm_type}",
+            )
+            for result in valid_results:
+                if not result:
+                    continue
+                for norm in result:
+                    queue_item = {"year": year, "type": norm_type, **norm}
+                    results.append(queue_item)
 
-                for future in tqdm(
-                    as_completed(futures),
-                    desc="GOIAS | Get document data",
-                    total=len(futures),
-                    disable=not self.verbose,
-                ):
+            return results
 
-                    try:
-                        norms = future.result()
-                        if not norms:
-                            continue
+        # Scrape all types concurrently
+        tasks = [_scrape_type(nt, ntd) for nt, ntd in self.types.items()]
+        all_type_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                        for norm in norms:
-                            # save to results
-                            queue_item = {
-                                "year": year,
-                                "type": norm_type,
-                                **norm,
-                            }
-                            results.append(queue_item)
-
-                    except Exception as e:
-                        print(f"Error getting document data | Error: {e}")
-
-            all_results.extend(results)
-            self.results.extend(results)
+        # Flatten results and handle errors
+        all_results = []
+        for type_result in all_type_results:
+            if isinstance(type_result, Exception):
+                logger.error(f"Error scraping type for year {year}: {type_result}")
+                continue
+            all_results.extend(type_result)
 
         return all_results

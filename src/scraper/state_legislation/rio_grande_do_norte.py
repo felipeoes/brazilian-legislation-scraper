@@ -1,12 +1,11 @@
+import asyncio
+import time
 from typing import Optional
 from urllib.parse import urlencode
 
-import requests
 from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
-from src.scraper.base.scraper import BaseScaper, YEAR_START
-from src.database.saver import FileSaver
+from loguru import logger
+from src.scraper.base.scraper import BaseScraper
 
 TYPES = {
     "Lei Ordinária": "lei ord",
@@ -23,7 +22,7 @@ INVALID_SITUATIONS = []
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class RNAlrnScraper(BaseScaper):
+class RNAlrnScraper(BaseScraper):
     """Webscraper for Rio Grande do Norte state legislation website (https://www.al.rn.leg.br/legislacao/pesquisa)
 
     Example search request: https://www.al.rn.leg.br/legislacao/pesquisa?tipo=nome&nome=lei%20ord&page=4
@@ -40,28 +39,36 @@ class RNAlrnScraper(BaseScaper):
         base_url: str = "https://www.al.rn.leg.br",
         **kwargs,
     ):
-        super().__init__(base_url, types=TYPES, situations=SITUATIONS, **kwargs)
-        self.docs_save_dir = self.docs_save_dir / "RIO_GRANDE_DO_NORTE"
-        self.params = {
+        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
+
+        if STATE_LEGISLATION_SAVE_DIR:
+            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
+        super().__init__(
+            base_url,
+            types=TYPES,
+            situations=SITUATIONS,
+            name="RIO_GRANDE_DO_NORTE",
+            **kwargs,
+        )
+
+    def _build_search_url(self, norm_type_id: str, page: int) -> str:
+        """Build search URL from arguments (no shared state mutation)."""
+        params = {
             "tipo": "nome",
-            "nome": "",
-            "page": 1,
+            "nome": norm_type_id,
+            "page": page,
         }
-        # Initialize the FileSaver
-        self.saver = FileSaver(self.docs_save_dir)
+        return f"{self.base_url}/legislacao/pesquisa?{urlencode(params)}"
 
-    def _format_search_url(self, norm_type_id: int, page: int) -> str:
-        self.params["nome"] = norm_type_id
-        self.params["page"] = page
-
-        return f"{self.base_url}/legislacao/pesquisa?{urlencode(self.params)}"
-
-    def _get_docs_links(self, url: str) -> list:
+    async def _get_docs_links(self, url: str) -> list:
         """Get documents html links from given page.
         Returns a list of dicts with keys 'title', 'summary', 'html_link'
         """
-        response = self._make_request(url)
-        soup = BeautifulSoup(response.content, "html.parser")
+        response = await self.request_service.make_request(url)
+        if response is None:
+            logger.warning(f"No response for url: {url}")
+            return []
+        soup = BeautifulSoup(await response.read(), "html.parser")
 
         docs = []
 
@@ -69,7 +76,7 @@ class RNAlrnScraper(BaseScaper):
         items = table.find_all("tr")
 
         if not items:
-            print(f"Empty table for url: {url}")
+            logger.warning(f"Empty table for url: {url}")
 
         for item in items:
             tds = item.find_all("td")
@@ -94,18 +101,24 @@ class RNAlrnScraper(BaseScaper):
 
         return docs
 
-    def _get_doc_data(
+    async def _get_doc_data(
         self, doc_info: dict, pdf_len_threshold: int = 200
     ) -> Optional[dict]:
         """Get document data from given document dict"""
         # remove pdf_link from doc_info
         pdf_link = doc_info.pop("pdf_link")
-        response = self._make_request(pdf_link)
+        response = await self.request_service.make_request(pdf_link)
 
         if not response:
+            await self._save_doc_error(
+                title=doc_info.get("title", ""),
+                year=doc_info.get("year", ""),
+                html_link=pdf_link,
+                error_message="Failed to download PDF",
+            )
             return None
 
-        text_markdown = self._get_markdown(response=response)
+        text_markdown = await self._get_markdown(response=response)
 
         if (
             not text_markdown
@@ -113,11 +126,17 @@ class RNAlrnScraper(BaseScaper):
             or len(text_markdown.strip()) < pdf_len_threshold
         ):
             # probably image pdf
-            text_markdown = self._get_pdf_image_markdown(response.content)
+            text_markdown = await self._get_pdf_image_markdown(await response.read())
 
         if (
             not text_markdown or not text_markdown.strip()
         ):  # indeed an invalid or unavailable pdf
+            await self._save_doc_error(
+                title=doc_info.get("title", ""),
+                year=doc_info.get("year", ""),
+                html_link=pdf_link,
+                error_message="Empty markdown from PDF",
+            )
             return None
 
         doc_info["text_markdown"] = text_markdown.strip()
@@ -125,9 +144,12 @@ class RNAlrnScraper(BaseScaper):
 
         return doc_info
 
-    def _scrape_norms(self, norm_type: str, norm_type_id: str, situation: str) -> list:
-        url = self._format_search_url(norm_type_id, 1)
-        soup = self._get_soup(url)
+    async def _scrape_situation_type(
+        self, situation: str, norm_type: str, norm_type_id: str
+    ) -> list:
+        """Scrape norms for a specific situation and type"""
+        url = self._build_search_url(norm_type_id, 1)
+        soup = await self.request_service.get_soup(url)
 
         total_pages = soup.find("ul", class_="pagination")
         if not total_pages:  # must have only one page
@@ -139,89 +161,71 @@ class RNAlrnScraper(BaseScaper):
         # Get documents html links
         documents = []
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = [
-                executor.submit(
-                    self._get_docs_links,
-                    self._format_search_url(norm_type_id, page),
-                )
-                for page in range(1, total_pages + 1)
-            ]
-
-            for future in tqdm(
-                as_completed(futures),
-                total=len(futures),
-                desc="RIO GRANDE DO NORTE | Get document link",
-                disable=not self.verbose,
-            ):
-                docs = future.result()
-                if docs:
-                    documents.extend(docs)
+        tasks = [
+            self._get_docs_links(
+                self._build_search_url(norm_type_id, page),
+            )
+            for page in range(1, total_pages + 1)
+        ]
+        valid_results = await self._gather_results(
+            tasks,
+            context={"year": "N/A", "type": norm_type, "situation": situation},
+            desc=f"RIO GRANDE DO NORTE | {norm_type} | get_docs_links",
+        )
+        for result in valid_results:
+            if result:
+                documents.extend(result)
 
         # Get document data
         results = []
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = [
-                executor.submit(self._get_doc_data, doc_info) for doc_info in documents
-            ]
-            for future in tqdm(
-                as_completed(futures),
-                total=len(documents),
-                desc="RIO GRANDE DO NORTE | Get document data",
-                disable=not self.verbose,
-            ):
+        tasks = [self._get_doc_data(doc_info) for doc_info in documents]
+        valid_results = await self._gather_results(
+            tasks,
+            context={"year": "N/A", "type": norm_type, "situation": situation},
+            desc=f"RIO GRANDE DO NORTE | {norm_type}",
+        )
+        for result in valid_results:
+            if result:
+                # prepare item for saving
+                queue_item = {
+                    # hardcode since we only get valid documents in search request
+                    "situation": situation,
+                    "type": norm_type,
+                    **result,
+                }
 
-                try:
-                    result = future.result()
-
-                    if result:
-                        # prepare item for saving
-                        queue_item = {
-                            # hardcode since we only get valid documents in search request
-                            "situation": situation,
-                            "type": norm_type,
-                            **result,
-                        }
-
-                        results.append(queue_item)
-                    else:
-                        print("Invalid document returned from get_doc_data")
-                except Exception as e:
-                    print(f"Error getting document data: {e}")
-
-        self.results.extend(results)
-        self.count += len(results)
+                results.append(queue_item)
+            else:
+                logger.warning("Invalid document returned from get_doc_data")
 
         if self.verbose:
-            print(
-                f"Finished scraping for Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
+            logger.info(
+                f"Finished scraping for Situation: {situation} | Type: {norm_type} | Results: {len(results)}"
             )
 
         return results
 
-    def scrape(self) -> list:
-        """Scrape data from all years"""
+    async def scrape(self) -> list:
+        """Scrape data from all types and situations"""
 
-        all_results = []
-        
+        await self._ensure_session()
+        self._scrape_start = time.time()
+
         # scrape data
-        for situation in tqdm(
-            self.situations,
-            desc="RIO GRANDE DO NORTE | Situations",
-            total=len(self.situations),
-            disable=not self.verbose,
-        ):
-            for norm_type, norm_type_id in tqdm(
-                self.types.items(),
-                desc="RIO GRANDE DO NORTE | Types",
-                total=len(self.types),
-                disable=not self.verbose,
-            ):
-                norms_results = self._scrape_norms(norm_type, norm_type_id, situation)
-                all_results.extend(norms_results)
+        tasks = [
+            self._scrape_situation_type(sit, nt, nt_id)
+            for sit in self.situations
+            for nt, nt_id in self.types.items()
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Save all results at the end
-        if all_results:
-            self.saver.save(all_results)
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"Error in _scrape_situation_type: {result}")
+            elif result:
+                await self.saver.save(result)
+                self.results.extend(result)
+                self.count += len(result)
 
-        return all_results
+        await self._save_summary()
+        return self.results

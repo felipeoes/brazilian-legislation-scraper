@@ -25,3 +25,33 @@ from .roraima import RoraimaAlpbScraper
 from .santa_catarina import SantaCatarinaScraper
 from .sergipe import SergipeLegsonScraper
 from .tocantins import TocantinsScraper
+
+__all__ = [
+    "AcreLegisScraper",
+    "AlagoasSefazScraper",
+    "AmapaAlapScraper",
+    "LegislaAMScraper",
+    "BahiaLegislaScraper",
+    "CearaAleceScraper",
+    "DFSinjScraper",
+    "ESAlesScraper",
+    "LegislaGoias",
+    "MaranhaoAlemaScraper",
+    "MSAlemsScraper",
+    "MTAlmtScraper",
+    "MGAlmgScraper",
+    "ParaAlepaScraper",
+    "ParaibaAlpbScraper",
+    "ParanaCVScraper",
+    "PernambucoAlepeScraper",
+    "PiauiAlpbScraper",
+    "SaoPauloAlespScraper",
+    "RJAlerjScraper",
+    "RNAlrnScraper",
+    "RSAlrsScraper",
+    "RondoniaCotelScraper",
+    "RoraimaAlpbScraper",
+    "SantaCatarinaScraper",
+    "SergipeLegsonScraper",
+    "TocantinsScraper",
+]

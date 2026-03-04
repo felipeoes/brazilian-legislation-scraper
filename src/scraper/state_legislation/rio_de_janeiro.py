@@ -1,19 +1,13 @@
+import asyncio
 import base64
 import re
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from io import BytesIO
-from typing import Any, Dict, List
+from typing import Any
 
-import requests
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
-from tqdm import tqdm
 
-from src.scraper.base.scraper import BaseScaper
-from src.database.saver import FileSaver
-
-load_dotenv()
+from src.scraper.base.scraper import BaseScraper
+from loguru import logger
 
 # obs: LeiComp = Lei Complementar; LeiOrd = Lei Ordinária;
 TYPES = [
@@ -34,7 +28,7 @@ INVALID_SITUATIONS = []
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class RJAlerjScraper(BaseScaper):
+class RJAlerjScraper(BaseScraper):
     """Webscraper for Alesp (Assembleia Legislativa do Rio de Janeiro) website (https://www.alerj.rj.gov.br/)
 
     Example search request: http://alerjln1.alerj.rj.gov.br/contlei.nsf/DecretoAnoInt?OpenForm&Start=1&Count=300
@@ -47,16 +41,23 @@ class RJAlerjScraper(BaseScaper):
         base_url: str = "http://alerjln1.alerj.rj.gov.br/contlei.nsf",
         **kwargs,
     ):
-        super().__init__(base_url, types=TYPES, situations=SITUATIONS, **kwargs)
+        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
+
+        if STATE_LEGISLATION_SAVE_DIR:
+            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
+        super().__init__(
+            base_url,
+            types=TYPES,
+            situations=SITUATIONS,
+            name="RIO_DE_JANEIRO",
+            **kwargs,
+        )
         self.params = {
             "OpenForm": "",
             "Start": 1,
             "Count": 500,
         }
-        self.docs_save_dir = self.docs_save_dir / "RIO_DE_JANEIRO"
         self.fetched_constitution = False
-        # Initialize the FileSaver
-        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(self, norm_type: str) -> str:
         """Format url for search request"""
@@ -64,7 +65,7 @@ class RJAlerjScraper(BaseScaper):
 
     def _get_docs_html_links(
         self, norm_type: str, soup: BeautifulSoup
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Get documents html links from soup object."""
         html_links = []
         for tr in soup.find_all("tr", valign="top"):
@@ -88,20 +89,27 @@ class RJAlerjScraper(BaseScaper):
             )
         return html_links
 
-    def _html_to_markdown(self, html_string: str) -> str:
+    async def _html_to_markdown(self, html_string: str) -> str:
         """Converts an HTML string to Markdown."""
         # Add <html><body> tags to the html string to avoid error with markdown conversion
         full_html = f"<html><body>{html_string}</body></html>"
-        buffer = BytesIO(full_html.encode())
-        return self._get_markdown(stream=buffer).strip()
+        return (await self._get_markdown(html_content=full_html)).strip()
 
-    def _get_doc_data(self, doc_info: dict) -> dict:
+    async def _get_doc_data(self, doc_info: dict) -> dict:
         """Get document data from given html link"""
         doc_html_link = doc_info["html_link"]
-        soup = self._get_soup(doc_html_link)
+        soup = await self.request_service.get_soup(doc_html_link)
 
         body = soup.body
         if not body:
+            await self._save_doc_error(
+                title=doc_info.get("title", "Unknown"),
+                year="",
+                situation="",
+                norm_type="",
+                html_link=doc_html_link,
+                error_message="Page body is empty",
+            )
             return None
 
         # Decompose all content after the main section
@@ -125,7 +133,7 @@ class RJAlerjScraper(BaseScaper):
         )
 
         html_string = body.prettify().replace("\n", "")
-        text_markdown = self._html_to_markdown(html_string)
+        text_markdown = await self._html_to_markdown(html_string)
 
         return {
             **doc_info,
@@ -157,10 +165,20 @@ class RJAlerjScraper(BaseScaper):
         for img_to_remove in soup.find_all("img"):
             img_to_remove.decompose()
 
-    def scrape_constitution(self):
+    async def _fetch_constitution_section(self, a_link) -> str | None:
+        """Fetch a single constitution section and return its HTML."""
+        section_url = self._build_constitution_section_url(a_link["data-role"])
+        section_soup = await self.request_service.get_soup(section_url)
+        self._clean_constitution_section_soup(section_soup)
+        content_div = section_soup.find("div", id="divConteudo")
+        if content_div:
+            return content_div.prettify().replace("\n", "")
+        return None
+
+    async def scrape_constitution(self):
         """Scrape constitution data"""
         constitution_url = "http://www3.alerj.rj.gov.br/lotus_notes/default.asp?id=73&url=L2NvbnN0ZXN0Lm5zZi9JbmRpY2VJbnQ/T3BlbkZvcm0mU3RhcnQ9MSZDb3VudD0zMDA="
-        soup = self._get_soup(constitution_url)
+        soup = await self.request_service.get_soup(constitution_url)
 
         a_links = [
             a
@@ -170,18 +188,12 @@ class RJAlerjScraper(BaseScaper):
             and "EMENDAS CONSTITUCIONAIS" not in a.text.strip().upper()
         ]
 
-        html_parts = []
-        for a_link in tqdm(a_links, desc="RJ - ALERJ | Constitution"):
-            section_url = self._build_constitution_section_url(a_link["data-role"])
-            section_soup = self._get_soup(section_url)
-            self._clean_constitution_section_soup(section_soup)
-
-            content_div = section_soup.find("div", id="divConteudo")
-            if content_div:
-                html_parts.append(content_div.prettify().replace("\n", ""))
+        tasks = [self._fetch_constitution_section(a) for a in a_links]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        html_parts = [r for r in results if isinstance(r, str)]
 
         html_string = "<hr/>".join(html_parts)
-        text_markdown = self._html_to_markdown(html_string)
+        text_markdown = await self._html_to_markdown(html_string)
 
         queue_item = {
             "year": 1989,
@@ -198,65 +210,48 @@ class RJAlerjScraper(BaseScaper):
         }
 
         self.queue.put(queue_item)
-        self.results.append(queue_item)
-        self.count += 1
         self.fetched_constitution = True
 
-    def _scrape_year(self, year: str) -> List[Dict]:
-        """Scrape data from given year"""
-        all_results = []
-        
-        for norm_type in tqdm(
-            self.types, desc=f"RJ - ALERJ | {year} | Types", total=len(self.types)
-        ):
-            if norm_type == "Constituição Estadual":
-                if not self.fetched_constitution:
-                    self.scrape_constitution()
-                continue
+    async def _scrape_type(self, norm_type: str, _norm_type_id, year: str) -> list[dict]:
+        """Scrape norms for a specific type in a year"""
+        if norm_type == "Constituição Estadual":
+            if not self.fetched_constitution:
+                await self.scrape_constitution()
+            return []
 
-            url = self._format_search_url(norm_type)
-            soup = self._get_soup(url)
+        url = self._format_search_url(norm_type)
+        soup = await self.request_service.get_soup(url)
 
-            if soup.find("tr", valign="top") is None:
-                continue
+        if soup.find("tr", valign="top") is None:
+            return []
 
-            img_item = soup.find("img", alt=f"Show details for {year}")
-            if not img_item:
-                continue
+        img_item = soup.find("img", alt=f"Show details for {year}")
+        if not img_item:
+            return []
 
-            year_item = img_item.find_parent("a")
-            if not year_item or not year_item.has_attr("href"):
-                continue
+        year_item = img_item.find_parent("a")
+        if not year_item or not year_item.has_attr("href"):
+            return []
 
-            year_url = urllib.parse.urljoin(url, year_item["href"])
-            soup = self._get_soup(year_url)
+        year_url = urllib.parse.urljoin(url, year_item["href"])
+        soup = await self.request_service.get_soup(year_url)
 
-            documents_html_links = self._get_docs_html_links(norm_type, soup)
+        documents_html_links = self._get_docs_html_links(norm_type, soup)
 
-            scraped_docs = []
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                future_to_doc = {
-                    executor.submit(self._get_doc_data, doc): doc
-                    for doc in documents_html_links
-                }
-                for future in tqdm(
-                    as_completed(future_to_doc),
-                    desc=f"RJ - ALERJ | {year} | {norm_type}",
-                    total=len(documents_html_links),
-                    leave=False,
-                ):
-                    result = future.result()
-                    if result:
-                        queue_item = {"year": year, "type": norm_type, **result}
-                        scraped_docs.append(queue_item)
+        tasks = [self._get_doc_data(doc) for doc in documents_html_links]
+        valid_results = await self._gather_results(
+            tasks,
+            context={"year": year, "type": norm_type, "situation": "N/A"},
+            desc=f"RJ - ALERJ | {norm_type}",
+        )
+        scraped_docs = []
+        for result in valid_results:
+            queue_item = {"year": year, "type": norm_type, **result}
+            scraped_docs.append(queue_item)
 
-            all_results.extend(scraped_docs)
-            self.results.extend(scraped_docs)
-            self.count += len(scraped_docs)
+        if self.verbose:
+            logger.info(f"Scraped {len(scraped_docs)} {norm_type} documents in {year}")
 
-            if self.verbose:
-                print(
-                    f"Scraped {len(scraped_docs)} {norm_type} documents in {year}"
-                )
-        
-        return all_results
+        return scraped_docs
+
+    # _scrape_year uses default from BaseScraper

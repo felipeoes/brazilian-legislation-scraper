@@ -1,14 +1,13 @@
 from typing import Optional
 from urllib.parse import urljoin
 
-import requests
+import aiohttp
+import ssl as ssl_module
 import re
-from io import BytesIO
 from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
-from src.scraper.base.scraper import BaseScaper
-from src.database.saver import FileSaver
+from loguru import logger
+from tenacity import retry, stop_after_attempt, wait_exponential
+from src.scraper.base.scraper import BaseScraper
 
 TYPES = {
     "Acórdão do Colegiado da Procuradoria": 18,
@@ -43,7 +42,7 @@ INVALID_SITUATIONS = {
 SITUATIONS = {**VALID_SITUATIONS, **INVALID_SITUATIONS}
 
 
-class ESAlesScraper(BaseScaper):
+class ESAlesScraper(BaseScraper):
     """Webscraper for Espirito Santo state legislation website (https://www3.al.es.gov.br/legislacao)
 
     Example search request: https://www3.al.es.gov.br/legislacao/consulta-legislacao.aspx?tipo=7&situacao=2&ano=2000&interno=1
@@ -54,103 +53,103 @@ class ESAlesScraper(BaseScaper):
         base_url: str = "https://www3.al.es.gov.br",
         **kwargs,
     ):
-        super().__init__(base_url, types=TYPES, situations=SITUATIONS, **kwargs)
-        self.docs_save_dir = self.docs_save_dir / "ESPIRITO_SANTO"
-        self.params = {"tipo": "", "situacao": "", "ano": "", "interno": 1}
-        self.reached_end_page = False
-        # Initialize the FileSaver
-        self.saver = FileSaver(self.docs_save_dir)
+        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
+
+        if STATE_LEGISLATION_SAVE_DIR:
+            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
+        super().__init__(
+            base_url,
+            name="ESPIRITO_SANTO",
+            types=TYPES,
+            situations=SITUATIONS,
+            **kwargs,
+        )
 
     def _format_search_url(
         self, norm_type_id: str, situation_id: str, year: int
     ) -> str:
         """Format url for search request"""
-        self.params["tipo"] = norm_type_id
-        self.params["situacao"] = situation_id
-        self.params["ano"] = year
-
         return f"{self.base_url}/legislacao/consulta-legislacao.aspx?tipo={norm_type_id}&situacao={situation_id}&ano={year}&interno=1"
 
-    def _get_page_html(self, url: str, page_number: int):
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=2, max=15),
+        reraise=True,
+    )
+    async def _get_page_html(self, url: str, page_number: int):
         """
-        Navigates to a specific page number using __doPostBack.
+        Navigates to a specific page number using __doPostBack with native async HTTP.
 
         Args:
             url: The initial URL of the page.
             page_number: The page number to navigate to (e.g., 1, 2, 3...).
 
         Returns:
-            The HTML content of the requested page as bytes, or None if an error occurs.
+            The HTML content of the requested page, or None if an error occurs.
         """
-        session = (
-            requests.Session()
-        )  # need to create a new session for each request in order to make the logic work
+        ssl_ctx = ssl_module.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl_module.CERT_NONE
 
-        retries = 3
-        for attempt in range(retries):
-            try:
-                response = session.get(url, verify=False)
-                response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, ssl=ssl_ctx) as resp:
+                resp.raise_for_status()
+                content = await resp.read()
 
-                if response:
-                    break  # If the request is successful, exit the loop
-            except requests.exceptions.RequestException as e:
-                print(f"Attempt {attempt + 1} failed: {e}")
-                if attempt == retries - 1:
-                    print("Max retries reached. Exiting.")
-                    return None
+            soup = BeautifulSoup(content, "html.parser")
 
-        soup = BeautifulSoup(response.content, "html.parser")
+            if page_number == 1:
+                return soup.prettify()
 
-        if page_number == 1:  # don't need to post back for page 1
-            return soup.prettify()
+            viewstate = soup.find(id="__VIEWSTATE")
+            eventvalidation = soup.find(id="__EVENTVALIDATION")
 
-        viewstate = soup.find(id="__VIEWSTATE")
-        eventvalidation = soup.find(id="__EVENTVALIDATION")
+            if not viewstate or not eventvalidation:
+                logger.error(
+                    "Error: __VIEWSTATE or __EVENTVALIDATION not found on the page."
+                )
+                return None
 
-        if not viewstate or not eventvalidation:
-            print("Error: __VIEWSTATE or __EVENTVALIDATION not found on the page.")
-            return None
+            viewstate_value = viewstate["value"]
+            eventvalidation_value = eventvalidation["value"]
 
-        viewstate_value = viewstate["value"]
-        eventvalidation_value = eventvalidation["value"]
+            if page_number <= 1:
+                logger.error("Error: Page number must be greater than or equal to 1.")
+                return None
 
-        if page_number > 1:
-            # Construct the event target for specific page number
             page_index = page_number - 1
-            event_target = f"ctl00$ContentPlaceHolder1$rptPaging$ctl{page_index:02d}$lbPaging"  # Using :02d to
-        else:
-            print("Error: Page number must be greater than or equal to 1.")
-            return None
-
-        post_data = {
-            "__EVENTTARGET": event_target,
-            "__EVENTARGUMENT": "",
-            "__VIEWSTATE": viewstate_value,
-            "__EVENTVALIDATION": eventvalidation_value,
-            # Include other necessary form data if needed
-        }
-
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:94.0) Gecko/20100101 Firefox/94.0",  # Optional: Mimic a browser
-        }
-
-        try:
-            page_response = session.post(
-                url, data=post_data, headers=headers, verify=False
+            event_target = (
+                f"ctl00$ContentPlaceHolder1$rptPaging$ctl{page_index:02d}$lbPaging"
             )
-            page_response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-            return page_response.content
-        except requests.exceptions.RequestException as e:
-            print(f"Error fetching page {page_number}: {e}")
-            return None
 
-    def _get_docs_links(self, url: str, page: int) -> list:
+            post_data = {
+                "__EVENTTARGET": event_target,
+                "__EVENTARGUMENT": "",
+                "__VIEWSTATE": viewstate_value,
+                "__EVENTVALIDATION": eventvalidation_value,
+            }
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:94.0) Gecko/20100101 Firefox/94.0",
+            }
+
+            try:
+                async with session.post(
+                    url, data=post_data, headers=headers, ssl=ssl_ctx
+                ) as page_resp:
+                    page_resp.raise_for_status()
+                    return await page_resp.read()
+            except aiohttp.ClientError as e:
+                logger.error(f"Error fetching page {page_number}: {e}")
+                return None
+
+    async def _get_docs_links(self, url: str, page: int) -> tuple[list, bool]:
         """Get documents html links from given page.
-        Returns a list of dicts with keys 'title', 'year', 'norm_number', 'summary', 'document_url'
+        Returns (docs, reached_end) where docs is a list of dicts and
+        reached_end indicates there are no more pages.
         """
 
-        page_html = self._get_page_html(url, page)
+        page_html = await self._get_page_html(url, page)
         soup = BeautifulSoup(page_html, "html.parser")
         docs = []
 
@@ -160,20 +159,17 @@ class ESAlesScraper(BaseScaper):
 
         # if no items found, we reached the end of the page
         if not items:
-            self.reached_end_page = True
-            return []
+            return [], True
 
         # check if page number is not in pagination and is greater than last available page
         if page > 0:
             pagination = soup.find("div", class_="pagination pagination-custom")
             if not pagination:
-                self.reached_end_page = True
-                return []
+                return [], True
 
             last_available_page = int(pagination.find_all("a")[-2].text)
             if page > last_available_page:
-                self.reached_end_page = True
-                return []
+                return [], True
 
         for item in items:
             # get title
@@ -196,12 +192,12 @@ class ESAlesScraper(BaseScaper):
 
             if "processo.aspx?" in doc_link:
                 # this is a link to a process, not a document
-                print(f"Skipping '{title}' since it is a process link")
+                logger.info(f"Skipping '{title}' since it is a process link")
                 continue
 
             # skip docx links
             if doc_link.endswith(".docx"):
-                print(f"Skipping '{title}' since it is a docx document")
+                logger.info(f"Skipping '{title}' since it is a docx document")
                 continue
 
             docs.append(
@@ -214,9 +210,9 @@ class ESAlesScraper(BaseScaper):
                 }
             )
 
-        return docs
+        return docs, False
 
-    def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
+    async def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
         """Get document data from document link"""
         doc_link = doc_info.pop("doc_link")
         url = urljoin(self.base_url, doc_link)
@@ -227,34 +223,43 @@ class ESAlesScraper(BaseScaper):
 
         # if url ends with .pdf, get only text_markdown
         if url.endswith(".pdf"):
-            text_markdown = self._get_markdown(url)
+            text_markdown = await self._get_markdown(url=url)
 
             if not text_markdown:
                 # pdf may be an image
-                response = self._make_request(url)
+                response = await self.request_service.make_request(url)
                 if not response:
-                    print(f"Failed to download PDF from URL: {url}")
+                    logger.error(f"Failed to download PDF from URL: {url}")
+                    await self._save_doc_error(
+                        title=doc_info.get("title", ""),
+                        year=doc_info.get("year", ""),
+                        html_link=url,
+                        error_message="Failed to download PDF",
+                    )
                     return None
 
-                text_markdown = self._get_pdf_image_markdown(response.content)
+                pdf_content = await response.read()
+                text_markdown = await self._get_pdf_image_markdown(pdf_content)
 
             doc_info["html_string"] = ""
             doc_info["text_markdown"] = text_markdown
             doc_info["document_url"] = url
             return doc_info
 
-        soup = self._get_soup(url)
+        soup = await self.request_service.get_soup(url)
         if not soup:
-            print(f"Failed to get soup for URL: {url}")
+            logger.error(f"Failed to get soup for URL: {url}")
+            await self._save_doc_error(
+                title=doc_info.get("title", ""),
+                year=doc_info.get("year", ""),
+                html_link=url,
+                error_message="Failed to get document page",
+            )
             return None
 
         html_string = soup.prettify()
 
-        buffer = BytesIO()
-        buffer.write(html_string.encode())
-        buffer.seek(0)
-
-        text_markdown = self._get_markdown(stream=buffer)
+        text_markdown = await self._get_markdown(html_content=html_string)
 
         doc_info["html_string"] = html_string
         doc_info["text_markdown"] = text_markdown
@@ -262,90 +267,90 @@ class ESAlesScraper(BaseScaper):
 
         return doc_info
 
-    def _scrape_year(self, year: int) -> list:
+    async def _scrape_situation_type(
+        self,
+        year: int,
+        situation: str,
+        situation_id: int,
+        norm_type: str,
+        norm_type_id: int,
+    ) -> list:
+        """Scrape norms for a specific situation and type"""
+        # total pages info is not available, so we need to check if the page is empty. In order to make parallel calls, we will assume an initial number of pages and increase if needed. We will know that all the pages were scraped when we request a page and it shows a error message
+
+        total_pages = 10
+        reached_end_page = False
+
+        # Get documents html links
+        documents = []
+        start_page = 1
+        while not reached_end_page:
+            tasks = [
+                self._get_docs_links(
+                    self._format_search_url(norm_type_id, situation_id, year),
+                    page,
+                )
+                for page in range(start_page, total_pages + 1)
+            ]
+            valid_results = await self._gather_results(
+                tasks,
+                context={
+                    "year": year,
+                    "type": norm_type,
+                    "situation": situation,
+                },
+                desc=f"ESPIRITO SANTO | {norm_type} | get_docs_links",
+            )
+            for result in valid_results:
+                docs, ended = result
+                if ended:
+                    reached_end_page = True
+                if docs:
+                    documents.extend(docs)
+
+            start_page += total_pages
+            total_pages += 10
+
+        # Get document data
+        results = []
+        tasks = [self._get_doc_data(doc_info) for doc_info in documents]
+        valid_results = await self._gather_results(
+            tasks,
+            context={"year": year, "type": norm_type, "situation": situation},
+            desc=f"ESPIRITO SANTO | {norm_type}",
+        )
+        for result in valid_results:
+            queue_item = {
+                "year": year,
+                "situation": situation,
+                "type": norm_type,
+                **result,
+            }
+            results.append(queue_item)
+
+        if self.verbose:
+            logger.info(
+                f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)}"
+            )
+
+        return results
+
+    async def _scrape_year(self, year: int) -> list:
         """Scrape norms for a specific year"""
-        all_results = []
-
-        for situation, situation_id in tqdm(
-            self.situations.items(),
-            desc="ESPIRITO SANTO | Situations",
-            total=len(self.situations),
-            disable=not self.verbose,
-        ):
-            for norm_type, norm_type_id in tqdm(
-                self.types.items(),
-                desc=f"ESPIRITO SANTO | Year: {year} | Types",
-                total=len(self.types),
-                disable=not self.verbose,
-            ):
-
-                # total pages info is not available, so we need to check if the page is empty. In order to make parallel calls, we will assume an initial number of pages and increase if needed. We will know that all the pages were scraped when we request a page and it shows a error message
-
-                total_pages = 10
-                self.reached_end_page = False
-
-                # Get documents html links
-                documents = []
-                start_page = 1
-                while not self.reached_end_page:
-                    with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                        futures = [
-                            executor.submit(
-                                self._get_docs_links,
-                                self._format_search_url(
-                                    norm_type_id, situation_id, year
-                                ),
-                                page,
-                            )
-                            for page in range(start_page, total_pages + 1)
-                        ]
-                    for future in tqdm(
-                        as_completed(futures),
-                        total=total_pages - start_page + 1,
-                        desc="ESPIRITO SANTO | Get document link",
-                        disable=not self.verbose,
-                    ):
-                        docs = future.result()
-                        if docs:
-                            documents.extend(docs)
-
-                    start_page += total_pages
-                    total_pages += 10
-
-                # Get document data
-                results = []
-                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                    futures = [
-                        executor.submit(self._get_doc_data, doc_info)
-                        for doc_info in documents
-                    ]
-                    for future in tqdm(
-                        as_completed(futures),
-                        total=len(documents),
-                        desc="ESPIRITO SANTO | Get document data",
-                        disable=not self.verbose,
-                    ):
-                        result = future.result()
-                        if result is None:
-                            continue
-
-                        # prepare item for saving
-                        queue_item = {
-                            "year": year,
-                            # hardcode since we only get valid documents in search request
-                            "situation": situation,
-                            "type": norm_type,
-                            **result,
-                        }
-
-                        results.append(queue_item)
-
-                all_results.extend(results)
-                self.count += len(results)
-
-                if self.verbose:
-                    print(
-                        f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
-                    )
-
-        return all_results
+        tasks = [
+            self._scrape_situation_type(
+                year, situation, situation_id, norm_type, norm_type_id
+            )
+            for situation, situation_id in self.situations.items()
+            for norm_type, norm_type_id in self.types.items()
+        ]
+        valid = await self._gather_results(
+            tasks,
+            context={"year": year, "type": "N/A", "situation": "N/A"},
+            desc=f"{self.name} | Year {year}",
+        )
+        return [
+            item
+            for result in valid
+            for item in (result if isinstance(result, list) else [result])
+        ]

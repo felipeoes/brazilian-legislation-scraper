@@ -1,14 +1,10 @@
 import re
-from typing import Optional, List, Dict
-from urllib.parse import urljoin, urlencode
+from typing import Optional
+from urllib.parse import urlencode
 
-import requests
 from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
-from src.scraper.base.scraper import BaseScaper
-from src.database.saver import FileSaver
-from io import BytesIO
+from src.scraper.base.scraper import BaseScraper
+from loguru import logger
 
 # ALRS does not have a type field, norm type is gotten while scraping
 TYPES = []
@@ -22,7 +18,7 @@ INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no lon
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class RSAlrsScraper(BaseScaper):
+class RSAlrsScraper(BaseScraper):
     """Webscraper for Rio Grande do Sul state legislation website (https://www.al.rs.gov.br/legis)
 
 
@@ -35,15 +31,28 @@ class RSAlrsScraper(BaseScaper):
         base_url: str = "https://www.al.rs.gov.br",
         **kwargs,
     ):
-        super().__init__(base_url, types=TYPES, situations=SITUATIONS, **kwargs)
-        self.docs_save_dir = self.docs_save_dir / "RIO_GRANDE_DO_SUL"
-        self.params = {
+        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
+
+        if STATE_LEGISLATION_SAVE_DIR:
+            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
+        super().__init__(
+            base_url,
+            types=TYPES,
+            situations=SITUATIONS,
+            name="RIO_GRANDE_DO_SUL",
+            **kwargs,
+        )
+        self.fetched_constitution = False
+
+    def _build_search_url(self, year: int, page: int) -> str:
+        """Build search URL from arguments (no shared state mutation)."""
+        params = {
             "txthNRO_PROPOSICAO": "",
             "txthAdin": "",
             "txthQualquerPalavra": "",
             "cboTipoNorma": "",
             "TxtNumero_Norma": "",
-            "TxtAno": 1830,
+            "TxtAno": year,
             "txtData": "",
             "txtDataInicial": "",
             "txtDataFinal": "",
@@ -54,24 +63,16 @@ class RSAlrsScraper(BaseScaper):
             "cmbNumero_Docs": 50,
             "txtOrdenacao": "data",
             "txtOperacaoFormulario": "Pesquisar",
-            "pagina": 1,
+            "pagina": page,
         }
-        self.fetched_constitution = False
-        # Initialize the FileSaver
-        self.saver = FileSaver(self.docs_save_dir)
+        return f"{self.base_url}/legis/M010/M0100008.asp?{urlencode(params)}"
 
-    def _format_search_url(self, year: int, page: int) -> str:
-        self.params["TxtAno"] = year
-        self.params["pagina"] = page
-
-        return f"{self.base_url}/legis/M010/M0100008.asp?{urlencode(self.params)}"
-
-    def _get_docs_links(self, url: str) -> list:
+    async def _get_docs_links(self, url: str) -> list:
         """Get documents html links from given page.
         Returns a list of dicts with keys 'type', 'title', 'date',  'summary', 'html_link'
         """
 
-        soup = self._get_soup(url)
+        soup = await self.request_service.get_soup(url)
         table = soup.find("table", class_="TableResultado")
         items = table.find_all("tr")
 
@@ -131,16 +132,24 @@ class RSAlrsScraper(BaseScaper):
 
         return html_string
 
-    def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
+    async def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
         """Get document data from given document dict"""
 
         # remove html_link from doc_info
         html_link = doc_info.pop("html_link")
-        soup = self._get_soup(html_link)
+        soup = await self.request_service.get_soup(html_link)
 
         # check for error (some documents are not available)
         if not soup or "a página não pode ser exibida" in soup.prettify().lower():
-            print(f"Error getting document data: {html_link}")
+            logger.error(f"Error getting document data: {html_link}")
+            await self._save_doc_error(
+                title=doc_info.get("title", "Unknown"),
+                year="",
+                situation="",
+                norm_type=doc_info.get("type", ""),
+                html_link=html_link,
+                error_message="Page could not be displayed or soup is None",
+            )
             return None
 
         # get situation, subject and pdf_link.
@@ -163,7 +172,7 @@ class RSAlrsScraper(BaseScaper):
         # <iframe name=txt_Texto_teste src='https://ww3.al.rs.gov.br/filerepository/repLegis/arquivos/DECR IMP SN 1830 S FRANCISCO.pdf' width=100% height=100% frameborder=0></iframe>
 
         # get text from pdf ( need to make a requst to html and get pdf link from iframe)
-        soup = self._get_soup(html_link)
+        soup = await self.request_service.get_soup(html_link)
 
         # invalid norm
         if (
@@ -171,16 +180,21 @@ class RSAlrsScraper(BaseScaper):
             or "norma sem texto" in soup.prettify().lower()
             or "sem texto para exibi" in soup.prettify().lower()
         ):
+            await self._save_doc_error(
+                title=doc_info.get("title", "Unknown"),
+                year="",
+                situation="",
+                norm_type=doc_info.get("type", ""),
+                html_link=html_link,
+                error_message="Norm has no text content",
+            )
             return None
 
         pdf_link = None
         html_string = self._get_html_string(soup)
         if html_string:
-            buffer = BytesIO()
-            buffer.write(html_string.encode())
-            buffer.seek(0)
-
-            text_markdown = self._get_markdown(stream=buffer)
+            # Use direct HTML content conversion
+            text_markdown = await self._get_markdown(html_content=html_string)
         else:
             pdf_link = soup.find("iframe")
             if pdf_link:
@@ -191,10 +205,18 @@ class RSAlrsScraper(BaseScaper):
                 pdf_link = re.search(r"window\.open\('([^']+)'", soup.prettify())
                 pdf_link = pdf_link.group(1)
 
-            text_markdown = self._get_markdown(pdf_link)
+            text_markdown = await self._get_markdown(pdf_link)
 
         if not text_markdown or not text_markdown.strip():
-            print(f"Error getting markdown from pdf: {pdf_link}")
+            logger.error(f"Error getting markdown from pdf: {pdf_link}")
+            await self._save_doc_error(
+                title=doc_info.get("title", "Unknown"),
+                year="",
+                situation="",
+                norm_type=doc_info.get("type", ""),
+                html_link=pdf_link if pdf_link else html_link,
+                error_message="Failed to extract markdown from document",
+            )
             return None
 
         return {
@@ -206,13 +228,13 @@ class RSAlrsScraper(BaseScaper):
             "document_url": pdf_link if pdf_link else html_link,
         }
 
-    def scrape_constitution(self):
+    async def scrape_constitution(self):
         """Scrape constitution data"""
         url = "https://ww2.al.rs.gov.br/dal/LinkClick.aspx?fileticket=9p-X_3esaNg%3d&tabid=3683&mid=5358"
 
-        text_markdown = self._get_markdown(url)
+        text_markdown = await self._get_markdown(url)
         if not text_markdown or not text_markdown.strip():
-            print("Error getting markdown for state constitution")
+            logger.error("Error getting markdown for state constitution")
             return None
 
         # save to one drive
@@ -228,100 +250,69 @@ class RSAlrsScraper(BaseScaper):
         }
 
         self.queue.put(queue_item)
-        self.results.append(queue_item)
-        self.count += 1
 
         self.fetched_constitution = True
 
-    def _scrape_year(self, year: int) -> List[Dict]:
+    async def _scrape_year(self, year: int) -> list[dict]:
         """Scrape norms for a specific year"""
-        all_results = []
-        
-        for situation in tqdm(
-            self.situations,
-            desc="RIO GRANDE DO SUL | Situations",
-            total=len(self.situations),
-            disable=not self.verbose,
-        ):
+        if not self.fetched_constitution:
+            await self.scrape_constitution()
 
-            if not self.fetched_constitution:
-                self.scrape_constitution()
-                continue
+        # get total pages
+        url = self._build_search_url(year, 1)
+        soup = await self.request_service.get_soup(url)
 
-            # get total pages
-            url = self._format_search_url(year, 1)
-            soup = self._get_soup(url)
+        total_pages = soup.find("img", alt="Última Página")
+        if total_pages:
+            total_pages = total_pages.find_parent("a")
+            total_pages = int(total_pages["href"].split("txtPage=")[-1].split("&")[0])
+        else:
+            total_pages = 0  # no documents for this year
 
-            total_pages = soup.find("img", alt="Última Página")
-            if total_pages:
-                total_pages = total_pages.find_parent("a")
-                total_pages = int(
-                    total_pages["href"].split("txtPage=")[-1].split("&")[0]
-                )
-            else:
-                total_pages = 0  # no documents for this year
+        # Get documents html links
+        tasks = [
+            self._get_docs_links(
+                self._build_search_url(year, page),
+            )
+            for page in range(1, total_pages + 1)
+        ]
+        valid_results = await self._gather_results(
+            tasks,
+            context={"year": year, "type": "N/A", "situation": "N/A"},
+            desc="RIO GRANDE DO SUL | get_docs_links",
+        )
+        documents = []
+        for result in valid_results:
+            documents.extend(result)
 
-            # Get documents html links
-            documents = []
+        # get all norms
+        tasks = [
+            self._get_doc_data(
+                doc_info,
+            )
+            for doc_info in documents
+        ]
+        valid_results = await self._gather_results(
+            tasks,
+            context={"year": year, "type": "N/A", "situation": "N/A"},
+            desc="RIO GRANDE DO SUL",
+        )
+        results = []
+        for result in valid_results:
+            # save to results
+            queue_item = {
+                **result,
+                "year": year,
+                "situation": (
+                    result["situation"] if result.get("situation") else "Não consta"
+                ),
+            }
 
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                futures = [
-                    executor.submit(
-                        self._get_docs_links,
-                        self._format_search_url(year, page),
-                    )
-                    for page in range(1, total_pages + 1)
-                ]
+            results.append(queue_item)
 
-                for future in tqdm(
-                    as_completed(futures),
-                    total=len(futures),
-                    desc="RIO GRANDE DO SUL | Get document link",
-                    disable=not self.verbose,
-                ):
-                    docs = future.result()
-                    if docs:
-                        documents.extend(docs)
+        if self.verbose:
+            logger.info(
+                f"Finished scraping for Year: {year} | Results: {len(results)} | Total: {self.count}"
+            )
 
-            # get all norms
-            results = []
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                futures = [
-                    executor.submit(
-                        self._get_doc_data,
-                        doc_info,
-                    )
-                    for doc_info in documents
-                ]
-
-                for future in tqdm(
-                    as_completed(futures),
-                    desc="RIO GRANDE DO SUL | Get document data",
-                    total=len(futures),
-                    disable=not self.verbose,
-                ):
-                    norm = future.result()
-                    if not norm:
-                        continue
-
-                    # save to results
-                    queue_item = {
-                        **norm,
-                        "year": year,
-                        "situation": (
-                            norm["situation"] if norm.get("situation") else "Não consta"
-                        ),
-                    }
-
-                    results.append(queue_item)
-
-            all_results.extend(results)
-            self.results.extend(results)
-            self.count += len(results)
-
-            if self.verbose:
-                print(
-                    f"Finished scraping for Year: {year} | Results: {len(results)} | Total: {self.count}"
-                )
-        
-        return all_results
+        return results

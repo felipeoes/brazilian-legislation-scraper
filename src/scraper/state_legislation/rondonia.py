@@ -1,13 +1,10 @@
-import re
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, Any, List, Optional
+from typing import Any, Optional
 from urllib.parse import urljoin
 
-from bs4 import BeautifulSoup, Tag
-from tqdm import tqdm
-from src.scraper.base.scraper import BaseScaper
-from src.database.saver import FileSaver
+from bs4 import Tag
+from loguru import logger
+from src.scraper.base.scraper import BaseScraper
 
 
 TYPES = {
@@ -21,7 +18,7 @@ TYPES = {
 SITUATIONS = []
 
 
-class RondoniaCotelScraper(BaseScaper):
+class RondoniaCotelScraper(BaseScraper):
     """Webscraper for Rondônia state legislation website (http://ditel.casacivil.ro.gov.br/)
 
     Example search request: http://ditel.casacivil.ro.gov.br/COTEL/Livros/listdeclei.aspx?ano=2025
@@ -32,18 +29,22 @@ class RondoniaCotelScraper(BaseScaper):
         base_url: str = "http://ditel.casacivil.ro.gov.br/COTEL",
         **kwargs: Any,
     ):
-        super().__init__(base_url, types=TYPES, situations=SITUATIONS, **kwargs)
-        self.docs_save_dir = self.docs_save_dir / "RONDONIA"
-        self.saver = FileSaver(self.docs_save_dir)
-        self._fetch_constitution()
+        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
+
+        if STATE_LEGISLATION_SAVE_DIR:
+            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
+        super().__init__(
+            base_url, types=TYPES, situations=SITUATIONS, name="RONDONIA", **kwargs
+        )
+        self._constitution_fetched = False
 
     def _format_search_url(self, norm_type_id: str, year: int) -> str:
         """Format url for search request"""
         return f"{self.base_url}/Livros/list{norm_type_id}.aspx?ano={year}"
 
-    def _get_docs_links(self, url: str) -> list:
+    async def _get_docs_links(self, url: str) -> list:
         """Get document links from search request."""
-        soup = self._get_soup(url)
+        soup = await self.request_service.get_soup(url)
         docs = []
 
         if not soup:
@@ -133,15 +134,19 @@ class RondoniaCotelScraper(BaseScaper):
 
         return docs
 
-    def _process_pdf(
+    async def _process_pdf(
         self, pdf_link: str, pdf_len_threshold: int = 99
     ) -> Optional[dict]:
         """Process PDF and return text markdown."""
-        response = self._make_request(pdf_link)
-        if not response or not response.content:
+        response = await self.request_service.make_request(pdf_link)
+        if not response:
             return None
 
-        text_markdown = self._get_markdown(response=response)
+        content = await response.read()
+        if not content:
+            return None
+
+        text_markdown = await self._get_markdown(response=response)
 
         if text_markdown:
             text_markdown = text_markdown.strip()
@@ -151,7 +156,7 @@ class RondoniaCotelScraper(BaseScaper):
                     "document_url": pdf_link,
                 }
 
-        text_markdown = self._get_pdf_image_markdown(response.content)
+        text_markdown = await self._get_pdf_image_markdown(content)
         text_markdown = text_markdown.strip() if text_markdown else ""
         if not text_markdown or not len(text_markdown) > pdf_len_threshold:
             return None
@@ -161,22 +166,28 @@ class RondoniaCotelScraper(BaseScaper):
             "document_url": pdf_link,
         }
 
-    def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
+    async def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
         """Get document data"""
         pdf_link = doc_info.pop("pdf_link")
-        processed_pdf = self._process_pdf(pdf_link)
+        processed_pdf = await self._process_pdf(pdf_link)
 
         if processed_pdf is None:
+            await self._save_doc_error(
+                title=doc_info.get("title", ""),
+                year=doc_info.get("year", ""),
+                html_link=pdf_link,
+                error_message="Failed to process PDF",
+            )
             return None
 
         doc_info.update(processed_pdf)
         return doc_info
 
-    def _fetch_constitution(self):
+    async def _fetch_constitution(self):
         """Fetch the state constitution if available."""
         pdf_url = f"{self.base_url}/Livros/CE1989-2014.pdf"
 
-        text_markdown = self._get_markdown(url=pdf_url)
+        text_markdown = await self._get_markdown(url=pdf_url)
 
         doc_info = {
             "year": datetime.now().year,
@@ -189,62 +200,52 @@ class RondoniaCotelScraper(BaseScaper):
             "document_url": pdf_url,
         }
 
-        self.saver.save([doc_info])
+        await self.saver.save([doc_info])
         self.results.append(doc_info)
-        self.count += 1
-        print("Scraped state constitution")
+        if self.verbose:
+            logger.info("Scraped state constitution")
 
-    def _scrape_year(self, year: int) -> List[Dict]:
-        """Scrape norms for a specific year"""
-        all_results = []
-        
-        for norm_type, norm_type_id in tqdm(
-            self.types.items() if isinstance(self.types, dict) else [],
-            desc=f"RONDONIA | Year: {year} | Types",
-            total=len(self.types) if isinstance(self.types, dict) else 0,
-            disable=not self.verbose,
-        ):
-            url = self._format_search_url(norm_type_id, year)
+    async def _scrape_type(
+        self, norm_type: str, norm_type_id: str, year: int
+    ) -> list[dict]:
+        """Scrape norms for a specific type and year"""
+        url = self._format_search_url(norm_type_id, year)
 
-            try:
-                documents = self._get_docs_links(url)
+        try:
+            documents = await self._get_docs_links(url)
 
-                if not documents:
-                    continue
+            if not documents:
+                return []
 
-                # Process documents with threading
-                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                    doc_data_futures = [
-                        executor.submit(self._get_doc_data, doc_info)
-                        for doc_info in documents
-                    ]
+            # Process documents with asyncio
+            doc_data_tasks = [self._get_doc_data(doc_info) for doc_info in documents]
+            valid_results = await self._gather_results(
+                doc_data_tasks,
+                context={"year": year, "type": norm_type, "situation": "N/A"},
+                desc=f"RONDONIA | {norm_type}",
+            )
+            results = []
+            for result in valid_results:
+                if result:
+                    queue_item = {"year": year, "type": norm_type, **result}
+                    results.append(queue_item)
 
-                    results = []
-                    for future in tqdm(
-                        as_completed(doc_data_futures),
-                        desc="RONDONIA | Get document data",
-                        total=len(doc_data_futures),
-                        disable=not self.verbose,
-                    ):
-                        result = future.result()
-                        if result:
-                            queue_item = {"year": year, "type": norm_type, **result}
-                            results.append(queue_item)
+            if self.verbose:
+                logger.info(
+                    f"Finished scraping for Year: {year} | Type: {norm_type} | Results: {len(results)}"
+                )
 
-                all_results.extend(results)
-                self.results.extend(results)
-                self.count += len(results)
+            return results
 
-                if self.verbose:
-                    print(
-                        f"Finished scraping for Year: {year} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
-                    )
+        except Exception as e:
+            logger.error(
+                f"Error scraping Year: {year} | Type: {norm_type} | Error: {e}"
+            )
+            return []
 
-            except Exception as e:
-                if self.verbose:
-                    print(
-                        f"Error scraping Year: {year} | Type: {norm_type} | Error: {e}"
-                    )
-                continue
-        
-        return all_results
+    async def _scrape_year(self, year: int) -> list[dict]:
+        """Scrape norms for a specific year, fetching constitution on first call."""
+        if not self._constitution_fetched:
+            await self._fetch_constitution()
+            self._constitution_fetched = True
+        return await super()._scrape_year(year)

@@ -1,17 +1,18 @@
 from typing import Optional
 from urllib.parse import urljoin, urlencode
 
+import asyncio
 import re
+import time
 from datetime import datetime
 from bs4 import BeautifulSoup
-from io import BytesIO
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
-from src.scraper.base.scraper import BaseScaper, YEAR_START
+from loguru import logger
+from src.scraper.base.scraper import BaseScraper, YEAR_START
 
 TYPES = {
     "Ato Deliberativo": "ato-deliberativo",
     "Ato Normativo": "ato-normativo",
+    "Decreto Legislativo": "decleg/decleg.htm",  # HTML index, same scraping logic as Emenda/Lei Complementar
     "Emenda Constitucional": "legislacao5/const_e/ement.htm",  # lei complementar, lei ordinaria and emenda constitucional share the same scraping logic
     "Lei Complementar": "ementario/lc.htm",
     "Lei Ordinária": "lei_ordinaria.htm",
@@ -29,7 +30,7 @@ INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no lon
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class CearaAleceScraper(BaseScaper):
+class CearaAleceScraper(BaseScraper):
     """Webscraper for Ceara state legislation website (https://www.al.ce.gov.br/)
 
     Example search request: https://www.al.ce.gov.br/legislativo/leis-e-normativos-internos?categoria=ato-normativo&page=1
@@ -40,13 +41,17 @@ class CearaAleceScraper(BaseScaper):
         base_url: str = "https://www.al.ce.gov.br/legislativo",
         **kwargs,
     ):
-        super().__init__(base_url, types=TYPES, situations=SITUATIONS, **kwargs)
-        self.docs_save_dir = self.docs_save_dir / "CEARA"
+        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
+
+        if STATE_LEGISLATION_SAVE_DIR:
+            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
+        super().__init__(
+            base_url, name="CEARA", types=TYPES, situations=SITUATIONS, **kwargs
+        )
         self.params = {
             "categoria": "",
             "page": 1,
         }
-        self._initialize_saver()
 
     def _format_search_url(self, norm_type_id: str, page: int) -> str:
         """Format url for search request"""
@@ -54,12 +59,12 @@ class CearaAleceScraper(BaseScaper):
         self.params["page"] = page
         return f"{self.base_url}/leis-e-normativos-internos?{urlencode(self.params)}"
 
-    def _get_docs_links(self, norm_type: str, url: str) -> list:
+    async def _get_docs_links(self, norm_type: str, url: str) -> list:
         """Get documents html links from given page.
         Returns a list of dicts with keys 'title', 'year', 'norm_number', 'summary', 'document_url'
         """
 
-        soup = self._get_soup(url, timeout=60)
+        soup = await self.request_service.get_soup(url, timeout=60)
         docs = []
 
         # check if the page is empty
@@ -76,14 +81,14 @@ class CearaAleceScraper(BaseScaper):
         items = table.find_all("tr")
         for item in items:
             tds = item.find_all("td")
-            if len(tds) != 5:
+            if len(tds) != 6:
                 continue
 
             norm_number = tds[0].text.strip()
             year = norm_number.split("/")[1]
             title = norm_number
             summary = tds[2].text.strip()
-            document_url = tds[4].find("a")["href"]
+            document_url = tds[5].find("a")["href"]
             docs.append(
                 {
                     "title": f"{norm_type} {title}",
@@ -96,18 +101,20 @@ class CearaAleceScraper(BaseScaper):
 
         return docs
 
-    def _get_doc_data(self, doc_info: dict) -> dict:
+    async def _get_doc_data(self, doc_info: dict) -> dict:
         """Get document data from given document dict"""
         # document url will be a link to pdf document
-        text_markdown = self._get_markdown(doc_info["document_url"])
+        text_markdown = await self._get_markdown(url=doc_info["document_url"])
         doc_info["text_markdown"] = text_markdown
 
         return doc_info
 
-    def _scrape_norms(self, situation: str, norm_type: str, norm_type_id: str) -> list:
+    async def _scrape_situation_type_norms(
+        self, situation: str, norm_type: str, norm_type_id: str
+    ) -> list:
         """Scrape laws and norms from given situation and norm type"""
         url = self._format_search_url(norm_type_id, 1)
-        soup = self._get_soup(url, timeout=60)
+        soup = await self.request_service.get_soup(url, timeout=60)
 
         # get total pages
         pagination = soup.find("ul", class_="pagination")
@@ -119,77 +126,63 @@ class CearaAleceScraper(BaseScaper):
             total_pages = 1
 
         # Get documents html links
+        tasks = [
+            self._get_docs_links(
+                norm_type,
+                self._format_search_url(norm_type_id, page),
+            )
+            for page in range(1, total_pages + 1)
+        ]
+        valid_results = await self._gather_results(
+            tasks,
+            context={"year": "NA", "type": norm_type, "situation": situation},
+            desc=f"CEARA | {norm_type} | get_docs_links",
+        )
         documents = []
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = [
-                executor.submit(
-                    self._get_docs_links,
-                    norm_type,
-                    self._format_search_url(norm_type_id, page),
-                )
-                for page in range(1, total_pages + 1)
-            ]
-
-            for future in tqdm(
-                as_completed(futures),
-                total=total_pages,
-                desc="CEARA | Get document link",
-                disable=not self.verbose,
-            ):
-                try:
-                    docs = future.result()
-                    if docs:
-                        documents.extend(docs)
-                except Exception as e:
-                    print(f"Error getting document links: {e}")
-                    continue
+        for result in valid_results:
+            documents.extend(result)
 
         # Get document data
+        tasks = [self._get_doc_data(doc) for doc in documents]
+        valid_results = await self._gather_results(
+            tasks,
+            context={"year": "NA", "type": norm_type, "situation": situation},
+            desc=f"CEARA | {norm_type}",
+        )
         results = []
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = [executor.submit(self._get_doc_data, doc) for doc in documents]
+        for result in valid_results:
+            # prepare item for saving
+            queue_item = {
+                # hardcode since we only get valid documents in search request
+                "situation": situation,
+                "type": norm_type,
+                **result,
+            }
 
-            for future in tqdm(
-                as_completed(futures),
-                total=len(documents),
-                desc="CEARA | Get document data",
-                disable=not self.verbose,
-            ):
-                try:
-                    result = future.result()
-                    if result is None:
-                        continue
+            results.append(queue_item)
 
-                    # prepare item for saving
-                    queue_item = {
-                        # hardcode since we only get valid documents in search request
-                        "situation": situation,
-                        "type": norm_type,
-                        **result,
-                    }
-
-                    results.append(queue_item)
-                except Exception as e:
-                    print(f"Error getting document data: {e}")
-                    continue
-
-            self.results.extend(results)
-            self.count += len(results)
-
-            if self.verbose:
-                print(
-                    f"Finished scraping for | Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
-                )
+        if self.verbose:
+            logger.info(
+                f"Finished scraping for | Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
+            )
 
         return results
 
-    def _get_laws_constitution_amendments_docs_links(
+    async def _scrape_norms(
+        self, situation: str, norm_type: str, norm_type_id: str
+    ) -> list:
+        """Scrape laws and norms from given situation and norm type"""
+        return await self._scrape_situation_type_norms(
+            situation, norm_type, norm_type_id
+        )
+
+    async def _get_laws_constitution_amendments_docs_links(
         self, url: str, norm_type: str
     ) -> list:
         """Get documents html links from given page.
         Returns a list of dicts with keys 'title', 'year', 'summary', 'html_link'
         """
-        soup = self._get_soup(url)
+        soup = await self.request_service.get_soup(url)
         docs = []
 
         table = soup.find_all("table")
@@ -216,10 +209,18 @@ class CearaAleceScraper(BaseScaper):
             # don't need for lei ordinaria
             year = None
             if norm_type != "Lei Ordinária":
-                # regex to get year part directly (FORMATs: "DE 20.10.09",  "DE 20.10.2009", "DE 06/03/25" or "DE 06/03/2009")
-                year_text = re.search(
-                    r"\s+\d{2}\s*[./]\s*\d{2}\s*[./]\s*(\d{2}|\d{4})\b", title
-                ).group(1)
+                # regex to get year part directly (FORMATs: "DE 20.10.09", "DE 20.10.2009",
+                # "DE 06/03/25", "DE 06/03/2009", "N° 468, 2.06.2010", "DE 1°.07.2021")
+                year_match = re.search(
+                    r"[\s,]\d{1,2}°?[./]\d{1,2}[./](\d{2}|\d{4})\b", title
+                )
+                if not year_match:
+                    # fallback: any 4-digit year in valid century range
+                    year_match = re.search(r"\b((?:19|20)\d{2})\b", title)
+                if not year_match:
+                    logger.warning(f"Could not extract year from title '{title[:80]}' — skipping")
+                    continue
+                year_text = year_match.group(1)
 
                 if len(year_text) == 2:
                     year_now = datetime.now().year
@@ -243,8 +244,8 @@ class CearaAleceScraper(BaseScaper):
                     }
                 )
 
-            except Exception as e:
-                print(f"Error getting html link: {e}")
+            except Exception:
+                logger.warning(f"No link found for document '{title}' — skipping")
                 continue
 
         return docs
@@ -267,12 +268,14 @@ class CearaAleceScraper(BaseScaper):
 
         if norm_type == "Lei Complementar":
             base_url = "https://www2.al.ce.gov.br/legislativo/"
-            if not "ementario" in html_link:
+            if "ementario" not in html_link:
                 html_link = f"ementario/{html_link}"
+        elif norm_type == "Decreto Legislativo":
+            base_url = "https://www2.al.ce.gov.br/legislativo/decleg/"
         else:
             base_url = "https://www2.al.ce.gov.br/legislativo/legislacao5/"
             if norm_type == "Lei Ordinária":
-                if not "leis" in html_link:
+                if "leis" not in html_link:
                     year = year if year >= 2000 else str(year)[2:]
 
                     html_link = f"leis{year}/{html_link}"
@@ -290,7 +293,7 @@ class CearaAleceScraper(BaseScaper):
 
         return urljoin(base_url, html_link)
 
-    def _get_laws_constitution_amendments_doc_data(
+    async def _get_laws_constitution_amendments_doc_data(
         self, doc_info: dict, norm_type: str, year: Optional[int] = None
     ) -> Optional[dict]:
         """Get document data from given document dict"""
@@ -299,37 +302,61 @@ class CearaAleceScraper(BaseScaper):
         html_link = doc_info.pop("html_link")
         url = self.construct_url(norm_type, html_link, year)
 
-        response = self._make_request(url)
+        response = await self.request_service.make_request(url)
 
         if not response:
-            print(
+            logger.error(
                 f"Error fetching document page: {url}. Year: {year}. HTML link: {html_link}"
+            )
+            await self._save_doc_error(
+                title=doc_info.get("title", "Unknown"),
+                year=year or "",
+                situation="",
+                norm_type=norm_type,
+                html_link=url,
+                error_message="Failed to fetch document page",
             )
             return None
 
-        soup = BeautifulSoup(response.content, "html.parser")
+        soup = BeautifulSoup(await response.read(), "html.parser")
 
-        # remove <a href="javascript:%20history.back();"><b><span style="color:blue">VOLTAR</span></b></a>
-        voltar_link = soup.find("a", text=re.compile(r"^VOLTAR$", re.IGNORECASE))
-        if voltar_link:
-            voltar_link.decompose()
+        # Remove VOLTAR nav link (structure varies: <a><b>VOLTAR</b></a>, <a><span>VOLTAR</span></a>, etc.)
+        for a in soup.find_all("a"):
+            if a.get_text(strip=True).upper() == "VOLTAR":
+                a.decompose()
+
+        # Remove editorial disclaimer "O texto desta Lei não substitui o publicado no Diário Oficial"
+        # (text may contain \r\n linebreaks, so match on the opening phrase only)
+        for node in soup.find_all(string=re.compile(r"O texto desta Lei", re.IGNORECASE)):
+            node.parent.decompose()
 
         html_string = soup.prettify().strip()
 
         # check if invalid document
         if "NÄO EXISTE LEI COM ESTE NÚMERO".lower() in html_string.lower():
+            await self._save_doc_error(
+                title=doc_info.get("title", "Unknown"),
+                year=year or "",
+                situation="",
+                norm_type=norm_type,
+                html_link=url,
+                error_message="Invalid document (NÄO EXISTE LEI COM ESTE NÚMERO)",
+            )
             return None
 
-        buffer = BytesIO()
-        buffer.write(soup.html.encode())
-        buffer.seek(0)
-
-        text_markdown = self._get_markdown(stream=buffer)
-        # remove header
-        text_markdown = text_markdown.replace("**VOLTAR**", "").strip()
+        # Use direct HTML content conversion
+        text_markdown = await self._get_markdown(html_content=html_string)
 
         if not text_markdown:
-            print(f"Error converting document to markdown: {url}. Year: {year}")
+            logger.error(f"Error converting document to markdown: {url}. Year: {year}")
+            await self._save_doc_error(
+                title=doc_info.get("title", "Unknown"),
+                year=year or "",
+                situation="",
+                norm_type=norm_type,
+                html_link=url,
+                error_message="Markdown conversion returned empty result",
+            )
             return None
 
         doc_info["html_string"] = html_string
@@ -338,7 +365,7 @@ class CearaAleceScraper(BaseScaper):
 
         return doc_info
 
-    def _scrape_laws_constitution_amendments(
+    async def _scrape_laws_constitution_amendments(
         self, situation: str, norm_type: str, norm_type_id: str, year: int = None
     ):
         """Scrape constitution amendments"""
@@ -359,129 +386,132 @@ class CearaAleceScraper(BaseScaper):
         else:
             url = f"https://www2.al.ce.gov.br/legislativo/{norm_type_id}"
 
-        docs = self._get_laws_constitution_amendments_docs_links(url, norm_type)
+        docs = await self._get_laws_constitution_amendments_docs_links(url, norm_type)
 
+        tasks = [
+            self._get_laws_constitution_amendments_doc_data(
+                doc,
+                norm_type,
+                year,
+            )
+            for doc in docs
+        ]
+        valid_results = await self._gather_results(
+            tasks,
+            context={"year": year, "type": norm_type, "situation": situation},
+            desc=f"CEARA | {norm_type}",
+        )
         results = []
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = [
-                executor.submit(
-                    self._get_laws_constitution_amendments_doc_data,
-                    doc,
-                    norm_type,
-                    year,
-                )
-                for doc in docs
-            ]
+        for result in valid_results:
+            # prepare item for saving
+            queue_item = {
+                # hardcode since we only get valid documents in search request
+                "situation": situation,
+                "type": norm_type,
+                **result,
+            }
 
-            for future in tqdm(
-                as_completed(futures),
-                total=len(docs),
-                desc="CEARA | Get norms data",
-                disable=not self.verbose,
-            ):
-                result = future.result()
-                if result is None:
-                    continue
+            if queue_item["year"] is None:
+                queue_item["year"] = year
 
-                # prepare item for saving
-                queue_item = {
-                    # hardcode since we only get valid documents in search request
-                    "situation": situation,
-                    "type": norm_type,
-                    **result,
-                }
+            results.append(queue_item)
 
-                if queue_item["year"] is None:
-                    queue_item["year"] = year
-
-                results.append(queue_item)
-
-            self.results.extend(results)
-            self.count += len(results)
-
-            if self.verbose:
-                print(
-                    f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
-                )
+        if self.verbose:
+            logger.info(
+                f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
+            )
 
         return results
 
-    def _save_results(self, results: list):
+    async def _save_results(self, results: list):
         if results:
-            self.saver.save(results)
+            await self.saver.save(results)
 
-    def scrape(self) -> list:
+    async def scrape(self) -> list:
         """Scrape data from all years"""
+
+        self._scrape_start = time.time()
 
         # check if can resume from last scrapped year
         resume_from = self.year_start  # 1808
         forced_resume = self.year_start != YEAR_START
         if self.saver and self.saver.last_year is not None and not forced_resume:
-            print(f"Resuming from {self.saver.last_year}")
+            logger.info(f"Resuming from {self.saver.last_year}")
             resume_from = int(self.saver.last_year)
         else:
-            print(f"Starting from {resume_from}")
+            logger.info(f"Starting from {resume_from}")
 
-        # scrape data
-        for situation in tqdm(
-            self.situations,
-            desc="CEARA | Situations",
-            total=len(self.situations),
-            disable=not self.verbose,
-        ):
-            for norm_type, norm_type_id in tqdm(
-                self.types.items(),
-                desc="CEARA | Types",
-                total=len(self.types),
-                disable=not self.verbose,
-            ):
+        # Collect all tasks for concurrent execution
+        all_tasks = []
+        task_metadata = []
 
+        for situation in self.situations:
+            for norm_type, norm_type_id in self.types.items():
                 if norm_type in ["Ato Deliberativo", "Ato Normativo", "Resolução"]:
-                    results = self._scrape_norms(situation, norm_type, norm_type_id)
-                    self._save_results(results)
-                elif norm_type in [
-                    "Emenda Constitucional",
-                    "Lei Complementar",
-                ]:
-                    results = self._scrape_laws_constitution_amendments(
-                        situation, norm_type, norm_type_id
+                    all_tasks.append(
+                        self._scrape_situation_type_norms(
+                            situation, norm_type, norm_type_id
+                        )
                     )
-                    self._save_results(results)
+                    task_metadata.append(
+                        {"situation": situation, "norm_type": norm_type, "year": None}
+                    )
+                elif norm_type in ["Emenda Constitucional", "Lei Complementar", "Decreto Legislativo"]:
+                    all_tasks.append(
+                        self._scrape_laws_constitution_amendments(
+                            situation, norm_type, norm_type_id
+                        )
+                    )
+                    task_metadata.append(
+                        {"situation": situation, "norm_type": norm_type, "year": None}
+                    )
                 else:
-                    # get available years
+                    # For Lei Ordinária, we need to get available years first
+                    # This part remains sequential as it depends on fetching available years
                     url = f"https://www2.al.ce.gov.br/legislativo/{norm_type_id}"
-
-                    soup = self._get_soup(url)
-
+                    soup = await self.request_service.get_soup(url)
                     table = soup.find("table", {"class": "MsoNormalTable"})
                     rows = table.find_all("tr")
-
                     available_years = []
-                    for index in range(
-                        1, len(rows)
-                    ):  # skip the first  row, which is the header
+                    for index in range(1, len(rows)):
                         item = rows[index]
                         tds = item.find_all("td")
                         for td in tds:
                             a = td.find("a")
                             if a:
                                 available_years.append(int(a.text))
-
                     available_years.sort()
 
-                    for year in tqdm(
-                        available_years,
-                        desc="CEARA | Years",
-                        total=len(self.years),
-                        disable=not self.verbose,
-                    ):
-                        # skip years before resume_from
+                    for year in available_years:
                         if year < resume_from:
                             continue
-
-                        results = self._scrape_laws_constitution_amendments(
-                            situation, norm_type, norm_type_id, year
+                        all_tasks.append(
+                            self._scrape_laws_constitution_amendments(
+                                situation, norm_type, norm_type_id, year
+                            )
                         )
-                        self._save_results(results)
+                        task_metadata.append(
+                            {
+                                "situation": situation,
+                                "norm_type": norm_type,
+                                "year": year,
+                            }
+                        )
 
+        # Execute all tasks concurrently
+        results_list = await asyncio.gather(*all_tasks, return_exceptions=True)
+
+        # Process results
+        for i, result in enumerate(results_list):
+            if isinstance(result, Exception):
+                meta = task_metadata[i]
+                logger.error(
+                    f"Error in scraping {meta['norm_type']} (year: {meta['year']}): {result}"
+                )
+            elif result:
+                self.results.extend(result)
+                self.count += len(result)
+                await self._save_results(result)
+
+        await self._save_summary()
         return self.results

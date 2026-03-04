@@ -1,13 +1,8 @@
 from urllib.parse import urljoin
 
-import requests
 from bs4 import BeautifulSoup
-from io import BytesIO
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import requests.compat
-from tqdm import tqdm
-from src.scraper.base.scraper import BaseScaper
-from src.database.saver import FileSaver
+from loguru import logger
+from src.scraper.base.scraper import BaseScraper
 
 TYPES = {
     "Decreto Legislativo": 41535,
@@ -33,7 +28,7 @@ INVALID_SITUATIONS = (
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class LegislaAMScraper(BaseScaper):
+class LegislaAMScraper(BaseScraper):
     """Webscraper for Amazonas state legislation website (https://legisla.imprensaoficial.am.gov.br/)
 
     Example search request: https://legisla.imprensaoficial.am.gov.br/diario_am/41535/2022?page=1
@@ -46,29 +41,32 @@ class LegislaAMScraper(BaseScaper):
         base_url: str = "https://legisla.imprensaoficial.am.gov.br",
         **kwargs,
     ):
-        super().__init__(base_url, types=TYPES, situations=SITUATIONS, **kwargs)
-        self.docs_save_dir = self.docs_save_dir / "AMAZONAS"
-        self.reached_end_page = False
+        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
+
+        if STATE_LEGISLATION_SAVE_DIR:
+            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
+        super().__init__(
+            base_url, name="AMAZONAS", types=TYPES, situations=SITUATIONS, **kwargs
+        )
         self.fetched_constitution = False
-        # Initialize the FileSaver
-        self.saver = FileSaver(self.docs_save_dir)
 
     def _format_search_url(self, norm_type_id: str, year: int, page: int) -> str:
         """Format url for search request"""
         return f"{self.base_url}/diario_am/{norm_type_id}/{year}?page={page}"
 
-    def _get_docs_links(self, url: str) -> list:
+    async def _get_docs_links(self, url: str) -> tuple[list, bool]:
         """Get documents html links from given page.
-        Returns a list of dicts with keys 'title', 'summary', 'html_link'"""
-        soup = self._get_soup(url)
+        Returns a tuple of (docs, reached_end) where docs is a list of dicts
+        with keys 'title', 'summary', 'html_link' and reached_end indicates
+        there are no more pages."""
+        soup = await self.request_service.get_soup(url)
 
         # check if the page is empty (error)
         container = soup.find("div", id="container")
         if container:
             error = container.find("h1")
             if error and error.text == "Error":
-                self.reached_end_page = True
-                return []
+                return [], True
 
         docs = []
         items = soup.find_all("li", class_="item-li")
@@ -88,7 +86,7 @@ class LegislaAMScraper(BaseScaper):
                 }
             )
 
-        return docs
+        return docs, False
 
     def _get_norm_text(self, soup: BeautifulSoup) -> BeautifulSoup:
         """Get norm text from given document soup"""
@@ -99,6 +97,14 @@ class LegislaAMScraper(BaseScaper):
         if len(norm_text) < 70:
             return None
 
+        # Remove the "Este texto não substitui o publicado no DOL/DOE..." disclaimer
+        # It always appears as the last non-empty paragraph inside the materia div.
+        for tag in norm_element.find_all(["p", "span", "div"]):
+            txt = tag.get_text(strip=True)
+            if txt.lower().startswith("este texto não substitui"):
+                tag.decompose()
+                break
+
         # add html tags to the text
         empty_soup = BeautifulSoup(
             "<html><head></head><body></body></html>", "html.parser"
@@ -106,24 +112,26 @@ class LegislaAMScraper(BaseScaper):
         empty_soup.body.append(norm_element)
         return empty_soup
 
-    def _get_doc_data(self, doc_info: dict) -> dict:
+    async def _get_doc_data(self, doc_info: dict) -> dict:
         """Get document data from given document dict"""
         # remove html_link from doc_info
         html_link = doc_info.pop("html_link")
 
         url = urljoin(self.base_url, html_link)
-        soup = self._get_soup(url)
+        soup = await self.request_service.get_soup(url)
 
         html_content = self._get_norm_text(soup)
         if html_content is None:
+            await self._save_doc_error(
+                title=doc_info.get("title", ""),
+                year=doc_info.get("year", ""),
+                html_link=url,
+                error_message="No norm text found in page",
+            )
             return None
         html_string = html_content.prettify()
 
-        buffer = BytesIO()
-        buffer.write(html_content.html.encode())
-        buffer.seek(0)
-
-        text_markdown = self._get_markdown(stream=buffer)
+        text_markdown = await self._get_markdown(html_content=html_string)
 
         doc_info["html_string"] = html_string
         doc_info["text_markdown"] = text_markdown
@@ -131,118 +139,105 @@ class LegislaAMScraper(BaseScaper):
 
         return doc_info
 
-    def _scrape_year(self, year: str) -> list:
+    async def _scrape_situation_type(
+        self, situation: str, norm_type: str, norm_type_id: str, year: str
+    ) -> list:
+        """Scrape norms for a specific situation and type"""
+        if not self.fetched_constitution and norm_type == "Constituição Estadual":
+            url = f"{self.base_url}/diario_am/{norm_type_id}"
+            doc_info = {
+                "year": year,
+                "situation": situation,
+                "type": norm_type,
+                "title": "Constituição Estadual",
+                "date": year,
+                "summary": "",
+                "html_link": url,
+            }
+
+            doc_info = await self._get_doc_data(doc_info)
+
+            self.fetched_constitution = True
+            logger.info("Scraped state constitution")
+            return [doc_info]
+
+        total_pages = 30
+        reached_end_page = False
+
+        # Get documents html links
+        documents = []
+        start_page = 1
+        while not reached_end_page:
+            tasks = [
+                self._get_docs_links(
+                    self._format_search_url(norm_type_id, year, page),
+                )
+                for page in range(start_page, total_pages + 1)
+            ]
+            valid_results = await self._gather_results(
+                tasks,
+                context={
+                    "year": year,
+                    "type": norm_type,
+                    "situation": situation,
+                },
+                desc=f"AMAZONAS | {norm_type} | get_docs_links",
+            )
+            for result in valid_results:
+                docs, ended = result
+                if ended:
+                    reached_end_page = True
+                if docs:
+                    documents.extend(docs)
+
+            start_page += total_pages
+            total_pages += 10
+
+            if (
+                start_page > total_pages
+            ):  # adding this condition to avoid infinite loop for some buggy pages
+                reached_end_page = True
+
+        # Get document data
+        results = []
+        tasks = [self._get_doc_data(doc_info) for doc_info in documents]
+        valid_results = await self._gather_results(
+            tasks,
+            context={"year": year, "type": norm_type, "situation": situation},
+            desc=f"AMAZONAS | {norm_type}",
+        )
+        for result in valid_results:
+            queue_item = {
+                "year": year,
+                "situation": (
+                    result["situation"] if result.get("situation") else situation
+                ),
+                "type": norm_type,
+                **result,
+            }
+            results.append(queue_item)
+
+        if self.verbose:
+            logger.info(
+                f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)}"
+            )
+
+        return results
+
+    async def _scrape_year(self, year: str) -> list:
         """Scrape norms for a specific year"""
-        all_results = []
-
-        for situation in tqdm(
-            self.situations,
-            desc="AMAZONAS | Situations",
-            total=len(self.situations),
-            disable=not self.verbose,
-        ):
-            for norm_type, norm_type_id in tqdm(
-                self.types.items(),
-                desc=f"AMAZONAS | Year: {year} | Types",
-                total=len(self.types),
-                disable=not self.verbose,
-            ):
-                # total pages info is not available, so we need to check if the page is empty. In order to make parallel calls, we will assume an initial number of pages and increase if needed. We will know that all the pages were scraped when we request a page and it shows a error message
-
-                if (
-                    not self.fetched_constitution
-                    and norm_type == "Constituição Estadual"
-                ):
-                    url = f"{self.base_url}/diario_am/{norm_type_id}"
-                    doc_info = {
-                        "year": year,
-                        "situation": situation,
-                        "type": norm_type,
-                        "title": "Constituição Estadual",
-                        "date": year,
-                        "summary": "",
-                        "html_link": url,
-                    }
-
-                    doc_info = self._get_doc_data(doc_info)
-
-                    all_results.append(doc_info)
-                    self.count += 1
-                    self.fetched_constitution = True
-                    print("Scraped state constitution")
-                    continue
-
-                total_pages = 30
-                self.reached_end_page = False
-
-                # Get documents html links
-                documents = []
-                start_page = 1
-                while not self.reached_end_page:
-                    with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                        futures = [
-                            executor.submit(
-                                self._get_docs_links,
-                                self._format_search_url(norm_type_id, year, page),
-                            )
-                            for page in range(start_page, total_pages + 1)
-                        ]
-                        for future in tqdm(
-                            as_completed(futures),
-                            total=total_pages - start_page + 1,
-                            desc="AMAZONAS | Get document link",
-                            disable=not self.verbose,
-                        ):
-                            docs = future.result()
-                            if docs:
-                                documents.extend(docs)
-
-                    start_page += total_pages
-                    total_pages += 10
-
-                    if (
-                        start_page > total_pages
-                    ):  # adding this condition to avoid infinite loop for some buggy pages
-                        self.reached_end_page = True
-
-                # Get document data
-                results = []
-                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                    futures = [
-                        executor.submit(self._get_doc_data, doc_info)
-                        for doc_info in documents
-                    ]
-                    for future in tqdm(
-                        as_completed(futures),
-                        total=len(documents),
-                        desc="AMAZONAS | Get document data",
-                        disable=not self.verbose,
-                    ):
-                        result = future.result()
-                        if result is None:
-                            continue
-
-                        # prepare item for saving
-                        queue_item = {
-                            "year": year,
-                            # hardcode since we only get valid documents in search request
-                            "situation": (
-                                result["situation"]
-                                if result.get("situation")
-                                else situation
-                            ),
-                            "type": norm_type,
-                            **result,
-                        }
-
-                        results.append(queue_item)
-
-                all_results.extend(results)
-                self.count += len(results)
-
-                if self.verbose:
-                    print(
-                        f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
-                    )
-
-        return all_results
+        tasks = [
+            self._scrape_situation_type(sit, nt, ntid, year)
+            for sit in self.situations
+            for nt, ntid in self.types.items()
+        ]
+        valid = await self._gather_results(
+            tasks,
+            context={"year": year, "type": "NA", "situation": "NA"},
+            desc=f"{self.name} | Year {year}",
+        )
+        return [
+            item
+            for result in valid
+            for item in (result if isinstance(result, list) else [result])
+        ]
