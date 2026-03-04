@@ -73,9 +73,9 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
                 "year_start": 1807,
                 "year_end": 2026,
                 "rps": 200,
-                # "verbose": True,
+                "verbose": True,
             },
-            # run=True,
+            run=True,
         ),
         ScraperConfig(
             scraper=ConamaScraper,
@@ -84,7 +84,7 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
                 "docs_save_dir": SPECIFIC_LEGISLATION_SAVE_DIR,
                 "llm_config": llm_config,
             },
-            # run=True,
+            run=False,
         ),
         ScraperConfig(
             scraper=ICMBioScraper,
@@ -95,24 +95,24 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
                 "verbose": True,
                 "max_workers": 4,  # using 4 workers only to avoid 403 errors from in.gov.br
             },
-            # run=True,
+            run=False,
         ),
         ScraperConfig(
             scraper=AcreLegisScraper,
             params={
                 "year_start": 1963,  # starts from 1963
             },
-            # run=True
+            run=False
         ),
         ScraperConfig(
             scraper=AlagoasSefazScraper,
             params={
-                "year_start": 2011,  # starts at 1900
+                "year_start": 2018,  # starts at 1900
                 "llm_config": llm_config,
                 "rps": 5,
                 "verbose": True,
             },
-            # run=True,
+            run=False,
         ),
         ScraperConfig(
             scraper=LegislaAMScraper,
@@ -136,7 +136,7 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
                 "year_start": 1993,  # starts from 1891
                 "rps": 0.5,  # lower RPS to avoid 500 and 504 errors from https://www.legislabahia.ba.gov.br
             },
-            # run=True,
+            run=False,
         ),
         ScraperConfig(
             scraper=CearaAleceScraper,
@@ -145,7 +145,7 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
                 "verbose": True,
                 "llm_config": llm_config,
             },
-            run=True,
+            run=False,
         ),
         ScraperConfig(
             scraper=DFSinjScraper,
@@ -181,6 +181,9 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
         ),
         ScraperConfig(
             scraper=MSAlemsScraper,
+            params={
+                "year_start": 1979,  # starts from 1979
+            },
         ),
         ScraperConfig(
             scraper=MTAlmtScraper,
@@ -188,7 +191,7 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
                 "year_start": 2017,
                 "llm_config": llm_config,
             },
-            # run=True,
+            run=False,
         ),
         ScraperConfig(
             scraper=MGAlmgScraper,

@@ -1,12 +1,10 @@
 import asyncio
 from typing import Optional
 from urllib.parse import urljoin
+from bs4 import BeautifulSoup
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
-from docling.document_converter import DocumentConverter
-from docling_core.types.doc.document import ContentLayer, DocItemLabel
 from src.scraper.base.scraper import BaseScraper
-from src.scraper.base.concurrency import run_in_thread
 
 VALID_SITUATIONS = [
     "Não%20consta%20revogação%20expressa",
@@ -261,7 +259,7 @@ class CamaraDepScraper(BaseScraper):
     async def _get_document_data(
         self, document_text_link: str, title: str, summary: str
     ) -> Optional[dict]:
-        """Get data from given document text link using docling to convert HTML to markdown.
+        """Get data from given document text link using BS4 cleaning + markitdown.
         Data will be in the format {
             "title": str,
             "summary": str,
@@ -270,21 +268,46 @@ class CamaraDepScraper(BaseScraper):
             "document_url": str
         }"""
         try:
-            # Define filtering rules for document conversion
-            remove_contents = {
-                DocItemLabel.TITLE: ["Legislação"],
-                DocItemLabel.LIST_ITEM: ["Dados da Norma"],
-                DocItemLabel.TEXT: ["Por favor, aguarde.", "Veja também:"],
-                DocItemLabel.SECTION_HEADER: ["Legislação Informatizada", "Carregando"],
-            }
+            # Keywords to remove from the page before conversion
+            remove_keywords = [
+                "Legislação Informatizada",
+                "Carregando",
+                "Dados da Norma",
+                "Por favor, aguarde.",
+                "Veja também:",
+            ]
 
-            # Use base scraper's _get_markdown with filtering
-            text_markdown = await self._get_markdown(
-                url=document_text_link,
-                remove_contents=remove_contents,
-                remove_hyperlinks=True,
-                export_md_kwargs={"included_content_layers": {ContentLayer.BODY}},
-            )
+            # Fetch and clean HTML with BS4
+            soup = await self.request_service.get_soup(document_text_link)
+            if not soup:
+                logger.warning(f"Could not fetch document page: {title}")
+                error_data = {
+                    "title": title,
+                    "year": self.params["ano"],
+                    "situation": self.params["situacao"],
+                    "type": self.params["tipo"],
+                    "summary": summary,
+                    "html_link": document_text_link,
+                }
+                await self.saver.save_error(
+                    error_data,
+                    error_message="Could not fetch document page",
+                )
+                return None
+
+            # Remove elements containing unwanted keywords
+            for tag in soup.find_all(True):
+                if tag.string and any(kw in tag.string for kw in remove_keywords):
+                    tag.decompose()
+
+            # Remove all hyperlinks (unwrap <a> tags, keeping inner text)
+            for a_tag in soup.find_all("a"):
+                a_tag.unwrap()
+
+            html_string = soup.prettify()
+
+            # Convert cleaned HTML to markdown
+            text_markdown = await self._get_markdown(html_content=html_string)
 
             if not text_markdown or not text_markdown.strip():
                 logger.warning(f"Document text is empty after conversion: {title}")
@@ -298,33 +321,9 @@ class CamaraDepScraper(BaseScraper):
                 }
                 await self.saver.save_error(
                     error_data,
-                    error_message="Document text is empty after docling conversion",
+                    error_message="Document text is empty after conversion",
                 )
                 return None
-
-            # Get HTML string by converting again without filtering (for storage)
-            # We need a separate conversion for HTML export
-            converter = DocumentConverter()
-            conversion = await run_in_thread(
-                converter.convert, source=document_text_link
-            )
-            doc = conversion.document
-
-            # Apply same filtering to HTML export
-            items_to_delete = []
-            for item, item_index in doc.iterate_items():
-                if item.content_layer == ContentLayer.BODY:
-                    keywords = remove_contents.get(item.label, [])
-                    if any(keyword in item.text for keyword in keywords):
-                        items_to_delete.append(item)
-                    if hasattr(item, "hyperlink"):
-                        item.hyperlink = None
-
-            doc.delete_items(node_items=items_to_delete)
-
-            html_string = doc.export_to_html(
-                included_content_layers={ContentLayer.BODY},
-            )
 
             return {
                 "title": title,

@@ -1,6 +1,7 @@
 import urllib.parse
 import re
 from typing import Optional
+from bs4 import BeautifulSoup
 
 from loguru import logger
 from src.scraper.base.scraper import BaseScraper
@@ -18,7 +19,9 @@ VALID_SITUATIONS = [
     "Não consta"
 ]  # Conama does not have a situation field, invalid norms will have an indication in the document text
 
-INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no longer have legal effect)
+INVALID_SITUATIONS = (
+    []
+)  # norms with these situations are invalid norms (no longer have legal effect)
 
 # the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
@@ -103,10 +106,13 @@ class ConamaScraper(BaseScraper):
         content_type = (resp.content_type or "").lower()
 
         if "html" in content_type:
-            # HTML document — convert via Docling with hyperlink stripping and specific label filtering to remove common boilerplate sections and garbage text
+            # HTML document — strip hyperlinks and convert to markdown
+            body = await resp.read()
+            soup = BeautifulSoup(body, "html.parser")
+            for a_tag in soup.find_all("a"):
+                a_tag.unwrap()
             text_markdown = await self._get_markdown(
-                response=resp,
-                remove_hyperlinks=True,
+                html_content=soup.prettify(),
             )
         else:
             # PDF or other binary — let _get_markdown detect format and use ocr_service
@@ -124,7 +130,7 @@ class ConamaScraper(BaseScraper):
                     "type": doc_type,
                     "html_link": doc_url,
                 },
-                error_message="Empty markdown after docling conversion",
+                error_message="Empty markdown after conversion",
             )
             return None
 

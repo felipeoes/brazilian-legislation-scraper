@@ -4,7 +4,7 @@ from io import BytesIO
 
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
-from src.scraper.base.scraper import BaseScraper
+from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
 
 
 # We don't have situations for São Paulo, since the websitew only publishes valid documents (no invalid, no expired, no archived, no revoked, etc.)
@@ -55,8 +55,6 @@ class SaoPauloAlespScraper(BaseScraper):
         max_workers: int = 16,  # low max_workers bacause alesp website often returns server error
         **kwargs,
     ):
-        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
-
         if STATE_LEGISLATION_SAVE_DIR:
             kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
@@ -253,7 +251,7 @@ class SaoPauloAlespScraper(BaseScraper):
             if pdf_response is None:
                 raise Exception(f"No response downloading iframe PDF: {pdf_link}")
             pdf_content = await pdf_response.read()
-            text_markdown = await self._get_pdf_image_markdown(pdf_content)
+            text_markdown = await self._get_markdown(stream=BytesIO(pdf_content))
             if not text_markdown or not text_markdown.strip():
                 logger.error(f"Failed to get markdown for PDF: {pdf_link}")
                 await self._save_doc_error(

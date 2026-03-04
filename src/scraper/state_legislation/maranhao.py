@@ -5,7 +5,7 @@ import asyncio
 import re
 from bs4 import BeautifulSoup
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper
+from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
 
 TYPES = {
     "Constituição Estadual": "constituicao-estadual/detalhe.html?dswid=-4293",
@@ -72,8 +72,6 @@ class MaranhaoAlemaScraper(BaseScraper):
         base_url: str = "https://legislacao.al.ma.leg.br",
         **kwargs,
     ):
-        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
-
         if STATE_LEGISLATION_SAVE_DIR:
             kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(

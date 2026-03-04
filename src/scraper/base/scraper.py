@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import string
 import time
 import re
@@ -26,14 +27,13 @@ from tenacity import (
     retry_if_exception_type,
 )
 
-from docling.document_converter import DocumentConverter
-from docling.datamodel.base_models import DocumentStream
-from docling_core.types.doc.document import ContentLayer, DocItemLabel
+from markitdown import MarkItDown
 from pathlib import Path
 from src.database.saver import ERROR_LOG_DIR, FileSaver
 from src.utils import clean_md_tag
 from src.utils.openvpn import OpenVPNManager
 from src.scraper.base.concurrency import run_in_thread
+from src.services.proxy.service import ProxyService
 from src.services.request.service import RequestService
 from src.services.ocr.llm import LLMOCRService
 
@@ -43,7 +43,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # suppress httpx and urllib3 logging
 logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.getLogger("urllib3").setLevel(logging.ERROR)
-logging.getLogger("docling.backend.html_backend").setLevel(logging.ERROR)
+
 
 YEAR_START = 1808
 DEFAULT_VALID_SITUATION = "Não consta revogação expressa"
@@ -86,7 +86,7 @@ class BaseScraper:
     * Use títulos Markdown (`##` ou `###`) para títulos, capítulos e seções.
     * Aplique **negrito** ou *itálico* exatamente onde o texto original estiver em destaque.
     * Caso haja tabelas, preserve a formatação tabular usando a sintaxe de tabelas do Markdown.
-    * Se houver uma *ementa* (o bloco de texto que resume a norma, geralmente recuado à direita no topo), formate-a como citação (usando `>` no início do bloco).
+    * Se houver uma *ementa* (o bloco de texto que resume a norma, geralmente recuado à direita no topo), formate-a como citação (usando `>` antes do bloco).
 *   **Continuidade:** O texto pode ser continuação de uma página anterior ou terminar de forma abrupta. Extraia desde a primeira palavra válida até a última, mesmo que comece ou termine no meio de uma frase.
 *   **Limpeza e Exclusões (ATENÇÃO):** Ignore cabeçalhos (headers), rodapés (footers), números de página, datas de impressão ou marcas d'água. **Exclua obrigatoriamente qualquer nota editorial ou aviso legal que inicie com "Este texto não substitui..." ou "Esse texto não substitui..." ou outras notas e observações similares, independentemente de onde apareçam na página.**
 
@@ -120,8 +120,6 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
 
         self.proxy_service = None
         if proxy_config:
-            from src.services.proxy.service import ProxyService
-
             self.proxy_service = ProxyService(config=proxy_config, verbose=verbose)
 
         self.request_service = RequestService(
@@ -158,8 +156,8 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         self.error_count = 0
         self._scrape_start: Optional[float] = None
 
-        # Initialize Docling converter for HTML documents
-        self.doc_converter = DocumentConverter()
+        # Initialize MarkItDown converter for HTML/document conversion
+        self._markitdown = MarkItDown()
         # Browser service — initialised in scrape() via initialize_playwright()
         self.browser_service: Optional[BrowserService] = (
             BrowserService(
@@ -291,23 +289,9 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         """Strip markdown code block wrappers if present."""
         return clean_md_tag(md_content)
 
-    def _check_text_length(self, text: str, min_length: int = 50) -> bool:
-        """Return True if *text* meets the minimum character threshold.
-
-        Args:
-            text: Text to evaluate (typically a markdown string).
-            min_length: Minimum number of non-whitespace characters required
-                (default 50).
-
-        Returns:
-            ``True`` if the stripped text length is >= *min_length*, ``False``
-            otherwise.
-        """
-        return len(text.strip()) >= min_length
-
     @staticmethod
     def _wrap_html(content: str) -> str:
-        """Wrap HTML fragment in <html><body> tags for Docling conversion."""
+        """Wrap HTML fragment in <html><body> tags for markitdown conversion."""
         return f"<html><body>{content}</body></html>"
 
     # ------------------------------------------------------------------
@@ -328,12 +312,12 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
     ) -> tuple[str, str]:
         """Download a PDF and extract markdown, falling back to LLM OCR if needed.
 
-        Tries Docling conversion first. If the result is too short (likely a
+        Tries markitdown conversion first. If the result is too short (likely a
         scanned/image PDF), falls back to page-by-page LLM OCR.
 
         Args:
             url: URL of the PDF to download.
-            min_length: Minimum character threshold for the Docling result to be
+            min_length: Minimum character threshold for the markitdown result to be
                 accepted without falling back to OCR.
 
         Returns:
@@ -348,9 +332,10 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         if not content:
             return "", ""
 
-        # Try Docling first
+        # Try markitdown first (good for text-based PDFs)
         text_markdown = await self._get_markdown(response=response)
-        if text_markdown and self._check_text_length(text_markdown, min_length):
+        is_valid, _ = self._valid_markdown(text_markdown, min_length)
+        if is_valid:
             return text_markdown.strip(), url
 
         # Fallback to LLM OCR for image-based PDFs
@@ -373,67 +358,46 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
     )
     async def _convert_to_md(
         self,
-        source: str | BytesIO,
-        remove_contents: Optional[dict[DocItemLabel, list[str]]] = None,
-        remove_hyperlinks: bool = False,
-        export_md_kwargs: Optional[dict] = None,
-        filename: str = "document",
+        source: BytesIO,
+        filename: str = "document.html",
     ) -> str:
-        """Convert a source (URL or BytesIO stream) to markdown via Docling (with retry).
+        """Convert a BytesIO stream to markdown via markitdown (with retry).
+
+        Uses :pymeth:`MarkItDown.convert_stream` directly on the stream.
+        The file extension is inferred from *filename* so that markitdown
+        picks the correct converter.
 
         Args:
-            source: URL string or BytesIO stream with document content
-            remove_contents: Dict mapping DocItemLabel to list of keywords to filter out
-            remove_hyperlinks: If True, remove all hyperlinks from the document
-            export_md_kwargs: Keyword arguments forwarded directly to
-                ``doc.export_to_markdown()``. Defaults to
-                ``{"included_content_layers": {ContentLayer.BODY}}``.
+            source: BytesIO stream with document content.
+            filename: Suggested filename (used for its extension, e.g.
+                ``"document.html"``, ``"document.pdf"``).
 
         Returns:
-            Markdown string
+            Markdown string.
         """
+        _, ext = os.path.splitext(filename)
+        if not ext:
+            ext = ".html"
+
         try:
-            if isinstance(source, BytesIO):
-                doc_stream = DocumentStream(name=filename, stream=source)
-                result = await run_in_thread(self.doc_converter.convert, doc_stream)
-            else:
-                # Direct URL — Docling fetches and detects format (handles redirects)
-                result = await run_in_thread(self.doc_converter.convert, source)
-
-            doc = result.document
-
-            # Apply filtering if requested
-            if remove_contents or remove_hyperlinks:
-                items_to_delete = []
-
-                for item, item_index in doc.iterate_items():
-                    if item.content_layer == ContentLayer.BODY:
-                        # Filter by label and keywords
-                        if remove_contents and item.label in remove_contents:
-                            keywords = remove_contents[item.label]
-                            if any(keyword in item.text for keyword in keywords):
-                                items_to_delete.append(item)
-
-                        # Remove hyperlinks if requested
-                        if remove_hyperlinks and hasattr(item, "hyperlink"):
-                            item.hyperlink = None
-
-                if items_to_delete:
-                    doc.delete_items(node_items=items_to_delete)
-
-            kwargs = export_md_kwargs or {}
-            kwargs.setdefault("included_content_layers", {ContentLayer.BODY})
-            markdown = doc.export_to_markdown(**kwargs)
+            source.seek(0)
+            result = await run_in_thread(
+                self._markitdown.convert_stream,
+                source,
+                file_extension=ext,
+            )
+            markdown = result.text_content or ""
 
             if not markdown or not markdown.strip():
-                raise ValueError("Docling returned empty content")
+                raise ValueError("markitdown returned empty content")
 
             markdown = self._clean_md_tag(markdown.strip())
 
-            # Strip trailing horizontal-rule / table-border artefacts that
-            # docling emits when the HTML source is wrapped in an outer <table>.
-            # These look like "---…---" or "---…---|" lines at the very end.
+            # Strip trailing horizontal-rule / table-border artefacts.
             markdown = re.sub(r"(\n[-|]{3,}\s*)+$", "", markdown).strip()
+
+            # Strip markdown hyperlinks, keeping only the link text.
+            markdown = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", markdown)
 
             return markdown
 
@@ -457,38 +421,50 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         response: Optional[aiohttp.ClientResponse] = None,
         stream: Optional[BytesIO] = None,
         html_content: Optional[str] = None,
-        remove_contents: Optional[dict[DocItemLabel, list[str]]] = None,
-        remove_hyperlinks: bool = False,
-        export_md_kwargs: Optional[dict] = None,
     ) -> str:
-        """Get markdown from various input sources using Docling.
+        """Get markdown from various input sources using markitdown.
 
         Priority: stream > html_content > response > url
+
+        For URLs, the content is always fetched first via the request service
+        and then passed as a stream — markitdown is never called on URLs directly.
         """
         try:
             if stream is not None:
                 raw = stream.read()
-                if raw[:4] == b"%PDF":
-                    if not self.ocr_service:
-                        logger.warning(
-                            "No LLM OCR service configured; cannot process PDF."
-                        )
-                        return ""
-                    return await self.ocr_service.pdf_to_markdown(raw)
-                if not self.ocr_service:
+                # If image, we must use OCR
+                if not (raw[:4] == b"%PDF") and self.ocr_service:
+                    return await self.ocr_service.images_to_markdown([raw])
+                elif not (raw[:4] == b"%PDF"):
                     logger.warning(
                         "No LLM OCR service configured; cannot process image."
                     )
                     return ""
-                return await self.ocr_service.images_to_markdown([raw])
+
+                # For PDFs, try markitdown first
+                try:
+                    text_markdown = await self._convert_to_md(
+                        BytesIO(raw),
+                        filename="document.pdf",
+                    )
+                    if self._valid_markdown(text_markdown, min_length=50)[0]:
+                        return text_markdown.strip()
+                except Exception as e:
+                    logger.warning(f"markitdown PDF extraction failed: {e}")
+
+                # Fallback to OCR if markitdown extraction was poor/failed
+                if self.ocr_service:
+                    return await self.ocr_service.pdf_to_markdown(raw)
+
+                logger.warning(
+                    "PDF extraction yielded little text and no OCR service is available."
+                )
+                return ""
 
             if html_content is not None:
                 buffer = BytesIO(html_content.encode("utf-8"))
                 return await self._convert_to_md(
                     buffer,
-                    remove_contents,
-                    remove_hyperlinks,
-                    export_md_kwargs,
                     filename="document.html",
                 )
 
@@ -499,17 +475,31 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
                 )
 
                 if "pdf" in content_type or body[:4] == b"%PDF":
-                    if not self.ocr_service:
-                        logger.warning(
-                            "No LLM OCR service configured; cannot process PDF."
+                    try:
+                        text_markdown = await self._convert_to_md(
+                            BytesIO(body),
+                            filename=(
+                                "document.pdf"
+                                if not filename or "pdf" not in filename.lower()
+                                else filename
+                            ),
                         )
-                        return ""
-                    return await self.ocr_service.pdf_to_markdown(body)
+                        if self._valid_markdown(text_markdown, min_length=50)[0]:
+                            return text_markdown.strip()
+                    except Exception as e:
+                        logger.warning(
+                            f"markitdown PDF extraction failed for response: {e}"
+                        )
+
+                    if self.ocr_service:
+                        return await self.ocr_service.pdf_to_markdown(body)
+
+                    logger.warning(
+                        "PDF extraction yielded little text and no OCR service configured for response."
+                    )
+                    return ""
                 return await self._convert_to_md(
                     BytesIO(body),
-                    remove_contents,
-                    remove_hyperlinks,
-                    export_md_kwargs,
                     filename=filename,
                 )
 
@@ -522,17 +512,32 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
                     )
 
                     if "pdf" in content_type or body[:4] == b"%PDF":
-                        if not self.ocr_service:
-                            logger.warning(
-                                "No LLM OCR service configured; cannot process PDF URL."
+                        try:
+                            text_markdown = await self._convert_to_md(
+                                BytesIO(body),
+                                filename=(
+                                    "document.pdf"
+                                    if not filename or "pdf" not in filename.lower()
+                                    else filename
+                                ),
                             )
-                            return ""
-                        return await self.ocr_service.pdf_to_markdown(body)
+                            if self._valid_markdown(text_markdown, min_length=50)[0]:
+                                return text_markdown.strip()
+                        except Exception as e:
+                            logger.warning(
+                                f"markitdown PDF extraction failed for URL: {e}"
+                            )
+
+                        # Fallback to OCR
+                        if self.ocr_service:
+                            return await self.ocr_service.pdf_to_markdown(body)
+
+                        logger.warning(
+                            "PDF extraction yielded little text and no OCR service configured for URL."
+                        )
+                        return ""
                     return await self._convert_to_md(
                         BytesIO(body),
-                        remove_contents,
-                        remove_hyperlinks,
-                        export_md_kwargs,
                         filename=filename,
                     )
 
@@ -633,6 +638,17 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         }
         await self.saver.save_error(error_data, error_message=error_message)
 
+    # Patterns that indicate the server returned an error page instead of
+    # real document content.  Checked case-insensitively inside
+    # ``_valid_markdown``.
+    _SERVER_ERROR_PATTERNS: list[str] = [
+        "the requested url was not found on this server",
+        "failed to open stream",
+        "http request failed",
+        "service unavailable",
+        "doesn't work properly without javascript enabled",
+    ]
+
     def _valid_markdown(
         self,
         text_markdown: str | None,
@@ -644,7 +660,8 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         1. Falsy / None
         2. Empty after stripping whitespace
         3. Only punctuation (e.g. a single dot — seen in minas_gerais)
-        4. Below *min_length* characters (after strip)
+        4. Contains a known server-error pattern
+        5. Below *min_length* characters (after strip)
 
         Args:
             text_markdown: The text to validate.
@@ -667,6 +684,12 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         )
         if not cleaned:
             return False, "text_markdown contains only punctuation/whitespace"
+
+        # Detect server error pages returned instead of real content
+        lower = stripped.lower()
+        for pattern in self._SERVER_ERROR_PATTERNS:
+            if pattern in lower:
+                return False, f"text_markdown contains server error: {pattern}"
 
         if len(stripped) < min_length:
             return (

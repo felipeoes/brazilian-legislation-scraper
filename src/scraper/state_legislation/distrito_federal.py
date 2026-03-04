@@ -1,6 +1,6 @@
 from bs4 import BeautifulSoup
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper
+from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
 
 TYPES = {
     "Ato da Mesa Diretora": 17000000,
@@ -141,8 +141,6 @@ class DFSinjScraper(BaseScraper):
         base_url: str = "https://www.sinj.df.gov.br/sinj",
         **kwargs,
     ):
-        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
-
         if STATE_LEGISLATION_SAVE_DIR:
             kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(

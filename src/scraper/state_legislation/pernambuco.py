@@ -4,7 +4,7 @@ import time
 from typing import Optional
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup, Tag
-from src.scraper.base.scraper import BaseScraper
+from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
 from loguru import logger
 
 
@@ -85,8 +85,6 @@ class PernambucoAlepeScraper(BaseScraper):
         base_url: str = "https://legis.alepe.pe.gov.br",
         **kwargs,
     ):
-        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
-
         if STATE_LEGISLATION_SAVE_DIR:
             kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(

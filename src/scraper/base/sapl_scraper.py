@@ -4,7 +4,7 @@ Many Brazilian state legislatures use SAPL with identical REST API structures.
 This base class provides the shared logic for:
   - Paginated norm search via ``/api/norma/normajuridica/``
   - Subject (assunto) fetching via ``/api/norma/assuntonorma/``
-  - PDF processing with Docling → OCR fallback
+  - PDF processing with markitdown → OCR fallback
 """
 
 from __future__ import annotations
@@ -90,7 +90,7 @@ class SAPLBaseScraper(BaseScraper):
     async def _process_pdf(self, pdf_link: str, _year: int) -> dict | None:
         """Download and convert a PDF to markdown.
 
-        Default: tries Docling, then falls back to LLM OCR.
+        Default: tries markitdown, then falls back to LLM OCR.
         Override in subclasses for year-based or threshold-based strategies.
         """
         text_markdown, document_url = await self._process_pdf_with_fallback(

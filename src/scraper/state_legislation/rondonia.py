@@ -1,10 +1,11 @@
 from datetime import datetime
+from io import BytesIO
 from typing import Any, Optional
 from urllib.parse import urljoin
 
 from bs4 import Tag
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper
+from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
 
 
 TYPES = {
@@ -29,8 +30,6 @@ class RondoniaCotelScraper(BaseScraper):
         base_url: str = "http://ditel.casacivil.ro.gov.br/COTEL",
         **kwargs: Any,
     ):
-        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
-
         if STATE_LEGISLATION_SAVE_DIR:
             kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
@@ -156,7 +155,7 @@ class RondoniaCotelScraper(BaseScraper):
                     "document_url": pdf_link,
                 }
 
-        text_markdown = await self._get_pdf_image_markdown(content)
+        text_markdown = await self._get_markdown(stream=BytesIO(content))
         text_markdown = text_markdown.strip() if text_markdown else ""
         if not text_markdown or not len(text_markdown) > pdf_len_threshold:
             return None

@@ -1,7 +1,7 @@
 """Async concurrency utilities for scrapers."""
 
 import asyncio
-import collections
+import functools
 from typing import Any, TypeVar
 from collections.abc import Awaitable, Callable, Sequence
 
@@ -121,8 +121,6 @@ async def bounded_gather(
 async def run_in_thread(func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     """Run a sync function in a thread via asyncio.to_thread."""
     if kwargs:
-        import functools
-
         partial = functools.partial(func, *args, **kwargs)
         return await asyncio.to_thread(partial)
     return await asyncio.to_thread(func, *args)

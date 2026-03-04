@@ -1,7 +1,8 @@
 import re
+from io import BytesIO
 from typing import Optional
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper
+from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
 from urllib.parse import urlencode, urljoin
 
 TYPES = {
@@ -45,8 +46,6 @@ class MGAlmgScraper(BaseScraper):
         base_url: str = "https://www.almg.gov.br",
         **kwargs,
     ):
-        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
-
         if STATE_LEGISLATION_SAVE_DIR:
             kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
@@ -246,7 +245,7 @@ class MGAlmgScraper(BaseScraper):
                 )
                 return None
             pdf_content = await pdf_response.read()
-            text_markdown = await self._get_pdf_image_markdown(pdf_content)
+            text_markdown = await self._get_markdown(stream=BytesIO(pdf_content))
 
             if not text_markdown.replace(".", "").strip():
                 await self._save_doc_error(

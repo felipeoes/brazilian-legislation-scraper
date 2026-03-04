@@ -3,6 +3,7 @@ import ssl
 from typing import Optional
 
 import aiohttp
+from aiohttp_socks import ProxyConnector
 from bs4 import BeautifulSoup
 from loguru import logger
 from tenacity import (
@@ -11,6 +12,8 @@ from tenacity import (
     wait_exponential,
     retry_if_exception_type,
 )
+
+from src.scraper.base.concurrency import RateLimiter
 
 _SSL_CTX = ssl.create_default_context()
 _SSL_CTX.check_hostname = False
@@ -31,8 +34,6 @@ class RequestService:
         proxy_service=None,
         max_workers: int = 10,
     ):
-        from src.scraper.base.concurrency import RateLimiter
-
         self.rps = rps
         self.verbose = verbose
         self.max_workers = max_workers
@@ -50,8 +51,6 @@ class RequestService:
         """Get or create the aiohttp session."""
         if proxy:
             if proxy not in self._proxy_sessions or self._proxy_sessions[proxy].closed:
-                from aiohttp_socks import ProxyConnector
-
                 connector = ProxyConnector.from_url(proxy, ssl=_SSL_CTX)
                 timeout = aiohttp.ClientTimeout(total=120)
                 self._proxy_sessions[proxy] = aiohttp.ClientSession(

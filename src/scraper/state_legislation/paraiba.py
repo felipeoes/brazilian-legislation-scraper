@@ -1,6 +1,8 @@
+from io import BytesIO
 from typing import Any
 
 from src.scraper.base.sapl_scraper import SAPLBaseScraper
+from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
 
 
 # gotten from https://sapl3.al.pb.leg.br/api/norma/tiponormajuridica/
@@ -30,8 +32,6 @@ class ParaibaAlpbScraper(SAPLBaseScraper):
         base_url: str = "https://sapl3.al.pb.leg.br",
         **kwargs: Any,
     ):
-        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
-
         if STATE_LEGISLATION_SAVE_DIR:
             kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(base_url, name="PARAIBA", types=TYPES, **kwargs)
@@ -46,11 +46,11 @@ class ParaibaAlpbScraper(SAPLBaseScraper):
             return None
 
         if year <= 1990:
-            text_markdown = await self._get_pdf_image_markdown(content)
+            text_markdown = await self._get_markdown(stream=BytesIO(content))
         else:
             text_markdown = await self._get_markdown(response=response)
             if not text_markdown:
-                text_markdown = await self._get_pdf_image_markdown(content)
+                text_markdown = await self._get_markdown(stream=BytesIO(content))
 
         if not text_markdown or not text_markdown.strip():
             return None

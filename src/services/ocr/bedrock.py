@@ -7,7 +7,8 @@ makes HTTP requests via the shared ``RequestService``.
 from __future__ import annotations
 
 import re
-from typing import Any, Optional
+from typing import Optional
+from urllib.parse import quote
 
 from loguru import logger
 from ..request.service import RequestService
@@ -43,7 +44,6 @@ class BedrockClient:
         additional_request_fields: Optional[dict] = None,
         performance_config: Optional[dict] = None,
     ) -> None:
-
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.request_service = request_service
@@ -175,8 +175,6 @@ class BedrockClient:
         Raises:
             RuntimeError: If the API call fails or the response is malformed.
         """
-        from urllib.parse import quote
-
         encoded_model_id = quote(model_id, safe=":")
         endpoint_url = f"{self.base_url}/model/{encoded_model_id}/converse"
 

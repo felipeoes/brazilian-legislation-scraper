@@ -173,8 +173,7 @@ logs/*
 test.py
 error_log.json
 artifacts/
-md_test.md
-output.pdf
+test_data/
 
 # AI-related
 .gemini/

@@ -149,9 +149,7 @@ class ICMBioScraper(BaseScraper):
             if await checkbox_locator.count() > 0:
                 await checkbox_locator.first.click()
             else:
-                logger.warning(
-                    f"Could not find checkbox for {target_title} in slicer."
-                )
+                logger.warning(f"Could not find checkbox for {target_title} in slicer.")
                 # close dropdown and abort
                 await slicer_visual.hover()
                 return False
@@ -493,9 +491,7 @@ class ICMBioScraper(BaseScraper):
                 norms.extend(res_list)
 
         if not norms:
-            logger.warning(
-                f"No documents found for year {year} across all situations."
-            )
+            logger.warning(f"No documents found for year {year} across all situations.")
             return []
 
         # Concurrently process document HTML -> Markdown

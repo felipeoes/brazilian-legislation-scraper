@@ -3,7 +3,7 @@ from urllib.parse import urljoin, urlencode
 from typing import Optional
 from bs4 import BeautifulSoup
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper
+from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
 
 TYPES = {
     "Lei Complementar": 11,
@@ -26,7 +26,9 @@ VALID_SITUATIONS = [
     "Não consta"
 ]  # BahiaLegisla does not have a situation field, invalid norms will have an indication in the document text
 
-INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no longer have legal effect)
+INVALID_SITUATIONS = (
+    []
+)  # norms with these situations are invalid norms (no longer have legal effect)
 
 # the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
@@ -45,8 +47,6 @@ class BahiaLegislaScraper(BaseScraper):
         base_url: str = "https://www.legislabahia.ba.gov.br",
         **kwargs,
     ):
-        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
-
         if STATE_LEGISLATION_SAVE_DIR:
             kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
@@ -160,7 +160,7 @@ class BahiaLegislaScraper(BaseScraper):
             return None  # invalid norm
 
         # Remove empty heading tags — Word HTML exports often end with <h2></h2>.
-        # Docling treats any <h2>/<h3>/… as a section boundary and discards
+        # markitdown treats any <h2>/<h3>/… as a section boundary and discards
         # all <p> elements that precede it, so these artifacts must be stripped.
         for heading in norm_text_tag.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
             if not heading.get_text(strip=True):
@@ -170,9 +170,7 @@ class BahiaLegislaScraper(BaseScraper):
 
         # Detect revogado/revogada via regex: <span class="revogado"> or
         # <div class="alteracao"> whose text starts with "revogado/a".
-        is_revogado = bool(
-            norm_text_tag.find("span", class_=self._REVOGADO_RE)
-        ) or any(
+        is_revogado = bool(norm_text_tag.find("span", class_=self._REVOGADO_RE)) or any(
             self._REVOGADO_RE.match(div.get_text(strip=True))
             for div in norm_text_tag.find_all("div", class_="alteracao")
         )

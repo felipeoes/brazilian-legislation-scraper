@@ -2,7 +2,7 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper
+from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
 
 
 TYPES = {
@@ -36,8 +36,6 @@ class AmapaAlapScraper(BaseScraper):
         base_url: str = "https://al.ap.leg.br",
         **kwargs,
     ):
-        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
-
         if STATE_LEGISLATION_SAVE_DIR:
             kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
@@ -93,9 +91,7 @@ class AmapaAlapScraper(BaseScraper):
 
             a_tag = tds[5].find("a")
             if not a_tag:
-                logger.warning(
-                    f"No link found for document '{title}' — skipping"
-                )
+                logger.warning(f"No link found for document '{title}' — skipping")
                 continue
             html_link = a_tag["href"]
 
@@ -144,7 +140,7 @@ class AmapaAlapScraper(BaseScraper):
                 tbl.decompose()
 
         # After header removal the remaining table is the content wrapper.
-        # Pass only the inner <td> contents (the <p> tags) to docling — without
+        # Pass only the inner <td> contents (the <p> tags) to markitdown — without
         # the outer <table> wrapper — so paragraph breaks are preserved.
         remaining_table = soup.find("table")
         if remaining_table:
@@ -155,13 +151,13 @@ class AmapaAlapScraper(BaseScraper):
             )
             container = content_td or remaining_table
 
-            # Unwrap <font> tags — docling's HTML parser silently discards all
+            # Unwrap <font> tags — markitdown's HTML parser silently discards all
             # <p> content nested inside <font> wrappers, only retaining heading
             # tags (<h3>/<h1>) which are why only the signature block was returned.
             for font in container.find_all("font"):
                 font.unwrap()
 
-            # Strip inline style attributes so docling doesn't skip paragraphs.
+            # Strip inline style attributes so markitdown doesn't skip paragraphs.
             for tag in container.find_all(style=True):
                 del tag["style"]
 
@@ -172,7 +168,7 @@ class AmapaAlapScraper(BaseScraper):
 
         text_markdown = await self._get_markdown(html_content=html_string)
 
-        # Fallback: docling cannot parse <p><span>…</span></p> from old ALAP docs
+        # Fallback: markitdown cannot parse <p><span>…</span></p> from old ALAP docs
         # (only heading tags survive). Build plain markdown directly from the
         # BeautifulSoup <p> tags when the result is suspiciously short.
         if container is not None and len((text_markdown or "").strip()) < 100:
@@ -234,12 +230,12 @@ class AmapaAlapScraper(BaseScraper):
                 if docs:
                     page_docs.extend(docs)
 
+            # Add the documents from this batch to our total documents list
+            documents.extend(page_docs)
+
             # If we didn't get any docs or reached the end page, break the loop
             if not page_docs or reached_end_page:
                 break
-
-            # Add the documents from this batch to our total documents list
-            documents.extend(page_docs)
 
             # Move to the next batch of pages
             current_page += total_pages

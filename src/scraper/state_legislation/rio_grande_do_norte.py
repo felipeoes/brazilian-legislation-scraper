@@ -1,11 +1,12 @@
 import asyncio
 import time
+from io import BytesIO
 from typing import Optional
 from urllib.parse import urlencode
 
 from bs4 import BeautifulSoup
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper
+from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
 
 TYPES = {
     "Lei Ordinária": "lei ord",
@@ -39,8 +40,6 @@ class RNAlrnScraper(BaseScraper):
         base_url: str = "https://www.al.rn.leg.br",
         **kwargs,
     ):
-        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
-
         if STATE_LEGISLATION_SAVE_DIR:
             kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
@@ -126,7 +125,7 @@ class RNAlrnScraper(BaseScraper):
             or len(text_markdown.strip()) < pdf_len_threshold
         ):
             # probably image pdf
-            text_markdown = await self._get_pdf_image_markdown(await response.read())
+            text_markdown = await self._get_markdown(stream=BytesIO(await response.read()))
 
         if (
             not text_markdown or not text_markdown.strip()

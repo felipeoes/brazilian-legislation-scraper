@@ -3,7 +3,7 @@ from typing import Optional
 from urllib.parse import urlencode
 
 from bs4 import BeautifulSoup
-from src.scraper.base.scraper import BaseScraper
+from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
 from loguru import logger
 
 # ALRS does not have a type field, norm type is gotten while scraping
@@ -31,8 +31,6 @@ class RSAlrsScraper(BaseScraper):
         base_url: str = "https://www.al.rs.gov.br",
         **kwargs,
     ):
-        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
-
         if STATE_LEGISLATION_SAVE_DIR:
             kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(

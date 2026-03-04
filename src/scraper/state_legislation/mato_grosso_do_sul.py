@@ -1,10 +1,7 @@
-import asyncio
-import time
+from collections import defaultdict
 from loguru import logger
-from tqdm import tqdm
 from urllib.parse import urlencode, urljoin
-from src.scraper.base.scraper import BaseScraper, YEAR_START
-from src.scraper.base.concurrency import bounded_gather
+from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
 
 TYPES = {
     "Constituição Estadual": "/Web%5CConstituição%20Estadual",
@@ -43,8 +40,6 @@ class MSAlemsScraper(BaseScraper):
         base_url: str = "http://aacpdappls.net.ms.gov.br",
         **kwargs,
     ):
-        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
-
         if STATE_LEGISLATION_SAVE_DIR:
             kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
@@ -57,9 +52,11 @@ class MSAlemsScraper(BaseScraper):
         self.params = {
             "OpenView": "",
             "Start": 1,
-            "Count": 10000,  # there is no limit for count, so setting to a large number to get all norms in one request
+            "Count": 10000,
             "Expand": "",
         }
+        # year→expand_index mapping per norm type, built during prefetch
+        self._year_index_map: dict[str, dict[int, int]] = defaultdict(dict)
 
     def _format_search_url(self, norm_type_id: str, year_index: int) -> str:
         """Format url for search request"""
@@ -118,138 +115,76 @@ class MSAlemsScraper(BaseScraper):
 
         return doc_info
 
-    async def _get_available_years(self, norm_type_id: str) -> list:
-        """Get available years for given norm type"""
-        # need to construct the url instead of using the _format_search_url method to avoid expanding the years
+    async def _get_available_years(self, norm_type_id: str) -> list[int]:
+        """Get available years for given norm type and build the year→expand_index map."""
         url = f"{self.base_url}/appls/legislacao/secoge/govato.nsf/{norm_type_id}?OpenView?Start=1&Count=10000"
         soup = await self.request_service.get_soup(url)
 
-        years = []
+        years_desc: list[int] = []
         table = soup.find("table", border="0", cellpadding="2", cellspacing="0")
         items = table.find_all("tr", valign="top")
-        for _, item in enumerate(items):
+        for item in items:
             td = item.find("td")
             year = td.text.strip()
-
             if not year:
                 continue
+            years_desc.append(int(year))
 
-            years.append(int(year))
+        # years come in descending order; Expand index is 1-based position
+        for idx_0, year in enumerate(years_desc):
+            self._year_index_map[norm_type_id][year] = idx_0 + 1
 
-        # sort in descending order to guarantee we start from the latest year for the rest of the scraping logic to work
-        return sorted(years, reverse=True)
+        return years_desc
 
-    async def _scrape_year(
-        self,
-        year: int,
-        year_index: int,
-        norm_type: str,
-        norm_type_id: str,
-        situation: str,
+    async def _prefetch_year_indexes(self) -> None:
+        """Fetch year→index mappings for every norm type and build self.years."""
+        all_years: set[int] = set()
+        for norm_type_id in self.types.values():
+            years = await self._get_available_years(norm_type_id)
+            all_years.update(years)
+            logger.info(
+                f"Prefetched {len(years)} years for {norm_type_id} "
+                f"(range {min(years)}–{max(years)})"
+            )
+
+        self.years = sorted(
+            y for y in all_years if self.year_start <= y <= self.year_end
+        )
+
+    async def _scrape_type(
+        self, norm_type: str, norm_type_id: str, year: int
     ) -> list[dict]:
-        url = self._format_search_url(norm_type_id, year_index)
-        docs = await self._get_docs_links(url)
+        """Scrape documents of a single type for a given year."""
+        expand_index = self._year_index_map.get(norm_type_id, {}).get(year)
+        if expand_index is None:
+            return []
 
-        # Get document data
-        results = []
+        url = self._format_search_url(norm_type_id, expand_index)
+        docs = await self._get_docs_links(url)
+        if not docs:
+            return []
+
         tasks = [self._get_doc_data(doc) for doc in docs]
         valid_results = await self._gather_results(
             tasks,
-            context={"year": year, "type": norm_type, "situation": situation},
-            desc=f"MATO GROSSO DO SUL | {norm_type}",
+            context={"year": year, "type": norm_type},
+            desc=f"MATO GROSSO DO SUL | {norm_type} {year}",
         )
 
-        for result in tqdm(
-            valid_results,
-            total=len(valid_results),
-            desc="MATO GROSSO DO SUL | Get document data",
-            disable=not self.verbose,
-        ):
-            # prepare item for saving
-            queue_item = {
-                "year": year,
-                # hardcode since it seems we only get valid documents in search request
-                "situation": situation,
-                "type": norm_type,
-                **result,
-            }
-
-            results.append(queue_item)
+        situation = self.situations[0] if self.situations else "Não consta"
+        results = [
+            {"year": year, "situation": situation, "type": norm_type, **result}
+            for result in valid_results
+        ]
 
         if self.verbose:
             logger.info(
-                f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)}"
+                f"Year: {year} | Type: {norm_type} | Results: {len(results)}"
             )
 
         return results
 
-    async def _scrape_situation_type(
-        self, situation: str, norm_type: str, norm_type_id: str, resume_from: int
-    ) -> list:
-        """Scrape norms for a specific situation and type across all years"""
-        # get available years
-        years = await self._get_available_years(norm_type_id)
-        years_to_scrape = [
-            (year_index, year)
-            for year_index, year in enumerate(years)
-            if year >= resume_from
-        ]
-
-        async def _scrape_and_save(year_index, year):
-            results = await self._scrape_year(
-                year, year_index + 1, norm_type, norm_type_id, situation
-            )
-            if results:
-                await self.saver.save(results)
-            return results or []
-
-        all_results = await bounded_gather(
-            [_scrape_and_save(yi, y) for yi, y in years_to_scrape],
-            max_concurrency=self.max_workers,
-            desc=f"MATO GROSSO DO SUL | {norm_type}",
-            verbose=self.verbose,
-        )
-
-        flat_results = []
-        for results in all_results:
-            if results:
-                flat_results.extend(results)
-
-        return flat_results
-
     async def scrape(self) -> list:
-        """Scrape data from all years"""
-        if not self.saver:
-            raise ValueError(
-                "Saver is not initialized. Call _initialize_saver() first."
-            )
-
-        await self._ensure_session()
-        self._scrape_start = time.time()
-
-        # check if can resume from last scrapped year
-        resume_from = self.year_start  # 1808
-        forced_resume = self.year_start != YEAR_START
-        if self.saver.last_year is not None and not forced_resume:
-            logger.info(f"Resuming from {self.saver.last_year}")
-            resume_from = int(self.saver.last_year)
-        else:
-            logger.info(f"Starting from {resume_from}")
-
-        # scrape data with flattened situation+type loops
-        tasks = [
-            self._scrape_situation_type(sit, nt, ntid, resume_from)
-            for sit in self.situations
-            for nt, ntid in self.types.items()
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for result in results:
-            if isinstance(result, Exception):
-                logger.error(f"Error in _scrape_situation_type: {result}")
-            elif result:
-                self.results.extend(result)
-                self.count += len(result)
-
-        await self._save_summary()
-        return self.results
+        """Prefetch year indexes then delegate to BaseScraper's year-sequential flow."""
+        await self._prefetch_year_indexes()
+        return await super().scrape()

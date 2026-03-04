@@ -6,7 +6,7 @@ from typing import Any
 
 from bs4 import BeautifulSoup
 
-from src.scraper.base.scraper import BaseScraper
+from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
 from loguru import logger
 
 # obs: LeiComp = Lei Complementar; LeiOrd = Lei Ordinária;
@@ -41,8 +41,6 @@ class RJAlerjScraper(BaseScraper):
         base_url: str = "http://alerjln1.alerj.rj.gov.br/contlei.nsf",
         **kwargs,
     ):
-        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
-
         if STATE_LEGISLATION_SAVE_DIR:
             kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
@@ -212,7 +210,9 @@ class RJAlerjScraper(BaseScraper):
         self.queue.put(queue_item)
         self.fetched_constitution = True
 
-    async def _scrape_type(self, norm_type: str, _norm_type_id, year: str) -> list[dict]:
+    async def _scrape_type(
+        self, norm_type: str, _norm_type_id, year: str
+    ) -> list[dict]:
         """Scrape norms for a specific type in a year"""
         if norm_type == "Constituição Estadual":
             if not self.fetched_constitution:

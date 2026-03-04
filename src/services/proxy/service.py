@@ -1,3 +1,4 @@
+import json
 import random
 import time
 import aiohttp
@@ -49,8 +50,6 @@ class ProxyService:
 
         elif endpoint:
             try:
-                import json
-
                 async with aiohttp.ClientSession() as session:
                     async with session.get(endpoint) as response:
                         if response.status == 200:

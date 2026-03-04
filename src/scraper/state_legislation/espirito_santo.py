@@ -1,3 +1,4 @@
+from io import BytesIO
 from typing import Optional
 from urllib.parse import urljoin
 
@@ -7,7 +8,7 @@ import re
 from bs4 import BeautifulSoup
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
-from src.scraper.base.scraper import BaseScraper
+from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
 
 TYPES = {
     "Acórdão do Colegiado da Procuradoria": 18,
@@ -53,8 +54,6 @@ class ESAlesScraper(BaseScraper):
         base_url: str = "https://www3.al.es.gov.br",
         **kwargs,
     ):
-        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
-
         if STATE_LEGISLATION_SAVE_DIR:
             kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
@@ -239,7 +238,7 @@ class ESAlesScraper(BaseScraper):
                     return None
 
                 pdf_content = await response.read()
-                text_markdown = await self._get_pdf_image_markdown(pdf_content)
+                text_markdown = await self._get_markdown(stream=BytesIO(pdf_content))
 
             doc_info["html_string"] = ""
             doc_info["text_markdown"] = text_markdown

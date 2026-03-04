@@ -1,8 +1,9 @@
+from io import BytesIO
 from typing import Any, Optional
 
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
-from src.scraper.base.scraper import BaseScraper
+from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
 
 
 # Type mappings for Sergipe - these would need to be determined from the API
@@ -40,8 +41,6 @@ class SergipeLegsonScraper(BaseScraper):
         base_url: str = "https://legison.pge.se.gov.br",
         **kwargs: Any,
     ):
-        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
-
         if STATE_LEGISLATION_SAVE_DIR:
             kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
@@ -175,8 +174,8 @@ class SergipeLegsonScraper(BaseScraper):
 
                     if not text_markdown or not text_markdown.strip():
                         # Try image extraction if regular PDF extraction fails
-                        text_markdown = await self._get_pdf_image_markdown(
-                            await pdf_response.read()
+                        text_markdown = await self._get_markdown(stream=BytesIO(
+                            await pdf_response.read())
                         )
 
                     if text_markdown and text_markdown.strip():

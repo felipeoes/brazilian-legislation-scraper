@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Optional
 
 from bs4 import BeautifulSoup
@@ -67,9 +68,7 @@ class BrowserService:
         ]
 
         if self.use_vpn and self.vpn_extension_path:
-            from pathlib import Path as _Path
-
-            extension_abs_path = _Path(self.vpn_extension_path).resolve().as_posix()
+            extension_abs_path = Path(self.vpn_extension_path).resolve().as_posix()
             launch_args += [
                 f"--load-extension={extension_abs_path}",
                 "--disable-extensions-file-access-check",

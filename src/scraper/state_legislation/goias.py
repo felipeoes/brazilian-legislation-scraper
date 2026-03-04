@@ -1,10 +1,11 @@
 import re
+from io import BytesIO
 from typing import Optional
 from bs4 import BeautifulSoup
 import asyncio
 from urllib.parse import urlencode
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper
+from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
 
 TYPES = {
     "Constituição Estadual": {"id": 12, "url_suffix": "constituicao-estadual"},
@@ -38,8 +39,6 @@ class LegislaGoias(BaseScraper):
         base_url: str = "https://legisla.casacivil.go.gov.br/api/v2/pesquisa/legislacoes",
         **kwargs,
     ):
-        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
-
         if STATE_LEGISLATION_SAVE_DIR:
             kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
@@ -72,7 +71,7 @@ class LegislaGoias(BaseScraper):
             logger.error(f"Error fetching PDF for doc ID: {doc_id} | Link: {link}")
             return None
 
-        text_markdown = await self._get_pdf_image_markdown(await response.read())
+        text_markdown = await self._get_markdown(stream=BytesIO(await response.read()))
         if text_markdown:
             doc_info["text_markdown"] = text_markdown
             if not doc_info.get("document_url"):

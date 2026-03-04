@@ -4,7 +4,7 @@ from typing import Any, Optional
 from bs4 import BeautifulSoup, Tag
 from tqdm import tqdm
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper
+from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
 
 
 TYPES = {
@@ -35,8 +35,6 @@ class SantaCatarinaScraper(BaseScraper):
         base_url: str = "http://server03.pge.sc.gov.br/pge/normasjur.asp",
         **kwargs: Any,
     ):
-        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
-
         if STATE_LEGISLATION_SAVE_DIR:
             kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(

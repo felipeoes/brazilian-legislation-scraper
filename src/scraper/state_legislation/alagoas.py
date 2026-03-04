@@ -1,9 +1,10 @@
 from typing import Optional
 import base64
+import math
 from urllib.parse import quote
 
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper
+from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
 
 TYPES = {
     "Consituição Estadual": "TIP080",
@@ -51,8 +52,6 @@ class AlagoasSefazScraper(BaseScraper):
         base_url: str = "https://gcs2.sefaz.al.gov.br/sfz-gcs-api/api/administrativo/documento/consultar",
         **kwargs,
     ):
-        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
-
         if STATE_LEGISLATION_SAVE_DIR:
             kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
@@ -113,7 +112,9 @@ class AlagoasSefazScraper(BaseScraper):
             filename = ".".join(response["arquivo"]["nomeArquivo"].split(".")[:-1])
 
             pdf_bytes = base64.b64decode(base64_data)
-            text_markdown = await self._get_pdf_image_markdown(pdf_bytes)
+            from io import BytesIO
+
+            text_markdown = await self._get_markdown(stream=BytesIO(pdf_bytes))
 
         except Exception as e:
             logger.error(f"Error getting markdown from url: {doc_link} | Error: {e}")
@@ -157,8 +158,6 @@ class AlagoasSefazScraper(BaseScraper):
 
         if not total_norms:
             return []
-
-        import math
 
         pages = math.ceil(total_norms / 10)
 

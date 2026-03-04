@@ -1,11 +1,12 @@
 import re
+from io import BytesIO
 from typing import Optional
 from urllib.parse import urljoin, urlencode
 from bs4 import BeautifulSoup
 import asyncio
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
-from src.scraper.base.scraper import BaseScraper
+from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
 
 
 TYPES = {
@@ -83,8 +84,6 @@ class MTAlmtScraper(BaseScraper):
     """
 
     def __init__(self, base_url: str = "https://www.al.mt.gov.br", **kwargs):
-        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
-
         if STATE_LEGISLATION_SAVE_DIR:
             kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
@@ -321,7 +320,7 @@ class MTAlmtScraper(BaseScraper):
             pdf_content = await pdf_content_response.read()
 
             text_markdown = (
-                (await self._get_pdf_image_markdown(pdf_content))
+                (await self._get_markdown(stream=BytesIO(pdf_content)))
                 .replace("Powered by TCPDF (www.tcpdf.org)", "")
                 .strip()
             )
