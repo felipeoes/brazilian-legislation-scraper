@@ -8,6 +8,7 @@ from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 from tenacity import retry, stop_after_attempt, wait_exponential
 from src.scraper.base.scraper import (
     BaseScraper,
+    STATE_LEGISLATION_SAVE_DIR,
     DEFAULT_VALID_SITUATION,
     DEFAULT_INVALID_SITUATION,
 )

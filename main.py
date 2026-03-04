@@ -298,6 +298,11 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
             },
         ),
     ]
+
+    if proxy_config:
+        for cfg in configs:
+            cfg.params.setdefault("proxy_config", proxy_config)
+
     return configs
 
 
