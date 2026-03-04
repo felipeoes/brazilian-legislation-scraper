@@ -1,5 +1,4 @@
-import asyncio
-import time
+from collections import defaultdict
 from io import BytesIO
 from typing import Optional
 from urllib.parse import urlencode
@@ -48,6 +47,10 @@ class RNAlrnScraper(BaseScraper):
             situations=SITUATIONS,
             name="RIO_GRANDE_DO_NORTE",
             **kwargs,
+        )
+        # {year: {norm_type: [doc_info, ...]}} built during prefetch
+        self._prefetched_docs: dict[int, dict[str, list]] = defaultdict(
+            lambda: defaultdict(list)
         )
 
     def _build_search_url(self, norm_type_id: str, page: int) -> str:
@@ -125,7 +128,9 @@ class RNAlrnScraper(BaseScraper):
             or len(text_markdown.strip()) < pdf_len_threshold
         ):
             # probably image pdf
-            text_markdown = await self._get_markdown(stream=BytesIO(await response.read()))
+            text_markdown = await self._get_markdown(
+                stream=BytesIO(await response.read())
+            )
 
         if (
             not text_markdown or not text_markdown.strip()
@@ -143,88 +148,80 @@ class RNAlrnScraper(BaseScraper):
 
         return doc_info
 
-    async def _scrape_situation_type(
-        self, situation: str, norm_type: str, norm_type_id: str
-    ) -> list:
-        """Scrape norms for a specific situation and type"""
+    async def _prefetch_type_links(
+        self, norm_type: str, norm_type_id: str
+    ) -> None:
+        """Fetch all pages for a norm type and group doc links by year."""
         url = self._build_search_url(norm_type_id, 1)
         soup = await self.request_service.get_soup(url)
 
         total_pages = soup.find("ul", class_="pagination")
-        if not total_pages:  # must have only one page
+        if not total_pages:
             total_pages = 1
         else:
-            total_pages = total_pages.find_all("li")[-2]
-            total_pages = int(total_pages.find("a").text.strip())
-
-        # Get documents html links
-        documents = []
+            total_pages = int(total_pages.find_all("li")[-2].find("a").text.strip())
 
         tasks = [
-            self._get_docs_links(
-                self._build_search_url(norm_type_id, page),
-            )
+            self._get_docs_links(self._build_search_url(norm_type_id, page))
             for page in range(1, total_pages + 1)
         ]
         valid_results = await self._gather_results(
             tasks,
-            context={"year": "N/A", "type": norm_type, "situation": situation},
-            desc=f"RIO GRANDE DO NORTE | {norm_type} | get_docs_links",
+            context={"type": norm_type},
+            desc=f"RIO GRANDE DO NORTE | {norm_type} | prefetch",
         )
+
+        count = 0
         for result in valid_results:
             if result:
-                documents.extend(result)
+                for doc in result:
+                    year = doc["year"]
+                    self._prefetched_docs[year][norm_type].append(doc)
+                    count += 1
 
-        # Get document data
-        results = []
-        tasks = [self._get_doc_data(doc_info) for doc_info in documents]
+        logger.info(f"Prefetched {count} links for {norm_type} ({total_pages} pages)")
+
+    async def _prefetch_all_links(self) -> None:
+        """Prefetch doc links for all norm types and build self.years."""
+        for norm_type, norm_type_id in self.types.items():
+            await self._prefetch_type_links(norm_type, norm_type_id)
+
+        all_years = set(self._prefetched_docs.keys())
+        if all_years:
+            self.years = sorted(
+                y for y in all_years if self.year_start <= y <= self.year_end
+            )
+
+    async def _scrape_type(
+        self, norm_type: str, norm_type_id: str, year: int
+    ) -> list[dict]:
+        """Scrape documents of a single type for a given year using prefetched links."""
+        docs = self._prefetched_docs.get(year, {}).get(norm_type, [])
+        if not docs:
+            return []
+
+        tasks = [self._get_doc_data(doc) for doc in docs]
         valid_results = await self._gather_results(
             tasks,
-            context={"year": "N/A", "type": norm_type, "situation": situation},
-            desc=f"RIO GRANDE DO NORTE | {norm_type}",
+            context={"year": year, "type": norm_type},
+            desc=f"RIO GRANDE DO NORTE | {norm_type} {year}",
         )
-        for result in valid_results:
-            if result:
-                # prepare item for saving
-                queue_item = {
-                    # hardcode since we only get valid documents in search request
-                    "situation": situation,
-                    "type": norm_type,
-                    **result,
-                }
 
-                results.append(queue_item)
-            else:
-                logger.warning("Invalid document returned from get_doc_data")
+        situation = self.situations[0] if self.situations else "Não consta"
+        results = [
+            {"situation": situation, "type": norm_type, **result}
+            for result in valid_results
+            if result
+        ]
 
         if self.verbose:
             logger.info(
-                f"Finished scraping for Situation: {situation} | Type: {norm_type} | Results: {len(results)}"
+                f"Year: {year} | Type: {norm_type} | Results: {len(results)}"
             )
 
         return results
 
     async def scrape(self) -> list:
-        """Scrape data from all types and situations"""
-
-        await self._ensure_session()
-        self._scrape_start = time.time()
-
-        # scrape data
-        tasks = [
-            self._scrape_situation_type(sit, nt, nt_id)
-            for sit in self.situations
-            for nt, nt_id in self.types.items()
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for result in results:
-            if isinstance(result, Exception):
-                logger.error(f"Error in _scrape_situation_type: {result}")
-            elif result:
-                await self.saver.save(result)
-                self.results.extend(result)
-                self.count += len(result)
-
-        await self._save_summary()
-        return self.results
+        """Prefetch all doc links then delegate to BaseScraper's year-sequential flow."""
+        await self._prefetch_all_links()
+        return await super().scrape()

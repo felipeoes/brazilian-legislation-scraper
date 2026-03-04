@@ -75,7 +75,7 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
                 "rps": 200,
                 "verbose": True,
             },
-            run=True,
+            run=False,
         ),
         ScraperConfig(
             scraper=ConamaScraper,
@@ -107,12 +107,12 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
         ScraperConfig(
             scraper=AlagoasSefazScraper,
             params={
-                "year_start": 2018,  # starts at 1900
+                "year_start": 2019,  # starts at 1900
                 "llm_config": llm_config,
                 "rps": 5,
                 "verbose": True,
             },
-            run=False,
+            run=True,
         ),
         ScraperConfig(
             scraper=LegislaAMScraper,
@@ -133,8 +133,8 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
         ScraperConfig(
             scraper=BahiaLegislaScraper,
             params={
-                "year_start": 1993,  # starts from 1891
-                "rps": 0.5,  # lower RPS to avoid 500 and 504 errors from https://www.legislabahia.ba.gov.br
+                "year_start": 1891,  # starts from 1891
+                "rps": 1,  # lower RPS to avoid 500 and 504 errors from https://www.legislabahia.ba.gov.br
             },
             run=False,
         ),
@@ -243,7 +243,10 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
         ),
         ScraperConfig(
             scraper=RNAlrnScraper,
-            params={"llm_config": llm_config},
+            params={
+                "year_start": 1971,  # oldest Lei Complementar from 1971
+                "llm_config": llm_config,
+            },
         ),
         ScraperConfig(
             scraper=RSAlrsScraper,
