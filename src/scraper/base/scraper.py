@@ -289,6 +289,10 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         """Strip markdown code block wrappers if present."""
         return clean_md_tag(md_content)
 
+    def _check_text_length(self, text: str, min_length: int = 50) -> bool:
+        """Return True if *text* meets the minimum character threshold."""
+        return len(text.strip()) >= min_length
+
     @staticmethod
     def _wrap_html(content: str) -> str:
         """Wrap HTML fragment in <html><body> tags for markitdown conversion."""
@@ -652,7 +656,7 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
     def _valid_markdown(
         self,
         text_markdown: str | None,
-        min_length: int = 50,
+        min_length: int = 100,
     ) -> tuple[bool, str]:
         """Validate markdown text using common patterns found across all scrapers.
 
@@ -665,7 +669,7 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
 
         Args:
             text_markdown: The text to validate.
-            min_length: Minimum acceptable character count (default 50).
+            min_length: Minimum acceptable character count (default 100).
 
         Returns:
             Tuple of ``(is_valid, reason)``. *reason* is an empty string when
@@ -704,7 +708,7 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         results: list,
         context: dict,
         desc: str = "",
-        min_length: int = 50,
+        min_length: int = 100,
     ) -> list:
         """Filter asyncio.gather results: persist exceptions via save_error, return valid results.
 
@@ -712,7 +716,7 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
             results: Output of ``await asyncio.gather(*tasks, return_exceptions=True)``.
             context: Dict with ``year``, ``type``, ``situation`` — merged into each error record.
             desc: Label for log messages.
-            min_length: Minimum character count for valid text_markdown (default 50).
+            min_length: Minimum character count for valid text_markdown (default 100).
 
         Returns:
             List of non-None, non-Exception results with valid text_markdown (order preserved).
@@ -763,7 +767,7 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         tasks: list,
         context: dict | None = None,
         desc: str = "",
-        min_length: int = 50,
+        min_length: int = 100,
     ) -> list:
         """Run tasks with asyncio.gather and filter errors."""
         if self.verbose and tasks:
@@ -881,6 +885,18 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
             return
 
         elapsed = time.time() - (self._scrape_start or time.time())
+
+        types_summary = {}
+        for doc in self.results:
+            doc_type = doc.get("type", "Unknown")
+            doc_situation = doc.get("situation", "Unknown")
+            
+            if doc_type not in types_summary:
+                types_summary[doc_type] = {"total": 0, "situations": {}}
+                
+            types_summary[doc_type]["total"] += 1
+            types_summary[doc_type]["situations"][doc_situation] = types_summary[doc_type]["situations"].get(doc_situation, 0) + 1
+
         summary = {
             "scraper": self.__class__.__name__,
             "year_start": self.year_start,
@@ -890,6 +906,7 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
             "elapsed_seconds": round(elapsed, 2),
             "elapsed_human": _format_duration(elapsed),
             "completed_at": datetime.now().isoformat(),
+            "types_summary": types_summary,
         }
 
         summary_path = Path(self.saver.save_dir) / "summary.json"
