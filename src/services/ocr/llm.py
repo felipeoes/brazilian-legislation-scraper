@@ -9,6 +9,7 @@ import aiohttp
 import fitz
 from src.services.ocr.bedrock import BedrockClient
 from src.services.request.service import RequestService
+from src.scraper.base.concurrency import RateLimiter
 from src.utils import clean_md_tag
 from loguru import logger
 from openai import (
@@ -51,8 +52,6 @@ class LLMOCRService:
         verbose: bool = False,
         timeout: int = 180,
     ) -> None:
-        from src.scraper.base.concurrency import RateLimiter
-
         self.llm_config = llm_config or {}
         self.client: AsyncOpenAI | BedrockClient | None = self.llm_config.get(
             "llm_client"
@@ -71,7 +70,7 @@ class LLMOCRService:
 
         effective_rps = self.llm_config.get("llm_rps", 10)
         self._rate_limiter = RateLimiter(effective_rps)
-        self.batch_size = self.llm_config.get("llm_batch_size", 3)
+        self.batch_size = self.llm_config.get("llm_batch_size", 5)
         self.raw = self.llm_config.get("llm_raw", False)
         if verbose:
             logger.info(
@@ -123,7 +122,7 @@ class LLMOCRService:
     def _create_retry_strategy(self, max_attempts: int = 10) -> AsyncRetrying:
         """Create a configured AsyncRetrying instance for LLM requests."""
         return AsyncRetrying(
-            stop=stop_after_attempt(max_attempts),  # 12 attempts roughly 5 minutes
+            stop=stop_after_attempt(max_attempts),  # 10 attempts roughly 5 minutes
             wait=wait_fixed(5) + wait_random_exponential(min=1, max=60, multiplier=2),
             retry=retry_if_exception_type(
                 (
@@ -177,7 +176,7 @@ class LLMOCRService:
             async for attempt in self._create_retry_strategy():
                 with attempt:
                     await self._rate_limiter.acquire()
-                    if self.verbose and attempt.retry_state.attempt_number > 5:
+                    if self.verbose and attempt.retry_state.attempt_number > 6:
                         model = self.models[
                             (attempt.retry_state.attempt_number - 1) % len(self.models)
                         ]
@@ -214,7 +213,7 @@ class LLMOCRService:
             async for attempt in self._create_retry_strategy():
                 with attempt:
                     await self._rate_limiter.acquire()
-                    if self.verbose and attempt.retry_state.attempt_number > 5:
+                    if self.verbose and attempt.retry_state.attempt_number > 6:
                         model = self.models[
                             (attempt.retry_state.attempt_number - 1) % len(self.models)
                         ]
@@ -245,8 +244,10 @@ class LLMOCRService:
                         timeout=timeout,
                     )
                     return self._clean_md_tag(response_text or "")
-        except RetryError:
-            logger.error("LLM batch image conversion failed after 10 attempts.")
+        except RetryError as e:
+            logger.error(
+                f"LLM batch image conversion failed after 10 attempts: {e.last_attempt.exception()}"
+            )
             return ""
         except Exception as e:
             logger.error(f"LLM batch image conversion failed: {e}")
@@ -264,7 +265,7 @@ class LLMOCRService:
             async for attempt in self._create_retry_strategy():
                 with attempt:
                     await self._rate_limiter.acquire()
-                    if self.verbose and attempt.retry_state.attempt_number > 5:
+                    if self.verbose and attempt.retry_state.attempt_number > 6:
                         model = self.models[
                             (attempt.retry_state.attempt_number - 1) % len(self.models)
                         ]

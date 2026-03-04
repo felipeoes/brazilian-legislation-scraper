@@ -1,11 +1,10 @@
 import re
-import time
 
+from collections import defaultdict
 from datetime import datetime
 from bs4 import BeautifulSoup
 from loguru import logger
-from tqdm import tqdm
-from src.scraper.base.scraper import BaseScraper
+from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
 
 TYPES = {
     "Lei Ordinária": "lei_ordinarias",
@@ -18,9 +17,7 @@ VALID_SITUATIONS = [
     "Não consta revogação expressa",
 ]  # Legis - Acre only publishes norms that are currently valid (no explicit revocation)
 
-INVALID_SITUATIONS = (
-    []
-)  # norms with these situations are invalid norms (no longer have legal effect)
+INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no longer have legal effect)
 
 # the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
@@ -37,14 +34,16 @@ class AcreLegisScraper(BaseScraper):
         base_url: str = "https://legis.ac.gov.br/principal",
         **kwargs,
     ):
-        from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
-
         if STATE_LEGISLATION_SAVE_DIR:
             kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
             base_url, name="ACRE", types=TYPES, situations=SITUATIONS, **kwargs
         )
         self.year_regex = re.compile(r"\d{4}")
+        # {year: {norm_type: [doc_info, ...]}} — populated before year iteration
+        self._prefetched_docs: dict[int, dict[str, list]] = defaultdict(
+            lambda: defaultdict(list)
+        )
 
     def _format_search_url(self, norm_type_id: str) -> str:
         """Format url for search request"""
@@ -112,11 +111,16 @@ class AcreLegisScraper(BaseScraper):
             if doe_span:
                 doe_span.decompose()
 
+        if html_string:
+            # Remove hyperlinks (unwrap <a> tags, keeping inner text)
+            for a_tag in html_string.find_all("a"):
+                a_tag.unwrap()
+
         html_string = html_string.prettify() if html_string else ""
 
         # get text markdown from extracted HTML
         text_markdown = await self._get_markdown(
-            html_content=html_string, remove_hyperlinks=True
+            html_content=html_string,
         )
 
         if text_markdown is None:
@@ -161,11 +165,15 @@ class AcreLegisScraper(BaseScraper):
             if doe_span:
                 doe_span.decompose()
 
+        if html_string:
+            for a_tag in html_string.find_all("a"):
+                a_tag.unwrap()
+
         html_string = html_string.prettify() if html_string else ""
 
         # get text markdown
         text_markdown = await self._get_markdown(
-            html_content=html_string, remove_hyperlinks=True
+            html_content=html_string,
         )
 
         return {
@@ -177,74 +185,84 @@ class AcreLegisScraper(BaseScraper):
             "document_url": document_url,
         }
 
-    async def _scrape_situation_type(
-        self, situation: str, norm_type: str, norm_type_id: str
-    ) -> list:
-        """Scrape norms for a specific situation and type"""
-        # if it's state constitution, we need to change logic. All the text is within div class="exportacao"
+    async def _prefetch_all_links(self) -> None:
+        """Fetch all document links from the single page and group by year.
+
+        The Legis AC website loads all documents on a single page.
+        This method extracts links for all norm types and buckets them
+        into ``_prefetched_docs`` by year for year-sequential processing.
+        """
+        url = self._format_search_url(1)
+        soup = await self.request_service.get_soup(url)
+        if soup is None:
+            logger.error("Failed to fetch Acre main page")
+            return
+
+        for norm_type, norm_type_id in self.types.items():
+            if norm_type == "Constituição Estadual":
+                continue
+
+            html_links = await self._get_docs_links(soup, norm_type_id)
+            count = 0
+            for doc in html_links:
+                year = int(doc["year"])
+                self._prefetched_docs[year][norm_type].append(doc)
+                count += 1
+
+            if self.verbose:
+                logger.info(f"Prefetched {count} links for {norm_type}")
+
+    async def _scrape_type(
+        self, norm_type: str, norm_type_id: str, year: int
+    ) -> list[dict]:
+        """Scrape all documents of a single type for a year."""
+        situation = self.situations[0]
+
         if norm_type == "Constituição Estadual":
+            # Scrape once on the first year that reaches here
+            if getattr(self, "_scraped_constitution", False):
+                return []
+            self._scraped_constitution = True
             doc_info = await self._get_state_constitution(norm_type_id)
             doc_info["situation"] = situation
             doc_info["type"] = norm_type
             return [doc_info]
 
-        url = self._format_search_url(1)
-        soup = await self.request_service.get_soup(url)
-        if soup is None:
+        docs = self._prefetched_docs.get(year, {}).get(norm_type, [])
+        if not docs:
             return []
 
-        html_links = await self._get_docs_links(soup, norm_type_id)
-        results = []
-
-        # Get data from all documents text links using asyncio.gather with progress tracking
-        tasks = [self._get_doc_data(doc) for doc in html_links]
-
+        tasks = [self._get_doc_data(doc) for doc in docs]
         valid_results = await self._gather_results(
             tasks,
-            context={"year": "NA", "type": norm_type, "situation": situation},
-            desc=f"ACRE | {norm_type}",
+            context={"year": year, "type": norm_type, "situation": situation},
+            desc=f"ACRE | {norm_type} | Year {year}",
         )
 
+        results = []
         for result in valid_results:
-            # prepare item for saving
             queue_item = {
-                # "year": year, # getting year from document title because Legis does not have a search by year
-                # website only shows documents without any revocation
                 "situation": situation,
                 "type": norm_type,
                 **result,
             }
             results.append(queue_item)
 
-        if self.verbose:
-            logger.info(
-                f"Type: {norm_type} | Situation: {situation} | Total: {len(results)}"
-            )
-
         return results
 
-    async def scrape(self):
-        """Scrape norms"""
+    async def scrape(self) -> list:
+        """Scrape data from all years.
 
-        self._scrape_start = time.time()
+        Prefetches all document links from the single page, groups them
+        by year, then delegates to BaseScraper.scrape() for year-sequential
+        processing with resumability.
+        """
+        await self._prefetch_all_links()
 
-        # Collect all tasks for concurrent execution with progress tracking
-        task_configs = [
-            (situation, norm_type, norm_type_id)
-            for situation in self.situations
-            for norm_type, norm_type_id in self.types.items()
-        ]
-
-        all_results = []
-        for situation, norm_type, norm_type_id in tqdm(task_configs, desc="ACRE"):
-            results = await self._scrape_situation_type(
-                situation, norm_type, norm_type_id
+        all_years = set(self._prefetched_docs.keys())
+        if all_years:
+            self.years = sorted(
+                y for y in all_years if self.year_start <= y <= self.year_end
             )
-            if results:
-                await self.saver.save(results)
-                all_results.extend(results)
 
-        self.results = all_results
-        self.count = len(all_results)
-        await self._save_summary()
-        return self.results
+        return await super().scrape()

@@ -99,6 +99,9 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
         ),
         ScraperConfig(
             scraper=AcreLegisScraper,
+            params={
+                "year_start": 1963,  # starts from 1963
+            },
             # run=True
         ),
         ScraperConfig(
@@ -109,7 +112,7 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
                 "rps": 5,
                 "verbose": True,
             },
-            run=True,
+            # run=True,
         ),
         ScraperConfig(
             scraper=LegislaAMScraper,
@@ -131,8 +134,7 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
             scraper=BahiaLegislaScraper,
             params={
                 "year_start": 1993,  # starts from 1891
-                "verbose": True,
-                "rps": 1,  # lower RPS to avoid 500 and 504 errors from https://www.legislabahia.ba.gov.br
+                "rps": 0.5,  # lower RPS to avoid 500 and 504 errors from https://www.legislabahia.ba.gov.br
             },
             # run=True,
         ),
@@ -143,7 +145,7 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
                 "verbose": True,
                 "llm_config": llm_config,
             },
-            # run=True,
+            run=True,
         ),
         ScraperConfig(
             scraper=DFSinjScraper,
@@ -362,9 +364,9 @@ async def main():
             llm_config = {
                 "llm_client": client,
                 "llm_model": model,
-                "llm_rps": 5,
+                "llm_rps": 2,
                 "llm_kwargs": {
-                    "max_tokens": 32768,
+                    "max_completion_tokens": 32768,
                     "extra_body": {"media_resolution": "MEDIA_RESOLUTION_HIGH"},
                 },  # using stream=True for fireworks AI to send multiple images
             }
