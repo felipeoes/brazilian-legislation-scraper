@@ -1,10 +1,9 @@
 import asyncio
 import re
 import time
-from typing import Optional
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup, Tag
-from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
+from src.scraper.base.scraper import StateScraper
 from loguru import logger
 
 
@@ -34,7 +33,7 @@ INVALID_SITUATIONS = []
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class PernambucoAlepeScraper(BaseScraper):
+class PernambucoAlepeScraper(StateScraper):
     """Webscraper for Assembleia Legislativa de Pernambuco website (https://legis.alepe.pe.gov.br)
 
     This website uses ASP.NET forms with viewstate for search functionality.
@@ -85,8 +84,6 @@ class PernambucoAlepeScraper(BaseScraper):
         base_url: str = "https://legis.alepe.pe.gov.br",
         **kwargs,
     ):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
             base_url, types=TYPES, situations=SITUATIONS, name="PERNAMBUCO", **kwargs
         )
@@ -310,7 +307,7 @@ class PernambucoAlepeScraper(BaseScraper):
             logger.error(f"Failed to retrieve documents from page {page}: {e}")
             return []
 
-    async def _get_additional_data(self, url: str) -> Optional[dict[str, str | int]]:
+    async def _get_additional_data(self, url: str) -> dict[str, str | int | None]:
         """Get additional data from the document page. Returns a dict with keys 'situation', 'date', 'initiative', 'publication', 'subject', 'updates'."""
         soup = await self.request_service.get_soup(url)
         if soup is None:
@@ -366,6 +363,9 @@ class PernambucoAlepeScraper(BaseScraper):
         """Get document data from document link"""
         url = doc_info.get("document_url")
 
+        if self._is_already_scraped(url, doc_info.get("title", "")):
+            return None
+
         soup = await self.request_service.get_soup(url)
         if soup is None:
             logger.error(f"Failed to retrieve document data for URL: {url}")
@@ -399,6 +399,8 @@ class PernambucoAlepeScraper(BaseScraper):
 
         doc_info["html_string"] = html_string
         doc_info["text_markdown"] = text_markdown
+        doc_info["_raw_content"] = html_string.encode("utf-8")
+        doc_info["_content_extension"] = ".html"
 
         # Get additional data
         additional_data = await self._get_additional_data(
@@ -406,9 +408,16 @@ class PernambucoAlepeScraper(BaseScraper):
         )
         if not additional_data:
             logger.warning(f"Failed to retrieve additional data for URL: {url}")
+            saved = await self._save_doc_result(doc_info)
+            if saved is not None:
+                doc_info = saved
             return doc_info
 
         doc_info.update(additional_data)
+
+        saved = await self._save_doc_result(doc_info)
+        if saved is not None:
+            doc_info = saved
 
         return doc_info
 

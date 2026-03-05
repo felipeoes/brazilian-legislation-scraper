@@ -1,12 +1,11 @@
 from collections import defaultdict
-from typing import Optional
 from urllib.parse import urljoin, urlencode
 
 import re
 from datetime import datetime
 from bs4 import BeautifulSoup
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR, YEAR_START
+from src.scraper.base.scraper import StateScraper
 
 TYPES = {
     "Ato Deliberativo": "ato-deliberativo",
@@ -29,7 +28,7 @@ INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no lon
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class CearaAleceScraper(BaseScraper):
+class CearaAleceScraper(StateScraper):
     """Webscraper for Ceara state legislation website (https://www.al.ce.gov.br/)
 
     Example search request: https://www.al.ce.gov.br/legislativo/leis-e-normativos-internos?categoria=ato-normativo&page=1
@@ -47,8 +46,6 @@ class CearaAleceScraper(BaseScraper):
         base_url: str = "https://www.al.ce.gov.br/legislativo",
         **kwargs,
     ):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
             base_url, name="CEARA", types=TYPES, situations=SITUATIONS, **kwargs
         )
@@ -111,6 +108,11 @@ class CearaAleceScraper(BaseScraper):
 
     async def _get_doc_data(self, doc_info: dict) -> dict:
         """Get document data from given document dict"""
+        if self._is_already_scraped(
+            doc_info["document_url"], doc_info.get("title", "")
+        ):
+            return None
+
         # Use the /visualizar HTML page to avoid needing OCR on the PDF download.
         visualizar_url = doc_info["document_url"].rstrip("/") + "/visualizar"
         soup = await self.request_service.get_soup(visualizar_url)
@@ -119,8 +121,11 @@ class CearaAleceScraper(BaseScraper):
         for img in content.find_all("img"):
             img.decompose()
 
-        text_markdown = await self._get_markdown(html_content=str(content))
+        html_string = str(content)
+        text_markdown = await self._get_markdown(html_content=html_string)
         doc_info["text_markdown"] = text_markdown
+        doc_info["_raw_content"] = html_string.encode("utf-8")
+        doc_info["_content_extension"] = ".html"
 
         return doc_info
 
@@ -210,6 +215,7 @@ class CearaAleceScraper(BaseScraper):
                 "type": norm_type,
                 **result,
             }
+            await self._save_doc_result(queue_item)
             results.append(queue_item)
 
         return results
@@ -322,7 +328,7 @@ class CearaAleceScraper(BaseScraper):
 
         return docs
 
-    def construct_url(self, norm_type: str, html_link: str, year: Optional[int]) -> str:
+    def construct_url(self, norm_type: str, html_link: str, year: int | None) -> str:
         """Construct the full url for the document page"""
         if "https://" in html_link:
             # don't need to do anything, it's already a full url
@@ -366,13 +372,16 @@ class CearaAleceScraper(BaseScraper):
         return urljoin(base_url, html_link)
 
     async def _get_laws_constitution_amendments_doc_data(
-        self, doc_info: dict, norm_type: str, year: Optional[int] = None
-    ) -> Optional[dict]:
+        self, doc_info: dict, norm_type: str, year: int | None = None
+    ) -> dict | None:
         """Get document data from given document dict"""
         # html_link will be a link to the document page
 
         html_link = doc_info.pop("html_link")
         url = self.construct_url(norm_type, html_link, year)
+
+        if self._is_already_scraped(url, doc_info.get("title", "")):
+            return None
 
         response = await self.request_service.make_request(url)
 
@@ -440,6 +449,8 @@ class CearaAleceScraper(BaseScraper):
         doc_info["html_string"] = html_string
         doc_info["text_markdown"] = text_markdown
         doc_info["document_url"] = url
+        doc_info["_raw_content"] = html_string.encode("utf-8")
+        doc_info["_content_extension"] = ".html"
 
         return doc_info
 
@@ -492,6 +503,7 @@ class CearaAleceScraper(BaseScraper):
             if queue_item["year"] is None:
                 queue_item["year"] = year
 
+            await self._save_doc_result(queue_item)
             results.append(queue_item)
 
         if self.verbose:
@@ -506,16 +518,10 @@ class CearaAleceScraper(BaseScraper):
 
         Prefetches all document links for paginated categories, groups them
         by year, then delegates to BaseScraper.scrape() for year-sequential
-        processing with resumability.
+        processing with document-level resumability.
         """
-        # Determine resume point early so prefetch can skip old years
-        resume_from = self.year_start
-        forced_resume = self.year_start != YEAR_START
-        if self.saver and self.saver.last_year is not None and not forced_resume:
-            resume_from = int(self.saver.last_year)
-
         # Prefetch links for paginated categories (grouped by year)
-        await self._prefetch_paginated_links(resume_from)
+        await self._prefetch_paginated_links(self.year_start)
 
         # Fetch available Lei Ordinária years
         self._lei_ordinaria_years: set[int] = set(

@@ -2,7 +2,7 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
+from src.scraper.base.scraper import StateScraper
 
 TYPES = {
     "Decreto Legislativo": 41535,
@@ -26,7 +26,7 @@ INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no lon
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class LegislaAMScraper(BaseScraper):
+class LegislaAMScraper(StateScraper):
     """Webscraper for Amazonas state legislation website (https://legisla.imprensaoficial.am.gov.br/)
 
     Example search request: https://legisla.imprensaoficial.am.gov.br/diario_am/41535/2022?page=1
@@ -39,8 +39,6 @@ class LegislaAMScraper(BaseScraper):
         base_url: str = "https://legisla.imprensaoficial.am.gov.br",
         **kwargs,
     ):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
             base_url, name="AMAZONAS", types=TYPES, situations=SITUATIONS, **kwargs
         )
@@ -114,6 +112,10 @@ class LegislaAMScraper(BaseScraper):
         html_link = doc_info.pop("html_link")
 
         url = urljoin(self.base_url, html_link)
+
+        if self._is_already_scraped(url, doc_info.get("title", "")):
+            return None
+
         soup = await self.request_service.get_soup(url)
 
         html_content = self._get_norm_text(soup)
@@ -132,6 +134,8 @@ class LegislaAMScraper(BaseScraper):
         doc_info["html_string"] = html_string
         doc_info["text_markdown"] = text_markdown
         doc_info["document_url"] = url
+        doc_info["_raw_content"] = html_string.encode("utf-8")
+        doc_info["_content_extension"] = ".html"
 
         return doc_info
 
@@ -152,9 +156,12 @@ class LegislaAMScraper(BaseScraper):
             }
 
             doc_info = await self._get_doc_data(doc_info)
+            if doc_info is None:
+                return []
 
             self.fetched_constitution = True
             logger.info("Scraped state constitution")
+            await self._save_doc_result(doc_info)
             return [doc_info]
 
         total_pages = 30
@@ -211,6 +218,7 @@ class LegislaAMScraper(BaseScraper):
                 "type": norm_type,
                 **result,
             }
+            await self._save_doc_result(queue_item)
             results.append(queue_item)
 
         if self.verbose:

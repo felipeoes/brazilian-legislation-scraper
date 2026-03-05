@@ -1,10 +1,9 @@
 import re
 from urllib.parse import urljoin, urlencode
-from typing import Optional
 from bs4 import BeautifulSoup
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_random_exponential
-from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
+from src.scraper.base.scraper import StateScraper
 
 TYPES = {
     "Lei Complementar": 11,
@@ -33,7 +32,7 @@ INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no lon
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class BahiaLegislaScraper(BaseScraper):
+class BahiaLegislaScraper(StateScraper):
     """Webscraper for Bahia state legislation website (https://www.legislabahia.ba.gov.br/)
 
     Example search request: https://www.legislabahia.ba.gov.br/documentos?categoria%5B%5D=7&num=&ementa=&exp=&data%5Bmin%5D=2025-01-01&data%5Bmax%5D=2025-12-31&page=0
@@ -46,8 +45,6 @@ class BahiaLegislaScraper(BaseScraper):
         base_url: str = "https://www.legislabahia.ba.gov.br",
         **kwargs,
     ):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
             base_url, name="BAHIA", types=TYPES, situations=SITUATIONS, **kwargs
         )
@@ -64,19 +61,6 @@ class BahiaLegislaScraper(BaseScraper):
             "page": page,
         }
         return f"{self.base_url}/documentos?{urlencode(params)}"
-
-    @retry(
-        stop=stop_after_attempt(7),
-        wait=wait_random_exponential(multiplier=2, max=30),
-        reraise=True,
-    )
-    async def _fetch_soup_with_retry(
-        self, url: str, timeout: int = 120
-    ) -> BeautifulSoup:
-        soup = await self.request_service.get_soup(url, timeout=timeout)
-        if not soup:
-            raise ValueError(f"Failed to get soup for URL: {url}")
-        return soup
 
     @retry(
         stop=stop_after_attempt(7),
@@ -124,11 +108,14 @@ class BahiaLegislaScraper(BaseScraper):
 
         return docs
 
-    async def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
+    async def _get_doc_data(self, doc_info: dict) -> dict | None:
         """Get document data from given document dict"""
         # remove html_link from doc_info
         html_link = doc_info.pop("html_link")
         url = urljoin(self.base_url, html_link)
+
+        if self._is_already_scraped(url, doc_info.get("title", "")):
+            return None
 
         try:
             response = await self._fetch_request_with_retry(url)
@@ -210,6 +197,8 @@ class BahiaLegislaScraper(BaseScraper):
         doc_info["html_string"] = html_string
         doc_info["text_markdown"] = text_markdown
         doc_info["document_url"] = url
+        doc_info["_raw_content"] = html_string.encode("utf-8")
+        doc_info["_content_extension"] = ".html"
 
         return doc_info
 
@@ -264,6 +253,7 @@ class BahiaLegislaScraper(BaseScraper):
                 "type": norm_type,
                 **result,
             }
+            await self._save_doc_result(queue_item)
             results.append(queue_item)
 
         if self.verbose:

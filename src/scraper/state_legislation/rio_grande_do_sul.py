@@ -1,9 +1,8 @@
 import re
-from typing import Optional
 from urllib.parse import urlencode
 
 from bs4 import BeautifulSoup
-from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
+from src.scraper.base.scraper import StateScraper
 from loguru import logger
 
 # ALRS does not have a type field, norm type is gotten while scraping
@@ -18,7 +17,7 @@ INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no lon
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class RSAlrsScraper(BaseScraper):
+class RSAlrsScraper(StateScraper):
     """Webscraper for Rio Grande do Sul state legislation website (https://www.al.rs.gov.br/legis)
 
 
@@ -31,8 +30,6 @@ class RSAlrsScraper(BaseScraper):
         base_url: str = "https://www.al.rs.gov.br",
         **kwargs,
     ):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
             base_url,
             types=TYPES,
@@ -130,7 +127,7 @@ class RSAlrsScraper(BaseScraper):
 
         return html_string
 
-    async def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
+    async def _get_doc_data(self, doc_info: dict) -> dict | None:
         """Get document data from given document dict"""
 
         # remove html_link from doc_info
@@ -190,10 +187,7 @@ class RSAlrsScraper(BaseScraper):
 
         pdf_link = None
         html_string = self._get_html_string(soup)
-        if html_string:
-            # Use direct HTML content conversion
-            text_markdown = await self._get_markdown(html_content=html_string)
-        else:
+        if not html_string:
             pdf_link = soup.find("iframe")
             if pdf_link:
                 pdf_link = pdf_link["src"]
@@ -203,7 +197,20 @@ class RSAlrsScraper(BaseScraper):
                 pdf_link = re.search(r"window\.open\('([^']+)'", soup.prettify())
                 pdf_link = pdf_link.group(1)
 
-            text_markdown = await self._get_markdown(pdf_link)
+        document_url = pdf_link if pdf_link else html_link
+
+        if self._is_already_scraped(document_url, doc_info.get("title", "")):
+            return None
+
+        if html_string:
+            # Use direct HTML content conversion
+            text_markdown = await self._get_markdown(html_content=html_string)
+            raw_content = html_string.encode("utf-8")
+            content_ext = ".html"
+        else:
+            text_markdown, raw_content, content_ext = await self._download_and_convert(
+                pdf_link
+            )
 
         if not text_markdown or not text_markdown.strip():
             logger.error(f"Error getting markdown from pdf: {pdf_link}")
@@ -217,20 +224,33 @@ class RSAlrsScraper(BaseScraper):
             )
             return None
 
-        return {
+        result = {
             **doc_info,
             "situation": situation,
             "subject": subject,
             "html_string": html_string,
             "text_markdown": text_markdown.strip(),
-            "document_url": pdf_link if pdf_link else html_link,
+            "document_url": document_url,
+            "_raw_content": raw_content,
+            "_content_extension": content_ext,
         }
+
+        saved = await self._save_doc_result(result)
+        if saved is not None:
+            result = saved
+
+        return result
 
     async def scrape_constitution(self):
         """Scrape constitution data"""
         url = "https://ww2.al.rs.gov.br/dal/LinkClick.aspx?fileticket=9p-X_3esaNg%3d&tabid=3683&mid=5358"
 
-        text_markdown = await self._get_markdown(url)
+        title = "Constituição do Estado do Rio Grande do Sul"
+        if self._is_already_scraped(url, title):
+            self.fetched_constitution = True
+            return None
+
+        text_markdown, raw_content, content_ext = await self._download_and_convert(url)
         if not text_markdown or not text_markdown.strip():
             logger.error("Error getting markdown for state constitution")
             return None
@@ -239,13 +259,19 @@ class RSAlrsScraper(BaseScraper):
         queue_item = {
             "year": 1989,
             "type": "Constituição Estadual",
-            "title": "Constituição do Estado do Rio Grande do Sul",
+            "title": title,
             "date": "",
             "summary": "Texto constitucional de 3 de outubro de 1989 com as alterações adotadas pelas Emendas Constitucionais de n.º 1, de 1991, a 85, de 2023",
             "situation": "Sem revogação expressa",
             "text_markdown": text_markdown.strip(),
             "document_url": url,
+            "_raw_content": raw_content,
+            "_content_extension": content_ext,
         }
+
+        saved = await self._save_doc_result(queue_item)
+        if saved is not None:
+            queue_item = saved
 
         self.queue.put(queue_item)
 

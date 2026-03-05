@@ -3,7 +3,6 @@ import random
 import time
 import aiohttp
 import aiofiles
-from typing import Optional
 from loguru import logger
 
 
@@ -90,7 +89,7 @@ class ProxyService:
         self._loaded = True
         self._last_loaded = current_time
 
-    async def get_proxy(self) -> Optional[str]:
+    async def get_proxy(self) -> str | None:
         """
         Get a random proxy from the loaded list.
 

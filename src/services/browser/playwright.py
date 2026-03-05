@@ -1,11 +1,7 @@
 """Playwright browser service for async web scraping."""
 
-from __future__ import annotations
-
 import asyncio
 from pathlib import Path
-from typing import Optional
-
 from bs4 import BeautifulSoup
 from loguru import logger
 from playwright.async_api import (
@@ -35,7 +31,7 @@ class BrowserService:
     def __init__(
         self,
         use_vpn: bool = False,
-        vpn_extension_path: Optional[str] = None,
+        vpn_extension_path: str | None = None,
         multiple_pages: bool = False,
         max_workers: int = 50,
         headless: bool = True,
@@ -50,12 +46,31 @@ class BrowserService:
         self.verbose = verbose
         self.owner_class_name = owner_class_name
 
-        self._playwright: Optional[Playwright] = None
-        self._browser: Optional[Browser] = None
-        self._browser_context: Optional[BrowserContext] = None
-        self.page: Optional[Page] = None
+        self._playwright: Playwright | None = None
+        self._browser: Browser | None = None
+        self._browser_context: BrowserContext | None = None
+        self.page: Page | None = None
         self.pages: list[Page] = []
         self._page_pool: asyncio.Queue[Page] = asyncio.Queue()
+
+    async def _init_pages(self) -> None:
+        """Create the page pool or single page from the current browser context."""
+        if not self._browser_context:
+            raise RuntimeError("Browser context is not initialized.")
+
+        if self.multiple_pages:
+            for page_id in range(self.max_workers):
+                page = await self._browser_context.new_page()
+                self.pages.append(page)
+                self._page_pool.put_nowait(page)
+                if self.verbose:
+                    logger.info(f"Page {page_id} initialized")
+        else:
+            # Reuse existing page if available (e.g. persistent contexts)
+            if self._browser_context.pages:
+                self.page = self._browser_context.pages[0]
+            else:
+                self.page = await self._browser_context.new_page()
 
     async def initialize(self) -> None:
         """Launch Playwright and open the browser / page pool."""
@@ -89,34 +104,20 @@ class BrowserService:
                     args=launch_args,
                 )
             )
-            if self.multiple_pages:
-                for _ in range(self.max_workers):
-                    page = await self._browser_context.new_page()
-                    self.pages.append(page)
-                    self._page_pool.put_nowait(page)
-                    if self.verbose:
-                        logger.info(f"Page {len(self.pages) - 1} initialized")
-            else:
-                self.page = (
-                    self._browser_context.pages[0]
-                    if self._browser_context.pages
-                    else await self._browser_context.new_page()
-                )
         else:
             self._browser = await self._playwright.chromium.launch(
                 headless=self.headless, args=launch_args
             )
-            if self.multiple_pages:
-                for page_id in range(self.max_workers):
-                    page = await self._browser.new_page()
-                    self.pages.append(page)
-                    self._page_pool.put_nowait(page)
-                    if self.verbose:
-                        logger.info(f"Page {page_id} initialized")
-            else:
-                self.page = await self._browser.new_page()
+            self._browser_context = await self._browser.new_context(
+                accept_downloads=True
+            )
 
-    async def get_soup(self, url: str, page: Optional[Page] = None) -> BeautifulSoup:
+        await self._browser_context.grant_permissions(
+            ["clipboard-read", "clipboard-write"]
+        )
+        await self._init_pages()
+
+    async def get_soup(self, url: str, page: Page | None = None) -> BeautifulSoup:
         """Navigate to *url* and return parsed HTML as BeautifulSoup."""
         target_page = page or self.page
         if target_page is None:

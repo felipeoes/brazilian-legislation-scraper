@@ -1,6 +1,6 @@
 from bs4 import BeautifulSoup
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
+from src.scraper.base.scraper import StateScraper
 
 TYPES = {
     "Ato da Mesa Diretora": 17000000,
@@ -68,7 +68,7 @@ INVALID_SITUATIONS = {
 SITUATIONS = VALID_SITUATIONS | INVALID_SITUATIONS
 
 
-class DFSinjScraper(BaseScraper):
+class DFSinjScraper(StateScraper):
     """Webscraper for Distrito Federal state legislation website (https://www.sinj.df.gov.br/sinj/)
 
     Example search request: https://www.sinj.df.gov.br/sinj/ashx/Datatable/ResultadoDePesquisaNormaDatatable.ashx
@@ -141,8 +141,6 @@ class DFSinjScraper(BaseScraper):
         base_url: str = "https://www.sinj.df.gov.br/sinj",
         **kwargs,
     ):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
             base_url,
             name="DISTRITO_FEDERAL",
@@ -292,6 +290,10 @@ class DFSinjScraper(BaseScraper):
         try:
             # remove html link from doc_info
             html_link = doc_info.pop("html_link")
+
+            if self._is_already_scraped(html_link, doc_info.get("title", "")):
+                return None
+
             response = await self.request_service.make_request(html_link)
             if response is None:
                 raise RuntimeError(f"No response for {html_link}")
@@ -302,9 +304,13 @@ class DFSinjScraper(BaseScraper):
             # get id="div_texto"
             norm_text_tag = soup.find("div", id="div_texto")
             text_markdown = None
+            raw_content = None
+            content_ext = None
             if not norm_text_tag:
                 # it may be a pdf file, try to get text markdown instead (without using LLM for image extraction)
                 text_markdown = await self._get_markdown(response=response)
+                raw_content = body
+                content_ext = ".pdf"
 
                 if not text_markdown:
                     await self._save_doc_error(
@@ -334,9 +340,14 @@ class DFSinjScraper(BaseScraper):
                 )
 
                 doc_info["html_string"] = html_string
+                raw_content = html_string.encode("utf-8")
+                content_ext = ".html"
 
             doc_info["text_markdown"] = text_markdown
             doc_info["document_url"] = html_link
+            if raw_content is not None:
+                doc_info["_raw_content"] = raw_content
+                doc_info["_content_extension"] = content_ext
 
             return doc_info
         except Exception as e:
@@ -440,6 +451,7 @@ class DFSinjScraper(BaseScraper):
                     "situation": situation,
                     **result,
                 }
+                await self._save_doc_result(queue_item)
                 results.append(queue_item)
 
         if self.verbose:

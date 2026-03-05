@@ -1,11 +1,10 @@
 from collections import defaultdict
 from io import BytesIO
-from typing import Optional
 from urllib.parse import urlencode
 
 from bs4 import BeautifulSoup
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
+from src.scraper.base.scraper import StateScraper
 
 TYPES = {
     "Lei Ordinária": "lei ord",
@@ -22,7 +21,7 @@ INVALID_SITUATIONS = []
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class RNAlrnScraper(BaseScraper):
+class RNAlrnScraper(StateScraper):
     """Webscraper for Rio Grande do Norte state legislation website (https://www.al.rn.leg.br/legislacao/pesquisa)
 
     Example search request: https://www.al.rn.leg.br/legislacao/pesquisa?tipo=nome&nome=lei%20ord&page=4
@@ -39,8 +38,6 @@ class RNAlrnScraper(BaseScraper):
         base_url: str = "https://www.al.rn.leg.br",
         **kwargs,
     ):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
             base_url,
             types=TYPES,
@@ -105,10 +102,14 @@ class RNAlrnScraper(BaseScraper):
 
     async def _get_doc_data(
         self, doc_info: dict, pdf_len_threshold: int = 200
-    ) -> Optional[dict]:
+    ) -> dict | None:
         """Get document data from given document dict"""
         # remove pdf_link from doc_info
         pdf_link = doc_info.pop("pdf_link")
+
+        if self._is_already_scraped(pdf_link, doc_info.get("title", "")):
+            return None
+
         response = await self.request_service.make_request(pdf_link)
 
         if not response:
@@ -120,6 +121,7 @@ class RNAlrnScraper(BaseScraper):
             )
             return None
 
+        raw_content = await response.read()
         text_markdown = await self._get_markdown(response=response)
 
         if (
@@ -128,9 +130,7 @@ class RNAlrnScraper(BaseScraper):
             or len(text_markdown.strip()) < pdf_len_threshold
         ):
             # probably image pdf
-            text_markdown = await self._get_markdown(
-                stream=BytesIO(await response.read())
-            )
+            text_markdown = await self._get_markdown(stream=BytesIO(raw_content))
 
         if (
             not text_markdown or not text_markdown.strip()
@@ -145,6 +145,12 @@ class RNAlrnScraper(BaseScraper):
 
         doc_info["text_markdown"] = text_markdown.strip()
         doc_info["document_url"] = pdf_link
+        doc_info["_raw_content"] = raw_content
+        doc_info["_content_extension"] = ".pdf"
+
+        saved = await self._save_doc_result(doc_info)
+        if saved is not None:
+            doc_info = saved
 
         return doc_info
 

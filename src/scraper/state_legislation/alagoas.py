@@ -1,10 +1,9 @@
-from typing import Optional
 import base64
 import math
 from urllib.parse import quote
 
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
+from src.scraper.base.scraper import StateScraper
 
 TYPES = {
     "Consituição Estadual": "TIP080",
@@ -27,7 +26,7 @@ INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no lon
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class AlagoasSefazScraper(BaseScraper):
+class AlagoasSefazScraper(StateScraper):
     """Webscraper for Alagoas Sefaz website (https://gcs2.sefaz.al.gov.br/#/administrativo/documentos/consultar-gabinete)
 
     Example search request: https://gcs2.sefaz.al.gov.br/sfz-gcs-api/api/administrativo/documento/consultar?pagina=1
@@ -50,8 +49,6 @@ class AlagoasSefazScraper(BaseScraper):
         base_url: str = "https://gcs2.sefaz.al.gov.br/sfz-gcs-api/api/administrativo/documento/consultar",
         **kwargs,
     ):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
             base_url, name="ALAGOAS", types=TYPES, situations=SITUATIONS, **kwargs
         )
@@ -76,7 +73,7 @@ class AlagoasSefazScraper(BaseScraper):
 
     async def _get_docs_links(
         self, url: str, params: dict, norms: list
-    ) -> Optional[list[dict]]:
+    ) -> list[dict | None]:
         """Get document links from search request"""
         try:
             response = await self.request_service.make_request(
@@ -92,14 +89,18 @@ class AlagoasSefazScraper(BaseScraper):
         except Exception as e:
             logger.error(f"Error getting document links from url: {url} | Error: {e}")
 
-    async def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
+    async def _get_doc_data(self, doc_info: dict) -> dict | None:
         """Get document data from norm dict. Download url for pdf will follow the pattern: ttps://gcs2.sefaz.al.gov.br/#/documentos/visualizar-documento?acess={acess}&key={key}"""
 
         key = quote(
             quote(doc_info["link"]["key"])
         )  # need to double encode otherwise it will return 404
         doc_link = f"{self.view_doc_url}acess={doc_info['link']['acess']}&key={key}"
+        if self._is_already_scraped(doc_link):
+            return None
         filename = ""
+        ext = ".pdf"
+        pdf_bytes = b""
         try:
             # get text markdown
             response = await self.request_service.make_request(doc_link)
@@ -107,12 +108,21 @@ class AlagoasSefazScraper(BaseScraper):
                 raise RuntimeError(f"No response received for {doc_link}")
             response = await response.json()
             base64_data = response["arquivo"]["base64"]
-            filename = ".".join(response["arquivo"]["nomeArquivo"].split(".")[:-1])
+
+            full_filename = response["arquivo"]["nomeArquivo"]
+            from pathlib import Path
+
+            ext = Path(full_filename).suffix.lower()
+            if not ext:
+                ext = ".pdf"
+            filename = Path(full_filename).stem
 
             pdf_bytes = base64.b64decode(base64_data)
             from io import BytesIO
 
-            text_markdown = await self._get_markdown(stream=BytesIO(pdf_bytes))
+            text_markdown = await self._get_markdown(
+                stream=BytesIO(pdf_bytes), filename=full_filename
+            )
 
         except Exception as e:
             logger.error(f"Error getting markdown from url: {doc_link} | Error: {e}")
@@ -123,7 +133,7 @@ class AlagoasSefazScraper(BaseScraper):
                 title=doc_info.get("title", filename),
                 year=doc_info.get("year", ""),
                 html_link=doc_link,
-                error_message="Failed to extract markdown from PDF",
+                error_message="Failed to extract markdown from document",
             )
             return None
 
@@ -135,6 +145,8 @@ class AlagoasSefazScraper(BaseScraper):
             "publication_date": doc_info["dataPublicacao"],
             "text_markdown": text_markdown,
             "document_url": doc_link,
+            "_raw_content": pdf_bytes,
+            "_content_extension": ext,
         }
 
     async def _scrape_situation_type(
@@ -193,6 +205,7 @@ class AlagoasSefazScraper(BaseScraper):
                 "situation": situation,
                 **result,
             }
+            await self._save_doc_result(queue_item)
             results.append(queue_item)
 
         if self.verbose:

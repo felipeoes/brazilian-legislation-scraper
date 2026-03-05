@@ -1,12 +1,11 @@
 import re
 from io import BytesIO
-from typing import Optional
 from urllib.parse import urljoin, urlencode
 from bs4 import BeautifulSoup
 import asyncio
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
-from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
+from src.scraper.base.scraper import StateScraper
 
 
 TYPES = {
@@ -38,7 +37,7 @@ INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no lon
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class MTAlmtScraper(BaseScraper):
+class MTAlmtScraper(StateScraper):
     """Webscraper for Mato Grosso state legislation website (https://www.al.mt.gov.br/norma-juridica)
 
     Example search request: https://www.al.mt.gov.br/norma-juridica
@@ -84,8 +83,6 @@ class MTAlmtScraper(BaseScraper):
     """
 
     def __init__(self, base_url: str = "https://www.al.mt.gov.br", **kwargs):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
             base_url, types=TYPES, situations=SITUATIONS, name="MATO_GROSSO", **kwargs
         )
@@ -224,9 +221,14 @@ class MTAlmtScraper(BaseScraper):
 
     async def _get_doc_data(
         self, doc_info: dict, is_historic: bool = False
-    ) -> Optional[dict]:
+    ) -> dict | None:
         """Get document data from given document dict"""
         norm_link = doc_info.pop("norm_link")
+
+        if self._is_already_scraped(
+            doc_info.get("document_url", ""), doc_info.get("title", "")
+        ):
+            return None
 
         if is_historic:
             url = urljoin(self.base_url, norm_link)
@@ -277,10 +279,8 @@ class MTAlmtScraper(BaseScraper):
                 situation.find_parent("li").text.replace("Situação:", "").strip()
             )
 
-        pdf_content = await self.request_service.make_request(
-            doc_info["document_url"]
-        )  # need to make a request to get pdf content first, using directly _get_markdown will not work
-        if not pdf_content:
+        pdf_response = await self.request_service.make_request(doc_info["document_url"])
+        if not pdf_response:
             logger.error(f"Error getting pdf content for {doc_info['document_url']}")
             await self._save_doc_error(
                 title=doc_info.get("title", ""),
@@ -290,7 +290,9 @@ class MTAlmtScraper(BaseScraper):
             )
             return
 
-        text_markdown = await self._get_markdown(response=pdf_content)
+        raw_content = await pdf_response.read()
+        content_ext = ".pdf"
+        text_markdown = await self._get_markdown(stream=BytesIO(raw_content))
 
         # text_markdown = self._get_markdown(doc_info["document_url"])
         # remove header with link at beginning of document
@@ -318,6 +320,7 @@ class MTAlmtScraper(BaseScraper):
                 return
 
             pdf_content = await pdf_content_response.read()
+            raw_content = pdf_content
 
             text_markdown = (
                 (await self._get_markdown(stream=BytesIO(pdf_content)))
@@ -343,6 +346,8 @@ class MTAlmtScraper(BaseScraper):
             "tags": tags if tags else "",
             "situation": situation if situation else "",
             "text_markdown": text_markdown,
+            "_raw_content": raw_content,
+            "_content_extension": content_ext,
         }
 
         return doc_data
@@ -429,6 +434,7 @@ class MTAlmtScraper(BaseScraper):
                         norm["situation"] if norm.get("situation") else "Não consta"
                     ),
                 }
+                await self._save_doc_result(queue_item)
                 results.append(queue_item)
 
             if self.verbose:

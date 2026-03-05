@@ -12,7 +12,7 @@ Web scraper for legal documents regarding Brazilian legislation — federal, sta
 - **Async concurrency** — built on `asyncio` + `aiohttp` for non-blocking I/O with independent per-scraper rate limiting for HTTP and shared rate limiting for LLM API calls
 - **LLM providers** — supports OpenAI-compatible APIs and AWS Bedrock Converse for OCR
 - **PDF & image extraction** — converts PDFs to Markdown, with optional LLM-powered OCR for image-based documents
-- **Playwright support** — async Chromium automation for JavaScript-rendered pages, with optional VPN extension integration
+- **Playwright support** — async Chromium automation for JavaScript-rendered pages (3 state scrapers), with optional VPN extension integration
 - **Proxy rotation** — optional proxy support from a file or HTTP endpoint
 - **SAPL integration** — dedicated base class for state legislatures using the SAPL REST API
 - **Structured output** — saves scraped data as JSON files grouped by year via `FileSaver`
@@ -89,8 +89,16 @@ When `--verbose` is not specified, scrapers only log warnings, errors, and show 
 ### Run specific scrapers by name
 
 ```bash
-uv run main.py --scrapers MTAlmt CONAMA SPAlesp
+uv run main.py --scrapers MTAlmtScraper ConamaScraper SaoPauloAlespScraper
 ```
+
+### Overwrite previously scraped data
+
+```bash
+uv run main.py --overwrite
+```
+
+By default, scrapers resume from where they left off using document-level `(document_url, title)` keys. The `--overwrite` flag disables this resume logic and re-scrapes everything.
 
 ### List all available scrapers
 
@@ -106,11 +114,11 @@ uv run main.py --list
 ├── .env.example                     # Environment variable template
 ├── src/
 │   ├── database/
-│   │   └── saver.py                 # FileSaver — async JSON persistence (aiofiles)
+│   │   └── saver.py                 # FileSaver — async JSON persistence (aiofiles) with document-level resume
 │   ├── scraper/
 │   │   ├── base/
-│   │   │   ├── scraper.py           # BaseScraper — async HTTP via aiohttp
-│   │   │   ├── sapl_scraper.py      # SAPLBaseScraper — base for SAPL REST API sites
+│   │   │   ├── scraper.py           # BaseScraper & StateScraper — async HTTP, PDF/OCR, markdown, save/resume
+│   │   │   ├── sapl_scraper.py      # SAPLBaseScraper — base for SAPL REST API sites (Paraíba, Piauí, Roraima)
 │   │   │   └── concurrency.py       # RateLimiter, bounded_gather(), run_in_thread()
 │   │   ├── federal_legislation/
 │   │   │   └── scrape.py            # CamaraDepScraper
@@ -134,6 +142,7 @@ uv run main.py --list
 │   │   └── request/
 │   │       └── service.py           # RequestService — async HTTP with rate limiting & retries
 │   └── utils/
+│       ├── __init__.py              # clean_md_tag() — strips markdown code block wrappers
 │       └── openvpn.py               # OpenVPN manager (used by Paraná scraper)
 ```
 
@@ -161,7 +170,7 @@ The project uses an **async-first** concurrency model with optimized parallelism
 - **HTTP I/O** — `aiohttp.ClientSession` for non-blocking requests with per-scraper sliding-window rate limiting
 - **LLM OCR** — vision model-based PDF/image extraction via OpenAI-compatible API or AWS Bedrock Converse API
 - **File I/O** — `aiofiles` for non-blocking JSON writes
-- **Browser automation** (4 scrapers) — Playwright async API (natively async, no thread wrappers)
+- **Browser automation** (3 scrapers) — Playwright async API (natively async, no thread wrappers)
 - **CPU-bound work** (PDF/image conversion) — offloaded via `asyncio.to_thread()`
 - **Retries** — `tenacity` for async retry logic with exponential backoff
 - **Proxy support** — optional proxy rotation from a file or HTTP endpoint

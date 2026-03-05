@@ -1,10 +1,9 @@
-from typing import Optional
 from urllib.parse import urljoin
 from io import BytesIO
 
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
-from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
+from src.scraper.base.scraper import StateScraper
 
 
 # We don't have situations for São Paulo, since the websitew only publishes valid documents (no invalid, no expired, no archived, no revoked, etc.)
@@ -43,7 +42,7 @@ TYPES = {  # dict with norm type and its id
 }
 
 
-class SaoPauloAlespScraper(BaseScraper):
+class SaoPauloAlespScraper(StateScraper):
     """Webscraper for Alesp (Assembleia Legislativa do Estado de São Paulo) website (https://www.al.sp.gov.br/)
 
     Example search request url: # https://www.al.sp.gov.br/norma/resultados?page=0&size=500&tipoPesquisa=E&buscaLivreEscape=&buscaLivreDecode=&_idsTipoNorma=1&idsTipoNorma=3&nuNorma=&ano=&complemento=&dtNormaInicio=&dtNormaFim=&idTipoSituacao=1&_idsTema=1&palavraChaveEscape=&palavraChaveDecode=&_idsAutorPropositura=1&_temQuestionamentos=on&_pesquisaAvancada=on
@@ -55,8 +54,6 @@ class SaoPauloAlespScraper(BaseScraper):
         max_workers: int = 16,  # low max_workers bacause alesp website often returns server error
         **kwargs,
     ):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
             base_url=base_url,
             types=TYPES,
@@ -187,9 +184,13 @@ class SaoPauloAlespScraper(BaseScraper):
         wait=wait_exponential(multiplier=2, min=2, max=15),
         reraise=True,
     )
-    async def _get_doc_data(self, doc_info: dict, norm_type: str) -> Optional[dict]:
+    async def _get_doc_data(self, doc_info: dict, norm_type: str) -> dict | None:
         """Get document data from given html link"""
         doc_html_link = doc_info["html_link"]
+        title = doc_info["title"]
+
+        if self._is_already_scraped(doc_html_link, title):
+            return None
 
         # get norm data
         norm_link = doc_info["norm_link"]
@@ -200,7 +201,7 @@ class SaoPauloAlespScraper(BaseScraper):
             norm_data = {}
 
         data = {
-            "title": doc_info["title"],
+            "title": title,
             "summary": doc_info["summary"],
             "html_string": "",
             "text_markdown": "",
@@ -210,20 +211,26 @@ class SaoPauloAlespScraper(BaseScraper):
 
         # check if pdf
         if doc_html_link.endswith(".pdf"):
-            text_markdown = await self._get_markdown(url=doc_html_link)
+            text_markdown, raw_content, content_ext = await self._download_and_convert(
+                doc_html_link
+            )
 
             # check if got html content
-            if "<html>" in text_markdown or "<!DOCTYPE html>" in text_markdown:
+            if text_markdown and (
+                "<html>" in text_markdown or "<!DOCTYPE html>" in text_markdown
+            ):
                 if self.verbose:
                     logger.info(f"Got HTML content for PDF: {doc_html_link}")
 
                 # Use direct HTML content conversion
+                raw_content = text_markdown.encode("utf-8")
+                content_ext = ".html"
                 text_markdown = await self._get_markdown(html_content=text_markdown)
 
             if not text_markdown or not text_markdown.strip():
                 logger.error(f"Failed to get markdown for PDF: {doc_html_link}")
                 await self._save_doc_error(
-                    title=doc_info["title"],
+                    title=title,
                     year="",
                     situation="",
                     norm_type=norm_type,
@@ -233,6 +240,12 @@ class SaoPauloAlespScraper(BaseScraper):
                 return None
 
             data["text_markdown"] = text_markdown
+            data["_raw_content"] = raw_content
+            data["_content_extension"] = content_ext
+
+            saved = await self._save_doc_result(data)
+            if saved is not None:
+                data = saved
             return data
 
         soup = await self.request_service.get_soup(doc_html_link)
@@ -255,7 +268,7 @@ class SaoPauloAlespScraper(BaseScraper):
             if not text_markdown or not text_markdown.strip():
                 logger.error(f"Failed to get markdown for PDF: {pdf_link}")
                 await self._save_doc_error(
-                    title=doc_info["title"],
+                    title=title,
                     year="",
                     situation="",
                     norm_type=norm_type,
@@ -265,6 +278,12 @@ class SaoPauloAlespScraper(BaseScraper):
                 return None
 
             data["text_markdown"] = text_markdown
+            data["_raw_content"] = pdf_content
+            data["_content_extension"] = ".pdf"
+
+            saved = await self._save_doc_result(data)
+            if saved is not None:
+                data = saved
             return data
 
         # remove a tags with 'Assembleia Legislativa do Estado de São Paulo' and 'Ficha informativa'
@@ -293,6 +312,8 @@ class SaoPauloAlespScraper(BaseScraper):
 
         # get text markdown
         text_markdown = await self._get_markdown(html_content=html_string)
+        raw_content = html_string.encode("utf-8")
+        content_ext = ".html"
 
         # <p><img src="decisao.da.mesa-1311-img1-02.05.2005.jpg"></p>
         # For some Decisão da Mesa norms, it will have the content as image, so we need to get that and append to the markdown
@@ -319,14 +340,22 @@ class SaoPauloAlespScraper(BaseScraper):
                     else:
                         logger.error(f"Failed to get markdown for image: {img_url}")
 
-        return {
-            "title": doc_info["title"],
+        result = {
+            "title": title,
             "summary": doc_info["summary"],
             "html_string": html_string,
             "text_markdown": text_markdown,
             "document_url": doc_html_link,
+            "_raw_content": raw_content,
+            "_content_extension": content_ext,
             **norm_data,
         }
+
+        saved = await self._save_doc_result(result)
+        if saved is not None:
+            result = saved
+
+        return result
 
     async def _scrape_situation_type(
         self,

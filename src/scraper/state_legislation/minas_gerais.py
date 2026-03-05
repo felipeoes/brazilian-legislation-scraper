@@ -1,8 +1,7 @@
 import re
 from io import BytesIO
-from typing import Optional
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
+from src.scraper.base.scraper import StateScraper
 from urllib.parse import urlencode, urljoin
 
 TYPES = {
@@ -35,7 +34,7 @@ INVALID_SITUATIONS = []
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class MGAlmgScraper(BaseScraper):
+class MGAlmgScraper(StateScraper):
     """Webscraper for Minas Gerais state legislation website (https://www.almg.gov.br)
 
     Example search request: https://www.almg.gov.br/atividade-parlamentar/leis/legislacao-mineira/?pagina=2&aba=pesquisa&q=&ano=1989&dataFim=&num=&grupo=4&ordem=0&pesquisou=true&dataInicio=&sit=1
@@ -46,8 +45,6 @@ class MGAlmgScraper(BaseScraper):
         base_url: str = "https://www.almg.gov.br",
         **kwargs,
     ):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
             base_url, types=TYPES, situations=SITUATIONS, name="MINAS_GERAIS", **kwargs
         )
@@ -93,7 +90,7 @@ class MGAlmgScraper(BaseScraper):
 
         return docs, False
 
-    async def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
+    async def _get_doc_data(self, doc_info: dict) -> dict | None:
         """Get document data from given document dict"""
         # remove html_link from doc_info
         html_link = doc_info.pop("html_link")
@@ -177,6 +174,10 @@ class MGAlmgScraper(BaseScraper):
             return None
 
         html_link = urljoin(self.base_url, html_link_text)
+
+        if self._is_already_scraped(html_link, doc_info.get("title", "")):
+            return None
+
         if (
             html_link == self.base_url
         ):  # norm is invalid because it does not have a link to the document text
@@ -233,6 +234,10 @@ class MGAlmgScraper(BaseScraper):
                 f"Document {data.get('title', '')} is an image PDF, extracting text from image. URL: {html_link}"
             )
             pdf_link = a_tag["href"]
+
+            if self._is_already_scraped(pdf_link, doc_info.get("title", "")):
+                return None
+
             pdf_response = await self.request_service.make_request(pdf_link)
             if pdf_response is None:
                 await self._save_doc_error(
@@ -263,6 +268,8 @@ class MGAlmgScraper(BaseScraper):
                 "html_string": "",
                 "text_markdown": text_markdown,
                 "document_url": pdf_link,
+                "_raw_content": pdf_content,
+                "_content_extension": ".pdf",
             }
 
         # Use str() if prettify() is not available
@@ -306,6 +313,8 @@ class MGAlmgScraper(BaseScraper):
             "html_string": html_string,
             "text_markdown": text_markdown,
             "document_url": html_link,
+            "_raw_content": html_string.encode("utf-8"),
+            "_content_extension": ".html",
         }
 
     async def _scrape_situation_type(
@@ -359,6 +368,7 @@ class MGAlmgScraper(BaseScraper):
             if not result["situation"]:
                 result["situation"] = situation
             queue_item = {"year": year, "type": norm_type, **result}
+            await self._save_doc_result(queue_item)
             results.append(queue_item)
 
         if self.verbose:

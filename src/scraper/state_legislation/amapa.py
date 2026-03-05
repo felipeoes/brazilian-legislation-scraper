@@ -2,7 +2,7 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
+from src.scraper.base.scraper import StateScraper
 
 
 TYPES = {
@@ -23,7 +23,7 @@ INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no lon
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class AmapaAlapScraper(BaseScraper):
+class AmapaAlapScraper(StateScraper):
     """Webscraper for Amapa state legislation website (https://al.ap.leg.br)
 
     Example search request: https://al.ap.leg.br/pagina.php?pg=buscar_legislacao&aba=legislacao&submenu=listar_legislacao&especie_documento=13&ano=2020&pesquisa=&n_doeB=&n_leiB=&data_inicial=&data_final=&orgaoB=&autor=&legislaturaB=&pagina=2
@@ -34,8 +34,6 @@ class AmapaAlapScraper(BaseScraper):
         base_url: str = "https://al.ap.leg.br",
         **kwargs,
     ):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
             base_url, name="AMAPA", types=TYPES, situations=SITUATIONS, **kwargs
         )
@@ -110,6 +108,9 @@ class AmapaAlapScraper(BaseScraper):
         """Get document data from given document dict"""
         html_link = doc_info.pop("html_link")
         url = urljoin(self.base_url, html_link)
+
+        if self._is_already_scraped(url, doc_info.get("title", "")):
+            return None
 
         response = await self.request_service.make_request(url)
         if response is None:
@@ -187,6 +188,8 @@ class AmapaAlapScraper(BaseScraper):
         doc_info["html_string"] = html_string
         doc_info["text_markdown"] = text_markdown
         doc_info["document_url"] = url
+        doc_info["_raw_content"] = html_string.encode("utf-8")
+        doc_info["_content_extension"] = ".html"
 
         return doc_info
 
@@ -263,6 +266,7 @@ class AmapaAlapScraper(BaseScraper):
                     "type": norm_type,
                     **result,
                 }
+                await self._save_doc_result(queue_item)
                 results.append(queue_item)
 
             if self.verbose:

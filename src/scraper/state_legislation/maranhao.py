@@ -1,11 +1,10 @@
 from urllib.parse import urljoin
-from typing import Optional
 
 import asyncio
 import re
 from bs4 import BeautifulSoup
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
+from src.scraper.base.scraper import StateScraper
 
 TYPES = {
     "Constituição Estadual": "constituicao-estadual/detalhe.html?dswid=-4293",
@@ -32,7 +31,7 @@ INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no lon
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class MaranhaoAlemaScraper(BaseScraper):
+class MaranhaoAlemaScraper(StateScraper):
     """Webscraper for Maranhao state legislation website (https://legislacao.al.ma.leg.br)
 
     Example search request: https://legislacao.al.ma.leg.br/ged/busca.html?dswid=1381
@@ -72,8 +71,6 @@ class MaranhaoAlemaScraper(BaseScraper):
         base_url: str = "https://legislacao.al.ma.leg.br",
         **kwargs,
     ):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
             base_url, name="MARANHAO", types=TYPES, situations=SITUATIONS, **kwargs
         )
@@ -178,7 +175,12 @@ class MaranhaoAlemaScraper(BaseScraper):
         # remove pdf_link from doc_info
         pdf_link = doc_info.pop("pdf_link")
 
-        text_markdown = await self._get_markdown(url=pdf_link)
+        if self._is_already_scraped(pdf_link, doc_info.get("title", "")):
+            return None
+
+        text_markdown, raw_content, content_ext = await self._download_and_convert(
+            pdf_link
+        )
         if not text_markdown:
             logger.error(f"Failed to get markdown for {pdf_link}")
             await self._save_doc_error(
@@ -202,6 +204,8 @@ class MaranhaoAlemaScraper(BaseScraper):
 
         doc_info["text_markdown"] = text_markdown
         doc_info["document_url"] = pdf_link
+        doc_info["_raw_content"] = raw_content
+        doc_info["_content_extension"] = content_ext
         return doc_info
 
     async def _search_norms(
@@ -332,7 +336,7 @@ class MaranhaoAlemaScraper(BaseScraper):
                 "type": norm_type if not subtype else subtype,
                 **result,
             }
-
+            await self._save_doc_result(queue_item)
             results.append(queue_item)
 
         if self.verbose:
@@ -344,14 +348,20 @@ class MaranhaoAlemaScraper(BaseScraper):
 
     async def _scrape_constitution(
         self, norm_type: str, norm_type_id: str
-    ) -> Optional[dict]:
+    ) -> dict | None:
         """Scrape state constitution"""
         url = urljoin(f"{self.base_url}/ged/", norm_type_id)
         soup = await self.request_service.get_soup(url)
 
         # get pdf link <object class="view-pdf-constituicao" data="https://arquivos.al.ma.leg.br:8443/ged/codigos_juridicos/CE89_EC101_2025" type="application/pdf"></object>
         pdf_link = soup.find("object", {"class": "view-pdf-constituicao"})["data"]
-        text_markdown = await self._get_markdown(url=pdf_link)
+
+        if self._is_already_scraped(pdf_link, "Constituição Estadual do Maranhão"):
+            return None
+
+        text_markdown, raw_content, content_ext = await self._download_and_convert(
+            pdf_link
+        )
         if not text_markdown:
             logger.error(f"Failed to get markdown for Constitution | {pdf_link}")
             return None
@@ -365,8 +375,11 @@ class MaranhaoAlemaScraper(BaseScraper):
             "summary": "",
             "text_markdown": text_markdown,
             "document_url": pdf_link,
+            "_raw_content": raw_content,
+            "_content_extension": content_ext,
         }
 
+        await self._save_doc_result(queue_item)
         self.scraped_constitution = True
         return queue_item
 

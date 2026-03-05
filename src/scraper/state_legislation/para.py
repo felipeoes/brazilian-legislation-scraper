@@ -1,8 +1,7 @@
 import re
-from typing import Optional
 from bs4 import BeautifulSoup
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
+from src.scraper.base.scraper import StateScraper
 
 TYPES = {
     "Decreto Estadual": 2,
@@ -23,7 +22,7 @@ INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no lon
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class ParaAlepaScraper(BaseScraper):
+class ParaAlepaScraper(StateScraper):
     """Webscraper for Para state legislation website (http://bancodeleis.alepa.pa.gov.br)
 
     Example search request: http://bancodeleis.alepa.pa.gov.br/index.php
@@ -44,8 +43,6 @@ class ParaAlepaScraper(BaseScraper):
         base_url: str = "http://bancodeleis.alepa.pa.gov.br",
         **kwargs,
     ):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
             base_url, types=TYPES, situations=SITUATIONS, name="PARA", **kwargs
         )
@@ -106,11 +103,17 @@ class ParaAlepaScraper(BaseScraper):
 
         return docs
 
-    async def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
+    async def _get_doc_data(self, doc_info: dict) -> dict | None:
         """Get document data from given document dict"""
         # remove pdf_link from doc_info
         pdf_link = doc_info.pop("pdf_link")
-        text_markdown = await self._get_markdown(url=pdf_link)
+
+        if self._is_already_scraped(pdf_link, doc_info.get("title", "")):
+            return None
+
+        text_markdown, raw_content, content_ext = await self._download_and_convert(
+            pdf_link
+        )
 
         if not text_markdown or not text_markdown.strip():
             logger.error(f"Error getting markdown from pdf: {pdf_link}")
@@ -124,6 +127,8 @@ class ParaAlepaScraper(BaseScraper):
 
         doc_info["text_markdown"] = text_markdown
         doc_info["document_url"] = pdf_link
+        doc_info["_raw_content"] = raw_content
+        doc_info["_content_extension"] = content_ext
         return doc_info
 
     def _scrape_constitution(self):
@@ -152,6 +157,7 @@ class ParaAlepaScraper(BaseScraper):
                 "type": norm_type,
                 **result,
             }
+            await self._save_doc_result(queue_item)
             results.append(queue_item)
 
         if self.verbose:

@@ -4,7 +4,7 @@ from collections import defaultdict
 from datetime import datetime
 from bs4 import BeautifulSoup
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
+from src.scraper.base.scraper import StateScraper
 
 TYPES = {
     "Lei Ordinária": "lei_ordinarias",
@@ -23,7 +23,7 @@ INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no lon
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class AcreLegisScraper(BaseScraper):
+class AcreLegisScraper(StateScraper):
     """Webscraper for Legis - Acre website (https://legis.ac.gov.br)
 
     Example search request: https://legis.ac.gov.br/principal/1
@@ -34,8 +34,6 @@ class AcreLegisScraper(BaseScraper):
         base_url: str = "https://legis.ac.gov.br/principal",
         **kwargs,
     ):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
             base_url, name="ACRE", types=TYPES, situations=SITUATIONS, **kwargs
         )
@@ -86,6 +84,9 @@ class AcreLegisScraper(BaseScraper):
         doc_title = doc_info["title"]
         doc_year = doc_info["year"]
         doc_summary = doc_info["summary"]
+
+        if self._is_already_scraped(doc_html_link, doc_title):
+            return None
 
         response = await self.request_service.make_request(doc_html_link)
         if response is None:
@@ -139,11 +140,15 @@ class AcreLegisScraper(BaseScraper):
             "html_string": html_string,
             "text_markdown": text_markdown,
             "document_url": doc_html_link,
+            "_raw_content": html_string.encode("utf-8"),
+            "_content_extension": ".html",
         }
 
     async def _get_state_constitution(self, norm_type_id: str) -> dict:
         """Get state constitution data"""
         document_url = f"{self.base_url.replace('/principal', '')}/{norm_type_id}"
+        if self._is_already_scraped(document_url, "Constituição Estadual"):
+            return None
         response = await self.request_service.make_request(document_url)
         if response is None:
             return {
@@ -183,6 +188,8 @@ class AcreLegisScraper(BaseScraper):
             "html_string": html_string,
             "text_markdown": text_markdown,
             "document_url": document_url,
+            "_raw_content": html_string.encode("utf-8"),
+            "_content_extension": ".html",
         }
 
     async def _prefetch_all_links(self) -> None:
@@ -224,8 +231,11 @@ class AcreLegisScraper(BaseScraper):
                 return []
             self._scraped_constitution = True
             doc_info = await self._get_state_constitution(norm_type_id)
+            if doc_info is None:
+                return []
             doc_info["situation"] = situation
             doc_info["type"] = norm_type
+            await self._save_doc_result(doc_info)
             return [doc_info]
 
         docs = self._prefetched_docs.get(year, {}).get(norm_type, [])
@@ -246,6 +256,7 @@ class AcreLegisScraper(BaseScraper):
                 "type": norm_type,
                 **result,
             }
+            await self._save_doc_result(queue_item)
             results.append(queue_item)
 
         return results

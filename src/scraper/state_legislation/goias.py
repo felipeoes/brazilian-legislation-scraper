@@ -1,11 +1,10 @@
 import re
 from io import BytesIO
-from typing import Optional
 from bs4 import BeautifulSoup
 import asyncio
 from urllib.parse import urlencode
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
+from src.scraper.base.scraper import StateScraper
 
 TYPES = {
     "Constituição Estadual": {"id": 12, "url_suffix": "constituicao-estadual"},
@@ -28,7 +27,7 @@ INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no lon
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class LegislaGoias(BaseScraper):
+class LegislaGoias(StateScraper):
     """Webscraper for Espirito Santo state legislation website (https://legisla.casacivil.go.gov.br)
 
     Example search request: https://legisla.casacivil.go.gov.br/api/v2/pesquisa/legislacoes?ano=1798&ordenarPor=data&page=1&qtd_por_pagina=10&tipo_legislacao=7
@@ -39,8 +38,6 @@ class LegislaGoias(BaseScraper):
         base_url: str = "https://legisla.casacivil.go.gov.br/api/v2/pesquisa/legislacoes",
         **kwargs,
     ):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
             base_url, name="GOIAS", types=TYPES, situations=SITUATIONS, **kwargs
         )
@@ -65,15 +62,18 @@ class LegislaGoias(BaseScraper):
 
     async def _process_pdf_link(
         self, link: str, doc_id: str, doc_info: dict
-    ) -> Optional[dict]:
+    ) -> dict | None:
         response = await self.request_service.make_request(link)
         if not response:
             logger.error(f"Error fetching PDF for doc ID: {doc_id} | Link: {link}")
             return None
 
-        text_markdown = await self._get_markdown(stream=BytesIO(await response.read()))
+        raw_content = await response.read()
+        text_markdown = await self._get_markdown(stream=BytesIO(raw_content))
         if text_markdown:
             doc_info["text_markdown"] = text_markdown
+            doc_info["_raw_content"] = raw_content
+            doc_info["_content_extension"] = ".pdf"
             if not doc_info.get("document_url"):
                 doc_info["document_url"] = link
             else:
@@ -86,7 +86,7 @@ class LegislaGoias(BaseScraper):
 
         return doc_info
 
-    async def _get_doc_info(self, doc: dict, norm_url_suffix: str) -> Optional[dict]:
+    async def _get_doc_info(self, doc: dict, norm_url_suffix: str) -> dict | None:
         """Get document info from given doc data using API"""
         doc_id = doc["id"]
 
@@ -118,6 +118,15 @@ class LegislaGoias(BaseScraper):
             "title": f"{doc_detail['tipo_legislacao']['nome']} {doc_detail['numero']} de {doc_detail['ano']}",
             "summary": doc_detail["ementa"].strip(),
         }
+
+        # Build canonical URL for resume check
+        if norm_url_suffix == "constituicao-estadual":
+            html_link = f"https://legisla.casacivil.go.gov.br/pesquisa_legislacao/{doc_id}/{norm_url_suffix}"
+        else:
+            html_link = f"https://legisla.casacivil.go.gov.br/pesquisa_legislacao/{doc_id}/{norm_url_suffix}-{doc_detail['numero']}"
+
+        if self._is_already_scraped(html_link, doc_info["title"]):
+            return None
 
         # Check if we have formatted content (HTML)
         if doc_detail.get("conteudo"):
@@ -193,6 +202,8 @@ class LegislaGoias(BaseScraper):
             if text_markdown:
                 text_markdown = text_markdown.strip()
                 doc_info["text_markdown"] = text_markdown
+                doc_info["_raw_content"] = html_string.encode("utf-8")
+                doc_info["_content_extension"] = ".html"
 
                 new_text = self._special_regex.sub("", text_markdown.lower())
                 new_text = self._space_regex.sub("", new_text).strip()
@@ -207,12 +218,6 @@ class LegislaGoias(BaseScraper):
                 ):  # threshold for substantial content (based on experimentation with goias norms)
                     # set text_markdown to None so that we can fall back to PDF fetching below
                     doc_info["text_markdown"] = None
-
-            # Build the HTML link for reference
-            if norm_url_suffix == "constituicao-estadual":
-                html_link = f"https://legisla.casacivil.go.gov.br/pesquisa_legislacao/{doc_id}/{norm_url_suffix}"
-            else:
-                html_link = f"https://legisla.casacivil.go.gov.br/pesquisa_legislacao/{doc_id}/{norm_url_suffix}-{doc_detail['numero']}"
 
             doc_info["document_url"] = html_link
 
@@ -319,6 +324,7 @@ class LegislaGoias(BaseScraper):
                     continue
                 for norm in result:
                     queue_item = {"year": year, "type": norm_type, **norm}
+                    await self._save_doc_result(queue_item)
                     results.append(queue_item)
 
             return results

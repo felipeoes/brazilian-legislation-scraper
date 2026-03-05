@@ -12,10 +12,10 @@ from __future__ import annotations
 from typing import Any
 
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper
+from src.scraper.base.scraper import StateScraper
 
 
-class SAPLBaseScraper(BaseScraper):
+class SAPLBaseScraper(StateScraper):
     """Base scraper for SAPL API-based state legislation sites.
 
     Subclasses must set:
@@ -93,20 +93,28 @@ class SAPLBaseScraper(BaseScraper):
         Default: tries markitdown, then falls back to LLM OCR.
         Override in subclasses for year-based or threshold-based strategies.
         """
-        text_markdown, document_url = await self._process_pdf_with_fallback(
-            pdf_link, min_length=50
-        )
-        if not text_markdown:
+        text_markdown, raw_bytes, ext = await self._download_and_convert(pdf_link)
+        if not text_markdown or not text_markdown.strip():
             return None
-        return {"text_markdown": text_markdown, "document_url": document_url}
+        return {
+            "text_markdown": text_markdown.strip(),
+            "document_url": pdf_link,
+            "_raw_content": raw_bytes,
+            "_content_extension": ext,
+        }
 
     async def _get_doc_data(self, doc_info: dict, year: int = 0) -> dict | None:
         """Get full document data by processing the PDF attachment."""
         pdf_link = doc_info.pop("pdf_link")
+        title = doc_info.get("title", "")
+
+        if self._is_already_scraped(pdf_link, title):
+            return None
+
         processed = await self._process_pdf(pdf_link, year)
         if processed is None:
             await self._save_doc_error(
-                title=doc_info.get("title", "Unknown"),
+                title=title,
                 year=year or doc_info.get("date", ""),
                 situation=doc_info.get("situation", ""),
                 norm_type=doc_info.get("type", ""),
@@ -115,6 +123,11 @@ class SAPLBaseScraper(BaseScraper):
             )
             return None
         doc_info.update(processed)
+
+        saved = await self._save_doc_result(doc_info)
+        if saved is not None:
+            doc_info = saved
+
         return doc_info
 
     # ------------------------------------------------------------------
@@ -190,6 +203,15 @@ class SAPLBaseScraper(BaseScraper):
             desc=f"{self.name} | {norm_type} | get_docs_links",
         )
         documents = [doc for result in link_results for doc in (result or [])]
+
+        # Skip already-scraped documents to avoid unnecessary work
+        documents = [
+            doc
+            for doc in documents
+            if not self._is_already_scraped(
+                doc.get("pdf_link", ""), doc.get("title", "")
+            )
+        ]
 
         # Process all documents concurrently
         doc_tasks = [self._get_doc_data(doc, year) for doc in documents]

@@ -1,7 +1,7 @@
 from collections import defaultdict
 from loguru import logger
 from urllib.parse import urlencode, urljoin
-from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
+from src.scraper.base.scraper import StateScraper
 
 TYPES = {
     "Constituição Estadual": "/Web%5CConstituição%20Estadual",
@@ -27,7 +27,7 @@ INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no lon
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class MSAlemsScraper(BaseScraper):
+class MSAlemsScraper(StateScraper):
     """Webscraper for Mato Grosso do Sul state legislation website (https://www.al.ms.gov.br/)
 
     Example search request: http://aacpdappls.net.ms.gov.br/appls/legislacao/secoge/govato.nsf/Emenda?OpenView&Start=1&Count=30&Expand=1#1
@@ -40,8 +40,6 @@ class MSAlemsScraper(BaseScraper):
         base_url: str = "http://aacpdappls.net.ms.gov.br",
         **kwargs,
     ):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
             base_url,
             types=TYPES,
@@ -97,6 +95,10 @@ class MSAlemsScraper(BaseScraper):
         # remove html_link from doc_info
         html_link = doc_info.pop("html_link")
         url = urljoin(self.base_url, html_link)
+
+        if self._is_already_scraped(url, doc_info.get("title", "")):
+            return None
+
         soup = await self.request_service.get_soup(url)
 
         # norm text will be the first p tag in the document
@@ -112,6 +114,8 @@ class MSAlemsScraper(BaseScraper):
         doc_info["html_string"] = html_string
         doc_info["text_markdown"] = text_markdown
         doc_info["document_url"] = url
+        doc_info["_raw_content"] = html_string.encode("utf-8")
+        doc_info["_content_extension"] = ".html"
 
         return doc_info
 
@@ -172,10 +176,16 @@ class MSAlemsScraper(BaseScraper):
         )
 
         situation = self.situations[0] if self.situations else "Não consta"
-        results = [
-            {"year": year, "situation": situation, "type": norm_type, **result}
-            for result in valid_results
-        ]
+        results = []
+        for result in valid_results:
+            queue_item = {
+                "year": year,
+                "situation": situation,
+                "type": norm_type,
+                **result,
+            }
+            await self._save_doc_result(queue_item)
+            results.append(queue_item)
 
         if self.verbose:
             logger.info(f"Year: {year} | Type: {norm_type} | Results: {len(results)}")

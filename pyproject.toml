@@ -1,7 +1,7 @@
 [project]
 name = "legislation-scraper"
 version = "0.1.0"
-description = "Add your description here"
+description = "Async web scraper for Brazilian federal and state legislation, with PDF/OCR extraction and structured data output."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -29,4 +29,5 @@ dev = [
     "jupyter>=1.1.1",
     "pre-commit>=4.5.1",
     "ruff>=0.12.0",
+    "snowflake-connector-python>=4.3.0",
 ]

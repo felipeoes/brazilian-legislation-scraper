@@ -1,9 +1,9 @@
 from io import BytesIO
-from typing import Any, Optional
+from typing import Any
 
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
-from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
+from src.scraper.base.scraper import StateScraper
 
 
 # Type mappings for Sergipe - these would need to be determined from the API
@@ -30,7 +30,7 @@ INVALID_SITUATIONS = {
 SITUATIONS = VALID_SITUATIONS | INVALID_SITUATIONS
 
 
-class SergipeLegsonScraper(BaseScraper):
+class SergipeLegsonScraper(StateScraper):
     """Webscraper for Sergipe state legislation website (https://legison.pge.se.gov.br/)
 
     Example search request: POST to https://legison.pge.se.gov.br/Public/Consulta
@@ -41,8 +41,6 @@ class SergipeLegsonScraper(BaseScraper):
         base_url: str = "https://legison.pge.se.gov.br",
         **kwargs: Any,
     ):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
             base_url, types=TYPES, situations=SITUATIONS, name="SERGIPE", **kwargs
         )
@@ -133,12 +131,13 @@ class SergipeLegsonScraper(BaseScraper):
         wait=wait_exponential(multiplier=2, min=2, max=15),
         reraise=True,
     )
-    async def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
+    async def _get_doc_data(self, doc_info: dict) -> dict | None:
         """Get document data by fetching PDF content and converting to markdown"""
         doc_id = doc_info.pop("doc_id", None)
+        title = doc_info.get("title", "")
         if not doc_id:
             await self._save_doc_error(
-                title=doc_info.get("title", ""),
+                title=title,
                 year=doc_info.get("year", ""),
                 html_link="",
                 error_message="Missing doc_id",
@@ -166,16 +165,20 @@ class SergipeLegsonScraper(BaseScraper):
                 # Construct PDF URL
                 pdf_url = f"{self.base_url}/uploads/atos/{doc_id}/{caminho_pdf}"
 
+                if self._is_already_scraped(pdf_url, title):
+                    return None
+
                 # Download and process PDF
                 pdf_response = await self.request_service.make_request(pdf_url)
                 if pdf_response:
+                    pdf_content = await pdf_response.read()
                     # Convert PDF to markdown
                     text_markdown = await self._get_markdown(response=pdf_response)
 
                     if not text_markdown or not text_markdown.strip():
                         # Try image extraction if regular PDF extraction fails
                         text_markdown = await self._get_markdown(
-                            stream=BytesIO(await pdf_response.read())
+                            stream=BytesIO(pdf_content)
                         )
 
                     if text_markdown and text_markdown.strip():
@@ -183,12 +186,19 @@ class SergipeLegsonScraper(BaseScraper):
                             {
                                 "text_markdown": text_markdown,
                                 "document_url": pdf_url,
+                                "_raw_content": pdf_content,
+                                "_content_extension": ".pdf",
                             }
                         )
+
+                        saved = await self._save_doc_result(doc_info)
+                        if saved is not None:
+                            doc_info = saved
+
                         return doc_info
 
         await self._save_doc_error(
-            title=doc_info.get("title", ""),
+            title=title,
             year=doc_info.get("year", ""),
             html_link=content_url,
             error_message="No text extracted from document",
@@ -261,12 +271,21 @@ class SergipeLegsonScraper(BaseScraper):
             file_url = (
                 f"{self.base_url}/uploads/constituicao/{doc_id}/atualizado/{file_path}"
             )
-            text_markdown = await self._get_markdown(url=file_url)
+            title = "Constituição Estadual de Sergipe"
+
+            if self._is_already_scraped(file_url, title):
+                if self.verbose:
+                    logger.info("State constitution already scraped, skipping")
+                return
+
+            text_markdown, raw_content, content_ext = await self._download_and_convert(
+                file_url
+            )
 
             doc_info = {
                 "id": doc_id,
                 "year": 1989,  # Sergipe's constitution year
-                "title": "Constituição Estadual de Sergipe",
+                "title": title,
                 "type": "Constituição Estadual",
                 "summary": data.get("ementa", ""),
                 "date": data.get("dataAto", ""),
@@ -277,9 +296,13 @@ class SergipeLegsonScraper(BaseScraper):
                 ),
                 "text_markdown": text_markdown,
                 "document_url": file_url,
+                "_raw_content": raw_content,
+                "_content_extension": content_ext,
             }
 
-            await self.saver.save([doc_info])
+            saved = await self._save_doc_result(doc_info)
+            if saved is not None:
+                doc_info = saved
             self.results.append(doc_info)
             if self.verbose:
                 logger.info(

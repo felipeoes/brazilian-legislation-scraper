@@ -1,11 +1,11 @@
 from datetime import datetime
 from io import BytesIO
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import urljoin
 
 from bs4 import Tag
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
+from src.scraper.base.scraper import StateScraper
 
 
 TYPES = {
@@ -19,7 +19,7 @@ TYPES = {
 SITUATIONS = []
 
 
-class RondoniaCotelScraper(BaseScraper):
+class RondoniaCotelScraper(StateScraper):
     """Webscraper for Rondônia state legislation website (http://ditel.casacivil.ro.gov.br/)
 
     Example search request: http://ditel.casacivil.ro.gov.br/COTEL/Livros/listdeclei.aspx?ano=2025
@@ -30,8 +30,6 @@ class RondoniaCotelScraper(BaseScraper):
         base_url: str = "http://ditel.casacivil.ro.gov.br/COTEL",
         **kwargs: Any,
     ):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
             base_url, types=TYPES, situations=SITUATIONS, name="RONDONIA", **kwargs
         )
@@ -135,7 +133,7 @@ class RondoniaCotelScraper(BaseScraper):
 
     async def _process_pdf(
         self, pdf_link: str, pdf_len_threshold: int = 99
-    ) -> Optional[dict]:
+    ) -> dict | None:
         """Process PDF and return text markdown."""
         response = await self.request_service.make_request(pdf_link)
         if not response:
@@ -153,6 +151,8 @@ class RondoniaCotelScraper(BaseScraper):
                 return {
                     "text_markdown": text_markdown,
                     "document_url": pdf_link,
+                    "_raw_content": content,
+                    "_content_extension": ".pdf",
                 }
 
         text_markdown = await self._get_markdown(stream=BytesIO(content))
@@ -163,16 +163,23 @@ class RondoniaCotelScraper(BaseScraper):
         return {
             "text_markdown": text_markdown,
             "document_url": pdf_link,
+            "_raw_content": content,
+            "_content_extension": ".pdf",
         }
 
-    async def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
+    async def _get_doc_data(self, doc_info: dict) -> dict | None:
         """Get document data"""
         pdf_link = doc_info.pop("pdf_link")
+        title = doc_info.get("title", "")
+
+        if self._is_already_scraped(pdf_link, title):
+            return None
+
         processed_pdf = await self._process_pdf(pdf_link)
 
         if processed_pdf is None:
             await self._save_doc_error(
-                title=doc_info.get("title", ""),
+                title=title,
                 year=doc_info.get("year", ""),
                 html_link=pdf_link,
                 error_message="Failed to process PDF",
@@ -180,26 +187,43 @@ class RondoniaCotelScraper(BaseScraper):
             return None
 
         doc_info.update(processed_pdf)
+
+        saved = await self._save_doc_result(doc_info)
+        if saved is not None:
+            doc_info = saved
+
         return doc_info
 
     async def _fetch_constitution(self):
         """Fetch the state constitution if available."""
         pdf_url = f"{self.base_url}/Livros/CE1989-2014.pdf"
+        title = "Constituição do Estado de Rondônia"
 
-        text_markdown = await self._get_markdown(url=pdf_url)
+        if self._is_already_scraped(pdf_url, title):
+            if self.verbose:
+                logger.info("State constitution already scraped, skipping")
+            return
+
+        text_markdown, raw_content, content_ext = await self._download_and_convert(
+            pdf_url
+        )
 
         doc_info = {
             "year": datetime.now().year,
             "type": "Constituição Estadual",
-            "title": "Constituição do Estado de Rondônia",
+            "title": title,
             "norm_number": "CE1989-2014",
             "situation": "Não consta revogação expressa",
             "summary": "Constituição do Estado de Rondônia",
             "text_markdown": text_markdown,
             "document_url": pdf_url,
+            "_raw_content": raw_content,
+            "_content_extension": content_ext,
         }
 
-        await self.saver.save([doc_info])
+        saved = await self._save_doc_result(doc_info)
+        if saved is not None:
+            doc_info = saved
         self.results.append(doc_info)
         if self.verbose:
             logger.info("Scraped state constitution")

@@ -10,7 +10,6 @@ import aiofiles
 import aiohttp
 import urllib3
 
-from typing import Optional
 from io import BytesIO
 from os import environ
 from datetime import datetime
@@ -77,8 +76,8 @@ class BaseScraper:
         year_start: int = YEAR_START,
         year_end: int = datetime.now().year,
         docs_save_dir: Path = Path(environ.get("SAVE_DIR", "outputs/legislation")),
-        llm_config: Optional[dict] = None,
-        llm_prompt: str = """Você é um um especialista de extração e formatação de textos jurídicos. O documento fornecido é uma norma jurídica. Extraia todo o conteúdo principal e formate-o em Markdown, seguindo rigorosamente estas regras:
+        llm_config: dict | None = None,
+        llm_prompt: str = """Você é um especialista de extração e formatação de textos jurídicos. O documento fornecido é uma norma jurídica. Extraia todo o conteúdo principal e formate-o em Markdown, seguindo rigorosamente estas regras:
 
 *   **Fidelidade Absoluta (CRÍTICO):** Transcreva o texto exata e literalmente como aparece no documento. Não altere nenhuma palavra, não corrija gramática e não modifique a pontuação. Preservar a exatidão legal é essencial. Não introduza nenhuma palavra ou frase que não esteja presente no documento original.
 *   **Estrutura Legal:** Respeite rigorosamente a numeração e a hierarquia legislativa: títulos, capítulos, seções, artigos (Art.), parágrafos (§), incisos (algarismos romanos: I, II, III) e alíneas (letras: a, b, c).
@@ -97,16 +96,16 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         multiple_pages: bool = False,
         headless: bool = True,
         use_browser_vpn: bool = False,
-        vpn_extension_path: Optional[str] = None,
-        vpn_extension_page: Optional[str] = None,
+        vpn_extension_path: str | None = None,
+        vpn_extension_page: str | None = None,
         use_openvpn: bool = False,
-        config_files: Optional[list] = None,
-        openvpn_credentials_map: Optional[dict] = None,
-        proxies: Optional[dict] = None,
-        proxy_config: Optional[dict] = None,
+        config_files: list | None = None,
+        openvpn_credentials_map: dict | None = None,
+        proxy_config: dict | None = None,
         rps: float = 20,
         max_workers: int = 16,
         verbose: bool = False,
+        overwrite: bool = False,
     ):
         self.base_url = base_url
         self.name = name
@@ -147,19 +146,19 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         self.config_files = config_files
         self.openvpn_credentials_map = openvpn_credentials_map
         self.verbose = verbose
-        self.proxies = proxies
+        self.overwrite = overwrite
         self.rps = rps
         self.max_workers = max_workers
         self.years = list(range(self.year_start, self.year_end + 1))
         self.results = []
         self.count = 0
         self.error_count = 0
-        self._scrape_start: Optional[float] = None
+        self._scrape_start: float | None = None
 
         # Initialize MarkItDown converter for HTML/document conversion
         self._markitdown = MarkItDown()
         # Browser service — initialised in scrape() via initialize_playwright()
-        self.browser_service: Optional[BrowserService] = (
+        self.browser_service: BrowserService | None = (
             BrowserService(
                 use_vpn=use_browser_vpn,
                 vpn_extension_path=vpn_extension_path,
@@ -172,8 +171,10 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
             if use_browser
             else None
         )
-        self.saver: Optional[FileSaver] = None
-        self.openvpn_manager: Optional[OpenVPNManager] = None
+        self.saver: FileSaver | None = None
+        self.openvpn_manager: OpenVPNManager | None = None
+        # Set of (document_url, title) keys for the current year (resume support)
+        self._scraped_keys: set[tuple[str, str]] = set()
         self._initialize_openvpn_manager()
         self._initialize_saver()
         self._log_initialization()
@@ -203,7 +204,7 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
     # ------------------------------------------------------------------
 
     @property
-    def page(self) -> Optional[Page]:
+    def page(self) -> Page | None:
         """Active Playwright page (single-page mode)."""
         return self.browser_service.page if self.browser_service else None
 
@@ -253,12 +254,24 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         reraise=True,
     )
     async def _browser_get_soup(
-        self, url: str, page: Optional[Page] = None
+        self, url: str, page: Page | None = None
     ) -> BeautifulSoup:
         """Get BeautifulSoup object from given url using Playwright (async)."""
         if not self.browser_service:
             raise RuntimeError("Browser service is not initialized.")
         return await self.browser_service.get_soup(url, page)
+
+    @retry(
+        stop=stop_after_attempt(7),
+        wait=wait_exponential(multiplier=2, min=2, max=30),
+        reraise=True,
+    )
+    async def _fetch_soup_with_retry(self, url: str) -> BeautifulSoup:
+        """Fetch URL and return BeautifulSoup with automatic retry on failure."""
+        soup = await self.request_service.get_soup(url)
+        if soup is None:
+            raise RuntimeError(f"Failed to fetch {url}")
+        return soup
 
     # ------------------------------------------------------------------
     # Markdown utilities
@@ -267,7 +280,7 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
     def _clean_markdown(
         self,
         text: str,
-        replace: Optional[list[tuple[str, str]]] = None,
+        replace: list[tuple[str, str]] | None = None,
     ) -> str:
         """Clean markdown text by removing links and applying custom replacements.
 
@@ -294,6 +307,17 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         """Wrap HTML fragment in <html><body> tags for markitdown conversion."""
         return f"<html><body>{content}</body></html>"
 
+    async def _html_to_markdown(self, html_content: str) -> str:
+        """Wrap an HTML fragment and convert it to markdown in one step.
+
+        Convenience helper that combines ``_wrap_html`` + ``_convert_to_md``.
+        """
+        wrapped = self._wrap_html(html_content)
+        return await self._convert_to_md(
+            BytesIO(wrapped.encode("utf-8")),
+            filename="document.html",
+        )
+
     # ------------------------------------------------------------------
     # PDF / Image processing
     # ------------------------------------------------------------------
@@ -304,51 +328,6 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
             logger.warning("No LLM OCR service configured; cannot process PDF.")
             return ""
         return await self.ocr_service.pdf_to_markdown(pdf_content)
-
-    async def _process_pdf_with_fallback(
-        self,
-        url: str,
-        min_length: int = 50,
-    ) -> tuple[str, str]:
-        """Download a PDF and extract markdown, falling back to LLM OCR if needed.
-
-        Tries markitdown conversion first. If the result is too short (likely a
-        scanned/image PDF), falls back to page-by-page LLM OCR.
-
-        Args:
-            url: URL of the PDF to download.
-            min_length: Minimum character threshold for the markitdown result to be
-                accepted without falling back to OCR.
-
-        Returns:
-            Tuple of ``(text_markdown, document_url)``. Both are empty strings
-            on failure.
-        """
-        response = await self.request_service.make_request(url)
-        if not response:
-            return "", ""
-
-        content = await response.read()
-        if not content:
-            return "", ""
-
-        # Try markitdown first (good for text-based PDFs)
-        text_markdown = await self._get_markdown(response=response)
-        is_valid, _ = self._valid_markdown(text_markdown, min_length)
-        if is_valid:
-            return text_markdown.strip(), url
-
-        # Fallback to LLM OCR for image-based PDFs
-        try:
-            text_markdown = await self._get_pdf_image_markdown(content)
-        except Exception as e:
-            logger.error(f"OCR fallback failed for {url}: {e}")
-            return "", ""
-
-        if text_markdown and text_markdown.strip():
-            return text_markdown.strip(), url
-
-        return "", ""
 
     @retry(
         stop=stop_after_attempt(3),
@@ -396,9 +375,6 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
             # Strip trailing horizontal-rule / table-border artefacts.
             markdown = re.sub(r"(\n[-|]{3,}\s*)+$", "", markdown).strip()
 
-            # Strip markdown hyperlinks, keeping only the link text.
-            markdown = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", markdown)
-
             return markdown
 
         except Exception as e:
@@ -415,12 +391,41 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
             # Let other exceptions be retried
             raise
 
+    async def _bytes_to_markdown(
+        self,
+        body: bytes,
+        filename: str = "document.pdf",
+        content_type: str = "",
+    ) -> str:
+        """Convert raw bytes to markdown with markitdown, falling back to OCR for PDFs."""
+        is_pdf = "pdf" in content_type or body[:4] == b"%PDF"
+
+        try:
+            text_markdown = await self._convert_to_md(
+                BytesIO(body),
+                filename=filename or ("document.pdf" if is_pdf else "document.html"),
+            )
+            if self._valid_markdown(text_markdown, min_length=50)[0]:
+                return text_markdown.strip()
+        except Exception as e:
+            logger.warning(f"markitdown extraction failed: {e}")
+
+        if is_pdf and self.ocr_service:
+            return await self.ocr_service.pdf_to_markdown(body)
+
+        if is_pdf:
+            logger.warning(
+                "PDF extraction yielded little text and no OCR service configured."
+            )
+        return ""
+
     async def _get_markdown(
         self,
-        url: Optional[str] = None,
-        response: Optional[aiohttp.ClientResponse] = None,
-        stream: Optional[BytesIO] = None,
-        html_content: Optional[str] = None,
+        url: str | None = None,
+        response: aiohttp.ClientResponse | None = None,
+        stream: BytesIO | None = None,
+        html_content: str | None = None,
+        filename: str | None = None,
     ) -> str:
         """Get markdown from various input sources using markitdown.
 
@@ -432,34 +437,25 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         try:
             if stream is not None:
                 raw = stream.read()
+
+                if filename:
+                    ext = Path(filename).suffix.lower()
+                    is_image = ext in [".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif"]
+                else:
+                    is_image = raw[:4] != b"%PDF"
+
                 # If image, we must use OCR
-                if not (raw[:4] == b"%PDF") and self.ocr_service:
+                if is_image and self.ocr_service:
                     return await self.ocr_service.images_to_markdown([raw])
-                elif not (raw[:4] == b"%PDF"):
+                elif is_image:
                     logger.warning(
                         "No LLM OCR service configured; cannot process image."
                     )
                     return ""
 
-                # For PDFs, try markitdown first
-                try:
-                    text_markdown = await self._convert_to_md(
-                        BytesIO(raw),
-                        filename="document.pdf",
-                    )
-                    if self._valid_markdown(text_markdown, min_length=50)[0]:
-                        return text_markdown.strip()
-                except Exception as e:
-                    logger.warning(f"markitdown PDF extraction failed: {e}")
-
-                # Fallback to OCR if markitdown extraction was poor/failed
-                if self.ocr_service:
-                    return await self.ocr_service.pdf_to_markdown(raw)
-
-                logger.warning(
-                    "PDF extraction yielded little text and no OCR service is available."
+                return await self._bytes_to_markdown(
+                    raw, filename=filename or "document.pdf"
                 )
-                return ""
 
             if html_content is not None:
                 buffer = BytesIO(html_content.encode("utf-8"))
@@ -470,75 +466,24 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
 
             if response is not None:
                 body = await response.read()
-                filename, content_type = self.request_service.detect_content_info(
+                resp_filename, content_type = self.request_service.detect_content_info(
                     response
                 )
-
-                if "pdf" in content_type or body[:4] == b"%PDF":
-                    try:
-                        text_markdown = await self._convert_to_md(
-                            BytesIO(body),
-                            filename=(
-                                "document.pdf"
-                                if not filename or "pdf" not in filename.lower()
-                                else filename
-                            ),
-                        )
-                        if self._valid_markdown(text_markdown, min_length=50)[0]:
-                            return text_markdown.strip()
-                    except Exception as e:
-                        logger.warning(
-                            f"markitdown PDF extraction failed for response: {e}"
-                        )
-
-                    if self.ocr_service:
-                        return await self.ocr_service.pdf_to_markdown(body)
-
-                    logger.warning(
-                        "PDF extraction yielded little text and no OCR service configured for response."
-                    )
-                    return ""
-                return await self._convert_to_md(
-                    BytesIO(body),
-                    filename=filename,
+                used_filename = filename or resp_filename
+                return await self._bytes_to_markdown(
+                    body, filename=used_filename, content_type=content_type
                 )
 
             if url:
                 resp = await self.request_service.make_request(url)
                 if resp is not None:
                     body = await resp.read()
-                    filename, content_type = self.request_service.detect_content_info(
-                        resp
+                    resp_filename, content_type = (
+                        self.request_service.detect_content_info(resp)
                     )
-
-                    if "pdf" in content_type or body[:4] == b"%PDF":
-                        try:
-                            text_markdown = await self._convert_to_md(
-                                BytesIO(body),
-                                filename=(
-                                    "document.pdf"
-                                    if not filename or "pdf" not in filename.lower()
-                                    else filename
-                                ),
-                            )
-                            if self._valid_markdown(text_markdown, min_length=50)[0]:
-                                return text_markdown.strip()
-                        except Exception as e:
-                            logger.warning(
-                                f"markitdown PDF extraction failed for URL: {e}"
-                            )
-
-                        # Fallback to OCR
-                        if self.ocr_service:
-                            return await self.ocr_service.pdf_to_markdown(body)
-
-                        logger.warning(
-                            "PDF extraction yielded little text and no OCR service configured for URL."
-                        )
-                        return ""
-                    return await self._convert_to_md(
-                        BytesIO(body),
-                        filename=filename,
+                    used_filename = filename or resp_filename
+                    return await self._bytes_to_markdown(
+                        body, filename=used_filename, content_type=content_type
                     )
 
         except Exception as e:
@@ -588,6 +533,106 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
             **extra,
         }
 
+    # ------------------------------------------------------------------
+    # Document file saving & resume
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _detect_extension(content_type: str, filename: str | None = None) -> str:
+        """Determine file extension from content type or filename."""
+        if filename:
+            ext = Path(filename).suffix
+            if ext:
+                return ext
+
+        ct = (content_type or "").lower()
+        if "pdf" in ct:
+            return ".pdf"
+        if "html" in ct:
+            return ".html"
+        if "xml" in ct:
+            return ".xml"
+        if "msword" in ct or "officedocument.wordprocessing" in ct:
+            return ".docx"
+        if "rtf" in ct:
+            return ".rtf"
+        if "plain" in ct:
+            return ".txt"
+        return ".bin"
+
+    async def _download_and_convert(
+        self,
+        url: str,
+    ) -> tuple[str, bytes, str]:
+        """Download content from URL, convert to markdown, and return raw bytes.
+
+        Replaces ``_get_markdown(url=...)`` when the raw source file is also needed.
+
+        Returns:
+            Tuple of ``(markdown, raw_bytes, file_extension)``.
+        """
+        resp = await self.request_service.make_request(url)
+        if resp is None:
+            return "", b"", ""
+
+        body = await resp.read()
+        filename, content_type = self.request_service.detect_content_info(resp)
+        ext = self._detect_extension(content_type, filename)
+
+        # Use the appropriate _get_markdown path with already-downloaded content
+        if "pdf" in (content_type or "").lower() or body[:4] == b"%PDF":
+            markdown = await self._get_markdown(stream=BytesIO(body))
+            if not ext or ext == ".bin":
+                ext = ".pdf"
+        else:
+            # Determine the filename hint for markitdown conversion
+            md_filename = filename or f"document{ext}"
+            markdown = await self._convert_to_md(BytesIO(body), filename=md_filename)
+
+        return markdown, body, ext
+
+    async def _save_doc_result(self, doc_result: dict) -> dict | None:
+        """Save a document result immediately via FileSaver.
+
+        Extracts ``_raw_content`` and ``_content_extension`` from the result,
+        saves the source file and appends to ``data.json``.
+
+        Returns:
+            The saved document dict with ``file_path`` added, or None on failure.
+        """
+        if not self.saver:
+            return None
+
+        raw_content = doc_result.pop("_raw_content", None)
+        content_ext = doc_result.pop("_content_extension", None)
+
+        return await self.saver.save_document(
+            doc_data=doc_result,
+            raw_content=raw_content,
+            content_extension=content_ext,
+        )
+
+    async def _load_scraped_keys(self, year: int) -> None:
+        """Load already-scraped document keys for a year (resume support)."""
+        if self.saver:
+            self._scraped_keys = await self.saver.get_scraped_keys(year)
+            if self._scraped_keys and self.verbose:
+                logger.info(
+                    f"{self.__class__.__name__} | Year {year}: "
+                    f"{len(self._scraped_keys)} documents already scraped"
+                )
+        else:
+            self._scraped_keys = set()
+
+    def _is_already_scraped(self, document_url: str, title: str = "") -> bool:
+        """Check if a document has already been scraped (resume support).
+
+        Always returns ``False`` when ``self.overwrite`` is enabled.
+        """
+        if self.overwrite:
+            return False
+        return (document_url, title) in self._scraped_keys
+
     def _handle_blocked_access(self, *args, **kwargs):
         pass
 
@@ -597,13 +642,13 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
             "This method should be implemented in the child class."
         )
 
-    async def _get_docs_links(self, *args, **kwargs) -> Optional[list[dict]]:
+    async def _get_docs_links(self, *args, **kwargs) -> list[dict] | None:
         """Get document links from the given parameters"""
         raise NotImplementedError(
             "This method should be implemented in the child class."
         )
 
-    async def _get_doc_data(self, *args, **kwargs) -> Optional[dict | list[dict]]:
+    async def _get_doc_data(self, *args, **kwargs) -> dict | list[dict] | None:
         """Get document data from the given parameters"""
         raise NotImplementedError(
             "This method should be implemented in the child class."
@@ -838,39 +883,28 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
 
         self._scrape_start = time.time()
 
-        # check if can resume from last scraped year
-        resume_from = self.year_start
-        forced_resume = self.year_start != YEAR_START
-        if self.saver.last_year is not None and not forced_resume:
-            logger.info(f"Resuming from {self.saver.last_year}")
-            resume_from = int(self.saver.last_year)
-        else:
-            logger.info(f"Starting from {resume_from}")
-
-        # filter years to scrape
-        years_to_scrape = [y for y in self.years if y >= resume_from]
+        logger.info(f"Starting from {self.year_start}")
 
         # scrape years sequentially (types/situations within each year are concurrent)
-        all_year_results = []
-
         years_progress = tqdm(
-            years_to_scrape,
+            self.years,
             desc=f"{self.__class__.__name__} | Years",
         )
 
         for year in years_progress:
             years_progress.set_description(f"{self.__class__.__name__} | Year: {year}")
-            year_results = await self._scrape_year(year)
-            if year_results:
-                await self.saver.save(year_results)
-                all_year_results.append(year_results)
-            else:
-                all_year_results.append([])
 
-        for year_results in all_year_results:
+            # Load already-scraped keys for document-level resume
+            await self._load_scraped_keys(year)
+
+            year_results = await self._scrape_year(year)
             if year_results:
                 self.results.extend(year_results)
                 self.count += len(year_results)
+
+            # Flush any buffered documents for this year to disk
+            if self.saver:
+                await self.saver.flush(year)
 
         await self._save_summary()
         return self.results
@@ -879,6 +913,9 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         """Write a summary JSON file with final scraping statistics."""
         if not self.saver:
             return
+
+        # Ensure all buffered documents are written before computing stats
+        await self.saver.flush_all()
 
         elapsed = time.time() - (self._scrape_start or time.time())
 
@@ -932,3 +969,17 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
             await self.request_service.cleanup()
         if self.browser_service:
             await self.browser_service.cleanup()
+
+
+class StateScraper(BaseScraper):
+    """Convenience base for state-level legislation scrapers.
+
+    Automatically applies ``STATE_LEGISLATION_SAVE_DIR`` as the default
+    ``docs_save_dir`` when the environment variable is set, removing the
+    need for each state scraper to repeat this boilerplate.
+    """
+
+    def __init__(self, *args, **kwargs):
+        if STATE_LEGISLATION_SAVE_DIR:
+            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
+        super().__init__(*args, **kwargs)

@@ -76,7 +76,7 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
                 "rps": 200,
                 # "verbose": True,
             },
-            run=True,
+            run=False,
         ),
         ScraperConfig(
             scraper=ConamaScraper,
@@ -91,10 +91,9 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
             scraper=ICMBioScraper,
             params={
                 "year_start": 2016,  # starts from 2016
-                "headless": True,
                 "docs_save_dir": SPECIFIC_LEGISLATION_SAVE_DIR,
                 "verbose": True,
-                "max_workers": 4,  # using 4 workers only to avoid 403 errors from in.gov.br
+                "max_workers": 16,
             },
             run=False,
         ),
@@ -103,7 +102,7 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
             params={
                 "year_start": 1963,  # starts from 1963
             },
-            run=True,
+            run=False,
         ),
         ScraperConfig(
             scraper=AlagoasSefazScraper,
@@ -152,7 +151,6 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
             scraper=DFSinjScraper,
             params={
                 "year_start": 1922,
-                "use_requests_session": True,
                 "llm_config": llm_config,
             },
         ),
@@ -176,7 +174,6 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
             params={
                 "year_start": 1948,
                 "use_browser": True,
-                "use_requests_session": True,
                 "llm_config": llm_config,
             },
         ),
@@ -273,7 +270,6 @@ def build_scraper_configs(llm_config: dict) -> list[ScraperConfig]:
             scraper=SantaCatarinaScraper,
             params={
                 "year_start": 1946,
-                "use_requests_session": True,
             },
         ),
         ScraperConfig(
@@ -326,6 +322,11 @@ def parse_args() -> argparse.Namespace:
         "-v",
         action="store_true",
         help="Enable verbose logging for all scrapers.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Re-scrape all documents, ignoring resume/skip logic.",
     )
     return parser.parse_args()
 
@@ -405,6 +406,11 @@ async def main():
         if args.verbose:
             for cfg in configs:
                 cfg.params["verbose"] = True
+
+        # Apply --overwrite flag to all scraper configs
+        if args.overwrite:
+            for cfg in configs:
+                cfg.params["overwrite"] = True
 
         # Build list of enabled scrapers
         enabled_configs = [cfg for cfg in configs if cfg.run]

@@ -1,9 +1,9 @@
 from io import BytesIO
-from typing import Any, Optional
+from typing import Any
 
 from bs4 import BeautifulSoup, Tag
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
+from src.scraper.base.scraper import StateScraper
 
 
 # Type mappings for Tocantins
@@ -20,7 +20,7 @@ INVALID_SITUATIONS = []
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class TocantinsScraper(BaseScraper):
+class TocantinsScraper(StateScraper):
     """Webscraper for Tocantins state legislation website (https://www.al.to.leg.br/)
 
     Example search request: POST to https://www.al.to.leg.br/legislacaoEstadual
@@ -31,8 +31,6 @@ class TocantinsScraper(BaseScraper):
         base_url: str = "https://www.al.to.leg.br",
         **kwargs: Any,
     ):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
             base_url, types=TYPES, situations=SITUATIONS, name="TOCANTINS", **kwargs
         )
@@ -207,16 +205,20 @@ class TocantinsScraper(BaseScraper):
 
         return all_docs
 
-    async def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
+    async def _get_doc_data(self, doc_info: dict) -> dict | None:
         """Get document data by downloading PDF and converting to markdown"""
         pdf_link = doc_info.get("pdf_link")
+        title = doc_info.get("title", "")
         if not pdf_link:
             await self._save_doc_error(
-                title=doc_info.get("title", ""),
+                title=title,
                 year=doc_info.get("year", ""),
                 html_link="",
                 error_message="Missing PDF link",
             )
+            return None
+
+        if self._is_already_scraped(pdf_link, title):
             return None
 
         try:
@@ -224,25 +226,25 @@ class TocantinsScraper(BaseScraper):
             pdf_response = await self.request_service.make_request(pdf_link)
             if not pdf_response:
                 await self._save_doc_error(
-                    title=doc_info.get("title", ""),
+                    title=title,
                     year=doc_info.get("year", ""),
                     html_link=pdf_link,
                     error_message="Failed to download PDF",
                 )
                 return None
 
+            pdf_content = await pdf_response.read()
+
             # Convert PDF to markdown
             text_markdown = await self._get_markdown(response=pdf_response)
 
             if not text_markdown or not text_markdown.strip():
                 # Try image extraction if regular PDF extraction fails
-                text_markdown = await self._get_markdown(
-                    stream=BytesIO(await pdf_response.read())
-                )
+                text_markdown = await self._get_markdown(stream=BytesIO(pdf_content))
 
             if not text_markdown or not text_markdown.strip():
                 await self._save_doc_error(
-                    title=doc_info.get("title", ""),
+                    title=title,
                     year=doc_info.get("year", ""),
                     html_link=pdf_link,
                     error_message="Empty markdown from PDF",
@@ -255,17 +257,21 @@ class TocantinsScraper(BaseScraper):
                 {
                     "text_markdown": text_markdown,
                     "document_url": pdf_link,
+                    "_raw_content": pdf_content,
+                    "_content_extension": ".pdf",
                 }
             )
+
+            saved = await self._save_doc_result(doc_info)
+            if saved is not None:
+                doc_info = saved
 
             return doc_info
 
         except Exception as e:
-            logger.error(
-                f"Error processing document {doc_info.get('title', 'Unknown')}: {e}"
-            )
+            logger.error(f"Error processing document {title}: {e}")
             await self._save_doc_error(
-                title=doc_info.get("title", ""),
+                title=title,
                 year=doc_info.get("year", ""),
                 html_link=pdf_link,
                 error_message=f"Exception processing document: {e}",
@@ -275,13 +281,22 @@ class TocantinsScraper(BaseScraper):
     async def _fetch_constitution(self):
         """Fetch the Tocantins state constitution"""
         pdf_link = f"{self.base_url}/arquivos/documento_68367.PDF#dados"
-        text_markdown = await self._get_markdown(url=pdf_link)
+        title = "Constituição Estadual de Tocantins"
+
+        if self._is_already_scraped(pdf_link, title):
+            if self.verbose:
+                logger.info("Tocantins constitution already scraped, skipping")
+            return
+
+        text_markdown, raw_content, content_ext = await self._download_and_convert(
+            pdf_link
+        )
         if not text_markdown or not text_markdown.strip():
             logger.error("Failed to fetch Tocantins constitution text")
             return
 
         doc_info = {
-            "title": "Constituição Estadual de Tocantins",
+            "title": title,
             "summary": "Constituição do Estado do Tocantins",
             "type": "Constituição Estadual",
             "date": "05/10/1989",
@@ -289,9 +304,13 @@ class TocantinsScraper(BaseScraper):
             "situation": "Não consta revogação expressa",
             "text_markdown": text_markdown,
             "document_url": pdf_link,
+            "_raw_content": raw_content,
+            "_content_extension": content_ext,
         }
 
-        await self.saver.save([doc_info])
+        saved = await self._save_doc_result(doc_info)
+        if saved is not None:
+            doc_info = saved
         self.results.append(doc_info)
         if self.verbose:
             logger.info("Fetched Tocantins constitution successfully")

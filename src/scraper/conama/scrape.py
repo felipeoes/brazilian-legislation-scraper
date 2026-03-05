@@ -1,6 +1,5 @@
 import urllib.parse
 import re
-from typing import Optional
 from bs4 import BeautifulSoup
 
 from loguru import logger
@@ -61,16 +60,30 @@ class ConamaScraper(BaseScraper):
         ano = year or self.params["ano"]
         return f"{self.base_url}?option={self.params['option']}&order={self.params['order']}&offset={offset}&limit={self.params['limit']}&task={self.params['task']}&tipo={TYPES[norm_type]}&ano={ano}"
 
-    async def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
+    async def _get_doc_data(self, doc_info: dict) -> dict | None:
         """Get document data from norm dict. Download url for pdf will follow the pattern: https://conama.mma.gov.br/?option=com_sisconama&task=arquivo.download&id={id}"""
         doc_id = doc_info.get("aid")
         doc_number = doc_info.get("numero", "")
         doc_type = doc_info.get("nomeato", "")
         doc_year = doc_info.get("ano", "")
 
+        title = f"{doc_type} CONAMA Nº {doc_number}/{doc_year}"
+        doc_url = (
+            urllib.parse.urljoin(
+                self.base_url,
+                f"?option=com_sisconama&task=arquivo.download&id={doc_id}",
+            )
+            if doc_id is not None
+            else ""
+        )
+
+        if doc_id is not None and self._is_already_scraped(doc_url, title):
+            logger.debug(f"Skipping already scraped: {title}")
+            return None
+
         if doc_id is None:
             logger.info(
-                f"Skipping {doc_type} CONAMA Nº {doc_number}/{doc_year} as it has no document ID attached (aid is null)."
+                f"Skipping {title} as it has no document ID attached (aid is null)."
             )
             return None
 
@@ -78,10 +91,6 @@ class ConamaScraper(BaseScraper):
         doc_status = doc_info.get("status")
         doc_keyword = doc_info.get("palavra_chave", "")
         doc_origin = doc_info.get("porigem", "")
-        doc_url = urllib.parse.urljoin(
-            self.base_url,
-            f"?option=com_sisconama&task=arquivo.download&id={doc_id}",
-        )
 
         # Fetch the document once to detect content type and avoid double requests
         resp = await self.request_service.make_request(doc_url)
@@ -109,12 +118,18 @@ class ConamaScraper(BaseScraper):
             soup = BeautifulSoup(body, "html.parser")
             for a_tag in soup.find_all("a"):
                 a_tag.unwrap()
+            html_content = soup.prettify()
             text_markdown = await self._get_markdown(
-                html_content=soup.prettify(),
+                html_content=html_content,
             )
+            raw_content = html_content.encode("utf-8")
+            content_ext = ".html"
         else:
-            # PDF or other binary — let _get_markdown detect format and use ocr_service
+            # PDF or other binary — read bytes, then convert via stream
+            body = await resp.read()
             text_markdown = await self._get_markdown(response=resp)
+            raw_content = body
+            content_ext = ".pdf"
 
         if text_markdown is None or not text_markdown.strip():
             logger.warning(
@@ -207,8 +222,8 @@ class ConamaScraper(BaseScraper):
             return None
 
         # title will be like Resolução CONAMA Nº 501/2021
-        return {
-            "title": f"{doc_type} CONAMA Nº {doc_number}/{doc_info['ano']}",
+        result = {
+            "title": title,
             "id": doc_id,
             "number": doc_number,
             "summary": doc_description,
@@ -217,7 +232,12 @@ class ConamaScraper(BaseScraper):
             "origin": doc_origin,
             "text_markdown": text_markdown,
             "document_url": doc_url,
+            "_raw_content": raw_content,
+            "_content_extension": content_ext,
         }
+
+        await self._save_doc_result(result)
+        return result
 
     async def _fetch_page_norms(
         self, norm_type: str, offset: int, year_str: str

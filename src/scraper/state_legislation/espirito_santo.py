@@ -1,5 +1,4 @@
 from io import BytesIO
-from typing import Optional
 from urllib.parse import urljoin
 
 import aiohttp
@@ -8,7 +7,7 @@ import re
 from bs4 import BeautifulSoup
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
-from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
+from src.scraper.base.scraper import StateScraper
 
 TYPES = {
     "Acórdão do Colegiado da Procuradoria": 18,
@@ -43,7 +42,7 @@ INVALID_SITUATIONS = {
 SITUATIONS = {**VALID_SITUATIONS, **INVALID_SITUATIONS}
 
 
-class ESAlesScraper(BaseScraper):
+class ESAlesScraper(StateScraper):
     """Webscraper for Espirito Santo state legislation website (https://www3.al.es.gov.br/legislacao)
 
     Example search request: https://www3.al.es.gov.br/legislacao/consulta-legislacao.aspx?tipo=7&situacao=2&ano=2000&interno=1
@@ -54,8 +53,6 @@ class ESAlesScraper(BaseScraper):
         base_url: str = "https://www3.al.es.gov.br",
         **kwargs,
     ):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
             base_url,
             name="ESPIRITO_SANTO",
@@ -211,7 +208,7 @@ class ESAlesScraper(BaseScraper):
 
         return docs, False
 
-    async def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
+    async def _get_doc_data(self, doc_info: dict) -> dict | None:
         """Get document data from document link"""
         doc_link = doc_info.pop("doc_link")
         url = urljoin(self.base_url, doc_link)
@@ -220,9 +217,14 @@ class ESAlesScraper(BaseScraper):
         if url.endswith(".pd"):
             url = url + "f"
 
+        if self._is_already_scraped(url, doc_info.get("title", "")):
+            return None
+
         # if url ends with .pdf, get only text_markdown
         if url.endswith(".pdf"):
-            text_markdown = await self._get_markdown(url=url)
+            text_markdown, raw_content, content_ext = await self._download_and_convert(
+                url
+            )
 
             if not text_markdown:
                 # pdf may be an image
@@ -239,10 +241,14 @@ class ESAlesScraper(BaseScraper):
 
                 pdf_content = await response.read()
                 text_markdown = await self._get_markdown(stream=BytesIO(pdf_content))
+                raw_content = pdf_content
+                content_ext = ".pdf"
 
             doc_info["html_string"] = ""
             doc_info["text_markdown"] = text_markdown
             doc_info["document_url"] = url
+            doc_info["_raw_content"] = raw_content
+            doc_info["_content_extension"] = content_ext
             return doc_info
 
         soup = await self.request_service.get_soup(url)
@@ -263,6 +269,8 @@ class ESAlesScraper(BaseScraper):
         doc_info["html_string"] = html_string
         doc_info["text_markdown"] = text_markdown
         doc_info["document_url"] = url
+        doc_info["_raw_content"] = html_string.encode("utf-8")
+        doc_info["_content_extension"] = ".html"
 
         return doc_info
 
@@ -325,6 +333,7 @@ class ESAlesScraper(BaseScraper):
                 "type": norm_type,
                 **result,
             }
+            await self._save_doc_result(queue_item)
             results.append(queue_item)
 
         if self.verbose:

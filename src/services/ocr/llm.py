@@ -153,25 +153,21 @@ class LLMOCRService:
         doc.close()
         return pages
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    async def text_to_markdown(
-        self, text: str, prompt: str, timeout: int | None = None
+    async def _call_with_retry(
+        self,
+        messages: list,
+        desc: str = "LLM call",
+        timeout: int | None = None,
     ) -> str:
-        """Send plain text to the LLM and return its response as markdown.
-
-        Useful for post-processing already-extracted text (e.g. extracting a
-        specific norm from combined OCR pages that may contain multiple norms).
+        """Execute an LLM call with retry, rate limiting, and error handling.
 
         Args:
-            text: The text content to process.
-            prompt: Instruction prompt sent alongside the text.
-            timeout: Optional custom timeout in seconds.
+            messages: OpenAI-format messages list.
+            desc: Short description for log messages (e.g. "3 images").
+            timeout: Optional per-request timeout in seconds.
 
         Returns:
-            The LLM response string, or ``""`` on failure.
+            Cleaned markdown string, or ``""`` on failure.
         """
         timeout = timeout or self.timeout
         try:
@@ -183,25 +179,30 @@ class LLMOCRService:
                             (attempt.retry_state.attempt_number - 1) % len(self.models)
                         ]
                         logger.info(
-                            f"Sending text to LLM (size: {len(text)} chars) | Attempt {attempt.retry_state.attempt_number} | Model: {model}"
+                            f"Sending {desc} to LLM | Attempt {attempt.retry_state.attempt_number} | Model: {model}"
                         )
                     response_text = await self.generate(
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": f"{text}\n\n{prompt}",
-                            }
-                        ],
+                        messages=messages,
                         attempt_number=attempt.retry_state.attempt_number,
                         timeout=timeout,
                     )
             return self._clean_md_tag(response_text or "")
-        except RetryError:
-            logger.error("LLM text conversion failed after 10 attempts.")
+        except RetryError as e:
+            last_exc = e.last_attempt.exception() if e.last_attempt else e
+            logger.error(f"{desc} failed after retries: {last_exc}")
             return ""
         except Exception as e:
-            logger.error(f"LLM text conversion failed: {e}")
+            logger.error(f"{desc} failed: {e}")
             return ""
+
+    async def text_to_markdown(
+        self, text: str, prompt: str, timeout: int | None = None
+    ) -> str:
+        """Send plain text to the LLM and return its response as markdown."""
+        messages = [{"role": "user", "content": f"{text}\n\n{prompt}"}]
+        return await self._call_with_retry(
+            messages, desc=f"text ({len(text)} chars)", timeout=timeout
+        )
 
     async def images_to_markdown(
         self, images: list[bytes], timeout: int | None = None
@@ -210,50 +211,20 @@ class LLMOCRService:
         if not images:
             return ""
 
-        timeout = timeout or self.timeout
-        try:
-            async for attempt in self._create_retry_strategy():
-                with attempt:
-                    await self._rate_limiter.acquire()
-                    if self.verbose and attempt.retry_state.attempt_number > 6:
-                        model = self.models[
-                            (attempt.retry_state.attempt_number - 1) % len(self.models)
-                        ]
-                        logger.info(
-                            f"Sending {len(images)} images to LLM | Attempt {attempt.retry_state.attempt_number} | Model: {model}"
-                        )
-
-                    content_blocks = [{"type": "text", "text": self.prompt}]
-                    for img_bytes in images:
-                        image_b64 = base64.standard_b64encode(img_bytes).decode()
-                        content_blocks.append(
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{image_b64}"
-                                },
-                            }
-                        )
-
-                    response_text = await self.generate(
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": content_blocks,
-                            }
-                        ],
-                        attempt_number=attempt.retry_state.attempt_number,
-                        timeout=timeout,
-                    )
-                    return self._clean_md_tag(response_text or "")
-        except RetryError as e:
-            logger.error(
-                f"LLM batch image conversion failed after 10 attempts: {e.last_attempt.exception()}"
+        content_blocks: list[dict] = [{"type": "text", "text": self.prompt}]
+        for img_bytes in images:
+            image_b64 = base64.standard_b64encode(img_bytes).decode()
+            content_blocks.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                }
             )
-            return ""
-        except Exception as e:
-            logger.error(f"LLM batch image conversion failed: {e}")
-            return ""
+
+        messages = [{"role": "user", "content": content_blocks}]
+        return await self._call_with_retry(
+            messages, desc=f"{len(images)} images", timeout=timeout
+        )
 
     async def documents_to_markdown(
         self, docs: list[bytes], format: str = "pdf", timeout: int | None = None
@@ -262,50 +233,24 @@ class LLMOCRService:
         if not docs:
             return ""
 
-        timeout = timeout or self.timeout
-        try:
-            async for attempt in self._create_retry_strategy():
-                with attempt:
-                    await self._rate_limiter.acquire()
-                    if self.verbose and attempt.retry_state.attempt_number > 6:
-                        model = self.models[
-                            (attempt.retry_state.attempt_number - 1) % len(self.models)
-                        ]
-                        logger.info(
-                            f"Sending {len(docs)} documents to LLM | Attempt {attempt.retry_state.attempt_number} | Model: {model}"
-                        )
+        content_blocks: list[dict] = [{"type": "text", "text": self.prompt}]
+        for i, doc_bytes in enumerate(docs):
+            doc_b64 = base64.standard_b64encode(doc_bytes).decode()
+            content_blocks.append(
+                {
+                    "type": "document",
+                    "document": {
+                        "name": f"document_{i}",
+                        "format": format,
+                        "source": {"bytes": doc_b64},
+                    },
+                }
+            )
 
-                    content_blocks = [{"type": "text", "text": self.prompt}]
-                    for i, doc_bytes in enumerate(docs):
-                        doc_b64 = base64.standard_b64encode(doc_bytes).decode()
-                        content_blocks.append(
-                            {
-                                "type": "document",
-                                "document": {
-                                    "name": f"document_{i}",
-                                    "format": format,
-                                    "source": {"bytes": doc_b64},
-                                },
-                            }
-                        )
-
-                    response_text = await self.generate(
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": content_blocks,
-                            }
-                        ],
-                        attempt_number=attempt.retry_state.attempt_number,
-                        timeout=timeout,
-                    )
-            return self._clean_md_tag(response_text or "")
-        except RetryError:
-            logger.error("LLM batch document conversion failed after 10 attempts.")
-            return ""
-        except Exception as e:
-            logger.error(f"LLM batch document conversion failed: {e}")
-            return ""
+        messages = [{"role": "user", "content": content_blocks}]
+        return await self._call_with_retry(
+            messages, desc=f"{len(docs)} documents", timeout=timeout
+        )
 
     async def pdf_to_markdown(self, content: bytes, timeout: int | None = None) -> str:
         """Convert PDF bytes to markdown. If llm_raw=True (from llm_config), sends PDF bytes directly in batches."""

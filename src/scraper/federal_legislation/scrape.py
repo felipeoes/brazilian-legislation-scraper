@@ -1,5 +1,4 @@
 import asyncio
-from typing import Optional
 from urllib.parse import urljoin
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -149,7 +148,7 @@ class CamaraDepScraper(BaseScraper):
 
     async def _get_document_text_link(
         self, document_html_link: str, title: str, summary: str
-    ) -> Optional[dict]:
+    ) -> dict | None:
         """Get proper document text link from given document html link"""
 
         soup = await self.request_service.get_soup(document_html_link)
@@ -257,7 +256,7 @@ class CamaraDepScraper(BaseScraper):
 
     async def _get_document_data(
         self, document_text_link: str, title: str, summary: str
-    ) -> Optional[dict]:
+    ) -> dict | None:
         """Get data from given document text link using BS4 cleaning + markitdown.
         Data will be in the format {
             "title": str,
@@ -330,6 +329,8 @@ class CamaraDepScraper(BaseScraper):
                 "html_string": html_string,
                 "text_markdown": text_markdown.strip(),
                 "document_url": document_text_link,
+                "_raw_content": html_string.encode("utf-8"),
+                "_content_extension": ".html",
             }
         except Exception as e:
             logger.error(f"Error converting document to markdown: {title} - {e}")
@@ -416,6 +417,10 @@ class CamaraDepScraper(BaseScraper):
             )
             for document_text_link in documents_text_links
             if document_text_link is not None
+            and not self._is_already_scraped(
+                document_text_link.get("html_link", ""),
+                document_text_link.get("title", ""),
+            )
         ]
         doc_data_results = await asyncio.gather(*tasks)
         for result in doc_data_results:
@@ -428,6 +433,7 @@ class CamaraDepScraper(BaseScraper):
                 "type": type,
                 **result,
             }
+            await self._save_doc_result(queue_item)
             results.append(queue_item)
 
         if self.verbose:

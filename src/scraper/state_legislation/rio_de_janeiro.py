@@ -6,7 +6,7 @@ from typing import Any
 
 from bs4 import BeautifulSoup
 
-from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
+from src.scraper.base.scraper import StateScraper
 from loguru import logger
 
 # obs: LeiComp = Lei Complementar; LeiOrd = Lei Ordinária;
@@ -28,7 +28,7 @@ INVALID_SITUATIONS = []
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class RJAlerjScraper(BaseScraper):
+class RJAlerjScraper(StateScraper):
     """Webscraper for Alesp (Assembleia Legislativa do Rio de Janeiro) website (https://www.alerj.rj.gov.br/)
 
     Example search request: http://alerjln1.alerj.rj.gov.br/contlei.nsf/DecretoAnoInt?OpenForm&Start=1&Count=300
@@ -41,8 +41,6 @@ class RJAlerjScraper(BaseScraper):
         base_url: str = "http://alerjln1.alerj.rj.gov.br/contlei.nsf",
         **kwargs,
     ):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
             base_url,
             types=TYPES,
@@ -96,6 +94,11 @@ class RJAlerjScraper(BaseScraper):
     async def _get_doc_data(self, doc_info: dict) -> dict:
         """Get document data from given html link"""
         doc_html_link = doc_info["html_link"]
+        document_url = doc_html_link.strip().replace("?OpenDocument", "")
+
+        if self._is_already_scraped(document_url, doc_info.get("title", "")):
+            return None
+
         soup = await self.request_service.get_soup(doc_html_link)
 
         body = soup.body
@@ -133,13 +136,22 @@ class RJAlerjScraper(BaseScraper):
         html_string = body.prettify().replace("\n", "")
         text_markdown = await self._html_to_markdown(html_string)
 
-        return {
+        full_html = f"<html><body>{html_string}</body></html>"
+        result = {
             **doc_info,
             "situation": situation,
             "html_string": html_string,
             "text_markdown": text_markdown,
-            "document_url": doc_html_link.strip().replace("?OpenDocument", ""),
+            "document_url": document_url,
+            "_raw_content": full_html.encode("utf-8"),
+            "_content_extension": ".html",
         }
+
+        saved = await self._save_doc_result(result)
+        if saved is not None:
+            result = saved
+
+        return result
 
     def _build_constitution_section_url(self, data_role: str) -> str:
         """Builds the URL for a section of the constitution."""
@@ -176,6 +188,12 @@ class RJAlerjScraper(BaseScraper):
     async def scrape_constitution(self):
         """Scrape constitution data"""
         constitution_url = "http://www3.alerj.rj.gov.br/lotus_notes/default.asp?id=73&url=L2NvbnN0ZXN0Lm5zZi9JbmRpY2VJbnQ/T3BlbkZvcm0mU3RhcnQ9MSZDb3VudD0zMDA="
+
+        title = "Constituição Estadual do Rio de Janeiro"
+        if self._is_already_scraped(constitution_url, title):
+            self.fetched_constitution = True
+            return
+
         soup = await self.request_service.get_soup(constitution_url)
 
         a_links = [
@@ -193,19 +211,26 @@ class RJAlerjScraper(BaseScraper):
         html_string = "<hr/>".join(html_parts)
         text_markdown = await self._html_to_markdown(html_string)
 
+        full_html = f"<html><body>{html_string}</body></html>"
         queue_item = {
             "year": 1989,
             "type": "Constituição Estadual",
-            "title": "Constituição Estadual do Rio de Janeiro",
+            "title": title,
             "date": "05/10/1989",
             "author": "",
             "summary": "",
             "html_link": constitution_url,
-            "html_string": f"<html><body>{html_string}</body></html>",
+            "html_string": full_html,
             "text_markdown": text_markdown,
             "situation": "Sem revogação expressa",
             "document_url": constitution_url,
+            "_raw_content": full_html.encode("utf-8"),
+            "_content_extension": ".html",
         }
+
+        saved = await self._save_doc_result(queue_item)
+        if saved is not None:
+            queue_item = saved
 
         self.queue.put(queue_item)
         self.fetched_constitution = True

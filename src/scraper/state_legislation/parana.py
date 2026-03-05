@@ -7,8 +7,7 @@ from bs4 import BeautifulSoup
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 from tenacity import retry, stop_after_attempt, wait_exponential
 from src.scraper.base.scraper import (
-    BaseScraper,
-    STATE_LEGISLATION_SAVE_DIR,
+    StateScraper,
     DEFAULT_VALID_SITUATION,
     DEFAULT_INVALID_SITUATION,
 )
@@ -32,7 +31,7 @@ INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no lon
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
-class ParanaCVScraper(BaseScraper):
+class ParanaCVScraper(StateScraper):
     """Webscraper for Parana do Sul state legislation website (https://www.legislacao.pr.gov.br)
 
     Example search request: https://www.legislacao.pr.gov.br/legislacao/pesquisarAto.do?action=listar&opt=tm&indice=1&site=1
@@ -70,8 +69,6 @@ class ParanaCVScraper(BaseScraper):
         base_url: str = "https://www.legislacao.pr.gov.br",
         **kwargs,
     ):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
             base_url,
             types=TYPES,
@@ -483,10 +480,12 @@ class ParanaCVScraper(BaseScraper):
 
     async def _get_doc_data(self, doc_info: dict) -> dict:
         """Get document data from given doc info"""
+        html_link = doc_info.pop("html_link")
+
+        if self._is_already_scraped(html_link, doc_info.get("title", "")):
+            return None
 
         pw_page = await self._get_available_page()
-
-        html_link = doc_info.pop("html_link")
 
         norm_text_tag = None
         while not norm_text_tag:
@@ -530,6 +529,12 @@ class ParanaCVScraper(BaseScraper):
         doc_info["text_markdown"] = text_markdown
         doc_info["document_url"] = html_link
         doc_info["situation"] = situation
+        doc_info["_raw_content"] = html_string.encode("utf-8")
+        doc_info["_content_extension"] = ".html"
+
+        saved = await self._save_doc_result(doc_info)
+        if saved is not None:
+            doc_info = saved
 
         return doc_info
 

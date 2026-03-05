@@ -1,7 +1,5 @@
 import asyncio
 import ssl
-from typing import Optional
-
 import aiohttp
 from aiohttp_socks import ProxyConnector
 from bs4 import BeautifulSoup
@@ -40,14 +38,12 @@ class RequestService:
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
         }
-        self._default_session: Optional[aiohttp.ClientSession] = None
+        self._default_session: aiohttp.ClientSession | None = None
         self._proxy_sessions: dict[str, aiohttp.ClientSession] = {}
         self._rate_limiter = RateLimiter(rps)
         self.proxy_service = proxy_service
 
-    async def _ensure_session(
-        self, proxy: Optional[str] = None
-    ) -> aiohttp.ClientSession:
+    async def _ensure_session(self, proxy: str | None = None) -> aiohttp.ClientSession:
         """Get or create the aiohttp session."""
         if proxy:
             if proxy not in self._proxy_sessions or self._proxy_sessions[proxy].closed:
@@ -84,8 +80,8 @@ class RequestService:
         self,
         url: str,
         method: str = "GET",
-        json: Optional[dict] = None,
-        payload: Optional[list | dict] = None,
+        json: dict | None = None,
+        payload: list | dict | None = None,
         timeout: int = 120,
         **kwargs,
     ) -> aiohttp.ClientResponse:
@@ -122,11 +118,9 @@ class RequestService:
             # Pre-read the body so callers can use it freely
             await resp.read()
 
-            body_text = await resp.text(errors="replace")
-            if (
-                "O servidor encontrou um erro interno, ou está sobrecarregado"
-                in body_text
-            ):
+            # Check for Portuguese server error in raw bytes (ASCII-safe pattern)
+            # to avoid decoding the entire body to text on every request.
+            if b"O servidor encontrou um erro interno, ou est" in (resp._body or b""):
                 raise RetryableHTTPError("Server overloaded / internal error")
 
             if resp.status in (408, 429, 500, 502, 503, 504):
@@ -157,11 +151,11 @@ class RequestService:
         self,
         url: str,
         method: str = "GET",
-        json: Optional[dict] = None,
-        payload: Optional[list | dict] = None,
+        json: dict | None = None,
+        payload: list | dict | None = None,
         timeout: int = 60,
         **kwargs,
-    ) -> Optional[aiohttp.ClientResponse]:
+    ) -> aiohttp.ClientResponse | None:
         """Make async HTTP request with automatic retry on transient errors.
 
         Returns an aiohttp.ClientResponse that has already been read
@@ -175,7 +169,7 @@ class RequestService:
 
     async def get_soup(
         self, url: str, method: str = "GET", **kwargs
-    ) -> Optional[BeautifulSoup]:
+    ) -> BeautifulSoup | None:
         """Get BeautifulSoup object from given url (async)."""
         resp = await self.make_request(url, method=method, **kwargs)
         if resp is None:

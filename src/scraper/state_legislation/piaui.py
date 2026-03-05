@@ -1,7 +1,6 @@
 from typing import Any
 
 from src.scraper.base.sapl_scraper import SAPLBaseScraper
-from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
 
 
 # gotten from https://sapl.al.pi.leg.br/api/norma/tiponormajuridica/
@@ -27,15 +26,18 @@ class PiauiAlpbScraper(SAPLBaseScraper):
         base_url: str = "https://sapl.al.pi.leg.br",
         **kwargs: Any,
     ):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(base_url, name="PIAUI", types=TYPES, **kwargs)
 
     async def _process_pdf(self, pdf_link: str, _year: int = 0) -> dict | None:
         """Threshold-based PDF processing: try markitdown, fallback to OCR if too short."""
-        text_markdown, document_url = await self._process_pdf_with_fallback(
-            pdf_link, min_length=149
+        text_markdown, raw_content, content_ext = await self._download_and_convert(
+            pdf_link
         )
-        if not text_markdown:
+        if not text_markdown or len(text_markdown.strip()) < 149:
             return None
-        return {"text_markdown": text_markdown, "document_url": document_url}
+        return {
+            "text_markdown": text_markdown.strip(),
+            "document_url": pdf_link,
+            "_raw_content": raw_content,
+            "_content_extension": content_ext,
+        }

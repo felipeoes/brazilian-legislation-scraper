@@ -1,7 +1,6 @@
 from typing import Any
 
 from src.scraper.base.sapl_scraper import SAPLBaseScraper
-from src.scraper.base.scraper import STATE_LEGISLATION_SAVE_DIR
 
 
 # gotten from https://sapl.al.rr.leg.br/api/norma/tiponormajuridica/
@@ -30,6 +29,4 @@ class RoraimaAlpbScraper(SAPLBaseScraper):
         base_url: str = "https://sapl.al.rr.leg.br",
         **kwargs: Any,
     ):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(base_url, name="RORAIMA", types=TYPES, **kwargs)

@@ -7,7 +7,6 @@ makes HTTP requests via the shared ``RequestService``.
 from __future__ import annotations
 
 import re
-from typing import Optional
 from urllib.parse import quote
 
 from loguru import logger
@@ -40,9 +39,9 @@ class BedrockClient:
         base_url: str,
         api_key: str,
         request_service: RequestService,
-        inference_config: Optional[dict] = None,
-        additional_request_fields: Optional[dict] = None,
-        performance_config: Optional[dict] = None,
+        inference_config: dict | None = None,
+        additional_request_fields: dict | None = None,
+        performance_config: dict | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key

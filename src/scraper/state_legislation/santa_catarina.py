@@ -1,10 +1,10 @@
 import re
-from typing import Any, Optional
+from typing import Any
 
 from bs4 import BeautifulSoup, Tag
 from tqdm import tqdm
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper, STATE_LEGISLATION_SAVE_DIR
+from src.scraper.base.scraper import StateScraper
 
 
 TYPES = {
@@ -24,7 +24,7 @@ TYPES = {
 SITUATIONS = []
 
 
-class SantaCatarinaScraper(BaseScraper):
+class SantaCatarinaScraper(StateScraper):
     """Webscraper for Santa Catarina state legislation website (http://server03.pge.sc.gov.br/pge/normasjur.asp)
 
     Example search request: POST to http://server03.pge.sc.gov.br/pge/normasjur.asp
@@ -35,8 +35,6 @@ class SantaCatarinaScraper(BaseScraper):
         base_url: str = "http://server03.pge.sc.gov.br/pge/normasjur.asp",
         **kwargs: Any,
     ):
-        if STATE_LEGISLATION_SAVE_DIR:
-            kwargs.setdefault("docs_save_dir", STATE_LEGISLATION_SAVE_DIR)
         super().__init__(
             base_url,
             types=TYPES,
@@ -233,13 +231,14 @@ class SantaCatarinaScraper(BaseScraper):
 
         return docs
 
-    async def _get_doc_data(self, doc_info: dict) -> Optional[dict]:
+    async def _get_doc_data(self, doc_info: dict) -> dict | None:
         """Get document data by fetching document info page and final document content"""
         # Get the doc_info_link and remove it from the dict
         doc_info_link = doc_info.pop("doc_info_link", None)
+        title = doc_info.get("title", "")
         if not doc_info_link:
             await self._save_doc_error(
-                title=doc_info.get("title", ""),
+                title=title,
                 year=doc_info.get("year", ""),
                 html_link="",
                 error_message="Missing doc_info_link",
@@ -250,7 +249,7 @@ class SantaCatarinaScraper(BaseScraper):
         info_soup = await self.request_service.get_soup(doc_info_link)
         if not info_soup:
             await self._save_doc_error(
-                title=doc_info.get("title", ""),
+                title=title,
                 year=doc_info.get("year", ""),
                 html_link=doc_info_link,
                 error_message="Failed to get document info page",
@@ -271,15 +270,20 @@ class SantaCatarinaScraper(BaseScraper):
         # Look for "Texto Integral" link to get the actual document
         document_url = info_soup.find("a", string="Texto Integral")["href"]
 
+        if self._is_already_scraped(document_url or doc_info_link, title):
+            return None
+
         # If we have the document URL, fetch the content
         text_markdown = ""
+        raw_content = b""
+        content_ext = ".html"
         if document_url:
             doc_soup = await self.request_service.get_soup(document_url)
 
             body = doc_soup.find("div", class_="Section1")
             if not body:
                 await self._save_doc_error(
-                    title=doc_info.get("title", ""),
+                    title=title,
                     year=doc_info.get("year", ""),
                     html_link=document_url,
                     error_message="No Section1 div found in document",
@@ -290,10 +294,11 @@ class SantaCatarinaScraper(BaseScraper):
             html_string = f"<html><body>{html_string}</body></html>"
 
             text_markdown = await self._get_markdown(html_content=html_string)
+            raw_content = html_string.encode("utf-8")
 
         if not text_markdown:
             await self._save_doc_error(
-                title=doc_info.get("title", ""),
+                title=title,
                 year=doc_info.get("year", ""),
                 html_link=document_url or doc_info_link,
                 error_message="Empty markdown from document",
@@ -305,8 +310,14 @@ class SantaCatarinaScraper(BaseScraper):
                 "situation": situation,
                 "text_markdown": text_markdown,
                 "document_url": document_url or doc_info_link,
+                "_raw_content": raw_content,
+                "_content_extension": content_ext,
             }
         )
+
+        saved = await self._save_doc_result(doc_info)
+        if saved is not None:
+            doc_info = saved
 
         return doc_info
 
