@@ -1,6 +1,5 @@
 import asyncio
 import re
-import time
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup, Tag
 from src.scraper.base.scraper import StateScraper
@@ -146,7 +145,7 @@ class PernambucoAlepeScraper(StateScraper):
         return state
 
     def _format_search_url(
-        self, norm_type: str, norm_type_id: str, year: int, page: int = 0
+        self, norm_type: str, norm_type_id: str, year: int
     ) -> tuple[str, dict[str, str]]:
         """Format url for search request"""
         url = urljoin(self.base_url, "/Paginas/pesquisaAvancada.aspx")
@@ -155,162 +154,69 @@ class PernambucoAlepeScraper(StateScraper):
         params[f"ctl00$conteudo$cblTipoNorma$cblTipoNorma_{norm_type_id}"] = norm_type
         params["ctl00$conteudo$tbxAno"] = str(year)
 
-        if page > 1:
-            params["__EVENTTARGET"] = f"ctl00$conteudo$lbtn{page}"
-            params["__LASTFOCUS"] = ""
-            # params["ctl00$conteudo$hfPage"] = str(page - 2)
-            params["ctl00$conteudo$hfPage"] = "0"
-            params["ctl00$conteudo$ddlOrdem"] = "relevância"
-            params["ctl00$conteudo$ddlTamPagina"] = "100"
-            params.pop(
-                "ctl00$conteudo$btnPesquisar", None
-            )  # Remove button to avoid page error
-
         return url, params
 
-    async def _get_docs_links(self, url: str, params: dict, page: int = 1) -> list:
-        """Get documents html links from given page using Playwright for JavaScript navigation.
-        Returns a list of dicts with keys 'title', 'summary', 'additional_data_url', 'document_url'
-        """
-        try:
-            # Check if page is initialized
-            if self.page is None:
-                logger.warning("Playwright page is not initialized")
-                return []
+    def _extract_documents(self, soup: BeautifulSoup) -> list[dict]:
+        """Extract document links from search results page"""
+        docs = []
 
-            # Submit the form (for first page only, otherwise it will be handled by JavaScript)
-            if page == 1:
-                await self.page.goto(url, wait_until="domcontentloaded")
-
-                # Fill the search form with params
-                for field_name, field_value in params.items():
-                    if field_value and field_name not in [
-                        "__EVENTTARGET",
-                        "__EVENTARGUMENT",
-                        "__LASTFOCUS",
-                    ]:
-                        locator = self.page.locator(f'[name="{field_name}"]')
-                        if await locator.count() == 0:
-                            continue
-                        attr_type = await locator.get_attribute("type")
-                        if attr_type == "checkbox":
-                            is_selected = await locator.is_checked()
-                            if not is_selected:
-                                await locator.click()
-                        elif attr_type == "text":
-                            await locator.clear()
-                            await locator.fill(str(field_value))
-
-                search_button = self.page.locator(
-                    '[name="ctl00$conteudo$btnPesquisar"]'
-                )
-                if await search_button.count() == 0:
-                    logger.warning("Search button not found")
-                    return []
-                await search_button.click()
-                await asyncio.sleep(2)  # Wait for results to load
-
-                page_source = await self.page.content()
-                soup = BeautifulSoup(page_source, "html.parser")
-
-            # Navigate to specific page if page > 1
-            if page > 1:
-                timeout = 30  # seconds
-                current_time = time.time()
-                try:
-                    while time.time() - current_time < timeout:
-                        # Click the pagination link directly
-                        button = self.page.locator(f"#lbtn{page}")
-                        await button.click()
-
-                        # Wait for page to load (until active class is added to the button)
-                        while True:
-                            button = self.page.locator(f"#lbtn{page}")
-                            btn_class = await button.get_attribute("class")
-                            if btn_class and "active" in btn_class:
-                                if self.verbose:
-                                    logger.info(
-                                        f"Successfully navigated to page {page}"
-                                    )
-                                break
-                            await asyncio.sleep(1)
-
-                    if self.verbose:
-                        logger.info(f"Waiting for page {page} to load...")
-                except Exception:
-                    return []
-
-                page_source = await self.page.content()
-                soup = BeautifulSoup(page_source, "html.parser")
-
-            docs = []
-
-            # Find all items
-            div_resultado = soup.find("div", id="divResultado")
-            if not div_resultado:
-                logger.warning(f"No results div found on page {page}")
-                return []
-
-            table = div_resultado.find("table")
-            if not table:
-                logger.warning(f"No table found in results on page {page}")
-                return []
-
-            tbody = table.find("tbody")
-            if not tbody:
-                logger.warning(f"No tbody found in table on page {page}")
-                return []
-
-            items = tbody.find_all("tr")
-
-            for item in items:
-                try:
-                    # Get title and link
-                    title_span = item.find("span", class_="nome-norma")
-                    if not title_span:
-                        continue
-                    title = title_span.text.strip()
-
-                    summary_div = item.find("div", class_="fLeft")
-                    summary = summary_div.text.strip() if summary_div else ""
-
-                    additional_data_td = item.find("td", class_="ementa-norma")
-                    additional_data_url = ""
-                    if additional_data_td:
-                        additional_data_link = additional_data_td.find("a", href=True)
-                        if additional_data_link:
-                            additional_data_url = urljoin(
-                                self.base_url, additional_data_link["href"]
-                            )
-
-                    document_link = item.find("a", href=True)
-                    document_url = ""
-                    if document_link:
-                        document_url = urljoin(self.base_url, document_link["href"])
-
-                    if title and document_url:  # Only add if we have essential data
-                        docs.append(
-                            {
-                                "title": title,
-                                "summary": summary,
-                                "additional_data_url": additional_data_url,
-                                "document_url": document_url,
-                            }
-                        )
-                except Exception as e:
-                    logger.error(f"Error parsing item: {e}")
-                    continue
-
-            return docs
-
-        except Exception as e:
-            logger.error(f"Failed to retrieve documents from page {page}: {e}")
+        div_resultado = soup.find("div", id="divResultado")
+        if not div_resultado:
             return []
+
+        table = div_resultado.find("table")
+        if not table:
+            return []
+
+        tbody = table.find("tbody")
+        if not tbody:
+            return []
+
+        items = tbody.find_all("tr")
+
+        for item in items:
+            try:
+                title_span = item.find("span", class_="nome-norma")
+                if not title_span:
+                    continue
+                title = title_span.text.strip()
+
+                summary_div = item.find("div", class_="fLeft")
+                summary = summary_div.text.strip() if summary_div else ""
+
+                additional_data_td = item.find("td", class_="ementa-norma")
+                additional_data_url = ""
+                if additional_data_td:
+                    additional_data_link = additional_data_td.find("a", href=True)
+                    if additional_data_link:
+                        additional_data_url = urljoin(
+                            self.base_url, additional_data_link["href"]
+                        )
+
+                document_link = item.find("a", href=True)
+                document_url = ""
+                if document_link:
+                    document_url = urljoin(self.base_url, document_link["href"])
+
+                if title and document_url:  # Only add if we have essential data
+                    docs.append(
+                        {
+                            "title": title,
+                            "summary": summary,
+                            "additional_data_url": additional_data_url,
+                            "document_url": document_url,
+                        }
+                    )
+            except Exception as e:
+                logger.error(f"Error parsing item: {e}")
+                continue
+
+        return docs
 
     async def _get_additional_data(self, url: str) -> dict[str, str | int | None]:
         """Get additional data from the document page. Returns a dict with keys 'situation', 'date', 'initiative', 'publication', 'subject', 'updates'."""
         soup = await self.request_service.get_soup(url)
-        if soup is None:
+        if not soup:
             logger.warning(f"Failed to retrieve additional data for URL: {url}")
             return None
 
@@ -359,7 +265,7 @@ class PernambucoAlepeScraper(StateScraper):
 
         return additional_data
 
-    async def _get_doc_data(self, doc_info: dict) -> dict:
+    async def _get_doc_data(self, doc_info: dict, year: int, norm_type: str) -> dict:
         """Get document data from document link"""
         url = doc_info.get("document_url")
 
@@ -367,7 +273,7 @@ class PernambucoAlepeScraper(StateScraper):
             return None
 
         soup = await self.request_service.get_soup(url)
-        if soup is None:
+        if not soup:
             logger.error(f"Failed to retrieve document data for URL: {url}")
             await self._save_doc_error(
                 title=doc_info.get("title", ""),
@@ -381,8 +287,7 @@ class PernambucoAlepeScraper(StateScraper):
         content_div = soup.find("div", class_="WordSection1")
         html_string = content_div.prettify()
 
-        # enclose in html tags to convert to markdown
-        html_string = f"<html><body>{html_string}</body></html>"
+        html_string = self._wrap_html(html_string)
 
         # Use direct HTML content conversion
         text_markdown = await self._get_markdown(html_content=html_string)
@@ -402,35 +307,28 @@ class PernambucoAlepeScraper(StateScraper):
         doc_info["_raw_content"] = html_string.encode("utf-8")
         doc_info["_content_extension"] = ".html"
 
+        doc_info["year"] = year
+        doc_info["type"] = norm_type
+
         # Get additional data
         additional_data = await self._get_additional_data(
             doc_info.pop("additional_data_url")
         )
         if not additional_data:
             logger.warning(f"Failed to retrieve additional data for URL: {url}")
-            saved = await self._save_doc_result(doc_info)
-            if saved is not None:
-                doc_info = saved
             return doc_info
 
         doc_info.update(additional_data)
 
-        saved = await self._save_doc_result(doc_info)
-        if saved is not None:
-            doc_info = saved
-
         return doc_info
 
-    async def _scrape_type(
-        self, norm_type: str, norm_type_id: int, year: int
+    async def _get_docs_links(
+        self, url: str, base_params: dict, norm_type: str, year: int
     ) -> list[dict]:
-        """Scrape norms for a specific type and year"""
-        # Format search URL and params_get_form_state
-        url, params = self._format_search_url(norm_type, norm_type_id, year)
-
+        """Get document links and metadata by paginating through search results"""
         # Get initial form state using regular request
         soup = await self.request_service.get_soup(url)
-        if soup is None:
+        if not soup:
             logger.warning(f"Failed to retrieve initial page for URL: {url}")
             return []
 
@@ -439,67 +337,77 @@ class PernambucoAlepeScraper(StateScraper):
             logger.warning(f"Failed to retrieve form state for URL: {url}")
             return []
 
-        # Update params with form state
+        params = base_params.copy()
         params.update(form_state)
 
-        response = await self.request_service.make_request(
-            url, method="POST", payload=params
-        )
-        if response is None:
-            logger.error(f"Failed to make request for URL: {url}")
-            return []
-
-        # Get documents html links
         documents = []
-        current_page = total_pages = 1
-        reached_end_page = False
+        current_page = 1
 
-        while not reached_end_page:
-            tasks = [
-                self._get_docs_links(url, params, cp)
-                for cp in range(current_page, current_page + total_pages)
-            ]
-            results_list = await asyncio.gather(*tasks, return_exceptions=True)
+        while True:
+            # For page > 1, update params for pagination
+            if current_page > 1:
+                params["__EVENTTARGET"] = f"ctl00$conteudo$lbtn{current_page}"
+                params["__LASTFOCUS"] = ""
+                params["ctl00$conteudo$hfPage"] = "0"
+                params.pop("ctl00$conteudo$btnPesquisar", None)
 
-            for result in results_list:
-                if isinstance(result, Exception):
-                    logger.error(f"Error: {result}")
-                    reached_end_page = True
-                    break
-                if result is None:
-                    reached_end_page = True
-                    break
-                if result:
-                    documents.extend(result)
-                    current_page += 1
-                else:
-                    reached_end_page = True
-                    break
-
-            if reached_end_page:
+            response = await self.request_service.make_request(
+                url, method="POST", payload=params
+            )
+            if not response:
+                logger.error(f"Failed to make POST request for page {current_page}")
                 break
 
-            total_pages = min(
-                total_pages + 2, self.max_workers
-            )  # Gradually increase pages but don't exceed max_workers
+            html = await response.text(errors="replace")
+            page_soup = BeautifulSoup(html, "html.parser")
 
-        # Get document data
-        tasks = [self._get_doc_data(doc_info) for doc_info in documents]
-        valid_results = await self._gather_results(
+            docs = self._extract_documents(page_soup)
+            if not docs:
+                break
+
+            documents.extend(docs)
+            if self.verbose:
+                logger.info(
+                    f"PERNAMBUCO | {norm_type} | Year {year} | Page {current_page} | Found {len(docs)} docs on page"
+                )
+
+            # Check if there is a next page
+            next_page = current_page + 1
+            next_btn = page_soup.find("a", id=f"lbtn{next_page}")
+            if not next_btn:
+                break
+
+            # Extract new form state for next request
+            new_state = self._get_form_state(page_soup)
+            params.update(new_state)
+            current_page = next_page
+
+            # Small delay to be polite
+            await asyncio.sleep(1)
+
+        return documents
+
+    async def _scrape_type(
+        self, norm_type: str, norm_type_id: int, year: int
+    ) -> list[dict]:
+        """Scrape norms for a specific type and year"""
+        url, base_params = self._format_search_url(norm_type, str(norm_type_id), year)
+
+        documents = await self._get_docs_links(url, base_params, norm_type, year)
+        if not documents:
+            return []
+
+        # Get document data concurrently now that we have all links
+        ctx = {"year": year, "type": norm_type, "situation": "N/A"}
+        tasks = [
+            self._with_save(self._get_doc_data(doc_info, year, norm_type), ctx)
+            for doc_info in documents
+        ]
+        results = await self._gather_results(
             tasks,
-            context={"year": year, "type": norm_type, "situation": "N/A"},
+            context=ctx,
             desc=f"PERNAMBUCO | {norm_type}",
         )
-        results = []
-        for result in valid_results:
-            # save to results
-            queue_item = {
-                "year": year,
-                "type": norm_type,
-                **result,
-            }
-
-            results.append(queue_item)
 
         if self.verbose:
             logger.info(

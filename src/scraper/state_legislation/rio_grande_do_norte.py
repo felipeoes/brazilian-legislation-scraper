@@ -64,7 +64,7 @@ class RNAlrnScraper(StateScraper):
         Returns a list of dicts with keys 'title', 'summary', 'html_link'
         """
         response = await self.request_service.make_request(url)
-        if response is None:
+        if not response:
             logger.warning(f"No response for url: {url}")
             return []
         soup = BeautifulSoup(await response.read(), "html.parser")
@@ -148,10 +148,6 @@ class RNAlrnScraper(StateScraper):
         doc_info["_raw_content"] = raw_content
         doc_info["_content_extension"] = ".pdf"
 
-        saved = await self._save_doc_result(doc_info)
-        if saved is not None:
-            doc_info = saved
-
         return doc_info
 
     async def _prefetch_type_links(self, norm_type: str, norm_type_id: str) -> None:
@@ -204,19 +200,14 @@ class RNAlrnScraper(StateScraper):
         if not docs:
             return []
 
-        tasks = [self._get_doc_data(doc) for doc in docs]
-        valid_results = await self._gather_results(
+        situation = self.situations[0] if self.situations else "Não consta"
+        ctx = {"year": year, "situation": situation, "type": norm_type}
+        tasks = [self._with_save(self._get_doc_data(doc), ctx) for doc in docs]
+        results = await self._gather_results(
             tasks,
-            context={"year": year, "type": norm_type},
+            context=ctx,
             desc=f"RIO GRANDE DO NORTE | {norm_type} {year}",
         )
-
-        situation = self.situations[0] if self.situations else "Não consta"
-        results = [
-            {"situation": situation, "type": norm_type, **result}
-            for result in valid_results
-            if result
-        ]
 
         if self.verbose:
             logger.info(f"Year: {year} | Type: {norm_type} | Results: {len(results)}")

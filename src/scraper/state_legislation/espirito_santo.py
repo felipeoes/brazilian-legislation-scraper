@@ -1,8 +1,6 @@
 from io import BytesIO
 from urllib.parse import urljoin
 
-import aiohttp
-import ssl as ssl_module
 import re
 from bs4 import BeautifulSoup
 from loguru import logger
@@ -73,71 +71,45 @@ class ESAlesScraper(StateScraper):
         reraise=True,
     )
     async def _get_page_html(self, url: str, page_number: int):
-        """
-        Navigates to a specific page number using __doPostBack with native async HTTP.
+        """Navigate to a specific page number using __doPostBack via RequestService."""
+        resp = await self.request_service.make_request(url)
+        if not resp:
+            return None
 
-        Args:
-            url: The initial URL of the page.
-            page_number: The page number to navigate to (e.g., 1, 2, 3...).
+        content = await resp.read()
+        soup = BeautifulSoup(content, "html.parser")
 
-        Returns:
-            The HTML content of the requested page, or None if an error occurs.
-        """
-        ssl_ctx = ssl_module.create_default_context()
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl_module.CERT_NONE
+        if page_number == 1:
+            return soup.prettify()
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, ssl=ssl_ctx) as resp:
-                resp.raise_for_status()
-                content = await resp.read()
+        viewstate = soup.find(id="__VIEWSTATE")
+        eventvalidation = soup.find(id="__EVENTVALIDATION")
 
-            soup = BeautifulSoup(content, "html.parser")
-
-            if page_number == 1:
-                return soup.prettify()
-
-            viewstate = soup.find(id="__VIEWSTATE")
-            eventvalidation = soup.find(id="__EVENTVALIDATION")
-
-            if not viewstate or not eventvalidation:
-                logger.error(
-                    "Error: __VIEWSTATE or __EVENTVALIDATION not found on the page."
-                )
-                return None
-
-            viewstate_value = viewstate["value"]
-            eventvalidation_value = eventvalidation["value"]
-
-            if page_number <= 1:
-                logger.error("Error: Page number must be greater than or equal to 1.")
-                return None
-
-            page_index = page_number - 1
-            event_target = (
-                f"ctl00$ContentPlaceHolder1$rptPaging$ctl{page_index:02d}$lbPaging"
+        if not viewstate or not eventvalidation:
+            logger.error(
+                "Error: __VIEWSTATE or __EVENTVALIDATION not found on the page."
             )
+            return None
 
-            post_data = {
-                "__EVENTTARGET": event_target,
-                "__EVENTARGUMENT": "",
-                "__VIEWSTATE": viewstate_value,
-                "__EVENTVALIDATION": eventvalidation_value,
-            }
+        page_index = page_number - 1
+        event_target = (
+            f"ctl00$ContentPlaceHolder1$rptPaging$ctl{page_index:02d}$lbPaging"
+        )
 
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:94.0) Gecko/20100101 Firefox/94.0",
-            }
+        post_data = {
+            "__EVENTTARGET": event_target,
+            "__EVENTARGUMENT": "",
+            "__VIEWSTATE": viewstate["value"],
+            "__EVENTVALIDATION": eventvalidation["value"],
+        }
 
-            try:
-                async with session.post(
-                    url, data=post_data, headers=headers, ssl=ssl_ctx
-                ) as page_resp:
-                    page_resp.raise_for_status()
-                    return await page_resp.read()
-            except aiohttp.ClientError as e:
-                logger.error(f"Error fetching page {page_number}: {e}")
-                return None
+        post_resp = await self.request_service.make_request(
+            url, method="POST", payload=post_data
+        )
+        if not post_resp:
+            logger.error(f"Error fetching page {page_number}")
+            return None
+        return await post_resp.read()
 
     async def _get_docs_links(self, url: str, page: int) -> tuple[list, bool]:
         """Get documents html links from given page.
@@ -319,22 +291,15 @@ class ESAlesScraper(StateScraper):
             total_pages += 10
 
         # Get document data
-        results = []
-        tasks = [self._get_doc_data(doc_info) for doc_info in documents]
-        valid_results = await self._gather_results(
+        ctx = {"year": year, "situation": situation, "type": norm_type}
+        tasks = [
+            self._with_save(self._get_doc_data(doc_info), ctx) for doc_info in documents
+        ]
+        results = await self._gather_results(
             tasks,
-            context={"year": year, "type": norm_type, "situation": situation},
+            context=ctx,
             desc=f"ESPIRITO SANTO | {norm_type}",
         )
-        for result in valid_results:
-            queue_item = {
-                "year": year,
-                "situation": situation,
-                "type": norm_type,
-                **result,
-            }
-            await self._save_doc_result(queue_item)
-            results.append(queue_item)
 
         if self.verbose:
             logger.info(
@@ -357,8 +322,4 @@ class ESAlesScraper(StateScraper):
             context={"year": year, "type": "N/A", "situation": "N/A"},
             desc=f"{self.name} | Year {year}",
         )
-        return [
-            item
-            for result in valid
-            for item in (result if isinstance(result, list) else [result])
-        ]
+        return self._flatten_results(valid)

@@ -188,10 +188,6 @@ class RondoniaCotelScraper(StateScraper):
 
         doc_info.update(processed_pdf)
 
-        saved = await self._save_doc_result(doc_info)
-        if saved is not None:
-            doc_info = saved
-
         return doc_info
 
     async def _fetch_constitution(self):
@@ -224,7 +220,8 @@ class RondoniaCotelScraper(StateScraper):
         saved = await self._save_doc_result(doc_info)
         if saved is not None:
             doc_info = saved
-        self.results.append(doc_info)
+        self._track_results([doc_info])
+        self.count += 1
         if self.verbose:
             logger.info("Scraped state constitution")
 
@@ -240,18 +237,18 @@ class RondoniaCotelScraper(StateScraper):
             if not documents:
                 return []
 
-            # Process documents with asyncio
-            doc_data_tasks = [self._get_doc_data(doc_info) for doc_info in documents]
-            valid_results = await self._gather_results(
+            for doc in documents:
+                doc["year"] = year
+            ctx = {"year": year, "type": norm_type, "situation": "N/A"}
+            doc_data_tasks = [
+                self._with_save(self._get_doc_data(doc_info), ctx)
+                for doc_info in documents
+            ]
+            results = await self._gather_results(
                 doc_data_tasks,
-                context={"year": year, "type": norm_type, "situation": "N/A"},
+                context=ctx,
                 desc=f"RONDONIA | {norm_type}",
             )
-            results = []
-            for result in valid_results:
-                if result:
-                    queue_item = {"year": year, "type": norm_type, **result}
-                    results.append(queue_item)
 
             if self.verbose:
                 logger.info(

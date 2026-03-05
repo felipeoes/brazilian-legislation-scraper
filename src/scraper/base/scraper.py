@@ -30,7 +30,6 @@ from markitdown import MarkItDown
 from pathlib import Path
 from src.database.saver import ERROR_LOG_DIR, FileSaver
 from src.utils import clean_md_tag
-from src.utils.openvpn import OpenVPNManager
 from src.scraper.base.concurrency import run_in_thread
 from src.services.proxy.service import ProxyService
 from src.services.request.service import RequestService
@@ -49,6 +48,22 @@ DEFAULT_VALID_SITUATION = "Não consta revogação expressa"
 DEFAULT_INVALID_SITUATION = "Revogada"
 
 STATE_LEGISLATION_SAVE_DIR = environ.get("STATE_LEGISLATION_SAVE_DIR")
+
+DEFAULT_LLM_PROMPT = """Você é um especialista de extração e formatação de textos jurídicos. O documento fornecido é uma norma jurídica. Extraia todo o conteúdo principal e formate-o em Markdown, seguindo rigorosamente estas regras:
+
+*   **Fidelidade Absoluta (CRÍTICO):** Transcreva o texto exata e literalmente como aparece no documento. Não altere nenhuma palavra, não corrija gramática e não modifique a pontuação. Preservar a exatidão legal é essencial. Não introduza nenhuma palavra ou frase que não esteja presente no documento original.
+*   **Estrutura Legal:** Respeite rigorosamente a numeração e a hierarquia legislativa: títulos, capítulos, seções, artigos (Art.), parágrafos (§), incisos (algarismos romanos: I, II, III) e alíneas (letras: a, b, c).
+*   **Formatação Markdown:**
+    * Use títulos Markdown (`##` ou `###`) para títulos, capítulos e seções.
+    * Aplique **negrito** ou *itálico* exatamente onde o texto original estiver em destaque.
+    * Caso haja tabelas, preserve a formatação tabular usando a sintaxe de tabelas do Markdown.
+    * Se houver uma *ementa* (o bloco de texto que resume a norma, geralmente recuado à direita no topo), formate-a como citação (usando `>` antes do bloco).
+*   **Continuidade:** O texto pode ser continuação de uma página anterior ou terminar de forma abrupta. Extraia desde a primeira palavra válida até a última, mesmo que comece ou termine no meio de uma frase.
+*   **Limpeza e Exclusões (ATENÇÃO):** Ignore cabeçalhos (headers), rodapés (footers), números de página, datas de impressão ou marcas d'água. **Exclua obrigatoriamente qualquer nota editorial ou aviso legal que inicie com "Este texto não substitui..." ou "Esse texto não substitui..." ou outras notas e observações similares, independentemente de onde apareçam na página.**
+
+Nota: o documento recebido pode estar em branco ou inválido. Nesses casos, retorne uma string vazia ("") e nada além disso.
+
+Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown, não inclua saudações, introduções ou qualquer explicação adicional, antes ou depois do texto."""
 
 
 def _format_duration(seconds: float) -> str:
@@ -77,33 +92,17 @@ class BaseScraper:
         year_end: int = datetime.now().year,
         docs_save_dir: Path = Path(environ.get("SAVE_DIR", "outputs/legislation")),
         llm_config: dict | None = None,
-        llm_prompt: str = """Você é um especialista de extração e formatação de textos jurídicos. O documento fornecido é uma norma jurídica. Extraia todo o conteúdo principal e formate-o em Markdown, seguindo rigorosamente estas regras:
-
-*   **Fidelidade Absoluta (CRÍTICO):** Transcreva o texto exata e literalmente como aparece no documento. Não altere nenhuma palavra, não corrija gramática e não modifique a pontuação. Preservar a exatidão legal é essencial. Não introduza nenhuma palavra ou frase que não esteja presente no documento original.
-*   **Estrutura Legal:** Respeite rigorosamente a numeração e a hierarquia legislativa: títulos, capítulos, seções, artigos (Art.), parágrafos (§), incisos (algarismos romanos: I, II, III) e alíneas (letras: a, b, c).
-*   **Formatação Markdown:**
-    * Use títulos Markdown (`##` ou `###`) para títulos, capítulos e seções.
-    * Aplique **negrito** ou *itálico* exatamente onde o texto original estiver em destaque.
-    * Caso haja tabelas, preserve a formatação tabular usando a sintaxe de tabelas do Markdown.
-    * Se houver uma *ementa* (o bloco de texto que resume a norma, geralmente recuado à direita no topo), formate-a como citação (usando `>` antes do bloco).
-*   **Continuidade:** O texto pode ser continuação de uma página anterior ou terminar de forma abrupta. Extraia desde a primeira palavra válida até a última, mesmo que comece ou termine no meio de uma frase.
-*   **Limpeza e Exclusões (ATENÇÃO):** Ignore cabeçalhos (headers), rodapés (footers), números de página, datas de impressão ou marcas d'água. **Exclua obrigatoriamente qualquer nota editorial ou aviso legal que inicie com "Este texto não substitui..." ou "Esse texto não substitui..." ou outras notas e observações similares, independentemente de onde apareçam na página.**
-
-Nota: o documento recebido pode estar em branco ou inválido. Nesses casos, retorne uma string vazia ("") e nada além disso.
-
-Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown, não inclua saudações, introduções ou qualquer explicação adicional, antes ou depois do texto.""",
+        llm_prompt: str = DEFAULT_LLM_PROMPT,
         use_browser: bool = False,
         multiple_pages: bool = False,
         headless: bool = True,
         use_browser_vpn: bool = False,
         vpn_extension_path: str | None = None,
         vpn_extension_page: str | None = None,
-        use_openvpn: bool = False,
-        config_files: list | None = None,
-        openvpn_credentials_map: dict | None = None,
         proxy_config: dict | None = None,
         rps: float = 20,
         max_workers: int = 16,
+        max_retries: int = 3,
         verbose: bool = False,
         overwrite: bool = False,
     ):
@@ -126,11 +125,11 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
             verbose=verbose,
             proxy_service=self.proxy_service,
             max_workers=max_workers,
+            max_retries=max_retries,
         )
         self.ocr_service = (
             LLMOCRService(
                 prompt=self.llm_prompt,
-                request_service=self.request_service,
                 llm_config=self.llm_config,
                 verbose=verbose,
             )
@@ -140,24 +139,19 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         self.use_browser = use_browser
         self.multiple_pages = multiple_pages
         self.headless = headless
-        self.use_openvpn = use_openvpn
         self.vpn_extension_path = vpn_extension_path
         self.vpn_extension_page = vpn_extension_page
-        self.config_files = config_files
-        self.openvpn_credentials_map = openvpn_credentials_map
         self.verbose = verbose
         self.overwrite = overwrite
         self.rps = rps
         self.max_workers = max_workers
         self.years = list(range(self.year_start, self.year_end + 1))
-        self.results = []
         self.count = 0
         self.error_count = 0
         self._scrape_start: float | None = None
+        self._types_summary: dict[str, dict] = {}
 
-        # Initialize MarkItDown converter for HTML/document conversion
         self._markitdown = MarkItDown()
-        # Browser service — initialised in scrape() via initialize_playwright()
         self.browser_service: BrowserService | None = (
             BrowserService(
                 use_vpn=use_browser_vpn,
@@ -172,10 +166,7 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
             else None
         )
         self.saver: FileSaver | None = None
-        self.openvpn_manager: OpenVPNManager | None = None
-        # Set of (document_url, title) keys for the current year (resume support)
         self._scraped_keys: set[tuple[str, str]] = set()
-        self._initialize_openvpn_manager()
         self._initialize_saver()
         self._log_initialization()
 
@@ -188,7 +179,6 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
             f"situations={len(self.situations) if self.situations else 0} | "
             f"save_dir={self.docs_save_dir} | "
             f"use_browser={self.use_browser} | "
-            f"use_openvpn={self.use_openvpn} | "
             f"rps={self.rps} | "
             f"max_workers={self.max_workers} | "
         )
@@ -232,17 +222,30 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
     def _initialize_saver(self):
         """Initialize saver class. Called automatically at end of __init__."""
         error_dir = str(Path(ERROR_LOG_DIR) / self.name)
-        self.saver = FileSaver(
-            self.docs_save_dir, error_log_dir=error_dir, verbose=self.verbose
-        )
+        self._mhtml_browser: BrowserService | None = None
 
-    def _initialize_openvpn_manager(self):
-        """Initialize openvpn manager"""
-        if self.use_openvpn:
-            self.openvpn_manager = OpenVPNManager(
-                config_files=self.config_files if self.config_files is not None else [],
-                credentials_map=self.openvpn_credentials_map,
-            )
+        async def _capture_mhtml(url: str) -> bytes:
+            if self._mhtml_browser is None:
+                self._mhtml_browser = BrowserService(
+                    headless=True,
+                    multiple_pages=True,
+                    max_workers=self.max_workers,
+                    owner_class_name=f"{self.__class__.__name__}_mhtml",
+                )
+                await self._mhtml_browser.initialize()
+            page = await self._mhtml_browser.get_available_page()
+            try:
+                return await self._mhtml_browser.capture_mhtml(url, page=page)
+            finally:
+                self._mhtml_browser.release_page(page)
+
+        self.saver = FileSaver(
+            self.docs_save_dir,
+            error_log_dir=error_dir,
+            verbose=self.verbose,
+            max_workers=self.max_workers,
+            mhtml_capture_fn=_capture_mhtml,
+        )
 
     # ------------------------------------------------------------------
     # HTTP requests (async via RequestService)
@@ -269,7 +272,7 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
     async def _fetch_soup_with_retry(self, url: str) -> BeautifulSoup:
         """Fetch URL and return BeautifulSoup with automatic retry on failure."""
         soup = await self.request_service.get_soup(url)
-        if soup is None:
+        if not soup:
             raise RuntimeError(f"Failed to fetch {url}")
         return soup
 
@@ -282,25 +285,13 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         text: str,
         replace: list[tuple[str, str]] | None = None,
     ) -> str:
-        """Clean markdown text by removing links and applying custom replacements.
-
-        Args:
-            text: Input markdown string.
-            replace: Optional list of ``(find, replacement)`` tuples applied in order.
-
-        Returns:
-            Cleaned markdown string with link syntax stripped (text preserved)
-            and all replacements applied.
-        """
+        """Clean markdown text by removing links and applying custom replacements."""
+        text = clean_md_tag(text)
         text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
         if replace:
             for find, replacement in replace:
                 text = re.sub(find, replacement, text)
         return text.strip()
-
-    def _clean_md_tag(self, md_content: str) -> str:
-        """Strip markdown code block wrappers if present."""
-        return clean_md_tag(md_content)
 
     @staticmethod
     def _wrap_html(content: str) -> str:
@@ -308,26 +299,17 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         return f"<html><body>{content}</body></html>"
 
     async def _html_to_markdown(self, html_content: str) -> str:
-        """Wrap an HTML fragment and convert it to markdown in one step.
-
-        Convenience helper that combines ``_wrap_html`` + ``_convert_to_md``.
-        """
+        """Wrap an HTML fragment and convert it to cleaned markdown in one step."""
         wrapped = self._wrap_html(html_content)
-        return await self._convert_to_md(
+        md = await self._convert_to_md(
             BytesIO(wrapped.encode("utf-8")),
             filename="document.html",
         )
+        return self._clean_markdown(md)
 
     # ------------------------------------------------------------------
     # PDF / Image processing
     # ------------------------------------------------------------------
-
-    async def _get_pdf_image_markdown(self, pdf_content: bytes) -> str:
-        """Convert PDF bytes to markdown via the LLM OCR service."""
-        if not self.ocr_service:
-            logger.warning("No LLM OCR service configured; cannot process PDF.")
-            return ""
-        return await self.ocr_service.pdf_to_markdown(pdf_content)
 
     @retry(
         stop=stop_after_attempt(3),
@@ -340,20 +322,7 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         source: BytesIO,
         filename: str = "document.html",
     ) -> str:
-        """Convert a BytesIO stream to markdown via markitdown (with retry).
-
-        Uses :pymeth:`MarkItDown.convert_stream` directly on the stream.
-        The file extension is inferred from *filename* so that markitdown
-        picks the correct converter.
-
-        Args:
-            source: BytesIO stream with document content.
-            filename: Suggested filename (used for its extension, e.g.
-                ``"document.html"``, ``"document.pdf"``).
-
-        Returns:
-            Markdown string.
-        """
+        """Convert a BytesIO stream to markdown via markitdown (with retry)."""
         _, ext = os.path.splitext(filename)
         if not ext:
             ext = ".html"
@@ -370,16 +339,13 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
             if not markdown or not markdown.strip():
                 raise ValueError("markitdown returned empty content")
 
-            markdown = self._clean_md_tag(markdown.strip())
-
-            # Strip trailing horizontal-rule / table-border artefacts.
+            markdown = clean_md_tag(markdown.strip())
             markdown = re.sub(r"(\n[-|]{3,}\s*)+$", "", markdown).strip()
 
             return markdown
 
         except Exception as e:
             error_msg = str(e).lower()
-            # Non-retryable errors — return empty string immediately
             if "invalid float value" in error_msg or "gray stroke color" in error_msg:
                 logger.warning(
                     f"Document contains invalid color definitions, skipping: {e}"
@@ -388,7 +354,6 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
             if "data format error" in error_msg or "not valid" in error_msg:
                 logger.warning(f"Invalid or corrupted document: {e}")
                 return ""
-            # Let other exceptions be retried
             raise
 
     async def _bytes_to_markdown(
@@ -430,10 +395,8 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         """Get markdown from various input sources using markitdown.
 
         Priority: stream > html_content > response > url
-
-        For URLs, the content is always fetched first via the request service
-        and then passed as a stream — markitdown is never called on URLs directly.
         """
+        result = ""
         try:
             if stream is not None:
                 raw = stream.read()
@@ -444,52 +407,42 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
                 else:
                     is_image = raw[:4] != b"%PDF"
 
-                # If image, we must use OCR
                 if is_image and self.ocr_service:
-                    return await self.ocr_service.images_to_markdown([raw])
+                    result = await self.ocr_service.images_to_markdown([raw])
                 elif is_image:
                     logger.warning(
                         "No LLM OCR service configured; cannot process image."
                     )
-                    return ""
+                else:
+                    result = await self._bytes_to_markdown(
+                        raw, filename=filename or "document.pdf"
+                    )
 
-                return await self._bytes_to_markdown(
-                    raw, filename=filename or "document.pdf"
-                )
-
-            if html_content is not None:
+            elif html_content is not None:
                 buffer = BytesIO(html_content.encode("utf-8"))
-                return await self._convert_to_md(
+                result = await self._convert_to_md(
                     buffer,
                     filename="document.html",
                 )
 
-            if response is not None:
-                body = await response.read()
-                resp_filename, content_type = self.request_service.detect_content_info(
-                    response
-                )
-                used_filename = filename or resp_filename
-                return await self._bytes_to_markdown(
-                    body, filename=used_filename, content_type=content_type
-                )
-
-            if url:
-                resp = await self.request_service.make_request(url)
+            else:
+                resp = response
+                if not resp and url:
+                    resp = await self.request_service.make_request(url)
                 if resp is not None:
                     body = await resp.read()
                     resp_filename, content_type = (
                         self.request_service.detect_content_info(resp)
                     )
                     used_filename = filename or resp_filename
-                    return await self._bytes_to_markdown(
+                    result = await self._bytes_to_markdown(
                         body, filename=used_filename, content_type=content_type
                     )
 
         except Exception as e:
             logger.error(f"Error converting to markdown: {e}")
 
-        return ""
+        return self._clean_markdown(result) if result else ""
 
     # ------------------------------------------------------------------
     # Hooks for child classes
@@ -506,23 +459,7 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         document_url: str,
         **extra,
     ) -> dict:
-        """Build a standardized document result dict.
-
-        All scrapers should use this to construct their output dicts so
-        that downstream consumers see a consistent schema.
-
-        Args:
-            year: Publication year.
-            norm_type: Legislation type (e.g. "Lei", "Decreto").
-            situation: Vigency status (e.g. "Não consta revogação expressa").
-            title: Document title / heading.
-            text_markdown: Extracted markdown content.
-            document_url: URL the content was fetched from.
-            **extra: Any additional scraper-specific fields.
-
-        Returns:
-            Dict with all standard fields plus extras.
-        """
+        """Build a standardized document result dict."""
         return {
             "year": year,
             "type": norm_type,
@@ -566,40 +503,30 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
     ) -> tuple[str, bytes, str]:
         """Download content from URL, convert to markdown, and return raw bytes.
 
-        Replaces ``_get_markdown(url=...)`` when the raw source file is also needed.
-
         Returns:
             Tuple of ``(markdown, raw_bytes, file_extension)``.
         """
         resp = await self.request_service.make_request(url)
-        if resp is None:
+        if not resp:
             return "", b"", ""
 
         body = await resp.read()
         filename, content_type = self.request_service.detect_content_info(resp)
         ext = self._detect_extension(content_type, filename)
 
-        # Use the appropriate _get_markdown path with already-downloaded content
         if "pdf" in (content_type or "").lower() or body[:4] == b"%PDF":
             markdown = await self._get_markdown(stream=BytesIO(body))
             if not ext or ext == ".bin":
                 ext = ".pdf"
         else:
-            # Determine the filename hint for markitdown conversion
             md_filename = filename or f"document{ext}"
             markdown = await self._convert_to_md(BytesIO(body), filename=md_filename)
+            markdown = self._clean_markdown(markdown)
 
         return markdown, body, ext
 
     async def _save_doc_result(self, doc_result: dict) -> dict | None:
-        """Save a document result immediately via FileSaver.
-
-        Extracts ``_raw_content`` and ``_content_extension`` from the result,
-        saves the source file and appends to ``data.json``.
-
-        Returns:
-            The saved document dict with ``file_path`` added, or None on failure.
-        """
+        """Save a document result immediately via FileSaver."""
         if not self.saver:
             return None
 
@@ -611,6 +538,41 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
             raw_content=raw_content,
             content_extension=content_ext,
         )
+
+    def _with_save(self, coro, context: dict):
+        """Wrap a _get_doc_data coroutine to save its result immediately with context.
+
+        Each wrapped task calls ``_save_doc_result`` as soon as it finishes,
+        rather than deferring saves until after ``asyncio.gather`` collects
+        all results.
+        """
+
+        async def _wrapper():
+            result = await coro
+            if result is None:
+                return None
+
+            if isinstance(result, list):
+                saved = []
+                for r in result:
+                    doc = {**context, **r}
+                    if not doc.get("situation") and context.get("situation"):
+                        doc["situation"] = context["situation"]
+                    if doc.get("year") is None and context.get("year") is not None:
+                        doc["year"] = context["year"]
+                    s = await self._save_doc_result(doc)
+                    saved.append(s if s is not None else doc)
+                return saved
+
+            doc_result = {**context, **result}
+            if not doc_result.get("situation") and context.get("situation"):
+                doc_result["situation"] = context["situation"]
+            if doc_result.get("year") is None and context.get("year") is not None:
+                doc_result["year"] = context["year"]
+            saved = await self._save_doc_result(doc_result)
+            return saved if saved is not None else doc_result
+
+        return _wrapper()
 
     async def _load_scraped_keys(self, year: int) -> None:
         """Load already-scraped document keys for a year (resume support)."""
@@ -625,31 +587,25 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
             self._scraped_keys = set()
 
     def _is_already_scraped(self, document_url: str, title: str = "") -> bool:
-        """Check if a document has already been scraped (resume support).
-
-        Always returns ``False`` when ``self.overwrite`` is enabled.
-        """
+        """Check if a document has already been scraped (resume support)."""
         if self.overwrite:
             return False
         return (document_url, title) in self._scraped_keys
 
-    def _handle_blocked_access(self, *args, **kwargs):
-        pass
-
     def _format_search_url(self, *args, **kwargs) -> str:
-        """Format search URL for the given parameters"""
+        """Template method: build a search/listing URL for the scraper's site."""
         raise NotImplementedError(
             "This method should be implemented in the child class."
         )
 
     async def _get_docs_links(self, *args, **kwargs) -> list[dict] | None:
-        """Get document links from the given parameters"""
+        """Template method: return a list of document metadata dicts from a listing page."""
         raise NotImplementedError(
             "This method should be implemented in the child class."
         )
 
     async def _get_doc_data(self, *args, **kwargs) -> dict | list[dict] | None:
-        """Get document data from the given parameters"""
+        """Template method: fetch and parse a single document's content."""
         raise NotImplementedError(
             "This method should be implemented in the child class."
         )
@@ -665,12 +621,7 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         error_message: str = "Document processing failed",
         **extra,
     ) -> None:
-        """Persist a document-level processing error via the saver.
-
-        Convenience wrapper that normalises fields expected by
-        ``FileSaver.save_error`` so that every scraper can log
-        individual document failures with minimal boilerplate.
-        """
+        """Persist a document-level processing error via the saver."""
         if not self.saver:
             return
         error_data = {
@@ -683,9 +634,6 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         }
         await self.saver.save_error(error_data, error_message=error_message)
 
-    # Patterns that indicate the server returned an error page instead of
-    # real document content.  Checked case-insensitively inside
-    # ``_valid_markdown``.
     _SERVER_ERROR_PATTERNS: list[str] = [
         "the requested url was not found on this server",
         "failed to open stream",
@@ -699,23 +647,7 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         text_markdown: str | None,
         min_length: int = 100,
     ) -> tuple[bool, str]:
-        """Validate markdown text using common patterns found across all scrapers.
-
-        Checks (in order):
-        1. Falsy / None
-        2. Empty after stripping whitespace
-        3. Only punctuation (e.g. a single dot — seen in minas_gerais)
-        4. Contains a known server-error pattern
-        5. Below *min_length* characters (after strip)
-
-        Args:
-            text_markdown: The text to validate.
-            min_length: Minimum acceptable character count (default 100).
-
-        Returns:
-            Tuple of ``(is_valid, reason)``. *reason* is an empty string when
-            valid, otherwise a short description of the failure.
-        """
+        """Validate markdown text using common patterns found across all scrapers."""
         if not text_markdown:
             return False, "text_markdown is None or empty"
 
@@ -723,14 +655,12 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         if not stripped:
             return False, "text_markdown is empty after strip"
 
-        # Content that is only punctuation / whitespace (e.g. ".", "...", "- .")
         cleaned = stripped.translate(
             str.maketrans("", "", string.punctuation + string.whitespace)
         )
         if not cleaned:
             return False, "text_markdown contains only punctuation/whitespace"
 
-        # Detect server error pages returned instead of real content
         lower = stripped.lower()
         for pattern in self._SERVER_ERROR_PATTERNS:
             if pattern in lower:
@@ -751,17 +681,8 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         desc: str = "",
         min_length: int = 100,
     ) -> list:
-        """Filter asyncio.gather results: persist exceptions via save_error, return valid results.
-
-        Args:
-            results: Output of ``await asyncio.gather(*tasks, return_exceptions=True)``.
-            context: Dict with ``year``, ``type``, ``situation`` — merged into each error record.
-            desc: Label for log messages.
-            min_length: Minimum character count for valid text_markdown (default 100).
-
-        Returns:
-            List of non-None, non-Exception results with valid text_markdown (order preserved).
-        """
+        """Filter asyncio.gather results: persist exceptions via save_error, return valid results."""
+        ctx = {"year": "", "type": "", "situation": "", **context}
         valid = []
         for result in results:
             if isinstance(result, BaseException):
@@ -771,13 +692,12 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
                     error_data = {
                         "title": desc or "Unknown",
                         "html_link": "",
-                        **context,
+                        **ctx,
                     }
                     await self.saver.save_error(error_data, error_message=str(result))
                 continue
             if result is None:
                 continue
-            # Validate text_markdown if the result is a dict that contains one
             if isinstance(result, dict) and "text_markdown" in result:
                 is_valid, reason = self._valid_markdown(
                     result["text_markdown"], min_length=min_length
@@ -793,7 +713,7 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
                             "title": title,
                             "html_link": result.get("document_url", ""),
                             "text_markdown": result["text_markdown"],
-                            **context,
+                            **ctx,
                         }
                         await self.saver.save_error(
                             error_data,
@@ -809,9 +729,30 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
         context: dict | None = None,
         desc: str = "",
         min_length: int = 100,
+        max_concurrency: int | None = None,
     ) -> list:
-        """Run tasks with asyncio.gather and filter errors."""
-        if self.verbose and tasks:
+        """Run tasks with asyncio.gather and filter errors.
+
+        Args:
+            tasks: List of coroutines to execute.
+            context: Dict merged into error records (year, type, situation).
+            desc: Label for log messages and progress bar.
+            min_length: Minimum character count for valid text_markdown.
+            max_concurrency: If set, limits in-flight tasks via a semaphore.
+        """
+        if not tasks:
+            return []
+
+        if max_concurrency:
+            sem = asyncio.Semaphore(max_concurrency)
+
+            async def _limited(coro):
+                async with sem:
+                    return await coro
+
+            tasks = [_limited(t) for t in tasks]
+
+        if self.verbose:
 
             async def wrap_task(coro):
                 try:
@@ -827,6 +768,17 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
             results, context or {}, desc, min_length=min_length
         )
 
+    @staticmethod
+    def _flatten_results(results: list) -> list[dict]:
+        """Flatten a list that may contain dicts and/or lists of dicts."""
+        flat: list[dict] = []
+        for item in results:
+            if isinstance(item, list):
+                flat.extend(item)
+            elif item:
+                flat.append(item)
+        return flat
+
     async def _scrape_type(self, norm_type: str, norm_type_id, year: int) -> list[dict]:
         """Scrape all documents of a single type for a year.
 
@@ -836,7 +788,7 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
             "This method should be implemented in the child class."
         )
 
-    async def _scrape_year(self, year: int, *_args, **_kwargs) -> list[dict]:
+    async def _scrape_year(self, year: int) -> list[dict]:
         """Scrape norms for a specific year.
 
         Default implementation gathers all types concurrently via
@@ -856,28 +808,35 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
             desc=f"{self.name} | Year {year}",
         )
 
-        all_results: list[dict] = []
-        for result in valid:
-            if isinstance(result, list):
-                all_results.extend(result)
-            elif result:
-                all_results.append(result)
-        return all_results
+        return self._flatten_results(valid)
 
     # ------------------------------------------------------------------
     # Main scrape flow
     # ------------------------------------------------------------------
 
-    async def scrape(self) -> list:
-        """Scrape data from all years (async)."""
+    def _track_results(self, results: list[dict]) -> None:
+        """Update lightweight summary counters from a batch of results."""
+        for doc in results:
+            doc_type = doc.get("type", "Unknown")
+            doc_situation = doc.get("situation", "Unknown")
+            if doc_type not in self._types_summary:
+                self._types_summary[doc_type] = {"total": 0, "situations": {}}
+            self._types_summary[doc_type]["total"] += 1
+            self._types_summary[doc_type]["situations"][doc_situation] = (
+                self._types_summary[doc_type]["situations"].get(doc_situation, 0) + 1
+            )
 
-        # Check saver initialization
+    async def scrape(self) -> int:
+        """Scrape data from all years (async).
+
+        Returns:
+            Total number of documents scraped.
+        """
         if not self.saver:
             raise RuntimeError(
                 "Saver is not initialized. Call _initialize_saver() in the child class __init__ method."
             )
 
-        # Initialize Playwright browser if needed
         if self.use_browser:
             await self.initialize_playwright()
 
@@ -885,7 +844,6 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
 
         logger.info(f"Starting from {self.year_start}")
 
-        # scrape years sequentially (types/situations within each year are concurrent)
         years_progress = tqdm(
             self.years,
             desc=f"{self.__class__.__name__} | Years",
@@ -893,44 +851,27 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
 
         for year in years_progress:
             years_progress.set_description(f"{self.__class__.__name__} | Year: {year}")
-
-            # Load already-scraped keys for document-level resume
             await self._load_scraped_keys(year)
 
             year_results = await self._scrape_year(year)
             if year_results:
-                self.results.extend(year_results)
+                self._track_results(year_results)
                 self.count += len(year_results)
 
-            # Flush any buffered documents for this year to disk
             if self.saver:
                 await self.saver.flush(year)
 
         await self._save_summary()
-        return self.results
+        return self.count
 
     async def _save_summary(self) -> None:
         """Write a summary JSON file with final scraping statistics."""
         if not self.saver:
             return
 
-        # Ensure all buffered documents are written before computing stats
         await self.saver.flush_all()
 
         elapsed = time.time() - (self._scrape_start or time.time())
-
-        types_summary = {}
-        for doc in self.results:
-            doc_type = doc.get("type", "Unknown")
-            doc_situation = doc.get("situation", "Unknown")
-
-            if doc_type not in types_summary:
-                types_summary[doc_type] = {"total": 0, "situations": {}}
-
-            types_summary[doc_type]["total"] += 1
-            types_summary[doc_type]["situations"][doc_situation] = (
-                types_summary[doc_type]["situations"].get(doc_situation, 0) + 1
-            )
 
         summary = {
             "scraper": self.__class__.__name__,
@@ -941,7 +882,7 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
             "elapsed_seconds": round(elapsed, 2),
             "elapsed_human": _format_duration(elapsed),
             "completed_at": datetime.now().isoformat(),
-            "types_summary": types_summary,
+            "types_summary": self._types_summary,
         }
 
         summary_path = Path(self.saver.save_dir) / "summary.json"
@@ -954,29 +895,29 @@ Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown,
             f"{summary['total_errors']} errors, {summary['elapsed_human']}"
         )
 
-    async def _change_vpn_connection(self, *_args, **_kwargs):
-        """Change VPN connection (async-wrapped)."""
-        if not self.use_openvpn:
-            return
-        if self.openvpn_manager is None:
-            logger.warning("OpenVPN manager is not initialized")
-            return
-        await run_in_thread(self.openvpn_manager.change_vpn_connection)
-
     async def cleanup(self):
-        """Clean up aiohttp session, Playwright browser, etc."""
+        """Clean up aiohttp session, Playwright browser, etc.
+
+        Safe to call multiple times (idempotent).
+        """
+        if getattr(self, "_cleaned_up", False):
+            return
+        self._cleaned_up = True
         if hasattr(self, "request_service"):
             await self.request_service.cleanup()
         if self.browser_service:
             await self.browser_service.cleanup()
+        if getattr(self, "_mhtml_browser", None):
+            await self._mhtml_browser.cleanup()
+        if self.saver:
+            await self.saver.cleanup()
 
 
 class StateScraper(BaseScraper):
     """Convenience base for state-level legislation scrapers.
 
     Automatically applies ``STATE_LEGISLATION_SAVE_DIR`` as the default
-    ``docs_save_dir`` when the environment variable is set, removing the
-    need for each state scraper to repeat this boilerplate.
+    ``docs_save_dir`` when the environment variable is set.
     """
 
     def __init__(self, *args, **kwargs):

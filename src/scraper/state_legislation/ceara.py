@@ -22,7 +22,7 @@ VALID_SITUATIONS = [
     "Não consta"
 ]  # Alece does not have a situation field, invalid norms will have an indication in the document text
 
-INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no lon
+INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no longer have legal effect)
 
 # the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
@@ -201,22 +201,13 @@ class CearaAleceScraper(StateScraper):
 
         situation = self.situations[0]
 
-        tasks = [self._get_doc_data(doc) for doc in docs]
-        valid_results = await self._gather_results(
+        ctx = {"year": year, "situation": situation, "type": norm_type}
+        tasks = [self._with_save(self._get_doc_data(doc), ctx) for doc in docs]
+        results = await self._gather_results(
             tasks,
-            context={"year": year, "type": norm_type, "situation": situation},
+            context=ctx,
             desc=f"CEARA | {norm_type} | Year {year}",
         )
-
-        results = []
-        for result in valid_results:
-            queue_item = {
-                "situation": situation,
-                "type": norm_type,
-                **result,
-            }
-            await self._save_doc_result(queue_item)
-            results.append(queue_item)
 
         return results
 
@@ -477,34 +468,19 @@ class CearaAleceScraper(StateScraper):
 
         docs = await self._get_laws_constitution_amendments_docs_links(url, norm_type)
 
+        ctx = {"year": year, "situation": situation, "type": norm_type}
         tasks = [
-            self._get_laws_constitution_amendments_doc_data(
-                doc,
-                norm_type,
-                year,
+            self._with_save(
+                self._get_laws_constitution_amendments_doc_data(doc, norm_type, year),
+                ctx,
             )
             for doc in docs
         ]
-        valid_results = await self._gather_results(
+        results = await self._gather_results(
             tasks,
-            context={"year": year, "type": norm_type, "situation": situation},
+            context=ctx,
             desc=f"CEARA | {norm_type}",
         )
-        results = []
-        for result in valid_results:
-            # prepare item for saving
-            queue_item = {
-                # hardcode since we only get valid documents in search request
-                "situation": situation,
-                "type": norm_type,
-                **result,
-            }
-
-            if queue_item["year"] is None:
-                queue_item["year"] = year
-
-            await self._save_doc_result(queue_item)
-            results.append(queue_item)
 
         if self.verbose:
             logger.info(

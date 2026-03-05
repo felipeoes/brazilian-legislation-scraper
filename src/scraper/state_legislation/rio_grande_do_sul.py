@@ -11,7 +11,7 @@ TYPES = []
 # ALRS does not have a situation field, cannot distinguish between valid and invalid norms
 VALID_SITUATIONS = ["Não consta"]
 
-INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no lon
+INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no longer have legal effect)
 
 # the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
@@ -123,7 +123,7 @@ class RSAlrsScraper(StateScraper):
             tr = items[-1]
             norm_text = tr.text.strip()
 
-            html_string = f"<html><body>{norm_text}</body></html>"
+            html_string = self._wrap_html(norm_text)
 
         return html_string
 
@@ -235,10 +235,6 @@ class RSAlrsScraper(StateScraper):
             "_content_extension": content_ext,
         }
 
-        saved = await self._save_doc_result(result)
-        if saved is not None:
-            result = saved
-
         return result
 
     async def scrape_constitution(self):
@@ -273,7 +269,8 @@ class RSAlrsScraper(StateScraper):
         if saved is not None:
             queue_item = saved
 
-        self.queue.put(queue_item)
+        self._track_results([queue_item])
+        self.count += 1
 
         self.fetched_constitution = True
 
@@ -309,30 +306,17 @@ class RSAlrsScraper(StateScraper):
         for result in valid_results:
             documents.extend(result)
 
-        # get all norms
+        for doc in documents:
+            doc["year"] = year
+        ctx = {"year": year, "type": "N/A", "situation": "N/A"}
         tasks = [
-            self._get_doc_data(
-                doc_info,
-            )
-            for doc_info in documents
+            self._with_save(self._get_doc_data(doc_info), ctx) for doc_info in documents
         ]
-        valid_results = await self._gather_results(
+        results = await self._gather_results(
             tasks,
-            context={"year": year, "type": "N/A", "situation": "N/A"},
+            context=ctx,
             desc="RIO GRANDE DO SUL",
         )
-        results = []
-        for result in valid_results:
-            # save to results
-            queue_item = {
-                **result,
-                "year": year,
-                "situation": (
-                    result["situation"] if result.get("situation") else "Não consta"
-                ),
-            }
-
-            results.append(queue_item)
 
         if self.verbose:
             logger.info(

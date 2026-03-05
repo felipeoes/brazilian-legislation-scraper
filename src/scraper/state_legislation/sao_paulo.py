@@ -184,7 +184,9 @@ class SaoPauloAlespScraper(StateScraper):
         wait=wait_exponential(multiplier=2, min=2, max=15),
         reraise=True,
     )
-    async def _get_doc_data(self, doc_info: dict, norm_type: str) -> dict | None:
+    async def _get_doc_data(
+        self, doc_info: dict, norm_type: str, year: str = ""
+    ) -> dict | None:
         """Get document data from given html link"""
         doc_html_link = doc_info["html_link"]
         title = doc_info["title"]
@@ -201,6 +203,7 @@ class SaoPauloAlespScraper(StateScraper):
             norm_data = {}
 
         data = {
+            "year": year,
             "title": title,
             "summary": doc_info["summary"],
             "html_string": "",
@@ -243,9 +246,6 @@ class SaoPauloAlespScraper(StateScraper):
             data["_raw_content"] = raw_content
             data["_content_extension"] = content_ext
 
-            saved = await self._save_doc_result(data)
-            if saved is not None:
-                data = saved
             return data
 
         soup = await self.request_service.get_soup(doc_html_link)
@@ -261,7 +261,7 @@ class SaoPauloAlespScraper(StateScraper):
             if self.verbose:
                 logger.info(f"Found PDF link in iframe: {pdf_link}")
             pdf_response = await self.request_service.make_request(pdf_link)
-            if pdf_response is None:
+            if not pdf_response:
                 raise Exception(f"No response downloading iframe PDF: {pdf_link}")
             pdf_content = await pdf_response.read()
             text_markdown = await self._get_markdown(stream=BytesIO(pdf_content))
@@ -281,9 +281,6 @@ class SaoPauloAlespScraper(StateScraper):
             data["_raw_content"] = pdf_content
             data["_content_extension"] = ".pdf"
 
-            saved = await self._save_doc_result(data)
-            if saved is not None:
-                data = saved
             return data
 
         # remove a tags with 'Assembleia Legislativa do Estado de São Paulo' and 'Ficha informativa'
@@ -308,7 +305,7 @@ class SaoPauloAlespScraper(StateScraper):
         else:
             html_string = soup.prettify(formatter="html")
             if "<html>" not in html_string:
-                html_string = "<html><body>" + html_string + "</body></html>"
+                html_string = self._wrap_html(html_string)
 
         # get text markdown
         text_markdown = await self._get_markdown(html_content=html_string)
@@ -327,7 +324,7 @@ class SaoPauloAlespScraper(StateScraper):
                     )
                 img_url = urljoin(doc_html_link, img_url)
                 img_response = await self.request_service.make_request(img_url)
-                if img_response is None:
+                if not img_response:
                     logger.error(f"No response downloading image: {img_url}")
                 else:
                     buffer = BytesIO()
@@ -341,6 +338,7 @@ class SaoPauloAlespScraper(StateScraper):
                         logger.error(f"Failed to get markdown for image: {img_url}")
 
         result = {
+            "year": year,
             "title": title,
             "summary": doc_info["summary"],
             "html_string": html_string,
@@ -350,10 +348,6 @@ class SaoPauloAlespScraper(StateScraper):
             "_content_extension": content_ext,
             **norm_data,
         }
-
-        saved = await self._save_doc_result(result)
-        if saved is not None:
-            result = saved
 
         return result
 
@@ -411,24 +405,16 @@ class SaoPauloAlespScraper(StateScraper):
             documents_html_links.extend(result)
 
         # Get data from all documents text links
-        results = []
+        ctx = {"year": year, "type": norm_type, "situation": situation}
         tasks = [
-            self._get_doc_data(doc_html_link, norm_type)
+            self._with_save(self._get_doc_data(doc_html_link, norm_type, year), ctx)
             for doc_html_link in documents_html_links
         ]
-        valid_results = await self._gather_results(
+        results = await self._gather_results(
             tasks,
-            context={"year": year, "type": norm_type, "situation": situation},
+            context=ctx,
             desc=f"SAO PAULO | {norm_type}",
         )
-        for result in valid_results:
-            queue_item = {
-                "year": year,
-                "situation": situation,
-                "type": norm_type,
-                **result,
-            }
-            results.append(queue_item)
 
         if self.verbose:
             logger.info(
@@ -451,8 +437,4 @@ class SaoPauloAlespScraper(StateScraper):
             context={"year": year, "type": "N/A", "situation": "N/A"},
             desc=f"{self.name} | Year {year}",
         )
-        return [
-            item
-            for result in valid
-            for item in (result if isinstance(result, list) else [result])
-        ]
+        return self._flatten_results(valid)

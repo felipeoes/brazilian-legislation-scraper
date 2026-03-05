@@ -234,7 +234,6 @@ class MTAlmtScraper(StateScraper):
             url = urljoin(self.base_url, norm_link)
         else:
             url = f"{urljoin(self.base_url, norm_link)}/ficha-tecnica?exibirAnotacao=1"
-            url = f"{urljoin(self.base_url, norm_link)}/ficha-tecnica?exibirAnotacao=1"
 
         soup = await self.request_service.get_soup(url)
         if not soup:
@@ -416,26 +415,18 @@ class MTAlmtScraper(StateScraper):
                     documents.extend(result)
 
             results = []
+            ctx = {"year": year, "type": norm_type, "situation": "Não consta"}
             tasks = [
-                self._get_doc_data(doc_info, is_historic=is_historic)
+                self._with_save(
+                    self._get_doc_data(doc_info, is_historic=is_historic), ctx
+                )
                 for doc_info in documents
             ]
-            valid_results = await self._gather_results(
+            results = await self._gather_results(
                 tasks,
-                context={"year": year, "type": norm_type, "situation": "N/A"},
+                context=ctx,
                 desc=f"MATO GROSSO | {norm_type}",
             )
-            for norm in valid_results:
-                queue_item = {
-                    **norm,
-                    "year": year,
-                    "type": norm_type,
-                    "situation": (
-                        norm["situation"] if norm.get("situation") else "Não consta"
-                    ),
-                }
-                await self._save_doc_result(queue_item)
-                results.append(queue_item)
 
             if self.verbose:
                 logger.info(

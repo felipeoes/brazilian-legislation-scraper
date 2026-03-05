@@ -87,11 +87,10 @@ class RJAlerjScraper(StateScraper):
 
     async def _html_to_markdown(self, html_string: str) -> str:
         """Converts an HTML string to Markdown."""
-        # Add <html><body> tags to the html string to avoid error with markdown conversion
-        full_html = f"<html><body>{html_string}</body></html>"
+        full_html = self._wrap_html(html_string)
         return (await self._get_markdown(html_content=full_html)).strip()
 
-    async def _get_doc_data(self, doc_info: dict) -> dict:
+    async def _get_doc_data(self, doc_info: dict, year: str = "") -> dict:
         """Get document data from given html link"""
         doc_html_link = doc_info["html_link"]
         document_url = doc_html_link.strip().replace("?OpenDocument", "")
@@ -136,9 +135,10 @@ class RJAlerjScraper(StateScraper):
         html_string = body.prettify().replace("\n", "")
         text_markdown = await self._html_to_markdown(html_string)
 
-        full_html = f"<html><body>{html_string}</body></html>"
+        full_html = self._wrap_html(html_string)
         result = {
             **doc_info,
+            "year": year,
             "situation": situation,
             "html_string": html_string,
             "text_markdown": text_markdown,
@@ -146,10 +146,6 @@ class RJAlerjScraper(StateScraper):
             "_raw_content": full_html.encode("utf-8"),
             "_content_extension": ".html",
         }
-
-        saved = await self._save_doc_result(result)
-        if saved is not None:
-            result = saved
 
         return result
 
@@ -211,7 +207,7 @@ class RJAlerjScraper(StateScraper):
         html_string = "<hr/>".join(html_parts)
         text_markdown = await self._html_to_markdown(html_string)
 
-        full_html = f"<html><body>{html_string}</body></html>"
+        full_html = self._wrap_html(html_string)
         queue_item = {
             "year": 1989,
             "type": "Constituição Estadual",
@@ -232,7 +228,8 @@ class RJAlerjScraper(StateScraper):
         if saved is not None:
             queue_item = saved
 
-        self.queue.put(queue_item)
+        self._track_results([queue_item])
+        self.count += 1
         self.fetched_constitution = True
 
     async def _scrape_type(
@@ -263,20 +260,20 @@ class RJAlerjScraper(StateScraper):
 
         documents_html_links = self._get_docs_html_links(norm_type, soup)
 
-        tasks = [self._get_doc_data(doc) for doc in documents_html_links]
-        valid_results = await self._gather_results(
+        ctx = {"year": year, "type": norm_type, "situation": "N/A"}
+        tasks = [
+            self._with_save(self._get_doc_data(doc), ctx)
+            for doc in documents_html_links
+        ]
+        results = await self._gather_results(
             tasks,
-            context={"year": year, "type": norm_type, "situation": "N/A"},
+            context=ctx,
             desc=f"RJ - ALERJ | {norm_type}",
         )
-        scraped_docs = []
-        for result in valid_results:
-            queue_item = {"year": year, "type": norm_type, **result}
-            scraped_docs.append(queue_item)
 
         if self.verbose:
-            logger.info(f"Scraped {len(scraped_docs)} {norm_type} documents in {year}")
+            logger.info(f"Scraped {len(results)} {norm_type} documents in {year}")
 
-        return scraped_docs
+        return results
 
     # _scrape_year uses default from BaseScraper

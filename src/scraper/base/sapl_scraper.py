@@ -122,11 +122,8 @@ class SAPLBaseScraper(StateScraper):
                 error_message="PDF processing failed (no text extracted)",
             )
             return None
+        doc_info["year"] = year
         doc_info.update(processed)
-
-        saved = await self._save_doc_result(doc_info)
-        if saved is not None:
-            doc_info = saved
 
         return doc_info
 
@@ -214,14 +211,15 @@ class SAPLBaseScraper(StateScraper):
         ]
 
         # Process all documents concurrently
-        doc_tasks = [self._get_doc_data(doc, year) for doc in documents]
-        doc_results = await self._gather_results(
+        ctx = {"year": year, "type": norm_type, "situation": "NA"}
+        doc_tasks = [
+            self._with_save(self._get_doc_data(doc, year), ctx) for doc in documents
+        ]
+        results = await self._gather_results(
             doc_tasks,
-            context={"year": year, "type": norm_type, "situation": "NA"},
+            context=ctx,
             desc=f"{self.name} | {norm_type}",
         )
-
-        results = [{"year": year, "type": norm_type, **r} for r in doc_results if r]
 
         if self.verbose:
             logger.info(

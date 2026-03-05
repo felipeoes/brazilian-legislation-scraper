@@ -143,22 +143,15 @@ class ParaAlepaScraper(StateScraper):
         url = f"{self.base_url}/index.php"
         docs = await self._get_docs_links(url, params, norm_type)
 
-        results = []
-        tasks = [self._get_doc_data(doc_info) for doc_info in docs]
-        valid_results = await self._gather_results(
+        ctx = {"year": year, "situation": situation, "type": norm_type}
+        tasks = [
+            self._with_save(self._get_doc_data(doc_info), ctx) for doc_info in docs
+        ]
+        results = await self._gather_results(
             tasks,
-            context={"year": year, "type": norm_type, "situation": situation},
+            context=ctx,
             desc=f"PARA | {norm_type}",
         )
-        for result in valid_results:
-            queue_item = {
-                "year": year,
-                "situation": situation,
-                "type": norm_type,
-                **result,
-            }
-            await self._save_doc_result(queue_item)
-            results.append(queue_item)
 
         if self.verbose:
             logger.info(
@@ -179,8 +172,4 @@ class ParaAlepaScraper(StateScraper):
             context={"year": year, "type": "N/A", "situation": "N/A"},
             desc=f"{self.name} | Year {year}",
         )
-        return [
-            item
-            for result in valid
-            for item in (result if isinstance(result, list) else [result])
-        ]
+        return self._flatten_results(valid)

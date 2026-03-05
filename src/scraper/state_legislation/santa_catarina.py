@@ -291,7 +291,7 @@ class SantaCatarinaScraper(StateScraper):
                 return None
 
             html_string = body.prettify().strip()
-            html_string = f"<html><body>{html_string}</body></html>"
+            html_string = self._wrap_html(html_string)
 
             text_markdown = await self._get_markdown(html_content=html_string)
             raw_content = html_string.encode("utf-8")
@@ -315,10 +315,6 @@ class SantaCatarinaScraper(StateScraper):
             }
         )
 
-        saved = await self._save_doc_result(doc_info)
-        if saved is not None:
-            doc_info = saved
-
         return doc_info
 
     async def _scrape_type(
@@ -331,18 +327,18 @@ class SantaCatarinaScraper(StateScraper):
             if not documents:
                 return []
 
-            # Process documents concurrently with asyncio
-            tasks = [self._get_doc_data(doc_info) for doc_info in documents]
-            valid_results = await self._gather_results(
+            for doc in documents:
+                doc["year"] = year
+            ctx = {"year": year, "type": norm_type, "situation": "N/A"}
+            tasks = [
+                self._with_save(self._get_doc_data(doc_info), ctx)
+                for doc_info in documents
+            ]
+            results = await self._gather_results(
                 tasks,
-                context={"year": year, "type": norm_type, "situation": "N/A"},
+                context=ctx,
                 desc=f"SANTA CATARINA | {norm_type}",
             )
-            results = []
-            for result in valid_results:
-                if result:
-                    queue_item = {"year": year, "type": norm_type, **result}
-                    results.append(queue_item)
 
             if self.verbose:
                 logger.info(

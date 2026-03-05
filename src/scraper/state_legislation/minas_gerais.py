@@ -72,7 +72,7 @@ class MGAlmgScraper(StateScraper):
         """
         soup = await self.request_service.get_soup(url)
 
-        if soup is None:
+        if not soup:
             return [], False
 
         docs = []
@@ -98,7 +98,7 @@ class MGAlmgScraper(StateScraper):
 
         soup_data = await self.request_service.get_soup(url)
 
-        if soup_data is None:
+        if not soup_data:
             await self._save_doc_error(
                 title=doc_info.get("title", "Unknown"),
                 year="",
@@ -192,7 +192,7 @@ class MGAlmgScraper(StateScraper):
             return None
 
         soup = await self.request_service.get_soup(html_link)
-        if soup is None:
+        if not soup:
             await self._save_doc_error(
                 title=doc_info.get("title", "Unknown"),
                 year="",
@@ -239,7 +239,7 @@ class MGAlmgScraper(StateScraper):
                 return None
 
             pdf_response = await self.request_service.make_request(pdf_link)
-            if pdf_response is None:
+            if not pdf_response:
                 await self._save_doc_error(
                     title=data.get("title", "Unknown"),
                     year="",
@@ -292,7 +292,7 @@ class MGAlmgScraper(StateScraper):
             )
             return None
 
-        html_string = f"<html><body>{norm_text}</body></html>"
+        html_string = self._wrap_html(norm_text)
 
         text_markdown = await self._get_markdown(html_content=html_string)
 
@@ -357,19 +357,15 @@ class MGAlmgScraper(StateScraper):
             total_pages += self.max_workers
 
         # Get document data
-        results = []
-        tasks = [self._get_doc_data(doc_info) for doc_info in documents]
-        valid_results = await self._gather_results(
+        ctx = {"year": year, "type": norm_type, "situation": situation}
+        tasks = [
+            self._with_save(self._get_doc_data(doc_info), ctx) for doc_info in documents
+        ]
+        results = await self._gather_results(
             tasks,
-            context={"year": year, "type": norm_type, "situation": situation},
+            context=ctx,
             desc=f"MINAS GERAIS | {norm_type}",
         )
-        for result in valid_results:
-            if not result["situation"]:
-                result["situation"] = situation
-            queue_item = {"year": year, "type": norm_type, **result}
-            await self._save_doc_result(queue_item)
-            results.append(queue_item)
 
         if self.verbose:
             logger.info(
@@ -395,8 +391,4 @@ class MGAlmgScraper(StateScraper):
             context={"year": year, "type": "N/A", "situation": "N/A"},
             desc=f"{self.name} | Year {year}",
         )
-        return [
-            item
-            for result in valid
-            for item in (result if isinstance(result, list) else [result])
-        ]
+        return self._flatten_results(valid)

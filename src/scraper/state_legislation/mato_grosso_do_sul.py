@@ -21,7 +21,7 @@ VALID_SITUATIONS = [
     "Não consta"
 ]  # Alems does not have a situation field, invalid norms will have an indication in the document text
 
-INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no lon
+INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no longer have legal effect)
 
 # the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
@@ -105,8 +105,7 @@ class MSAlemsScraper(StateScraper):
         norm_text_tag = soup.find("p")
         html_string = norm_text_tag.prettify().strip()
 
-        # since we're getting the p tag, need to add the html and body tags to make it a valid html for markitdown
-        html_string = f"<html><body>{html_string}</body></html>"
+        html_string = self._wrap_html(html_string)
 
         # get text markdown
         text_markdown = await self._get_markdown(html_content=html_string)
@@ -168,24 +167,14 @@ class MSAlemsScraper(StateScraper):
         if not docs:
             return []
 
-        tasks = [self._get_doc_data(doc) for doc in docs]
-        valid_results = await self._gather_results(
+        situation = self.situations[0] if self.situations else "Não consta"
+        ctx = {"year": year, "situation": situation, "type": norm_type}
+        tasks = [self._with_save(self._get_doc_data(doc), ctx) for doc in docs]
+        results = await self._gather_results(
             tasks,
-            context={"year": year, "type": norm_type},
+            context=ctx,
             desc=f"MATO GROSSO DO SUL | {norm_type} {year}",
         )
-
-        situation = self.situations[0] if self.situations else "Não consta"
-        results = []
-        for result in valid_results:
-            queue_item = {
-                "year": year,
-                "situation": situation,
-                "type": norm_type,
-                **result,
-            }
-            await self._save_doc_result(queue_item)
-            results.append(queue_item)
 
         if self.verbose:
             logger.info(f"Year: {year} | Type: {norm_type} | Results: {len(results)}")

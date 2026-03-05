@@ -89,7 +89,7 @@ class AcreLegisScraper(StateScraper):
             return None
 
         response = await self.request_service.make_request(doc_html_link)
-        if response is None:
+        if not response:
             await self._save_doc_error(
                 title=doc_title,
                 year=doc_year,
@@ -150,7 +150,7 @@ class AcreLegisScraper(StateScraper):
         if self._is_already_scraped(document_url, "Constituição Estadual"):
             return None
         response = await self.request_service.make_request(document_url)
-        if response is None:
+        if not response:
             return {
                 "title": "Constituição Estadual",
                 "year": datetime.now().year,
@@ -201,7 +201,7 @@ class AcreLegisScraper(StateScraper):
         """
         url = self._format_search_url(1)
         soup = await self.request_service.get_soup(url)
-        if soup is None:
+        if not soup:
             logger.error("Failed to fetch Acre main page")
             return
 
@@ -242,22 +242,16 @@ class AcreLegisScraper(StateScraper):
         if not docs:
             return []
 
-        tasks = [self._get_doc_data(doc) for doc in docs]
+        ctx = {"year": year, "situation": situation, "type": norm_type}
+
+        tasks = [self._with_save(self._get_doc_data(doc), ctx) for doc in docs]
         valid_results = await self._gather_results(
             tasks,
-            context={"year": year, "type": norm_type, "situation": situation},
+            context=ctx,
             desc=f"ACRE | {norm_type} | Year {year}",
         )
 
-        results = []
-        for result in valid_results:
-            queue_item = {
-                "situation": situation,
-                "type": norm_type,
-                **result,
-            }
-            await self._save_doc_result(queue_item)
-            results.append(queue_item)
+        results = list(valid_results)
 
         return results
 

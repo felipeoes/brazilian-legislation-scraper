@@ -245,7 +245,7 @@ class DFSinjScraper(StateScraper):
             method="POST",
             payload=payload,
         )
-        if response is None:
+        if not response:
             return []
 
         def transform_norm_type(norm_type: str) -> str:
@@ -295,7 +295,7 @@ class DFSinjScraper(StateScraper):
                 return None
 
             response = await self.request_service.make_request(html_link)
-            if response is None:
+            if not response:
                 raise RuntimeError(f"No response for {html_link}")
 
             body = await response.read()
@@ -321,7 +321,7 @@ class DFSinjScraper(StateScraper):
                         html_link=html_link,
                         error_message="Could not find div_texto and markdown extraction failed",
                     )
-                    return False  # invalid norm, not applying image extraction for distrito federal for now
+                    return None
             else:
                 # Remove the "Este texto não substitui..." footer disclaimer
                 for tag in norm_text_tag.find_all(
@@ -360,7 +360,7 @@ class DFSinjScraper(StateScraper):
                 html_link=doc_info.get("html_link", ""),
                 error_message=str(e),
             )
-            return False
+            return None
 
     async def _scrape_situation_type(
         self,
@@ -399,7 +399,7 @@ class DFSinjScraper(StateScraper):
             method="POST",
             payload=total_pages_request_params,
         )
-        if response is None:
+        if not response:
             return []
 
         data = await response.json()
@@ -434,25 +434,14 @@ class DFSinjScraper(StateScraper):
         for result in valid_results:
             norms.extend(result)
 
-        results = []
-
         # get all norm data
-        tasks = [self._get_doc_data(norm) for norm in norms]
-        valid_results = await self._gather_results(
+        ctx = {"year": year, "type": norm_type, "situation": situation}
+        tasks = [self._with_save(self._get_doc_data(norm), ctx) for norm in norms]
+        results = await self._gather_results(
             tasks,
-            context={"year": year, "type": norm_type, "situation": situation},
+            context=ctx,
             desc=f"DISTRITO FEDERAL | {norm_type}",
         )
-        for result in valid_results:
-            if result:
-                queue_item = {
-                    "year": year,
-                    "type": norm_type,
-                    "situation": situation,
-                    **result,
-                }
-                await self._save_doc_result(queue_item)
-                results.append(queue_item)
 
         if self.verbose:
             logger.info(
@@ -473,8 +462,4 @@ class DFSinjScraper(StateScraper):
             context={"year": year, "type": "NA", "situation": "NA"},
             desc=f"{self.name} | Year {year}",
         )
-        return [
-            item
-            for result in valid
-            for item in (result if isinstance(result, list) else [result])
-        ]
+        return self._flatten_results(valid)

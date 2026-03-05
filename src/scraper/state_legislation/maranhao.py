@@ -25,7 +25,7 @@ VALID_SITUATIONS = [
     "Não consta"
 ]  # Alema does not have a situation field, invalid norms will have an indication in the document text
 
-INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no lon
+INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no longer have legal effect)
 
 # the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
 SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
@@ -316,28 +316,17 @@ class MaranhaoAlemaScraper(StateScraper):
                 documents.extend(result)
 
         # Get document data
-        results = []
-        tasks = [self._get_doc_data(doc) for doc in documents]
-        valid_results = await self._gather_results(
+        ctx = {
+            "year": year,
+            "situation": situation,
+            "type": norm_type if not subtype else subtype,
+        }
+        tasks = [self._with_save(self._get_doc_data(doc), ctx) for doc in documents]
+        results = await self._gather_results(
             tasks,
-            context={
-                "year": year,
-                "type": norm_type if not subtype else subtype,
-                "situation": situation,
-            },
+            context=ctx,
             desc=f"MARANHAO | {norm_type}",
         )
-        for result in valid_results:
-            # save to results
-            queue_item = {
-                "year": year,
-                # hardcode since it seems we only get valid documents in search request
-                "situation": situation,
-                "type": norm_type if not subtype else subtype,
-                **result,
-            }
-            await self._save_doc_result(queue_item)
-            results.append(queue_item)
 
         if self.verbose:
             logger.info(
@@ -437,8 +426,4 @@ class MaranhaoAlemaScraper(StateScraper):
             context={"year": year, "type": "N/A", "situation": "N/A"},
             desc=f"{self.name} | Year {year}",
         )
-        return [
-            item
-            for result in valid
-            for item in (result if isinstance(result, list) else [result])
-        ]
+        return self._flatten_results(valid)

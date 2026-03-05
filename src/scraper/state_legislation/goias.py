@@ -28,7 +28,7 @@ SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
 
 
 class LegislaGoias(StateScraper):
-    """Webscraper for Espirito Santo state legislation website (https://legisla.casacivil.go.gov.br)
+    """Webscraper for Goias state legislation website (https://legisla.casacivil.go.gov.br)
 
     Example search request: https://legisla.casacivil.go.gov.br/api/v2/pesquisa/legislacoes?ano=1798&ordenarPor=data&page=1&qtd_por_pagina=10&tipo_legislacao=7
     """
@@ -170,9 +170,8 @@ class LegislaGoias(StateScraper):
 
             html_string = soup.prettify().strip()
 
-            # Ensure we have a complete HTML document for markitdown
             if not html_string.startswith("<html"):
-                html_string = f"<html><body>{html_string}</body></html>"
+                html_string = self._wrap_html(html_string)
 
             doc_info["html_string"] = html_string
 
@@ -306,26 +305,23 @@ class LegislaGoias(StateScraper):
             pages = total_results // 100 + 1
 
             # get all norms
-            results = []
+            ctx = {"year": year, "type": norm_type, "situation": "N/A"}
             tasks = [
-                self._get_doc_data(
-                    self._build_search_url(norm_type_id, year, page),
-                    norm_type_data["url_suffix"],
+                self._with_save(
+                    self._get_doc_data(
+                        self._build_search_url(norm_type_id, year, page),
+                        norm_type_data["url_suffix"],
+                    ),
+                    ctx,
                 )
                 for page in range(1, pages + 1)
             ]
-            valid_results = await self._gather_results(
+            results = await self._gather_results(
                 tasks,
-                context={"year": year, "type": norm_type, "situation": "N/A"},
+                context=ctx,
                 desc=f"GOIAS | {norm_type}",
             )
-            for result in valid_results:
-                if not result:
-                    continue
-                for norm in result:
-                    queue_item = {"year": year, "type": norm_type, **norm}
-                    await self._save_doc_result(queue_item)
-                    results.append(queue_item)
+            results = self._flatten_results(results)
 
             return results
 
