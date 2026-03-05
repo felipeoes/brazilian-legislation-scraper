@@ -339,7 +339,6 @@ class DFSinjScraper(StateScraper):
                     else text_markdown
                 )
 
-                doc_info["html_string"] = html_string
                 raw_content = html_string.encode("utf-8")
                 content_ext = ".html"
 

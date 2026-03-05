@@ -261,7 +261,6 @@ class CamaraDepScraper(BaseScraper):
         Data will be in the format {
             "title": str,
             "summary": str,
-            "html_string": str,
             "text_markdown": str,
             "document_url": str
         }"""
@@ -326,7 +325,6 @@ class CamaraDepScraper(BaseScraper):
             return {
                 "title": title,
                 "summary": summary,
-                "html_string": html_string,
                 "text_markdown": text_markdown.strip(),
                 "document_url": document_text_link,
                 "_raw_content": html_string.encode("utf-8"),

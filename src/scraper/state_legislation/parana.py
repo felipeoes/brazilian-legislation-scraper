@@ -283,7 +283,6 @@ class ParanaCVScraper(StateScraper):
 
         result = {
             **doc_info,
-            "html_string": html_string,
             "text_markdown": text_markdown,
             "document_url": html_link,
             "situation": situation,

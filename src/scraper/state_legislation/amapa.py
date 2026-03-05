@@ -114,7 +114,6 @@ class AmapaAlapScraper(StateScraper):
 
         response = await self.request_service.make_request(url)
         if not response:
-            doc_info["html_string"] = ""
             doc_info["text_markdown"] = None
             doc_info["document_url"] = url
             return doc_info
@@ -185,7 +184,6 @@ class AmapaAlapScraper(StateScraper):
             if lines:
                 text_markdown = "\n\n".join(lines)
 
-        doc_info["html_string"] = html_string
         doc_info["text_markdown"] = text_markdown
         doc_info["document_url"] = url
         doc_info["_raw_content"] = html_string.encode("utf-8")

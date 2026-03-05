@@ -302,7 +302,6 @@ class PernambucoAlepeScraper(StateScraper):
             )
             return None
 
-        doc_info["html_string"] = html_string
         doc_info["text_markdown"] = text_markdown
         doc_info["_raw_content"] = html_string.encode("utf-8")
         doc_info["_content_extension"] = ".html"

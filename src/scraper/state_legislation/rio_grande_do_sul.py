@@ -228,7 +228,6 @@ class RSAlrsScraper(StateScraper):
             **doc_info,
             "situation": situation,
             "subject": subject,
-            "html_string": html_string,
             "text_markdown": text_markdown.strip(),
             "document_url": document_url,
             "_raw_content": raw_content,

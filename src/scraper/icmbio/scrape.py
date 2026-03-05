@@ -469,7 +469,6 @@ class ICMBioScraper(BaseScraper):
 
         result = {
             **doc_info,
-            "html_string": html_string,
             "text_markdown": text_markdown,
             "_raw_content": html_string.encode("utf-8"),
             "_content_extension": ".html",

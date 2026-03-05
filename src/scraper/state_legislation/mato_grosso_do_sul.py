@@ -110,7 +110,6 @@ class MSAlemsScraper(StateScraper):
         # get text markdown
         text_markdown = await self._get_markdown(html_content=html_string)
 
-        doc_info["html_string"] = html_string
         doc_info["text_markdown"] = text_markdown
         doc_info["document_url"] = url
         doc_info["_raw_content"] = html_string.encode("utf-8")

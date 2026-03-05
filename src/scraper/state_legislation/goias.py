@@ -173,8 +173,6 @@ class LegislaGoias(StateScraper):
             if not html_string.startswith("<html"):
                 html_string = self._wrap_html(html_string)
 
-            doc_info["html_string"] = html_string
-
             # check if botao-baixar in soup
             baixar_div = soup.find("div", class_="botao-baixar")
             if baixar_div:

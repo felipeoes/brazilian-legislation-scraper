@@ -137,7 +137,6 @@ class AcreLegisScraper(StateScraper):
             "title": doc_title,
             "year": doc_year,
             "summary": doc_summary,
-            "html_string": html_string,
             "text_markdown": text_markdown,
             "document_url": doc_html_link,
             "_raw_content": html_string.encode("utf-8"),
@@ -155,7 +154,6 @@ class AcreLegisScraper(StateScraper):
                 "title": "Constituição Estadual",
                 "year": datetime.now().year,
                 "summary": "Constituição Estadual do Estado do Acre",
-                "html_string": "",
                 "text_markdown": None,
                 "document_url": document_url,
             }
@@ -185,7 +183,6 @@ class AcreLegisScraper(StateScraper):
             "title": "Constituição Estadual",
             "year": datetime.now().year,
             "summary": "Constituição Estadual do Estado do Acre",
-            "html_string": html_string,
             "text_markdown": text_markdown,
             "document_url": document_url,
             "_raw_content": html_string.encode("utf-8"),

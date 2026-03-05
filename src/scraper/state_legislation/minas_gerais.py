@@ -265,7 +265,6 @@ class MGAlmgScraper(StateScraper):
 
             return {
                 **data,
-                "html_string": "",
                 "text_markdown": text_markdown,
                 "document_url": pdf_link,
                 "_raw_content": pdf_content,
@@ -310,7 +309,6 @@ class MGAlmgScraper(StateScraper):
 
         return {
             **data,
-            "html_string": html_string,
             "text_markdown": text_markdown,
             "document_url": html_link,
             "_raw_content": html_string.encode("utf-8"),
