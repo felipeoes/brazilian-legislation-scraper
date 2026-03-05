@@ -13,15 +13,54 @@ from tenacity import (
 
 from src.scraper.base.concurrency import RateLimiter
 
-_SSL_CTX = ssl.create_default_context()
-_SSL_CTX.check_hostname = False
-_SSL_CTX.verify_mode = ssl.CERT_NONE
+
+def _make_ssl_context(verify: bool = True) -> ssl.SSLContext:
+    """Build an SSL context. When *verify* is ``False`` certificate
+    checks are disabled — use only for sites with broken certificates."""
+    ctx = ssl.create_default_context()
+    if not verify:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
 
 
 class RetryableHTTPError(Exception):
     """Raised to trigger tenacity retry on transient HTTP errors."""
 
     pass
+
+
+class FailedRequest:
+    """Sentinel returned by ``make_request`` / ``get_soup`` on failure.
+
+    Falsy so that ``if not resp:`` works identically to the old
+    ``if resp is None:`` pattern, but carries diagnostic information.
+
+    Attributes:
+        url: The URL that was requested.
+        status: HTTP status code if the server responded, else ``None``.
+        reason: Human-readable error description.
+    """
+
+    __slots__ = ("url", "status", "reason")
+
+    def __init__(
+        self, url: str = "", status: int | None = None, reason: str = ""
+    ) -> None:
+        self.url = url
+        self.status = status
+        self.reason = reason
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        parts = [f"url={self.url!r}"]
+        if self.status is not None:
+            parts.append(f"status={self.status}")
+        if self.reason:
+            parts.append(f"reason={self.reason!r}")
+        return f"FailedRequest({', '.join(parts)})"
 
 
 class RequestService:
@@ -31,13 +70,19 @@ class RequestService:
         verbose: bool = False,
         proxy_service=None,
         max_workers: int = 10,
+        max_retries: int = 3,
+        verify_ssl: bool = False,
+        disable_cookies: bool = False,
     ):
         self.rps = rps
         self.verbose = verbose
         self.max_workers = max_workers
+        self.max_retries = max_retries
+        self._ssl_ctx = _make_ssl_context(verify_ssl)
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
         }
+        self._disable_cookies = disable_cookies
         self._default_session: aiohttp.ClientSession | None = None
         self._proxy_sessions: dict[str, aiohttp.ClientSession] = {}
         self._rate_limiter = RateLimiter(rps)
@@ -47,7 +92,7 @@ class RequestService:
         """Get or create the aiohttp session."""
         if proxy:
             if proxy not in self._proxy_sessions or self._proxy_sessions[proxy].closed:
-                connector = ProxyConnector.from_url(proxy, ssl=_SSL_CTX)
+                connector = ProxyConnector.from_url(proxy, ssl=self._ssl_ctx)
                 timeout = aiohttp.ClientTimeout(total=120)
                 self._proxy_sessions[proxy] = aiohttp.ClientSession(
                     headers=self.headers,
@@ -57,17 +102,18 @@ class RequestService:
             return self._proxy_sessions[proxy]
 
         if self._default_session is None or self._default_session.closed:
-            # limit_per_host caps simultaneous TCP connections to any single server,
-            # preventing 'Connection closed' from servers that reject high concurrency.
             connector = aiohttp.TCPConnector(
-                ssl=_SSL_CTX, limit=100, limit_per_host=self.max_workers
+                ssl=self._ssl_ctx, limit=100, limit_per_host=self.max_workers
             )
             timeout = aiohttp.ClientTimeout(total=120)
-            self._default_session = aiohttp.ClientSession(
-                headers=self.headers,
-                connector=connector,
-                timeout=timeout,
-            )
+            kwargs: dict = {
+                "headers": self.headers,
+                "connector": connector,
+                "timeout": timeout,
+            }
+            if self._disable_cookies:
+                kwargs["cookie_jar"] = aiohttp.DummyCookieJar()
+            self._default_session = aiohttp.ClientSession(**kwargs)
         return self._default_session
 
     @retry(
@@ -100,7 +146,7 @@ class RequestService:
             if method == "POST":
                 post_kwargs = kwargs.copy()
                 post_kwargs["timeout"] = req_timeout
-                post_kwargs["ssl"] = _SSL_CTX
+                post_kwargs["ssl"] = self._ssl_ctx
                 if json is not None:
                     post_kwargs["json"] = json
                 if payload is not None:
@@ -111,19 +157,21 @@ class RequestService:
                 resp = await session.get(
                     url,
                     timeout=req_timeout,
-                    ssl=_SSL_CTX,
+                    ssl=self._ssl_ctx,
                     **kwargs,
                 )
 
             # Pre-read the body so callers can use it freely
             await resp.read()
 
-            # Check for Portuguese server error in raw bytes (ASCII-safe pattern)
-            # to avoid decoding the entire body to text on every request.
             if b"O servidor encontrou um erro interno, ou est" in (resp._body or b""):
                 raise RetryableHTTPError("Server overloaded / internal error")
 
-            if resp.status in (408, 429, 500, 502, 503, 504):
+            retryable = {408, 429, 500, 502, 503, 504}
+            if self.proxy_service:
+                retryable.add(403)
+
+            if resp.status in retryable:
                 raise RetryableHTTPError(f"HTTP {resp.status}")
 
             return resp
@@ -134,10 +182,6 @@ class RequestService:
             aiohttp.ServerDisconnectedError,
             asyncio.TimeoutError,
         ) as e:
-            # Only reset isolated proxy sessions — never close the shared
-            # default session here, because that would kill ALL other
-            # concurrent in-flight requests on the same session.
-            # The TCPConnector handles per-connection recycling automatically.
             if proxy:
                 if (
                     proxy in self._proxy_sessions
@@ -155,27 +199,37 @@ class RequestService:
         payload: list | dict | None = None,
         timeout: int = 60,
         **kwargs,
-    ) -> aiohttp.ClientResponse | None:
+    ) -> aiohttp.ClientResponse | FailedRequest:
         """Make async HTTP request with automatic retry on transient errors.
 
-        Returns an aiohttp.ClientResponse that has already been read
-        (response.read() called), so .status, .text(), .json() etc. are safe.
-        Returns None for 4xx client errors or after all retries are exhausted.
+        Returns an ``aiohttp.ClientResponse`` on success (body already read),
+        or a **falsy** ``FailedRequest`` on failure — use ``if not resp:``
+        to branch on errors and inspect ``resp.status`` / ``resp.reason``
+        for diagnostics.
         """
         try:
-            return await self._do_request(url, method, json, payload, timeout, **kwargs)
-        except Exception:
-            return None
+            do_request = self._do_request
+            if self.max_retries != 3:
+                unbound = self._do_request.retry_with(
+                    stop=stop_after_attempt(self.max_retries)
+                )
+                do_request = unbound.__get__(self, type(self))
+            return await do_request(url, method, json, payload, timeout, **kwargs)
+        except RetryableHTTPError as e:
+            return FailedRequest(url=url, reason=str(e))
+        except Exception as e:
+            return FailedRequest(url=url, reason=str(e))
 
     async def get_soup(
         self, url: str, method: str = "GET", **kwargs
-    ) -> BeautifulSoup | None:
-        """Get BeautifulSoup object from given url (async)."""
+    ) -> BeautifulSoup | FailedRequest:
+        """Get BeautifulSoup object from given url (async).
+
+        Returns a ``FailedRequest`` (falsy) instead of ``None`` on failure.
+        """
         resp = await self.make_request(url, method=method, **kwargs)
-        if resp is None:
-            return None
-        # _do_request already called resp.read() to pre-buffer the body; using
-        # resp.text() here correctly returns the buffered content instead of b"".
+        if not resp:
+            return resp  # propagate the FailedRequest as-is
         body = await resp.text(errors="replace")
         return BeautifulSoup(body, "html.parser")
 

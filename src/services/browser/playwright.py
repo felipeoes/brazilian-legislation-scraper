@@ -11,6 +11,7 @@ from playwright.async_api import (
     Page,
     Playwright,
 )
+from playwright_stealth import Stealth
 
 
 class BrowserService:
@@ -75,6 +76,7 @@ class BrowserService:
     async def initialize(self) -> None:
         """Launch Playwright and open the browser / page pool."""
         self._playwright = await async_playwright().start()
+        Stealth().hook_playwright_context(self._playwright)
 
         launch_args = [
             "--no-sandbox",
@@ -126,6 +128,22 @@ class BrowserService:
         await asyncio.sleep(1)
         content = await target_page.content()
         return BeautifulSoup(content, "html.parser")
+
+    async def capture_mhtml(self, url: str, page: Page | None = None) -> bytes:
+        """Navigate to *url* and return the page as an MHTML snapshot.
+
+        Uses Chrome DevTools Protocol (CDP) ``Page.captureSnapshot`` to
+        produce a self-contained MHTML archive that includes all external
+        resources (CSS, images, fonts, etc.).
+        """
+        target_page = page or self.page
+        if target_page is None:
+            raise RuntimeError("Playwright page is not initialized.")
+        await target_page.goto(url, wait_until="networkidle")
+        client = await target_page.context.new_cdp_session(target_page)
+        snapshot = await client.send("Page.captureSnapshot")
+        await client.detach()
+        return snapshot["data"].encode("utf-8")
 
     async def get_available_page(self) -> Page:
         """Return the next available page from the pool (blocks until one is free)."""

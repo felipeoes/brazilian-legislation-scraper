@@ -7,13 +7,11 @@ import base64
 
 import aiohttp
 import fitz
-from src.services.ocr.bedrock import BedrockClient
-from src.services.request.service import RequestService
+from src.services.ocr.protocol import LLMClient
 from src.scraper.base.concurrency import RateLimiter
 from src.utils import clean_md_tag
 from loguru import logger
 from openai import (
-    AsyncOpenAI,
     RateLimitError,
     APITimeoutError,
     InternalServerError,
@@ -37,34 +35,28 @@ class LLMOCRService:
     support the Chat Completions API and do not accept raw PDF bytes.
 
     Args:
+        prompt: Instruction prompt sent with every image.
         llm_config: Dictionary containing LLM configurations (llm_client, llm_model,
             llm_kwargs, and optionally llm_rps).
-        prompt: Instruction prompt sent with every image.
-        request_service: Request service instance to be used by the OCR service.
         verbose: Enable verbose logging.
     """
 
     def __init__(
         self,
         prompt: str,
-        request_service: RequestService,
         llm_config: dict | None = None,
         verbose: bool = False,
         timeout: int = 180,
     ) -> None:
         self.llm_config = llm_config or {}
-        self.client: AsyncOpenAI | BedrockClient | None = self.llm_config.get(
-            "llm_client"
-        )
+        self.client: LLMClient | None = self.llm_config.get("llm_client")
         raw_model = self.llm_config.get("llm_model", "")
         if isinstance(raw_model, str):
             self.models = [m.strip() for m in raw_model.split(",") if m.strip()]
         else:
             self.models = raw_model if isinstance(raw_model, list) else []
 
-        self.kwargs = self.llm_config.get("llm_kwargs", {})
         self.prompt = prompt
-        self.request_service = request_service
         self.verbose = verbose
         self.timeout = timeout
 
@@ -80,51 +72,13 @@ class LLMOCRService:
             )
 
     # ------------------------------------------------------------------
-    # Utilities
-    # ------------------------------------------------------------------
-
-    async def generate(
-        self, messages: list, attempt_number: int = 1, timeout: int | None = None
-    ) -> str:
-        """Generate response from LLM.
-
-        Dispatches to either the OpenAI Chat Completions API or the
-        Amazon Bedrock Converse API depending on the configured client.
-        """
-        if not self.client or not self.models:
-            raise RuntimeError("LLM client or models are not initialized.")
-
-        model = self.models[(attempt_number - 1) % len(self.models)]
-
-        if isinstance(self.client, BedrockClient):
-            return await self.client.generate(messages, model_id=model, timeout=timeout)
-
-        # OpenAI-compatible path
-        is_stream = self.kwargs.get("stream", False)
-        kwargs = self.kwargs.copy()
-        if timeout is not None:
-            kwargs["timeout"] = timeout
-        response = await self.client.chat.completions.create(
-            model=model, messages=messages, **kwargs
-        )
-
-        if is_stream:
-            content = []
-            async for chunk in response:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    content.append(chunk.choices[0].delta.content)
-            return "".join(content)
-
-        return response.choices[0].message.content
-
-    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
     def _create_retry_strategy(self, max_attempts: int = 10) -> AsyncRetrying:
         """Create a configured AsyncRetrying instance for LLM requests."""
         return AsyncRetrying(
-            stop=stop_after_attempt(max_attempts),  # 10 attempts roughly 5 minutes
+            stop=stop_after_attempt(max_attempts),
             wait=wait_fixed(5) + wait_random_exponential(min=1, max=60, multiplier=2),
             retry=retry_if_exception_type(
                 (
@@ -138,10 +92,6 @@ class LLMOCRService:
                 )
             ),
         )
-
-    def _clean_md_tag(self, md_content: str) -> str:
-        """Strip markdown code block wrappers if present."""
-        return clean_md_tag(md_content)
 
     def _pdf_bytes_to_images(self, content: bytes) -> list[bytes]:
         """Render each PDF page to a PNG at 50 DPI and return the raw bytes."""
@@ -159,34 +109,27 @@ class LLMOCRService:
         desc: str = "LLM call",
         timeout: int | None = None,
     ) -> str:
-        """Execute an LLM call with retry, rate limiting, and error handling.
+        """Execute an LLM call with retry, rate limiting, and error handling."""
+        if not self.client or not self.models:
+            raise RuntimeError("LLM client or models are not initialized.")
 
-        Args:
-            messages: OpenAI-format messages list.
-            desc: Short description for log messages (e.g. "3 images").
-            timeout: Optional per-request timeout in seconds.
-
-        Returns:
-            Cleaned markdown string, or ``""`` on failure.
-        """
         timeout = timeout or self.timeout
         try:
             async for attempt in self._create_retry_strategy():
                 with attempt:
                     await self._rate_limiter.acquire()
-                    if self.verbose and attempt.retry_state.attempt_number > 6:
-                        model = self.models[
-                            (attempt.retry_state.attempt_number - 1) % len(self.models)
-                        ]
+                    attempt_num = attempt.retry_state.attempt_number
+                    model = self.models[(attempt_num - 1) % len(self.models)]
+                    if self.verbose and attempt_num > 6:
                         logger.info(
-                            f"Sending {desc} to LLM | Attempt {attempt.retry_state.attempt_number} | Model: {model}"
+                            f"Sending {desc} to LLM | Attempt {attempt_num} | Model: {model}"
                         )
-                    response_text = await self.generate(
+                    response_text = await self.client.generate(
                         messages=messages,
-                        attempt_number=attempt.retry_state.attempt_number,
+                        model_id=model,
                         timeout=timeout,
                     )
-            return self._clean_md_tag(response_text or "")
+            return clean_md_tag(response_text or "")
         except RetryError as e:
             last_exc = e.last_attempt.exception() if e.last_attempt else e
             logger.error(f"{desc} failed after retries: {last_exc}")
@@ -194,15 +137,6 @@ class LLMOCRService:
         except Exception as e:
             logger.error(f"{desc} failed: {e}")
             return ""
-
-    async def text_to_markdown(
-        self, text: str, prompt: str, timeout: int | None = None
-    ) -> str:
-        """Send plain text to the LLM and return its response as markdown."""
-        messages = [{"role": "user", "content": f"{text}\n\n{prompt}"}]
-        return await self._call_with_retry(
-            messages, desc=f"text ({len(text)} chars)", timeout=timeout
-        )
 
     async def images_to_markdown(
         self, images: list[bytes], timeout: int | None = None
@@ -253,10 +187,10 @@ class LLMOCRService:
         )
 
     async def pdf_to_markdown(self, content: bytes, timeout: int | None = None) -> str:
-        """Convert PDF bytes to markdown. If llm_raw=True (from llm_config), sends PDF bytes directly in batches."""
+        """Convert PDF bytes to markdown. If llm_raw=True, sends PDF bytes directly in batches."""
         if self.raw:
             try:
-                doc = fitz.open("pdf", content)
+                doc = fitz.open(stream=content, filetype="pdf")
                 total_pages = len(doc)
 
                 pdf_chunks = []

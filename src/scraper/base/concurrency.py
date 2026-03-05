@@ -3,10 +3,7 @@
 import asyncio
 import functools
 from typing import Any, TypeVar
-from collections.abc import Awaitable, Callable, Sequence
-
-from loguru import logger
-from tqdm.auto import tqdm
+from collections.abc import Callable
 
 T = TypeVar("T")
 
@@ -70,52 +67,6 @@ class RateLimiter:
 
         if sleep_time > 0:
             await asyncio.sleep(sleep_time)
-
-
-async def bounded_gather(
-    coros: Sequence[Awaitable[T]],
-    max_concurrency: int,
-    desc: str = "",
-    verbose: bool = False,
-    show_progress: bool = True,
-) -> list[T]:
-    """Run awaitables with bounded concurrency via a semaphore.
-
-    Args:
-        coros: Sequence of awaitables to run.
-        max_concurrency: Maximum number of concurrent tasks.
-        desc: Description for logging / tqdm bar.
-        verbose: Whether to log detailed progress messages.
-        show_progress: Whether to show a tqdm progress bar (always on by default).
-
-    Returns:
-        List of results in the same order as input coros.
-    """
-    semaphore = asyncio.Semaphore(max_concurrency)
-    total = len(coros)
-    pbar = tqdm(total=total, desc=desc, disable=not show_progress)
-
-    async def _limited(idx: int, coro: Awaitable[T]) -> tuple[int, T]:
-        async with semaphore:
-            result = await coro
-            pbar.update(1)
-            if verbose and total > 0 and pbar.n % max(1, total // 10) == 0:
-                logger.info(f"{desc} | Progress: {pbar.n}/{total}")
-            return idx, result
-
-    tasks = [asyncio.create_task(_limited(i, c)) for i, c in enumerate(coros)]
-    indexed_results = await asyncio.gather(*tasks, return_exceptions=True)
-    pbar.close()
-
-    results: list[Any] = [None] * total
-    for item in indexed_results:
-        if isinstance(item, BaseException):
-            logger.error(f"{desc} | Task failed: {item}")
-            continue
-        idx, result = item
-        results[idx] = result
-
-    return results
 
 
 async def run_in_thread(func: Callable[..., T], *args: Any, **kwargs: Any) -> T:

@@ -13,15 +13,13 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
+from bs4 import BeautifulSoup
 from loguru import logger
 
 from src.scraper.base.scraper import BaseScraper
 
 # ── PowerBI API constants ──────────────────────────────────────────
-QUERY_URL = (
-    "https://wabi-brazil-south-api.analysis.windows.net"
-    "/public/reports/querydata?synchronous=true"
-)
+QUERY_URL = "https://wabi-brazil-south-api.analysis.windows.net/public/reports/querydata?synchronous=true"
 RESOURCE_KEY = "0d484acd-a8f7-46f0-ad8f-9bfd5486eee3"
 MODEL_ID = 10709107
 DATASET_ID = "38b8dbf3-82ac-48b0-8572-174917b99a75"
@@ -354,7 +352,8 @@ class ICMBioScraper(BaseScraper):
 
         Returns None if the row has no usable DOU link.
         """
-        link_dou = row.get("link_dou") or ""
+        parts = (row.get("link_dou") or "").split()
+        link_dou = parts[0].strip() if parts else ""
         if not link_dou or "in.gov.br" not in link_dou:
             return None
 
@@ -422,8 +421,6 @@ class ICMBioScraper(BaseScraper):
             )
             return None
 
-        from bs4 import BeautifulSoup
-
         html = await response.text()
         soup = BeautifulSoup(html, "html.parser")
         text_div = soup.find("div", class_="texto-dou")
@@ -440,7 +437,7 @@ class ICMBioScraper(BaseScraper):
             )
             return None
 
-        html_string = f"<html><body>{text_div.prettify()}</body></html>"
+        html_string = self._wrap_html(text_div.prettify())
 
         text_markdown = await self._get_markdown(html_content=html_string)
         if not text_markdown or not text_markdown.strip():

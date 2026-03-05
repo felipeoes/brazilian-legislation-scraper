@@ -1,38 +1,59 @@
+"""Santa Catarina state legislation scraper.
+
+Scrapes the ALESC legislation system at ``leis.alesc.sc.gov.br``.
+The site is a NextJS app with server-rendered HTML.
+
+Search: GET ``/legislativo?ano={year}&page={page}`` (legislative acts)
+        GET ``/executivo?ano={year}&page={page}`` (executive decrees)
+Document: GET ``/ato-normativo/{path}/{id}`` returns full HTML content.
+"""
+
 import re
 from typing import Any
+from urllib.parse import urljoin
 
-from bs4 import BeautifulSoup, Tag
-from tqdm import tqdm
 from loguru import logger
+
 from src.scraper.base.scraper import StateScraper
 
+_RE_TYPE_FROM_TITLE = re.compile(
+    r"^(LEI COMPLEMENTAR|LEI|DECRETO LEGISLATIVO|DECRETO-LEI|DECRETO|DEC-|"
+    r"EMENDA CONSTITUCIONAL|RESOLUÇÃO|RES-|PORTARIA|PRT-|INSTRUÇÃO NORMATIVA)",
+    re.IGNORECASE,
+)
 
-TYPES = {
-    "Constituição Estadual": "Estadual",
-    "Decreto-Lei": "Decreto-Lei",
-    "Decreto Executivo": "Decreto Executivo",
-    "Decreto Legislativo": "Decreto Legislativo",
-    "Emenda Constitucional": "Emenda Constitucional",
-    "Instrução Normativa": "Normativa",
-    "Lei Ordinária": "Ordinaria",
-    "Lei Complementar": "Lei Complementar",
-    "Portaria": "Portaria",
-    "Resolução": "Resolucao",
+_ABBREV_TO_TYPE = {
+    "DEC-": "Decreto",
+    "RES-": "Resolução",
+    "PRT-": "Portaria",
 }
 
-# Cannot determine revocation status from the website, so the situation is hardcoded as "Não consta"
-SITUATIONS = []
+_SEARCH_PATHS: dict[str, str] = {
+    "legislativo": "/legislativo",
+    "executivo": "/executivo",
+}
+
+TYPES = {
+    "Lei Ordinária": "legislativo",
+    "Lei Complementar": "legislativo",
+    "Decreto Legislativo": "legislativo",
+    "Decreto-Lei": "legislativo",
+    "Emenda Constitucional": "legislativo",
+    "Resolução": "legislativo",
+    "Portaria": "legislativo",
+    "Instrução Normativa": "legislativo",
+    "Decreto Executivo": "executivo",
+}
+
+SITUATIONS: list[str] = []
 
 
 class SantaCatarinaScraper(StateScraper):
-    """Webscraper for Santa Catarina state legislation website (http://server03.pge.sc.gov.br/pge/normasjur.asp)
-
-    Example search request: POST to http://server03.pge.sc.gov.br/pge/normasjur.asp
-    """
+    """Scraper for Santa Catarina legislation (leis.alesc.sc.gov.br)."""
 
     def __init__(
         self,
-        base_url: str = "http://server03.pge.sc.gov.br/pge/normasjur.asp",
+        base_url: str = "https://leis.alesc.sc.gov.br",
         **kwargs: Any,
     ):
         super().__init__(
@@ -43,275 +64,111 @@ class SantaCatarinaScraper(StateScraper):
             **kwargs,
         )
 
-    def _format_search_url(self, _norm_type_id: str, _year: int) -> str:
-        """Format url for search request - returns base URL since we use POST"""
-        return self.base_url
-
-    def _format_search_payload(self, norm_type_id: str, year: int) -> dict:
-        """Format payload for search request"""
-        return {
-            "pTipoNorma": norm_type_id,
-            "pVigente": "Todas",
-            "pNumero": "",
-            "pEmissaoInicio": str(year),
-            "pEmissaoFim": str(year),
-            "pArtigo": "",
-            "pEmenta": "",
-            "pIndex": "",
-            "pCatalogo": "",
-            "pConteudo": "",
-            "Action": "Pesquisar",
-        }
-
-    def _format_pagination_params(
-        self, norm_type_id: str, year: int, page: int
-    ) -> dict:
-        """Format parameters for pagination GET request"""
-        return {
-            "qu": f"%40TipoNorma+{norm_type_id}+AND+%24AnoNorma+%3E%3D+{year}+AND+%24AnoNorma+%3C%3D+{year}",
-            "pTipoNorma": norm_type_id,
-            "pNumero": "",
-            "pEmissaoInicio": "",
-            "pEmissaoFim": "",
-            "pConteudo": "",
-            "pEmenta": "",
-            "pIndex": "",
-            "pVigente": "Todas",
-            "pArtigo": "",
-            "pInicio": "",
-            "pFim": "",
-            "pCatalogo": "",
-            "FreeText": "",
-            "sc": "D%3A%5CSiteLegEstIIS%5Cwwwroot%5CLegislacaoEstadual",
-            "RankBase": "1000",
-            "pg": str(page),
-        }
-
-    async def _get_docs_links_page(
-        self, norm_type_id: str, year: int, page: int = 1
-    ) -> list:
-        """Get document links from a specific page."""
-        if page == 1:
-            # First page - POST request
-            payload = self._format_search_payload(norm_type_id, year)
-            soup = await self.request_service.get_soup(
-                self.base_url, method="POST", payload=payload
-            )
-        else:
-            # Additional pages - GET requests
-            params = self._format_pagination_params(norm_type_id, year, page)
-            soup = await self.request_service.get_soup(
-                self.base_url, method="GET", params=params
-            )
-
-        if not soup:
-            return []
-
-        docs = self._extract_docs_from_soup(soup)
-        return docs
+    def _format_search_url(self, norm_type_id: str, year: int) -> str:
+        return f"{self.base_url}/{norm_type_id}?ano={year}"
 
     async def _get_docs_links(self, norm_type_id: str, year: int) -> list:
-        """Get document links from search request with pagination support."""
-        # First, get the first page to determine total pages
-        payload = self._format_search_payload(norm_type_id, year)
-        # make get request to create a session
-        soup = await self.request_service.get_soup(self.base_url, method="GET")
-        soup = await self.request_service.get_soup(
-            self.base_url, method="POST", payload=payload
-        )
+        """Paginate through all search pages and collect document links."""
+        all_docs: list[dict] = []
+        seen_hrefs: set[str] = set()
+        page = 1
+        max_empty = 3
+        empty_streak = 0
 
-        if not soup:
-            return []
+        while True:
+            url = f"{self.base_url}/{norm_type_id}?ano={year}&page={page}"
+            soup = await self.request_service.get_soup(url)
 
-        # Get documents from first page
-        first_page_docs = self._extract_docs_from_soup(soup)
+            if not soup:
+                break
 
-        if not first_page_docs:
-            return []
+            links = soup.find_all("a", href=re.compile(r"/ato-normativo/"))
+            new_docs = 0
+            for link in links:
+                href = link.get("href", "")
+                if href in seen_hrefs:
+                    continue
+                seen_hrefs.add(href)
 
-        # Check for pagination
-        total_pages = self._get_total_pages(soup)
+                title = link.get_text(strip=True)
+                if not title:
+                    continue
 
-        if total_pages <= 1:
-            return first_page_docs
+                ementa = ""
+                card = link.find_parent("div", class_=re.compile("card"))
+                if card:
+                    ementa_div = card.find("div", class_=re.compile("ementa|title"))
+                    if ementa_div and ementa_div.get_text(strip=True) != title:
+                        ementa = ementa_div.get_text(strip=True)
 
-        # Get remaining pages
-        ## Needs to be sequential because session state is needed to fetch the next pages
+                doc_url = urljoin(self.base_url, href)
+                all_docs.append(
+                    {
+                        "title": title,
+                        "summary": ementa,
+                        "document_url": doc_url,
+                    }
+                )
+                new_docs += 1
 
-        all_docs = first_page_docs.copy()
-        for page in tqdm(
-            range(2, total_pages + 1),
-            desc=f"SANTA CATARINA | Year: {year} | Type: {norm_type_id} | Fetching pages",
-            total=total_pages - 1,
-            disable=not self.verbose,
-        ):
-            docs = await self._get_docs_links_page(norm_type_id, year, page)
-            all_docs.extend(docs)
+            if new_docs == 0:
+                empty_streak += 1
+                if empty_streak >= max_empty:
+                    break
+            else:
+                empty_streak = 0
+
+            page += 1
 
         return all_docs
 
-    def _get_total_pages(self, soup: BeautifulSoup) -> int:
-        """Extract total number of pages from pagination info"""
-        # Look for pagination text like "Página 2 de 2".
-
-        # regex for "Página {x}" first
-        page_regex = re.compile(r"Página\s+(\d+)")
-        page_font = soup.find_all("font", string=page_regex)[0]
-        next_font = page_font.find_next("font")
-        if not next_font:
-            return 1
-
-        # Extract the total pages from the next font
-        total_pages_text = next_font.get_text(strip=True)
-        total_pages_match = re.search(r"de\s+(\d+)", total_pages_text)
-        if total_pages_match:
-            total_pages = int(total_pages_match.group(1))
-            return total_pages
-
-        return 1
-
-    def _extract_docs_from_soup(self, soup: BeautifulSoup) -> list:
-        """Extract document information from BeautifulSoup object"""
-        docs = []
-
-        if not soup:
-            return []
-
-        # Find all record title rows
-        title_rows = soup.find_all("tr", class_="RecordTitle")
-
-        for i, title_row in enumerate(title_rows):
-            if not isinstance(title_row, Tag):
-                continue
-
-            title_tag = title_row.find("b", class_="RecordTitle")
-            if not title_tag or not isinstance(title_tag, Tag):
-                continue
-
-            title_text = title_tag.get_text(strip=True).replace("\xa0", " ")
-
-            # Parse title like "LEI-006191  9/12/1982"
-            parts = title_text.split()
-            if len(parts) < 2:
-                continue
-
-            doc_id = parts[0]  # LEI-006191
-            date_part = parts[-1]  # 9/12/1982
-
-            # Find the next row with ementa (summary) and "Resumo" link
-            next_row = title_row.find_next_sibling("tr")
-            summary = ""
-            doc_info_link = ""
-
-            if next_row and isinstance(next_row, Tag):
-                # find summary_tag by searchinf gor TEXTO: or EMENTA:
-                summary_tag = next_row.find(
-                    lambda tag: (
-                        tag.name == "font"
-                        and "EMENTA:" in tag.text
-                        or "TEXTO:" in tag.text
-                    )
-                )
-                summary = summary_tag.text.strip()
-
-                # Find the "Resumo" link which contains the doc_info_link
-                doc_info_link = next_row.find("a", href=True).get("href")
-
-            if not doc_info_link:
-                continue  # Skip documents without detail links
-
-            doc = {
-                "id": doc_id,
-                "title": f"{doc_id} - {date_part}",
-                "summary": summary,
-                "date": date_part,
-                "doc_info_link": doc_info_link,
-            }
-            docs.append(doc)
-
-        return docs
-
     async def _get_doc_data(self, doc_info: dict) -> dict | None:
-        """Get document data by fetching document info page and final document content"""
-        # Get the doc_info_link and remove it from the dict
-        doc_info_link = doc_info.pop("doc_info_link", None)
+        """Fetch document HTML and convert to markdown."""
+        document_url = doc_info.get("document_url", "")
         title = doc_info.get("title", "")
-        if not doc_info_link:
+
+        if not document_url:
+            return None
+
+        if self._is_already_scraped(document_url, title):
+            return None
+
+        soup = await self.request_service.get_soup(document_url)
+        if not soup:
             await self._save_doc_error(
                 title=title,
                 year=doc_info.get("year", ""),
-                html_link="",
-                error_message="Missing doc_info_link",
+                html_link=document_url,
+                error_message="Failed to fetch document page",
             )
             return None
 
-        # First, get the document info page
-        info_soup = await self.request_service.get_soup(doc_info_link)
-        if not info_soup:
+        html_content = soup.prettify()
+        html_string = self._wrap_html(html_content)
+
+        text_markdown = await self._get_markdown(html_content=html_string)
+        if not text_markdown or not text_markdown.strip():
             await self._save_doc_error(
                 title=title,
                 year=doc_info.get("year", ""),
-                html_link=doc_info_link,
-                error_message="Failed to get document info page",
-            )
-            return None
-
-        # Extract situation from VIGENTE field
-        situation = "Não consta"
-        vigente_tag = info_soup.find(
-            lambda tag: tag.name == "td" and "VIGENTE:" in tag.text
-        )
-        vigent_text = vigente_tag.find_next("td") if vigente_tag else ""
-        if vigent_text and "não" in vigent_text.text.lower():
-            situation = "Revogada"
-        elif vigent_text and "sim" in vigent_text.text.lower():
-            situation = "Não consta revogação expressa"
-
-        # Look for "Texto Integral" link to get the actual document
-        document_url = info_soup.find("a", string="Texto Integral")["href"]
-
-        if self._is_already_scraped(document_url or doc_info_link, title):
-            return None
-
-        # If we have the document URL, fetch the content
-        text_markdown = ""
-        raw_content = b""
-        content_ext = ".html"
-        if document_url:
-            doc_soup = await self.request_service.get_soup(document_url)
-
-            body = doc_soup.find("div", class_="Section1")
-            if not body:
-                await self._save_doc_error(
-                    title=title,
-                    year=doc_info.get("year", ""),
-                    html_link=document_url,
-                    error_message="No Section1 div found in document",
-                )
-                return None
-
-            html_string = body.prettify().strip()
-            html_string = self._wrap_html(html_string)
-
-            text_markdown = await self._get_markdown(html_content=html_string)
-            raw_content = html_string.encode("utf-8")
-
-        if not text_markdown:
-            await self._save_doc_error(
-                title=title,
-                year=doc_info.get("year", ""),
-                html_link=document_url or doc_info_link,
+                html_link=document_url,
                 error_message="Empty markdown from document",
             )
             return None
 
+        norm_type = "Legislação"
+        m = _RE_TYPE_FROM_TITLE.match(title)
+        if m:
+            matched = m.group(1)
+            norm_type = _ABBREV_TO_TYPE.get(matched.upper(), matched.title())
+
         doc_info.update(
             {
-                "situation": situation,
+                "type": norm_type,
+                "situation": "Não consta",
                 "text_markdown": text_markdown,
-                "document_url": document_url or doc_info_link,
-                "_raw_content": raw_content,
-                "_content_extension": content_ext,
+                "_raw_content": html_content.encode("utf-8"),
+                "_content_extension": ".html",
             }
         )
 
@@ -320,37 +177,43 @@ class SantaCatarinaScraper(StateScraper):
     async def _scrape_type(
         self, norm_type: str, norm_type_id: str, year: int
     ) -> list[dict]:
-        """Scrape norms for a specific type and year"""
-        try:
-            documents = await self._get_docs_links(norm_type_id, year)
+        """Scrape documents for a given search path and year."""
+        documents = await self._get_docs_links(norm_type_id, year)
 
-            if not documents:
-                return []
-
-            for doc in documents:
-                doc["year"] = year
-            ctx = {"year": year, "type": norm_type, "situation": "N/A"}
-            tasks = [
-                self._with_save(self._get_doc_data(doc_info), ctx)
-                for doc_info in documents
-            ]
-            results = await self._gather_results(
-                tasks,
-                context=ctx,
-                desc=f"SANTA CATARINA | {norm_type}",
-            )
-
-            if self.verbose:
-                logger.info(
-                    f"Finished scraping for Year: {year} | Type: {norm_type} | Results: {len(results)}"
-                )
-
-            return results
-
-        except Exception as e:
-            logger.error(
-                f"Error scraping Year: {year} | Type: {norm_type} | Error: {e}"
-            )
+        if not documents:
             return []
 
-    # _scrape_year uses default from BaseScraper
+        for doc in documents:
+            doc["year"] = year
+        ctx = {"year": year, "type": norm_type, "situation": "N/A"}
+        tasks = [
+            self._with_save(self._get_doc_data(doc_info), ctx) for doc_info in documents
+        ]
+        results = await self._gather_results(
+            tasks,
+            context=ctx,
+            desc=f"SANTA CATARINA | {norm_type}",
+        )
+
+        if self.verbose:
+            logger.info(
+                f"Finished scraping Year: {year} | Type: {norm_type} | "
+                f"Results: {len(results)}"
+            )
+
+        return results
+
+    async def _scrape_year(self, year: int) -> list[dict]:
+        """Override to deduplicate search paths (legislativo/executivo)."""
+        scraped_paths: set[str] = set()
+        all_results: list[dict] = []
+
+        for norm_type, search_path in self.types.items():
+            if search_path in scraped_paths:
+                continue
+            scraped_paths.add(search_path)
+
+            results = await self._scrape_type(norm_type, search_path, year)
+            all_results.extend(results)
+
+        return all_results

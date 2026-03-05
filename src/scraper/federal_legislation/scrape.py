@@ -27,17 +27,21 @@ COVERAGE = [""]
 
 TYPES = [
     "Alvará",
-    "Ato",
+    "Ato+Conjunto",
+    "Ato+Declaratório+do+Presidente+da+Mesa",
+    "Ato+do+Presidente+da+Mesa",
     "Carta%20Régia",
     "Carta+Imperial",
     "Constitui%C3%A7%C3%A3o",
     "Decisão",
     "Decreto",
+    "Decreto+Legislativo",
     "Decreto+Sem+N%C3%BAmero",
     "Decreto-Lei",
     "Emenda+Constitucional",
     "Instrução",
-    "Lei",
+    "Lei+Complementar",
+    "Lei+Ordin%C3%A1ria",
     "Manifesto",
     "Mensagem",
     "Pacto",
@@ -120,7 +124,7 @@ class CamaraDepScraper(BaseScraper):
         # Get soup from url
         soup = await self.request_service.get_soup(url)
 
-        if soup is None:
+        if not soup:
             return documents_html_links_info
 
         # Get all documents html links from page
@@ -152,53 +156,40 @@ class CamaraDepScraper(BaseScraper):
         """Get proper document text link from given document html link"""
 
         soup = await self.request_service.get_soup(document_html_link)
-        if soup is None:
+        if not soup:
             logger.error(f"Could not get soup for document: {title}")
-            error_data = {
-                "title": title,
-                "year": self.params["ano"],
-                "situation": self.params["situacao"],
-                "type": self.params["tipo"],
-                "summary": summary,
-                "html_link": document_html_link,
-            }
-            await self.saver.save_error(
-                error_data, error_message="Could not fetch page HTML"
+            await self._save_doc_error(
+                title=title,
+                year=self.params["ano"],
+                situation=self.params["situacao"],
+                norm_type=self.params["tipo"],
+                html_link=document_html_link,
+                error_message="Could not fetch page HTML",
             )
             return None
 
-        # check if not found (text not available)
         not_found = soup.find("h1", text="Not Found")
         if not_found:
             logger.warning(f"Document not found: {title}")
-            await self.saver.save_error(
-                {
-                    "title": title,
-                    "year": self.params["ano"],
-                    "situation": self.params["situacao"],
-                    "type": self.params["tipo"],
-                    "summary": summary,
-                    "html_link": document_html_link,
-                },
+            await self._save_doc_error(
+                title=title,
+                year=self.params["ano"],
+                situation=self.params["situacao"],
+                norm_type=self.params["tipo"],
+                html_link=document_html_link,
                 error_message="Document text not found (404)",
             )
             return None
 
         document_text_links = soup.find("div", class_="sessao")
         if not document_text_links:
-            # probably link doesn't exist (error in website)
             logger.error(f"Could not find text link for document: {title}")
-            error_data = {
-                "title": title,
-                "year": self.params["ano"],
-                "situation": self.params["situacao"],
-                "type": self.params["tipo"],
-                "summary": summary,
-                "html_link": document_html_link,
-                "soup": str(soup.prettify()),  # include soup for debugging
-            }
-            await self.saver.save_error(
-                error_data,
+            await self._save_doc_error(
+                title=title,
+                year=self.params["ano"],
+                situation=self.params["situacao"],
+                norm_type=self.params["tipo"],
+                html_link=document_html_link,
                 error_message="Could not find text link div.sessao in page",
             )
             return None
@@ -237,17 +228,12 @@ class CamaraDepScraper(BaseScraper):
 
         if document_text_link is None:
             logger.error(f"Could not find text link for document: {title}")
-            error_data = {
-                "title": title,
-                "year": self.params["ano"],
-                "situation": self.params["situacao"],
-                "type": self.params["tipo"],
-                "summary": summary,
-                "html_link": document_html_link,
-                "soup": str(soup.prettify()),  # include soup for debugging
-            }
-            await self.saver.save_error(
-                error_data,
+            await self._save_doc_error(
+                title=title,
+                year=self.params["ano"],
+                situation=self.params["situacao"],
+                norm_type=self.params["tipo"],
+                html_link=document_html_link,
                 error_message="No text link found in page anchors",
             )
             return None
@@ -265,59 +251,61 @@ class CamaraDepScraper(BaseScraper):
             "document_url": str
         }"""
         try:
-            # Keywords to remove from the page before conversion
-            remove_keywords = [
-                "Legislação Informatizada",
-                "Carregando",
-                "Dados da Norma",
-                "Por favor, aguarde.",
-                "Veja também:",
-            ]
-
             # Fetch and clean HTML with BS4
             soup = await self.request_service.get_soup(document_text_link)
             if not soup:
                 logger.warning(f"Could not fetch document page: {title}")
-                error_data = {
-                    "title": title,
-                    "year": self.params["ano"],
-                    "situation": self.params["situacao"],
-                    "type": self.params["tipo"],
-                    "summary": summary,
-                    "html_link": document_text_link,
-                }
-                await self.saver.save_error(
-                    error_data,
+                await self._save_doc_error(
+                    title=title,
+                    year=self.params["ano"],
+                    situation=self.params["situacao"],
+                    norm_type=self.params["tipo"],
+                    html_link=document_text_link,
                     error_message="Could not fetch document page",
                 )
                 return None
 
-            # Remove elements containing unwanted keywords
-            for tag in soup.find_all(True):
-                if tag.string and any(kw in tag.string for kw in remove_keywords):
-                    tag.decompose()
+            # Extract only the main content area (div#content) to avoid
+            # navigation menus, headers, footers, and other portal chrome
+            content_div = soup.find("div", id="content")
+            if content_div is None:
+                content_div = soup.find("div", class_="textoNorma")
+            if content_div is None:
+                # Fallback: use entire page but aggressively strip chrome
+                content_div = soup
+
+            # Remove boilerplate sections within content
+            for selector in [
+                {"class_": "vejaTambem"},
+                {"class_": "documentFirstHeading"},
+                {"class_": "rodapeTexto"},
+                {"class_": "publicacoesTI"},
+            ]:
+                for el in content_div.find_all(True, **selector):
+                    el.decompose()
+
+            # Remove page-chrome elements (safety net for fallback path)
+            for tag_name in ["header", "footer", "nav", "script", "style", "aside"]:
+                for el in content_div.find_all(tag_name):
+                    el.decompose()
 
             # Remove all hyperlinks (unwrap <a> tags, keeping inner text)
-            for a_tag in soup.find_all("a"):
+            for a_tag in content_div.find_all("a"):
                 a_tag.unwrap()
 
-            html_string = soup.prettify()
+            html_string = content_div.prettify()
 
             # Convert cleaned HTML to markdown
             text_markdown = await self._get_markdown(html_content=html_string)
 
             if not text_markdown or not text_markdown.strip():
                 logger.warning(f"Document text is empty after conversion: {title}")
-                error_data = {
-                    "title": title,
-                    "year": self.params["ano"],
-                    "situation": self.params["situacao"],
-                    "type": self.params["tipo"],
-                    "summary": summary,
-                    "html_link": document_text_link,
-                }
-                await self.saver.save_error(
-                    error_data,
+                await self._save_doc_error(
+                    title=title,
+                    year=self.params["ano"],
+                    situation=self.params["situacao"],
+                    norm_type=self.params["tipo"],
+                    html_link=document_text_link,
                     error_message="Document text is empty after conversion",
                 )
                 return None
@@ -332,15 +320,14 @@ class CamaraDepScraper(BaseScraper):
             }
         except Exception as e:
             logger.error(f"Error converting document to markdown: {title} - {e}")
-            error_data = {
-                "title": title,
-                "year": self.params["ano"],
-                "situation": self.params["situacao"],
-                "type": self.params["tipo"],
-                "summary": summary,
-                "html_link": document_text_link,
-            }
-            await self.saver.save_error(error_data, error_message=str(e))
+            await self._save_doc_error(
+                title=title,
+                year=self.params["ano"],
+                situation=self.params["situacao"],
+                norm_type=self.params["tipo"],
+                html_link=document_text_link,
+                error_message=str(e),
+            )
             return None
 
     async def _scrape_situation_type(
@@ -353,7 +340,7 @@ class CamaraDepScraper(BaseScraper):
         per_page = 20
         soup = await self.request_service.get_soup(url)
 
-        if soup is None:
+        if not soup:
             logger.warning(f"Could not get soup for url: {url}")
             return results
 
@@ -380,16 +367,7 @@ class CamaraDepScraper(BaseScraper):
             for page in range(1, pages + 1)
         ]
         page_results = await asyncio.gather(*tasks, return_exceptions=True)
-        for result in page_results:
-            if isinstance(result, Exception):
-                logger.error(f"Error fetching page: {result}")
-                continue
-            if result is not None:
-                if isinstance(result, list):
-                    documents_html_links_info.extend(result)
-                else:
-                    logger.warning(f"Unexpected result type: {type(result)}")
-                    logger.warning(f"Result: {result}")
+        documents_html_links_info.extend(self._flatten_results(page_results))
 
         # Get proper document text link from each document html link
         documents_text_links = []
@@ -450,11 +428,7 @@ class CamaraDepScraper(BaseScraper):
         ]
         valid = await self._gather_results(
             tasks,
-            context={"year": year, "type": "NA", "situation": "NA"},
+            context={"year": year, "type": "", "situation": ""},
             desc=f"{self.name} | Year {year}",
         )
-        return [
-            item
-            for result in valid
-            for item in (result if isinstance(result, list) else [result])
-        ]
+        return self._flatten_results(valid)

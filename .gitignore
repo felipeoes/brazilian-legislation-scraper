@@ -175,3 +175,7 @@ error_log.json
 artifacts/
 test_data/
 scripts/
+proxies.txt
+
+# AI-RELATED
+.claude/

@@ -207,7 +207,7 @@ class BedrockClient:
 
         response = await self.request_service.make_request(**kwargs)
 
-        if response is None:
+        if not response:
             raise RuntimeError(
                 f"Bedrock Converse API returned no response for {endpoint_url}"
             )

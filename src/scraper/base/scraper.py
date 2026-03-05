@@ -105,6 +105,7 @@ class BaseScraper:
         max_retries: int = 3,
         verbose: bool = False,
         overwrite: bool = False,
+        disable_cookies: bool = False,
     ):
         self.base_url = base_url
         self.name = name
@@ -126,6 +127,7 @@ class BaseScraper:
             proxy_service=self.proxy_service,
             max_workers=max_workers,
             max_retries=max_retries,
+            disable_cookies=disable_cookies,
         )
         self.ocr_service = (
             LLMOCRService(

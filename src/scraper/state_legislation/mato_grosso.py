@@ -4,7 +4,6 @@ from urllib.parse import urljoin, urlencode
 from bs4 import BeautifulSoup
 import asyncio
 from loguru import logger
-from tenacity import retry, stop_after_attempt, wait_exponential
 from src.scraper.base.scraper import StateScraper
 
 
@@ -90,28 +89,22 @@ class MTAlmtScraper(StateScraper):
         self.max_year_historic = 1978
         self.min_year = 1979
         self.token = None
-        self.regex_total_items = re.compile(r"Total de registros:\n\s+(\d+)\n")
+        self.regex_total_items = re.compile(r"Total de registros:\s+([\d.]+)")
         self.header_remove_regex = re.compile(
             r"http://www.al.mt.gov.br/TNX/viewLegislacao.php\?cod=\d+"
         )
 
-    @retry(
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=2, min=2, max=30),
-        reraise=True,
-    )
     async def _set_token(self):
-        """Get token for search request"""
+        """Get token for search request (optional — field was removed from the form)."""
         url = f"{self.base_url}/norma-juridica"
         soup = await self.request_service.get_soup(url)
+        if not soup:
+            self.token = ""
+            return
         token_element = soup.find(
             "input", {"name": "almt_form_norma_juridica_ato_busca_avancada[_token]"}
         )
-        if not token_element:
-            raise ValueError("Token element not found in the page")
-
-        token = token_element["value"]
-        self.token = token
+        self.token = token_element["value"] if token_element else ""
 
     def _build_search_url(
         self, norm_type_id: str, year: int, page: int, is_historic: bool = False
@@ -151,10 +144,9 @@ class MTAlmtScraper(StateScraper):
                 "almt_form_norma_juridica_ato_busca_avancada[dataInicioVigenciaAte]": "",
                 "almt_form_norma_juridica_ato_busca_avancada[dataFimVigenciaDe]": "",
                 "almt_form_norma_juridica_ato_busca_avancada[dataFimVigenciaAte]": "",
-                "almt_form_norma_juridica_ato_busca_avancada[revogarNormaJuridica]": "nao",
+                "almt_form_norma_juridica_ato_busca_avancada[revogado]": "",
                 "almt_form_norma_juridica_ato_busca_avancada[possuiVeto]": "",
                 "almt_form_norma_juridica_ato_busca_avancada[possuiRemissao]": "",
-                "almt_form_norma_juridica_ato_busca_avancada[_token]": self.token or "",
                 "page": page,
             }
             return f"{self.base_url}/norma-juridica?{urlencode(params)}"
@@ -166,7 +158,7 @@ class MTAlmtScraper(StateScraper):
         """Get total number of norms from search page"""
         total_items = self.regex_total_items.search(soup.prettify())
         if total_items:
-            return int(total_items.group(1))
+            return int(total_items.group(1).replace(".", ""))
 
         return 0
 
@@ -392,6 +384,7 @@ class MTAlmtScraper(StateScraper):
 
             # get total pages (always 10 records per page)
             total_items = self._get_total_norms(soup)
+
             if total_items == 0:
                 return []
 

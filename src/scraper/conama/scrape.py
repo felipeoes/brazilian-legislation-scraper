@@ -60,6 +60,93 @@ class ConamaScraper(BaseScraper):
         ano = year or self.params["ano"]
         return f"{self.base_url}?option={self.params['option']}&order={self.params['order']}&offset={offset}&limit={self.params['limit']}&task={self.params['task']}&tipo={TYPES[norm_type]}&ano={ano}"
 
+    _DOU_GARBAGE_STRINGS = [
+        "DOU - Imprensa Nacional",
+        "DIÁRIO OFICIAL DA UNIÃO",
+        "Imprensa Nacional",
+    ]
+
+    _DISCLAIMER_PATTERNS = [
+        re.compile(r"Est[ea] conte.do não substitui", re.IGNORECASE),
+        re.compile(r"Est[ea] texto não substitui", re.IGNORECASE),
+        re.compile(r"Ess[ea] texto não substitui", re.IGNORECASE),
+        re.compile(r"\*?Obs:?\*?\*?\s*não há registro no sítio", re.IGNORECASE),
+    ]
+
+    _PDF_CLEANUP_PATTERNS: list[tuple[str, str, int]] = [
+        (r"\x0c", "", 0),
+        # SEI artefacts
+        (r"Ato \d+ \(\d+\)\s+SEI \S+ / pg\. \d+", "", 0),
+        (r"Documento assinado eletronicamente por\s+.+?de 2020\s*\.?", "", re.DOTALL),
+        (
+            r"A autenticidade deste documento pode ser conferida no site\s+.+?código CRC \w+\.?",
+            "",
+            re.DOTALL,
+        ),
+        (r"Refer.ncia: Processo n. \S+\s*\n*SEI n. \d+", "", 0),
+        # DOU artefacts (DOU web pages saved as PDF)
+        (r"\d{2}/\d{2}/\d{4},\s*\d{2}:\d{2}\s*\n*", "", 0),
+        (r"^.+?- DOU - Imprensa Nacional\s*\n*", "", re.MULTILINE),
+        (r"DI.RIO OFICIAL DA UNI.O\s*\n*", "", 0),
+        (r"Publicado em:.*?P.gina:.*?\n*", "", re.DOTALL),
+        (r".rg.o:.*?Meio Ambiente.*?\n+", "", 0),
+        (r"https?://www\.in\.gov\.br/\S+", "", 0),
+        (r"\n\d+/\d+\s*$", "\n", re.MULTILINE),
+    ]
+
+    def _clean_dou_html(self, soup: BeautifulSoup) -> BeautifulSoup:
+        """Remove DOU website chrome from HTML before markdown conversion."""
+        for tag_name in ["header", "footer", "nav", "script", "style", "aside"]:
+            for el in soup.find_all(tag_name):
+                el.decompose()
+
+        # Remove <title> tag (contains duplicated title + "DOU - Imprensa Nacional")
+        for el in soup.find_all("title"):
+            el.decompose()
+
+        for el in soup.find_all(True):
+            text = el.get_text(strip=True)
+            for garbage in self._DOU_GARBAGE_STRINGS:
+                if garbage in text and len(text) < 300:
+                    el.decompose()
+                    break
+
+        for el in soup.find_all(True):
+            text = el.get_text(strip=True)
+            if re.match(r"^Publicado em:\s*\d", text):
+                el.decompose()
+                continue
+            if re.match(r"^Órgão:\s*", text):
+                el.decompose()
+                continue
+            if re.match(r"^\d{2}/\d{2}/\d{4},\s*\d{2}:\d{2}$", text):
+                el.decompose()
+                continue
+            if re.match(r"^\d+/\d+$", text):
+                el.decompose()
+                continue
+            for pat in self._DISCLAIMER_PATTERNS:
+                if pat.search(text) and len(text) < 200:
+                    el.decompose()
+                    break
+
+        for el in soup.find_all("a"):
+            href = el.get("href", "")
+            if "in.gov.br" in href:
+                el.decompose()
+            else:
+                el.unwrap()
+
+        return soup
+
+    def _clean_pdf_markdown(self, text: str) -> str:
+        """Clean SEI/PDF-specific artefacts from extracted text."""
+        for pattern, replacement, flags in self._PDF_CLEANUP_PATTERNS:
+            text = re.sub(pattern, replacement, text, flags=flags)
+        for pat in self._DISCLAIMER_PATTERNS:
+            text = pat.sub("", text)
+        return self._clean_markdown(text)
+
     async def _get_doc_data(self, doc_info: dict) -> dict | None:
         """Get document data from norm dict. Download url for pdf will follow the pattern: https://conama.mma.gov.br/?option=com_sisconama&task=arquivo.download&id={id}"""
         doc_id = doc_info.get("aid")
@@ -94,40 +181,37 @@ class ConamaScraper(BaseScraper):
 
         # Fetch the document once to detect content type and avoid double requests
         resp = await self.request_service.make_request(doc_url)
-        if resp is None:
+        if not resp:
             logger.warning(
                 f"Failed to fetch document for {doc_type} CONAMA Nº {doc_number}/{doc_year}"
             )
-            await self.saver.save_error(
-                {
-                    "title": f"{doc_type} CONAMA Nº {doc_number}/{doc_year}",
-                    "year": doc_year,
-                    "situation": "",
-                    "type": doc_type,
-                    "html_link": doc_url,
-                },
+            await self._save_doc_error(
+                title=f"{doc_type} CONAMA Nº {doc_number}/{doc_year}",
+                year=doc_year,
+                norm_type=doc_type,
+                html_link=doc_url,
                 error_message="Failed to fetch document URL",
             )
             return None
 
         content_type = (resp.content_type or "").lower()
 
-        if "html" in content_type:
-            # HTML document — strip hyperlinks and convert to markdown
+        is_html = "html" in content_type
+        if is_html:
             body = await resp.read()
             soup = BeautifulSoup(body, "html.parser")
-            for a_tag in soup.find_all("a"):
-                a_tag.unwrap()
+            soup = self._clean_dou_html(soup)
             html_content = soup.prettify()
             text_markdown = await self._get_markdown(
                 html_content=html_content,
             )
+            text_markdown = self._clean_markdown(text_markdown)
             raw_content = html_content.encode("utf-8")
             content_ext = ".html"
         else:
-            # PDF or other binary — read bytes, then convert via stream
             body = await resp.read()
             text_markdown = await self._get_markdown(response=resp)
+            text_markdown = self._clean_pdf_markdown(text_markdown)
             raw_content = body
             content_ext = ".pdf"
 
@@ -135,14 +219,11 @@ class ConamaScraper(BaseScraper):
             logger.warning(
                 f"Empty markdown for {doc_type} CONAMA Nº {doc_number}/{doc_info['ano']}"
             )
-            await self.saver.save_error(
-                {
-                    "title": f"{doc_type} CONAMA Nº {doc_number}/{doc_info['ano']}",
-                    "year": doc_info["ano"],
-                    "situation": "",
-                    "type": doc_type,
-                    "html_link": doc_url,
-                },
+            await self._save_doc_error(
+                title=f"{doc_type} CONAMA Nº {doc_number}/{doc_info['ano']}",
+                year=doc_info["ano"],
+                norm_type=doc_type,
+                html_link=doc_url,
                 error_message="Empty markdown after conversion",
             )
             return None
@@ -157,14 +238,11 @@ class ConamaScraper(BaseScraper):
                 f"Server error response for {doc_type} CONAMA Nº {doc_number}/{doc_info['ano']}: "
                 f"{text_markdown}"
             )
-            await self.saver.save_error(
-                {
-                    "title": f"{doc_type} CONAMA Nº {doc_number}/{doc_info['ano']}",
-                    "year": doc_info["ano"],
-                    "situation": "",
-                    "type": doc_type,
-                    "html_link": doc_url,
-                },
+            await self._save_doc_error(
+                title=f"{doc_type} CONAMA Nº {doc_number}/{doc_info['ano']}",
+                year=doc_info["ano"],
+                norm_type=doc_type,
+                html_link=doc_url,
                 error_message=f"Server error response: {text_markdown}",
             )
             return None
@@ -174,55 +252,24 @@ class ConamaScraper(BaseScraper):
         if doc_status and self._situation_regex.search(doc_status):
             situation = "Revogada"
 
-        text_markdown = self._clean_markdown(
-            text_markdown,
-            replace=[
-                (
-                    re.escape(
-                        "*Obs:** não há registro no sítio http://portal.imprensanacional.gov.br/ devido a data de publicação ser anterior ao ano de 1990."
-                    ),
-                    "",
-                ),
-                (
-                    re.escape(
-                        "*Obs: não há registro no sítio http://portal.imprensanacional.gov.br/ devido a data de publicação ser anterior ao ano de 1990."
-                    ),
-                    "",
-                ),
-                (
-                    r"Esse texto não substitui o publicado no Boletim de Serviço (.*?), do Ministério do Interior",
-                    "",
-                ),
-                (
-                    r"Este texto não substitui o publicado no Boletim de Serviço, de (.*?)\.",
-                    "",
-                ),
-                (
-                    r"Este texto não substitui o publicado no DOU, de (.*?)\.",
-                    "",
-                ),
-            ],
-        )
-
         is_valid, reason = self._valid_markdown(text_markdown, 200)
         if not is_valid:
             logger.warning(
                 f"Markdown text for {doc_type} CONAMA Nº {doc_number}/{doc_info['ano']} is invalid: {reason}. Length: {len(text_markdown) if text_markdown else 0} chars."
             )
-            await self.saver.save_error(
-                {
-                    "title": f"{doc_type} CONAMA Nº {doc_number}/{doc_info['ano']}",
-                    "year": doc_info["ano"],
-                    "situation": situation,
-                    "type": doc_type,
-                    "html_link": doc_url,
-                },
+            await self._save_doc_error(
+                title=f"{doc_type} CONAMA Nº {doc_number}/{doc_info['ano']}",
+                year=doc_info["ano"],
+                situation=situation,
+                norm_type=doc_type,
+                html_link=doc_url,
                 error_message="Markdown text very short after cleaning, may indicate conversion issues",
             )
             return None
 
         # title will be like Resolução CONAMA Nº 501/2021
         result = {
+            "year": doc_year,
             "title": title,
             "id": doc_id,
             "number": doc_number,
@@ -245,7 +292,7 @@ class ConamaScraper(BaseScraper):
         """Fetch norms from a single pagination page."""
         url = self._format_search_url(norm_type, offset=offset, year=year_str)
         response = await self.request_service.make_request(url)
-        if response is None:
+        if not response:
             return []
         try:
             json_response = await response.json(content_type=None)
@@ -264,7 +311,7 @@ class ConamaScraper(BaseScraper):
         url = self._format_search_url(norm_type, offset=0, year=year_str)
 
         response = await self.request_service.make_request(url)
-        if response is None:
+        if not response:
             return []
 
         # CONAMA API may return JSON with text/html content-type, so parse with content_type=None
@@ -291,9 +338,7 @@ class ConamaScraper(BaseScraper):
                 context={"year": year_str, "type": norm_type, "situation": situation},
                 desc=f"CONAMA | {norm_type} | pagination",
             )
-            for result in page_results:
-                if isinstance(result, list):
-                    norms.extend(result)
+            norms.extend(self._flatten_results(page_results))
 
         type_results = []
         # get all norm data
@@ -335,8 +380,4 @@ class ConamaScraper(BaseScraper):
             context={"year": year, "type": "NA", "situation": "NA"},
             desc=f"{self.name} | Year {year}",
         )
-        return [
-            item
-            for result in valid
-            for item in (result if isinstance(result, list) else [result])
-        ]
+        return self._flatten_results(valid)
