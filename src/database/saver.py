@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 import asyncio
 import hashlib
 import json
 import re
+from collections.abc import Callable, Awaitable
 from unidecode import unidecode
 from os import environ
 from pathlib import Path
@@ -16,53 +19,64 @@ load_dotenv()
 SAVE_DIR = Path(rf"{environ.get('SAVE_DIR', 'outputs/legislation')}")
 ERROR_LOG_DIR = rf"{environ.get('ERROR_LOG_DIR', 'logs/legislation')}"
 
-logger.info(f"Default saving to SAVE_DIR: {SAVE_DIR}")
-logger.info(f"Default saving to ERROR_LOG_DIR: {ERROR_LOG_DIR}")
+MHTMLCaptureFn = Callable[[str], Awaitable[bytes]]
 
 
 class FileSaver:
-    """File saver to save data to txt files with optimized performance"""
+    """Async file saver with buffered JSON writes and per-year locking."""
 
     def __init__(
         self,
         save_dir: Path = SAVE_DIR,
         error_log_dir: str = ERROR_LOG_DIR,
-        max_path_length: int = 225,  # Windows max path length
+        max_path_length: int = 225,
         verbose: bool = False,
         flush_interval: int = 50,
+        max_workers: int = 16,
+        mhtml_capture_fn: MHTMLCaptureFn | None = None,
     ):
         self.save_dir = save_dir
         self.error_log_dir = error_log_dir
         self.max_path_length = max_path_length
         self.verbose = verbose
         self.flush_interval = flush_interval
+        self.max_workers = max_workers
+        self._mhtml_capture_fn = mhtml_capture_fn
 
-        # Regex patterns compiled once
-        self.format_regex_1 = re.compile(r"[\s]+")
-        self.format_regex_2 = re.compile(r"[^\w\s-]")
+        self._format_regex_ws = re.compile(r"[\s]+")
+        self._format_regex_special = re.compile(r"[^\w\s-]")
 
-        # Per-year locks for concurrent document saves within a year
         self._year_locks: dict[int, asyncio.Lock] = {}
-        # In-memory buffer: year -> {(doc_url, title): doc_dict}
         self._pending_docs: dict[int, dict[tuple[str, str], dict]] = {}
-        self._pending_counts: dict[int, int] = {}
+
         if self.verbose:
             logger.info(f"Saving to {save_dir}")
             logger.info(f"Saving errors to {error_log_dir}")
 
+    _ERROR_PAGE_MARKERS = (
+        b"Azion - Default error page",
+        b"<title>403 Forbidden</title>",
+        b"<title>Access Denied</title>",
+        b"<title>Error</title>",
+    )
+
+    def _is_error_page(self, content: bytes) -> bool:
+        """Return True if *content* looks like a CDN / WAF error page."""
+        head = content[:2048]
+        return any(marker in head for marker in self._ERROR_PAGE_MARKERS)
+
     def _validate_data(self, data: dict[str, Any]) -> bool:
-        """Validate that data contains required fields"""
+        """Validate that data contains required fields."""
         required_fields = ["year", "document_url", "title"]
         return all(
             field in data and data[field] is not None for field in required_fields
         )
 
     def _truncate_path(self, path: str) -> str:
-        """Truncate path if it exceeds max_path_length"""
+        """Truncate path if it exceeds max_path_length."""
         if len(path) <= self.max_path_length:
             return path
 
-        # Keep extension and truncate filename
         path_obj = Path(path)
         extension = path_obj.suffix
         max_name_length = (
@@ -84,9 +98,13 @@ class FileSaver:
     def _sanitize_filename(self, name: str) -> str:
         """Sanitize a string for use as a filename."""
         name = unidecode(name)
-        name = self.format_regex_1.sub("_", name)
-        name = self.format_regex_2.sub("", name)
+        name = self._format_regex_ws.sub("_", name)
+        name = self._format_regex_special.sub("", name)
         return name.strip("_") or "document"
+
+    async def cleanup(self) -> None:
+        """Flush remaining documents."""
+        await self.flush_all()
 
     async def _load_year_data(self, year: int) -> dict[tuple[str, str], dict]:
         """Load existing data.json for a year, keyed by (document_url, title)."""
@@ -117,15 +135,12 @@ class FileSaver:
         main_file = year_dir / "data.json"
         all_items = list(data.values())
         async with aiofiles.open(main_file, "w", encoding="utf-8") as f:
-            await f.write(json.dumps(all_items, ensure_ascii=False, indent=2))
+            await f.write(
+                json.dumps(all_items, ensure_ascii=False, indent=2, sort_keys=True)
+            )
 
     async def get_scraped_keys(self, year: int) -> set[tuple[str, str]]:
-        """Return set of (document_url, title) pairs already scraped for a year.
-
-        Only documents that have a ``file_path`` (i.e. their source file was
-        saved) are considered fully scraped.  Legacy entries without
-        ``file_path`` will be re-processed on the next run.
-        """
+        """Return set of (document_url, title) pairs already scraped for a year."""
         lock = self._get_year_lock(year)
         async with lock:
             data = await self._load_year_data(year)
@@ -137,24 +152,37 @@ class FileSaver:
         raw_content: bytes | None = None,
         content_extension: str | None = None,
     ) -> dict[str, Any] | None:
-        """Save a single document: source file written immediately, JSON metadata buffered.
-
-        The JSON metadata is accumulated in memory and flushed to ``data.json``
-        every ``flush_interval`` documents or when ``flush()`` / ``flush_all()``
-        is called.  Source files (PDF, HTML, etc.) are always written to disk
-        immediately so that no data is lost on crash.
-
-        Args:
-            doc_data: Document dict (must have year, document_url, title).
-            raw_content: Raw source file bytes (PDF, HTML, etc.) to save.
-            content_extension: File extension for the source file (e.g. ".pdf", ".html").
-
-        Returns:
-            Updated doc_data dict with ``file_path`` added, or None on failure.
-        """
+        """Save a single document: source file written immediately, JSON metadata buffered."""
         if not self._validate_data(doc_data):
             logger.warning(f"Invalid document data, skipping save: {doc_data}")
             return None
+
+        # Capture MHTML before acquiring the year lock (slow I/O).
+        # Falls back to the original HTML when capture fails or returns
+        # an error page (e.g. Azion CDN blocking headless browsers).
+        if (
+            raw_content
+            and content_extension
+            and content_extension.lstrip(".") == "html"
+            and self._mhtml_capture_fn
+        ):
+            doc_url = doc_data.get("document_url", "")
+            if doc_url:
+                try:
+                    mhtml_bytes = await self._mhtml_capture_fn(doc_url)
+                    if self._is_error_page(mhtml_bytes):
+                        logger.debug(
+                            f"MHTML captured an error page for {doc_url}, "
+                            "falling back to raw HTML"
+                        )
+                    else:
+                        raw_content = mhtml_bytes
+                        content_extension = ".mhtml"
+                except Exception as e:
+                    logger.debug(
+                        f"MHTML capture failed for {doc_url}, "
+                        f"falling back to raw HTML: {e}"
+                    )
 
         year = int(doc_data["year"])
         lock = self._get_year_lock(year)
@@ -165,12 +193,12 @@ class FileSaver:
                 year_dir = save_dir / str(year)
                 year_dir.mkdir(parents=True, exist_ok=True)
 
-                # Strip internal fields before persisting
                 clean_data = {
-                    k: v for k, v in doc_data.items() if not k.startswith("_")
+                    k: v
+                    for k, v in doc_data.items()
+                    if not k.startswith("_") and k != "html_string"
                 }
 
-                # Save source file immediately if raw content provided
                 if raw_content and content_extension:
                     docs_dir = year_dir / "docs"
                     docs_dir.mkdir(parents=True, exist_ok=True)
@@ -193,25 +221,16 @@ class FileSaver:
                     async with aiofiles.open(file_path, "wb") as f:
                         await f.write(raw_content)
 
-                    # Store relative path from save_dir for portability
                     clean_data["file_path"] = str(file_path.relative_to(save_dir))
 
-                # Buffer the JSON metadata instead of writing immediately
                 key = (clean_data.get("document_url", ""), clean_data.get("title", ""))
                 if year not in self._pending_docs:
                     self._pending_docs[year] = {}
-                    self._pending_counts[year] = 0
                 self._pending_docs[year][key] = clean_data
-                self._pending_counts[year] += 1
 
-                if self.verbose:
-                    logger.info(
-                        f"Buffered document '{clean_data.get('title', '?')}' "
-                        f"for year {year} (pending: {self._pending_counts[year]})"
-                    )
+                pending_count = len(self._pending_docs[year])
 
-                # Auto-flush when buffer reaches flush_interval
-                if self._pending_counts[year] >= self.flush_interval:
+                if pending_count >= self.flush_interval:
                     await self._flush_year(year)
 
                 return clean_data
@@ -238,7 +257,6 @@ class FileSaver:
 
         count = len(pending)
         self._pending_docs[year] = {}
-        self._pending_counts[year] = 0
 
         if self.verbose:
             logger.info(
@@ -257,96 +275,15 @@ class FileSaver:
         for year in list(self._pending_docs.keys()):
             await self.flush(year)
 
-    async def save(self, data_list: list[dict[str, Any]]) -> None:
-        """Save a list of data items to files, grouped by year (async)."""
-        if not data_list:
-            return
-
-        # Group items by year
-        data_by_year = {}
-        error_items = []
-
-        for item in data_list:
-            if self._validate_data(item):
-                year = item.get("year")
-                if year:
-                    if year not in data_by_year:
-                        data_by_year[year] = []
-                    data_by_year[year].append(item)
-            else:
-                logger.warning(f"Invalid data format: {item}")
-                error_items.append(item)
-
-        # Save valid items by year
-        for year, items in data_by_year.items():
-            await self._save_year_data(year, items)
-
-        # Save error items
-        for item in error_items:
-            await self.save_error(item)
-
-    async def _save_year_data(self, year: int, items: list[dict[str, Any]]) -> None:
-        """Save data for a specific year, merging with existing data (async)."""
-        lock = self._get_year_lock(year)
-        async with lock:
-            try:
-                existing_data = await self._load_year_data(year)
-
-                # Process new items and merge with existing data
-                new_items_count = 0
-                updated_keys: set[tuple[str, str]] = set()
-
-                for item in items:
-                    document_url = item.get("document_url")
-                    title = item.get("title", "")
-                    if not document_url:
-                        continue
-
-                    key = (document_url, title)
-                    if key in existing_data:
-                        # Update existing document
-                        existing_data[key] = item
-                        updated_keys.add(key)
-                    else:
-                        # New document
-                        new_items_count += 1
-                        existing_data[key] = item
-
-                updated_items_count = len(updated_keys)
-
-                await self._write_year_data(year, existing_data)
-
-                if self.verbose:
-                    total = len(existing_data)
-                    logger.info(
-                        f"Saved data for year {year}: {total} total items "
-                        f"({new_items_count} new, {updated_items_count} updated, "
-                        f"{total - new_items_count - updated_items_count} unchanged)"
-                    )
-
-            except Exception as e:
-                error_msg = f"Error saving {len(items)} items for year {year}: {e}"
-                logger.error(error_msg)
-                # Save individual items as errors
-                for item in items:
-                    await self.save_error(item)
-
     async def save_error(self, data: dict[str, Any], error_message: str = "") -> None:
-        """Save error data to file (async).
-
-        Args:
-            data: Dict with at least title, year, situation, type, html_link.
-            error_message: Human-readable description of what went wrong.
-        """
+        """Save error data to file (async)."""
         file_path = None
         try:
-            # Validate required fields for error data
             required_error_fields = ["title", "year", "situation", "type", "html_link"]
             if not all(field in data for field in required_error_fields):
                 logger.error(f"Missing required fields in error data: {data}")
                 return
 
-            # Inject the error message into the persisted JSON
             if error_message:
                 data = {**data, "error_message": error_message}
 
@@ -355,24 +292,15 @@ class FileSaver:
             type_dir = year_dir / data["type"]
             situation_dir = type_dir / data["situation"]
 
-            # Decode and create directory path
             situation_dir = Path(unquote(str(situation_dir)))
             situation_dir.mkdir(parents=True, exist_ok=True)
 
-            # Clean and format filename components
-            title = unidecode(data["title"]).replace(" ", "_")
-            title = self.format_regex_1.sub("_", title)
-            title = self.format_regex_2.sub("", title)
+            title = self._sanitize_filename(data["title"])
+            html_link = self._sanitize_filename(Path(data["html_link"]).stem)
 
-            html_link = unidecode(data["html_link"]).replace(" ", "_")
-            html_link = self.format_regex_1.sub("_", Path(html_link).stem)
-            html_link = self.format_regex_2.sub("", html_link)
-
-            # Create file path and apply length restrictions
             file_path = situation_dir / f"{title}_{html_link}.json"
             file_path = Path(self._truncate_path(str(file_path)))
 
-            # Save JSON data
             async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
                 await f.write(json.dumps(data, ensure_ascii=False, indent=4))
 
