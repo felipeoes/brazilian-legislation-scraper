@@ -475,22 +475,34 @@ class ICMBioScraper(BaseScraper):
 
     # ── Year-level orchestration ───────────────────────────────────
 
-    async def _scrape_year(self, year: str):
+    async def _scrape_year(self, year: int):
         """Scrape all ICMBio documents for a specific year."""
         year_int = int(year)
 
-        # Fetch all rows from the API once (the dataset is not very large)
-        if not hasattr(self, "_all_rows"):
+        # Fetch all rows from the API and pre-index by year once.
+        if not hasattr(self, "_docs_by_year"):
             logger.info("ICMBIO | Fetching all rows from PowerBI API...")
-            self._all_rows = await self._fetch_all_rows()
-            logger.info(f"ICMBIO | Total rows fetched: {len(self._all_rows)}")
+            all_rows = await self._fetch_all_rows()
+            logger.info(f"ICMBIO | Total rows fetched: {len(all_rows)}")
 
-        # Filter rows for this year and convert to doc dicts
-        docs = []
-        for row in self._all_rows:
-            doc = self._row_to_doc(row)
-            if doc and int(doc["year"]) == year_int:
-                docs.append(doc)
+            docs_by_year: dict[int, list[dict]] = {}
+            parsed_docs = 0
+            for row in all_rows:
+                doc = self._row_to_doc(row)
+                if not doc:
+                    continue
+                doc_year = int(doc["year"])
+                docs_by_year.setdefault(doc_year, []).append(doc)
+                parsed_docs += 1
+
+            self._docs_by_year = docs_by_year
+            if self.verbose:
+                logger.info(
+                    f"ICMBIO | Parsed {parsed_docs} valid docs into "
+                    f"{len(docs_by_year)} yearly buckets"
+                )
+
+        docs = list(self._docs_by_year.get(year_int, []))
 
         if not docs:
             logger.warning(f"No documents found for year {year}")

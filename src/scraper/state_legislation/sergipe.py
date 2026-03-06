@@ -173,13 +173,9 @@ class SergipeLegsonScraper(StateScraper):
                 if pdf_response:
                     pdf_content = await pdf_response.read()
                     # Convert PDF to markdown
-                    text_markdown = await self._get_markdown(response=pdf_response)
-
-                    if not text_markdown or not text_markdown.strip():
-                        # Try image extraction if regular PDF extraction fails
-                        text_markdown = await self._get_markdown(
-                            stream=BytesIO(pdf_content)
-                        )
+                    text_markdown = await self._get_markdown(
+                        stream=BytesIO(pdf_content)
+                    )
 
                     if text_markdown and text_markdown.strip():
                         doc_info.update(

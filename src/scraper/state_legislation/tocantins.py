@@ -1,3 +1,4 @@
+import re
 from io import BytesIO
 from typing import Any
 
@@ -162,19 +163,24 @@ class TocantinsScraper(StateScraper):
         # Find pagination links
         pagination_links = nav.find_all("a", class_="page-link")
         max_page = 1
+        max_range_end = 0
 
         for link in pagination_links:
             if not isinstance(link, Tag):
                 continue
             text = link.get_text(strip=True)
-            # Look for patterns like "1-10", "11-20", etc.
-            if "-" in text and text.replace("-", "").isdigit():
-                # Extract the end number
-                try:
-                    end_num = int(text.split("-")[1])
-                    max_page = max(max_page, end_num)
-                except (ValueError, IndexError):
-                    continue
+            if text.isdigit():
+                max_page = max(max_page, int(text))
+                continue
+
+            # Some pages show record ranges like "1-10", "11-20", etc.
+            range_match = re.fullmatch(r"(\d+)\s*-\s*(\d+)", text)
+            if range_match:
+                max_range_end = max(max_range_end, int(range_match.group(2)))
+
+        if max_page == 1 and max_range_end > 0:
+            # Range labels refer to record offsets; convert to page count.
+            return (max_range_end + 9) // 10
 
         return max_page
 
@@ -236,11 +242,7 @@ class TocantinsScraper(StateScraper):
             pdf_content = await pdf_response.read()
 
             # Convert PDF to markdown
-            text_markdown = await self._get_markdown(response=pdf_response)
-
-            if not text_markdown or not text_markdown.strip():
-                # Try image extraction if regular PDF extraction fails
-                text_markdown = await self._get_markdown(stream=BytesIO(pdf_content))
+            text_markdown = await self._get_markdown(stream=BytesIO(pdf_content))
 
             if not text_markdown or not text_markdown.strip():
                 await self._save_doc_error(

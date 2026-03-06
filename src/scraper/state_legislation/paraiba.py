@@ -45,9 +45,7 @@ class ParaibaAlpbScraper(SAPLBaseScraper):
         if year <= 1990:
             text_markdown = await self._get_markdown(stream=BytesIO(content))
         else:
-            text_markdown = await self._get_markdown(response=response)
-            if not text_markdown:
-                text_markdown = await self._get_markdown(stream=BytesIO(content))
+            text_markdown = await self._get_markdown(stream=BytesIO(content))
 
         if not text_markdown or not text_markdown.strip():
             return None

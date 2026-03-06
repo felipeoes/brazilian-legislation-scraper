@@ -102,7 +102,7 @@ class ParanaCVScraper(StateScraper):
         base = f"{self.base_url}/legislacao/pesquisarAto.do?action=listar&opt=tm"
         if total_records is not None:
             return f"{base}&indice={page}&totalRegistros={total_records}#resultado"
-        return f"{base}&indice{page}&site=1"
+        return f"{base}&indice={page}&site=1"
 
     # ── Page fetching ──────────────────────────────────────────────
 

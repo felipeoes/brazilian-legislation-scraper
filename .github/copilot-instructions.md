@@ -5,7 +5,7 @@
 ```bash
 uv sync                              # install deps
 uv sync --group dev                  # install dev deps
-uv run playwright install chromium   # install browser (needed by 3 state scrapers + Paraná via Chrome)
+uv run playwright install chromium   # install browser (needed by 3 state scrapers)
 
 uv run main.py                       # run enabled scrapers
 uv run main.py --scrapers AcreLegisScraper ConamaScraper  # run specific scrapers by class name
@@ -43,7 +43,7 @@ All scrapers inherit from `BaseScraper`. State scrapers go through `StateScraper
 
 - **RequestService** (`src/services/request/service.py`) — `aiohttp` with per-scraper `RateLimiter`, retries via `tenacity`, optional proxy rotation.
 - **LLMOCRService** (`src/services/ocr/llm.py`) — renders PDF pages to PNG via PyMuPDF, sends to LLM vision model. Supports OpenAI-compatible API and Bedrock Converse (`BedrockClient`).
-- **BrowserService** (`src/services/browser/playwright.py`) — Playwright page pool for JS-rendered sites. Used by Maranhão, Paraná (with VPN extension), and Pernambuco.
+- **BrowserService** (`src/services/browser/playwright.py`) — Playwright page pool for JS-rendered sites. Used by Maranhão, Paraná, and Pernambuco.
 - **ProxyService** (`src/services/proxy/service.py`) — proxy rotation from file or HTTP endpoint.
 - **FileSaver** (`src/database/saver.py`) — async JSON persistence via `aiofiles`. Saves documents grouped by year into `data.json` files with document-level resume support.
 

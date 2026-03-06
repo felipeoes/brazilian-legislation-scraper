@@ -324,13 +324,12 @@ class MGAlmgScraper(StateScraper):
         total_pages = (
             1  # just to start and avoid making a lot of requests for empty pages
         )
+        start_page = 1
         reached_end_page = False
 
         # Get documents html links
         documents = []
         while not reached_end_page:
-            start_page = 1
-
             tasks = [
                 self._get_docs_links(self._build_search_url(norm_type_id, year, page))
                 for page in range(start_page, total_pages + 1)
@@ -351,7 +350,7 @@ class MGAlmgScraper(StateScraper):
                 if docs:
                     documents.extend(docs)
 
-            start_page += total_pages
+            start_page = total_pages + 1
             total_pages += self.max_workers
 
         # Get document data

@@ -82,31 +82,25 @@ class CamaraDepScraper(BaseScraper):
         self.base_url = base_url
         self.coverage = kwargs.get("coverage", COVERAGE)
         self.ordering = kwargs.get("ordering", ORDERING)
-        self.params = {
-            "abrangencia": "",
+
+    def _format_search_url(self, year: str, situation: str, norm_type: str) -> str:
+        """Format search url with given year"""
+        params = {
+            "abrangencia": self.coverage[0],
             "geral": "",
-            "ano": "",
-            "situacao": "",
+            "ano": year,
+            "situacao": situation,
             "origem": "",
             "numero": "",
-            "ordenacao": "",
+            "ordenacao": self.ordering,
+            "tipo": norm_type,
         }
 
-    def _format_search_url(self, year: str, situation: str, type: str) -> str:
-        """Format search url with given year"""
-        self.params["ano"] = year
-        self.params["abrangencia"] = self.coverage[0]
-        self.params["ordenacao"] = self.ordering
-        self.params["situacao"] = situation
-        self.params["tipo"] = type
-
-        url = (
+        return (
             self.base_url
             + "busca?"
-            + "&".join([f"{key}={value}" for key, value in self.params.items()])
+            + "&".join(f"{key}={value}" for key, value in params.items())
         )
-
-        return url
 
     @retry(
         stop=stop_after_attempt(5),
@@ -151,7 +145,13 @@ class CamaraDepScraper(BaseScraper):
         return documents_html_links_info
 
     async def _get_document_text_link(
-        self, document_html_link: str, title: str, summary: str
+        self,
+        document_html_link: str,
+        title: str,
+        summary: str,
+        year: int,
+        situation: str,
+        norm_type: str,
     ) -> dict | None:
         """Get proper document text link from given document html link"""
 
@@ -160,9 +160,9 @@ class CamaraDepScraper(BaseScraper):
             logger.error(f"Could not get soup for document: {title}")
             await self._save_doc_error(
                 title=title,
-                year=self.params["ano"],
-                situation=self.params["situacao"],
-                norm_type=self.params["tipo"],
+                year=year,
+                situation=situation,
+                norm_type=norm_type,
                 html_link=document_html_link,
                 error_message="Could not fetch page HTML",
             )
@@ -173,9 +173,9 @@ class CamaraDepScraper(BaseScraper):
             logger.warning(f"Document not found: {title}")
             await self._save_doc_error(
                 title=title,
-                year=self.params["ano"],
-                situation=self.params["situacao"],
-                norm_type=self.params["tipo"],
+                year=year,
+                situation=situation,
+                norm_type=norm_type,
                 html_link=document_html_link,
                 error_message="Document text not found (404)",
             )
@@ -186,9 +186,9 @@ class CamaraDepScraper(BaseScraper):
             logger.error(f"Could not find text link for document: {title}")
             await self._save_doc_error(
                 title=title,
-                year=self.params["ano"],
-                situation=self.params["situacao"],
-                norm_type=self.params["tipo"],
+                year=year,
+                situation=situation,
+                norm_type=norm_type,
                 html_link=document_html_link,
                 error_message="Could not find text link div.sessao in page",
             )
@@ -230,9 +230,9 @@ class CamaraDepScraper(BaseScraper):
             logger.error(f"Could not find text link for document: {title}")
             await self._save_doc_error(
                 title=title,
-                year=self.params["ano"],
-                situation=self.params["situacao"],
-                norm_type=self.params["tipo"],
+                year=year,
+                situation=situation,
+                norm_type=norm_type,
                 html_link=document_html_link,
                 error_message="No text link found in page anchors",
             )
@@ -241,7 +241,13 @@ class CamaraDepScraper(BaseScraper):
         return {"title": title, "summary": summary, "html_link": document_text_link}
 
     async def _get_document_data(
-        self, document_text_link: str, title: str, summary: str
+        self,
+        document_text_link: str,
+        title: str,
+        summary: str,
+        year: int,
+        situation: str,
+        norm_type: str,
     ) -> dict | None:
         """Get data from given document text link using BS4 cleaning + markitdown.
         Data will be in the format {
@@ -257,9 +263,9 @@ class CamaraDepScraper(BaseScraper):
                 logger.warning(f"Could not fetch document page: {title}")
                 await self._save_doc_error(
                     title=title,
-                    year=self.params["ano"],
-                    situation=self.params["situacao"],
-                    norm_type=self.params["tipo"],
+                    year=year,
+                    situation=situation,
+                    norm_type=norm_type,
                     html_link=document_text_link,
                     error_message="Could not fetch document page",
                 )
@@ -302,9 +308,9 @@ class CamaraDepScraper(BaseScraper):
                 logger.warning(f"Document text is empty after conversion: {title}")
                 await self._save_doc_error(
                     title=title,
-                    year=self.params["ano"],
-                    situation=self.params["situacao"],
-                    norm_type=self.params["tipo"],
+                    year=year,
+                    situation=situation,
+                    norm_type=norm_type,
                     html_link=document_text_link,
                     error_message="Document text is empty after conversion",
                 )
@@ -322,21 +328,21 @@ class CamaraDepScraper(BaseScraper):
             logger.error(f"Error converting document to markdown: {title} - {e}")
             await self._save_doc_error(
                 title=title,
-                year=self.params["ano"],
-                situation=self.params["situacao"],
-                norm_type=self.params["tipo"],
+                year=year,
+                situation=situation,
+                norm_type=norm_type,
                 html_link=document_text_link,
                 error_message=str(e),
             )
             return None
 
     async def _scrape_situation_type(
-        self, year: int, situation: str, type: str
+        self, year: int, situation: str, norm_type: str
     ) -> list:
         """Scrape data for a specific year, situation, and type combination"""
         results = []
 
-        url = self._format_search_url(str(year), situation, type)
+        url = self._format_search_url(str(year), situation, norm_type)
         per_page = 20
         soup = await self.request_service.get_soup(url)
 
@@ -358,7 +364,7 @@ class CamaraDepScraper(BaseScraper):
 
         if total == 0:
             return results
-        pages = total // per_page + 1
+        pages = (total + per_page - 1) // per_page
 
         # Get documents html links from all pages
         documents_html_links_info = []
@@ -376,6 +382,9 @@ class CamaraDepScraper(BaseScraper):
                 document_html_link.get("html_link"),
                 document_html_link.get("title"),
                 document_html_link.get("summary"),
+                year,
+                situation,
+                norm_type,
             )
             for document_html_link in documents_html_links_info
             if document_html_link is not None
@@ -390,6 +399,9 @@ class CamaraDepScraper(BaseScraper):
                 document_text_link.get("html_link"),
                 document_text_link.get("title"),
                 document_text_link.get("summary"),
+                year,
+                situation,
+                norm_type,
             )
             for document_text_link in documents_text_links
             if document_text_link is not None
@@ -406,7 +418,7 @@ class CamaraDepScraper(BaseScraper):
             queue_item = {
                 "year": year,
                 "situation": situation,
-                "type": type,
+                "type": norm_type,
                 **result,
             }
             await self._save_doc_result(queue_item)
@@ -414,7 +426,7 @@ class CamaraDepScraper(BaseScraper):
 
         if self.verbose:
             logger.info(
-                f"Finished scraping for Year: {year} | Situation: {situation} | Type: {type} | Results: {len(results)}"
+                f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)}"
             )
 
         return results
@@ -422,9 +434,9 @@ class CamaraDepScraper(BaseScraper):
     async def _scrape_year(self, year: int) -> list:
         """Scrape data from given year"""
         tasks = [
-            self._scrape_situation_type(year, situation, type)
+            self._scrape_situation_type(year, situation, norm_type)
             for situation in self.situations
-            for type in self.types
+            for norm_type in self.types
         ]
         valid = await self._gather_results(
             tasks,

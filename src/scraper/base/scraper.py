@@ -13,6 +13,7 @@ import urllib3
 from io import BytesIO
 from os import environ
 from datetime import datetime
+from typing import cast
 from bs4 import BeautifulSoup
 from playwright.async_api import Page
 from src.services.browser.playwright import BrowserService
@@ -32,7 +33,7 @@ from src.database.saver import ERROR_LOG_DIR, FileSaver
 from src.utils import clean_md_tag
 from src.scraper.base.concurrency import run_in_thread
 from src.services.proxy.service import ProxyService
-from src.services.request.service import RequestService
+from src.services.request.service import FailedRequest, RequestService
 from src.services.ocr.llm import LLMOCRService
 
 # suppress urllib3 InsecureRequestWarning (verify=False is used intentionally for some gov sites)
@@ -96,9 +97,6 @@ class BaseScraper:
         use_browser: bool = False,
         multiple_pages: bool = False,
         headless: bool = True,
-        use_browser_vpn: bool = False,
-        vpn_extension_path: str | None = None,
-        vpn_extension_page: str | None = None,
         proxy_config: dict | None = None,
         rps: float = 20,
         max_workers: int = 16,
@@ -141,8 +139,6 @@ class BaseScraper:
         self.use_browser = use_browser
         self.multiple_pages = multiple_pages
         self.headless = headless
-        self.vpn_extension_path = vpn_extension_path
-        self.vpn_extension_page = vpn_extension_page
         self.verbose = verbose
         self.overwrite = overwrite
         self.rps = rps
@@ -156,8 +152,6 @@ class BaseScraper:
         self._markitdown = MarkItDown()
         self.browser_service: BrowserService | None = (
             BrowserService(
-                use_vpn=use_browser_vpn,
-                vpn_extension_path=vpn_extension_path,
                 multiple_pages=multiple_pages,
                 max_workers=max_workers,
                 headless=headless,
@@ -274,7 +268,9 @@ class BaseScraper:
     async def _fetch_soup_with_retry(self, url: str) -> BeautifulSoup:
         """Fetch URL and return BeautifulSoup with automatic retry on failure."""
         soup = await self.request_service.get_soup(url)
-        if not soup:
+        if isinstance(soup, FailedRequest):
+            raise RuntimeError(f"Failed to fetch {url}")
+        if not isinstance(soup, BeautifulSoup):
             raise RuntimeError(f"Failed to fetch {url}")
         return soup
 
@@ -304,7 +300,9 @@ class BaseScraper:
         """Wrap an HTML fragment and convert it to cleaned markdown in one step."""
         wrapped = self._wrap_html(html_content)
         md = await self._convert_to_md(
-            BytesIO(wrapped.encode("utf-8")),
+            BytesIO(
+                wrapped.encode("latin-1")
+            ),  # using latin-1 because it's Brazilian portuguese text
             filename="document.html",
         )
         return self._clean_markdown(md)
@@ -431,10 +429,11 @@ class BaseScraper:
                 resp = response
                 if not resp and url:
                     resp = await self.request_service.make_request(url)
-                if resp is not None:
-                    body = await resp.read()
+                if resp and not isinstance(resp, FailedRequest):
+                    client_resp = cast(aiohttp.ClientResponse, resp)
+                    body = await client_resp.read()
                     resp_filename, content_type = (
-                        self.request_service.detect_content_info(resp)
+                        self.request_service.detect_content_info(client_resp)
                     )
                     used_filename = filename or resp_filename
                     result = await self._bytes_to_markdown(
@@ -509,11 +508,12 @@ class BaseScraper:
             Tuple of ``(markdown, raw_bytes, file_extension)``.
         """
         resp = await self.request_service.make_request(url)
-        if not resp:
+        if not resp or isinstance(resp, FailedRequest):
             return "", b"", ""
 
-        body = await resp.read()
-        filename, content_type = self.request_service.detect_content_info(resp)
+        client_resp = cast(aiohttp.ClientResponse, resp)
+        body = await client_resp.read()
+        filename, content_type = self.request_service.detect_content_info(client_resp)
         ext = self._detect_extension(content_type, filename)
 
         if "pdf" in (content_type or "").lower() or body[:4] == b"%PDF":
@@ -731,7 +731,6 @@ class BaseScraper:
         context: dict | None = None,
         desc: str = "",
         min_length: int = 100,
-        max_concurrency: int | None = None,
     ) -> list:
         """Run tasks with asyncio.gather and filter errors.
 
@@ -740,19 +739,9 @@ class BaseScraper:
             context: Dict merged into error records (year, type, situation).
             desc: Label for log messages and progress bar.
             min_length: Minimum character count for valid text_markdown.
-            max_concurrency: If set, limits in-flight tasks via a semaphore.
         """
         if not tasks:
             return []
-
-        if max_concurrency:
-            sem = asyncio.Semaphore(max_concurrency)
-
-            async def _limited(coro):
-                async with sem:
-                    return await coro
-
-            tasks = [_limited(t) for t in tasks]
 
         if self.verbose:
 
@@ -909,8 +898,9 @@ class BaseScraper:
             await self.request_service.cleanup()
         if self.browser_service:
             await self.browser_service.cleanup()
-        if getattr(self, "_mhtml_browser", None):
-            await self._mhtml_browser.cleanup()
+        mhtml_browser: BrowserService | None = getattr(self, "_mhtml_browser", None)
+        if mhtml_browser is not None:
+            await mhtml_browser.cleanup()
         if self.saver:
             await self.saver.cleanup()
 

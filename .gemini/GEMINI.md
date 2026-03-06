@@ -6,7 +6,7 @@ This is a Python-based asynchronous web scraper designed to collect legal docume
 **Key Features & Architecture:**
 - **Concurrency:** Built heavily on `asyncio` and `aiohttp` for non-blocking I/O.
 - **Data Extraction:** Supports PDF to Markdown conversion and includes optional LLM-powered OCR (using OpenAI-compatible APIs or AWS Bedrock Converse) for image-based documents.
-- **Browser Automation:** Uses Playwright for JavaScript-rendered pages, with optional VPN extension integration.
+- **Browser Automation:** Uses Playwright for JavaScript-rendered pages.
 - **Rate Limiting:** Independent per-scraper rate limiting for HTTP requests and shared rate limiting for LLM API calls.
 - **Proxy Support:** Includes optional proxy rotation from a file or HTTP endpoint.
 

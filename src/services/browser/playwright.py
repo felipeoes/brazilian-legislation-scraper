@@ -1,7 +1,6 @@
 """Playwright browser service for async web scraping."""
 
 import asyncio
-from pathlib import Path
 from bs4 import BeautifulSoup
 from loguru import logger
 from playwright.async_api import (
@@ -21,26 +20,20 @@ class BrowserService:
     so that scrapers interact with a clean, high-level API.
 
     Args:
-        use_vpn: Whether to load a browser extension for VPN support.
-        vpn_extension_path: Filesystem path to the unpacked VPN extension.
         multiple_pages: If True, pre-create *max_workers* pages in a pool.
         max_workers: Number of pages to open when *multiple_pages* is True.
         verbose: Enable verbose logging.
-        owner_class_name: Used to name the Chromium user-data temp dir.
+        owner_class_name: Optional label for diagnostics/logging.
     """
 
     def __init__(
         self,
-        use_vpn: bool = False,
-        vpn_extension_path: str | None = None,
         multiple_pages: bool = False,
         max_workers: int = 50,
         headless: bool = True,
         verbose: bool = False,
         owner_class_name: str = "browser",
     ) -> None:
-        self.use_vpn = use_vpn
-        self.vpn_extension_path = vpn_extension_path
         self.multiple_pages = multiple_pages
         self.max_workers = max_workers
         self.headless = headless
@@ -83,36 +76,10 @@ class BrowserService:
             "--disable-dev-shm-usage",
             "--disable-gpu",
         ]
-
-        if self.use_vpn and self.vpn_extension_path:
-            extension_abs_path = Path(self.vpn_extension_path).resolve().as_posix()
-            launch_args += [
-                f"--load-extension={extension_abs_path}",
-                "--disable-extensions-file-access-check",
-                "--allow-running-insecure-content",
-                "--disable-web-security",
-                "--allow-file-access-from-files",
-            ]
-            if self.verbose:
-                logger.info(
-                    f"Attempting to load packed extension from: {extension_abs_path}"
-                )
-            user_data_dir = f"/tmp/pw-{self.owner_class_name.lower()}"
-            self._browser_context = (
-                await self._playwright.chromium.launch_persistent_context(
-                    user_data_dir,
-                    channel="chrome",
-                    headless=self.headless,
-                    args=launch_args,
-                )
-            )
-        else:
-            self._browser = await self._playwright.chromium.launch(
-                headless=self.headless, args=launch_args
-            )
-            self._browser_context = await self._browser.new_context(
-                accept_downloads=True
-            )
+        self._browser = await self._playwright.chromium.launch(
+            headless=self.headless, args=launch_args
+        )
+        self._browser_context = await self._browser.new_context(accept_downloads=True)
 
         await self._browser_context.grant_permissions(
             ["clipboard-read", "clipboard-write"]

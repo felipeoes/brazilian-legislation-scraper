@@ -128,6 +128,8 @@ class LegislaGoias(StateScraper):
         if self._is_already_scraped(html_link, doc_info["title"]):
             return None
 
+        pdf_link = ""
+
         # Check if we have formatted content (HTML)
         if doc_detail.get("conteudo"):
             html_content = doc_detail["conteudo"]
@@ -157,8 +159,6 @@ class LegislaGoias(StateScraper):
                 and "GOVERNO DO ESTADO DE GOIÁS".lower() in header_table.text.lower()
             ):
                 header_table.decompose()
-
-            pdf_link = ""
 
             # remove a tag if it has <img src="/assets/ver_lei.jpg">
             for a_tag in soup.find_all("a"):
@@ -300,7 +300,7 @@ class LegislaGoias(StateScraper):
             if total_results == 0:
                 return []
 
-            pages = total_results // 100 + 1
+            pages = (total_results + 99) // 100
 
             # get all norms
             ctx = {"year": year, "type": norm_type, "situation": "N/A"}

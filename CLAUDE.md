@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 uv sync                              # install deps
 uv sync --group dev                  # install dev deps
-uv run playwright install chromium   # install browser (needed by 3 state scrapers + Paraná via Chrome)
+uv run playwright install chromium   # install browser (needed by 3 state scrapers)
 
 uv run main.py                       # run enabled scrapers
 uv run main.py --scrapers AcreLegisScraper ConamaScraper  # run specific scrapers by class name
@@ -45,7 +45,7 @@ All scrapers inherit from `BaseScraper`. State scrapers go through `StateScraper
 
 - **RequestService** (`src/services/request/service.py`) — `aiohttp` with per-scraper `RateLimiter`, retries via `tenacity`, optional proxy rotation. On failure, `make_request` / `get_soup` return a **falsy** `FailedRequest` sentinel (with `.url`, `.status`, `.reason`) instead of `None` — always use `if not resp:` (not `is None`) to check for errors.
 - **LLMOCRService** (`src/services/ocr/llm.py`) — renders PDF pages to PNG via PyMuPDF, sends to LLM vision model. All backends implement the `LLMClient` protocol (`src/services/ocr/protocol.py`): `OpenAIClient`, `BedrockClient`, `SnowflakeClient`.
-- **BrowserService** (`src/services/browser/playwright.py`) — Playwright page pool for JS-rendered sites. Used by Maranhão, Paraná (with VPN extension), and Pernambuco.
+- **BrowserService** (`src/services/browser/playwright.py`) — Playwright page pool for JS-rendered sites. Used by Maranhão, Paraná, and Pernambuco.
 - **ProxyService** (`src/services/proxy/service.py`) — proxy rotation from file or HTTP endpoint.
 - **FileSaver** (`src/database/saver.py`) — async JSON persistence via `aiofiles`. Saves documents grouped by year into `data.json` files with document-level resume support. MHTML capture is injected via `mhtml_capture_fn` callback (not owned).
 
@@ -53,7 +53,7 @@ All scrapers inherit from `BaseScraper`. State scrapers go through `StateScraper
 
 - **Years** — scraped **sequentially** (one year completes before next).
 - **Types/Situations within a year** — scraped **concurrently** via `asyncio.gather()`.
-- **Pages and documents** — scraped **concurrently** via `_gather_results()` (wraps `asyncio.gather` with error filtering, progress bars, and optional `max_concurrency` semaphore).
+- **Pages and documents** — scraped **concurrently** via `_gather_results()` (wraps `asyncio.gather` with error filtering and progress bars).
 - **Rate limiting** — each scraper has its own `RateLimiter` for HTTP (via `rps` param). All scrapers share a single `RateLimiter` for LLM API calls.
 - **CPU-bound work** (PDF rendering) — offloaded via `asyncio.to_thread()` / `run_in_thread()`.
 

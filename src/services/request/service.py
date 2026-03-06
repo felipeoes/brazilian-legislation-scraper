@@ -1,6 +1,7 @@
 import asyncio
 import ssl
 import aiohttp
+from typing import Any
 from aiohttp_socks import ProxyConnector
 from bs4 import BeautifulSoup
 from loguru import logger
@@ -161,17 +162,12 @@ class RequestService:
                     **kwargs,
                 )
 
-            # Pre-read the body so callers can use it freely
-            await resp.read()
-
-            if b"O servidor encontrou um erro interno, ou est" in (resp._body or b""):
-                raise RetryableHTTPError("Server overloaded / internal error")
-
             retryable = {408, 429, 500, 502, 503, 504}
             if self.proxy_service:
                 retryable.add(403)
 
             if resp.status in retryable:
+                resp.release()
                 raise RetryableHTTPError(f"HTTP {resp.status}")
 
             return resp
@@ -202,15 +198,15 @@ class RequestService:
     ) -> aiohttp.ClientResponse | FailedRequest:
         """Make async HTTP request with automatic retry on transient errors.
 
-        Returns an ``aiohttp.ClientResponse`` on success (body already read),
+        Returns an ``aiohttp.ClientResponse`` on success,
         or a **falsy** ``FailedRequest`` on failure — use ``if not resp:``
         to branch on errors and inspect ``resp.status`` / ``resp.reason``
         for diagnostics.
         """
         try:
-            do_request = self._do_request
+            do_request: Any = self._do_request
             if self.max_retries != 3:
-                unbound = self._do_request.retry_with(
+                unbound: Any = do_request.retry_with(
                     stop=stop_after_attempt(self.max_retries)
                 )
                 do_request = unbound.__get__(self, type(self))
@@ -228,8 +224,10 @@ class RequestService:
         Returns a ``FailedRequest`` (falsy) instead of ``None`` on failure.
         """
         resp = await self.make_request(url, method=method, **kwargs)
-        if not resp:
+        if isinstance(resp, FailedRequest):
             return resp  # propagate the FailedRequest as-is
+        if not isinstance(resp, aiohttp.ClientResponse):
+            return FailedRequest(url=url, reason="Unexpected response type")
         body = await resp.text(errors="replace")
         return BeautifulSoup(body, "html.parser")
 

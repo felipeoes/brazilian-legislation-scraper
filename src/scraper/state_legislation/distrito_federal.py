@@ -1,3 +1,5 @@
+from io import BytesIO
+
 from bs4 import BeautifulSoup
 from loguru import logger
 from src.scraper.base.scraper import StateScraper
@@ -308,7 +310,7 @@ class DFSinjScraper(StateScraper):
             content_ext = None
             if not norm_text_tag:
                 # it may be a pdf file, try to get text markdown instead (without using LLM for image extraction)
-                text_markdown = await self._get_markdown(response=response)
+                text_markdown = await self._get_markdown(stream=BytesIO(body))
                 raw_content = body
                 content_ext = ".pdf"
 

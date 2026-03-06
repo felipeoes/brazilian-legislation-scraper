@@ -1,5 +1,6 @@
 import urllib.parse
 import re
+from io import BytesIO
 from bs4 import BeautifulSoup
 
 from loguru import logger
@@ -210,7 +211,7 @@ class ConamaScraper(BaseScraper):
             content_ext = ".html"
         else:
             body = await resp.read()
-            text_markdown = await self._get_markdown(response=resp)
+            text_markdown = await self._get_markdown(stream=BytesIO(body))
             text_markdown = self._clean_pdf_markdown(text_markdown)
             raw_content = body
             content_ext = ".pdf"

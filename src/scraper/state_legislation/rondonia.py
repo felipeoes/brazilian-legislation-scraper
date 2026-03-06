@@ -143,21 +143,9 @@ class RondoniaCotelScraper(StateScraper):
         if not content:
             return None
 
-        text_markdown = await self._get_markdown(response=response)
-
-        if text_markdown:
-            text_markdown = text_markdown.strip()
-            if len(text_markdown) > pdf_len_threshold:
-                return {
-                    "text_markdown": text_markdown,
-                    "document_url": pdf_link,
-                    "_raw_content": content,
-                    "_content_extension": ".pdf",
-                }
-
         text_markdown = await self._get_markdown(stream=BytesIO(content))
         text_markdown = text_markdown.strip() if text_markdown else ""
-        if not text_markdown or not len(text_markdown) > pdf_len_threshold:
+        if not text_markdown or len(text_markdown) <= pdf_len_threshold:
             return None
 
         return {

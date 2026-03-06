@@ -122,7 +122,7 @@ class RNAlrnScraper(StateScraper):
             return None
 
         raw_content = await response.read()
-        text_markdown = await self._get_markdown(response=response)
+        text_markdown = await self._get_markdown(stream=BytesIO(raw_content))
 
         if (
             not text_markdown

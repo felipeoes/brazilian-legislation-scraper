@@ -285,6 +285,16 @@ class PernambucoAlepeScraper(StateScraper):
 
         # Extract document content
         content_div = soup.find("div", class_="WordSection1")
+        if not content_div:
+            logger.warning(f"WordSection1 not found for URL: {url}")
+            await self._save_doc_error(
+                title=doc_info.get("title", ""),
+                year=doc_info.get("year", ""),
+                html_link=url,
+                error_message="Could not find WordSection1 in document page",
+            )
+            return None
+
         html_string = content_div.prettify()
 
         html_string = self._wrap_html(html_string)

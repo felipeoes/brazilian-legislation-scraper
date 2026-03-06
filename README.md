@@ -12,7 +12,7 @@ Web scraper for legal documents regarding Brazilian legislation — federal, sta
 - **Async concurrency** — built on `asyncio` + `aiohttp` for non-blocking I/O with independent per-scraper rate limiting for HTTP and shared rate limiting for LLM API calls
 - **LLM providers** — supports OpenAI-compatible APIs and AWS Bedrock Converse for OCR
 - **PDF & image extraction** — converts PDFs to Markdown, with optional LLM-powered OCR for image-based documents
-- **Playwright support** — async Chromium automation for JavaScript-rendered pages (3 state scrapers), with optional VPN extension integration
+- **Playwright support** — async Chromium automation for JavaScript-rendered pages (3 state scrapers)
 - **Proxy rotation** — optional proxy support from a file or HTTP endpoint
 - **SAPL integration** — dedicated base class for state legislatures using the SAPL REST API
 - **Structured output** — saves scraped data as JSON files grouped by year via `FileSaver`
@@ -22,7 +22,7 @@ Web scraper for legal documents regarding Brazilian legislation — federal, sta
 
 - Python >= 3.12
 - [uv](https://docs.astral.sh/uv/) package manager
-- Google Chrome (only for Paraná scraper's VPN extension — other browser scrapers use Playwright's bundled Chromium)
+- Playwright Chromium browser (`uv run playwright install chromium`)
 
 ## Installation
 
@@ -133,7 +133,7 @@ uv run main.py --list
 │   │       └── tocantins.py
 │   ├── services/
 │   │   ├── browser/
-│   │   │   └── playwright.py        # BrowserService — Playwright page pool & VPN support
+│   │   │   └── playwright.py        # BrowserService — Playwright page pool
 │   │   ├── ocr/
 │   │   │   ├── llm.py               # LLMOCRService — PDF/image-to-Markdown via LLM vision
 │   │   │   └── bedrock.py           # BedrockClient — AWS Bedrock Converse API adapter
@@ -142,8 +142,7 @@ uv run main.py --list
 │   │   └── request/
 │   │       └── service.py           # RequestService — async HTTP with rate limiting & retries
 │   └── utils/
-│       ├── __init__.py              # clean_md_tag() — strips markdown code block wrappers
-│       └── openvpn.py               # OpenVPN manager (used by Paraná scraper)
+│       └── __init__.py              # clean_md_tag() — strips markdown code block wrappers
 ```
 
 ## Architecture

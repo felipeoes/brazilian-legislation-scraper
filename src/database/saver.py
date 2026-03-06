@@ -48,6 +48,8 @@ class FileSaver:
 
         self._year_locks: dict[int, asyncio.Lock] = {}
         self._pending_docs: dict[int, dict[tuple[str, str], dict]] = {}
+        self._year_shard_seq: dict[int, int] = {}
+        self._shard_name_regex = re.compile(r"^chunk_(\d{6})\.json$")
 
         if self.verbose:
             logger.info(f"Saving to {save_dir}")
@@ -95,6 +97,103 @@ class FileSaver:
             self._year_locks[year] = asyncio.Lock()
         return self._year_locks[year]
 
+    def _year_dir(self, year: int) -> Path:
+        """Return the directory used for a given year."""
+        return Path(self.save_dir) / str(year)
+
+    def _main_data_file(self, year: int) -> Path:
+        """Return the canonical ``data.json`` path for a given year."""
+        return self._year_dir(year) / "data.json"
+
+    def _shards_dir(self, year: int) -> Path:
+        """Return the shard directory for a given year."""
+        return self._year_dir(year) / "shards"
+
+    @staticmethod
+    def _doc_key(item: dict[str, Any]) -> tuple[str, str] | None:
+        """Build ``(document_url, title)`` key for a saved document row."""
+        document_url = str(item.get("document_url", ""))
+        if not document_url:
+            return None
+        return document_url, str(item.get("title", ""))
+
+    async def _read_items_file(self, file_path: Path) -> list[dict[str, Any]]:
+        """Load a JSON list of documents from disk."""
+        if not file_path.exists():
+            return []
+        try:
+            async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+                content = await f.read()
+            data = json.loads(content)
+            if not isinstance(data, list):
+                logger.warning(
+                    f"Expected a list in {file_path}, got {type(data).__name__}"
+                )
+                return []
+            return [item for item in data if isinstance(item, dict)]
+        except (json.JSONDecodeError, OSError, Exception) as e:
+            logger.warning(f"Could not read {file_path}: {e}")
+            return []
+
+    def _list_shard_files(self, year: int) -> list[Path]:
+        """List shard files for a year, sorted by sequence."""
+        shards_dir = self._shards_dir(year)
+        if not shards_dir.exists():
+            return []
+
+        shard_files = [
+            p
+            for p in shards_dir.glob("chunk_*.json")
+            if p.is_file() and self._shard_name_regex.match(p.name)
+        ]
+        return sorted(shard_files)
+
+    def _next_shard_path(self, year: int) -> Path:
+        """Return the next shard file path for a given year."""
+        if year not in self._year_shard_seq:
+            max_seq = 0
+            for shard_path in self._list_shard_files(year):
+                match = self._shard_name_regex.match(shard_path.name)
+                if match:
+                    max_seq = max(max_seq, int(match.group(1)))
+            self._year_shard_seq[year] = max_seq
+
+        self._year_shard_seq[year] += 1
+        shards_dir = self._shards_dir(year)
+        shards_dir.mkdir(parents=True, exist_ok=True)
+        return shards_dir / f"chunk_{self._year_shard_seq[year]:06d}.json"
+
+    def _years_with_shards(self) -> set[int]:
+        """Return years that currently have shard files on disk."""
+        years: set[int] = set()
+        root = Path(self.save_dir)
+        if not root.exists():
+            return years
+
+        for entry in root.iterdir():
+            if not entry.is_dir():
+                continue
+            try:
+                year = int(entry.name)
+            except ValueError:
+                continue
+            shard_files = list((entry / "shards").glob("chunk_*.json"))
+            if shard_files:
+                years.add(year)
+
+        return years
+
+    async def _load_main_year_data(self, year: int) -> dict[tuple[str, str], dict]:
+        """Load canonical ``data.json`` rows for a year keyed by document key."""
+        main_file = self._main_data_file(year)
+        items = await self._read_items_file(main_file)
+        data: dict[tuple[str, str], dict] = {}
+        for item in items:
+            key = self._doc_key(item)
+            if key is not None:
+                data[key] = item
+        return data
+
     def _sanitize_filename(self, name: str) -> str:
         """Sanitize a string for use as a filename."""
         name = unidecode(name)
@@ -107,44 +206,43 @@ class FileSaver:
         await self.flush_all()
 
     async def _load_year_data(self, year: int) -> dict[tuple[str, str], dict]:
-        """Load existing data.json for a year, keyed by (document_url, title)."""
-        main_file = Path(self.save_dir) / str(year) / "data.json"
-        if not main_file.exists():
-            return {}
-        try:
-            async with aiofiles.open(main_file, "r", encoding="utf-8") as f:
-                content = await f.read()
-                items = json.loads(content)
-                return {
-                    (item.get("document_url", ""), item.get("title", "")): item
-                    for item in items
-                    if item.get("document_url")
-                }
-        except (json.JSONDecodeError, Exception) as e:
-            logger.warning(
-                f"Could not load existing data for year {year}: {e}. Starting fresh."
-            )
-            return {}
+        """Load full year data from canonical file + pending shards."""
+        data = await self._load_main_year_data(year)
+
+        for shard_path in self._list_shard_files(year):
+            items = await self._read_items_file(shard_path)
+            for item in items:
+                key = self._doc_key(item)
+                if key is not None:
+                    data[key] = item
+
+        pending = self._pending_docs.get(year, {})
+        if pending:
+            data.update(pending)
+
+        return data
 
     async def _write_year_data(
         self, year: int, data: dict[tuple[str, str], dict]
     ) -> None:
-        """Write merged data back to data.json for a year."""
-        year_dir = Path(self.save_dir) / str(year)
+        """Atomically write merged data back to ``data.json`` for a year."""
+        year_dir = self._year_dir(year)
         year_dir.mkdir(parents=True, exist_ok=True)
-        main_file = year_dir / "data.json"
+        main_file = self._main_data_file(year)
+        temp_file = year_dir / "data.json.tmp"
         all_items = list(data.values())
-        async with aiofiles.open(main_file, "w", encoding="utf-8") as f:
+        async with aiofiles.open(temp_file, "w", encoding="utf-8") as f:
             await f.write(
                 json.dumps(all_items, ensure_ascii=False, indent=2, sort_keys=True)
             )
+        temp_file.replace(main_file)
 
     async def get_scraped_keys(self, year: int) -> set[tuple[str, str]]:
         """Return set of (document_url, title) pairs already scraped for a year."""
         lock = self._get_year_lock(year)
         async with lock:
             data = await self._load_year_data(year)
-            return {key for key, item in data.items() if item.get("file_path")}
+            return set(data.keys())
 
     async def save_document(
         self,
@@ -243,7 +341,7 @@ class FileSaver:
                 return None
 
     async def _flush_year(self, year: int) -> None:
-        """Merge buffered docs for a year into data.json and clear the buffer.
+        """Flush buffered docs for a year into a new shard file.
 
         Must be called while holding the year lock.
         """
@@ -251,28 +349,71 @@ class FileSaver:
         if not pending:
             return
 
-        existing_data = await self._load_year_data(year)
-        existing_data.update(pending)
-        await self._write_year_data(year, existing_data)
+        shard_path = self._next_shard_path(year)
+        payload = list(pending.values())
+        async with aiofiles.open(shard_path, "w", encoding="utf-8") as f:
+            await f.write(
+                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+            )
 
-        count = len(pending)
+        count = len(payload)
         self._pending_docs[year] = {}
 
         if self.verbose:
             logger.info(
-                f"Flushed {count} documents for year {year} "
-                f"(total on disk: {len(existing_data)})"
+                f"Flushed {count} documents for year {year} to shard {shard_path.name}"
+            )
+
+    async def _compact_year(self, year: int) -> None:
+        """Compact ``data.json`` + shard files into a single canonical file."""
+        shard_files = self._list_shard_files(year)
+        if not shard_files:
+            return
+
+        merged_data = await self._load_main_year_data(year)
+        merged_from_shards = 0
+
+        for shard_path in shard_files:
+            items = await self._read_items_file(shard_path)
+            for item in items:
+                key = self._doc_key(item)
+                if key is None:
+                    continue
+                merged_data[key] = item
+                merged_from_shards += 1
+
+        await self._write_year_data(year, merged_data)
+
+        for shard_path in shard_files:
+            try:
+                shard_path.unlink()
+            except OSError as e:
+                logger.warning(f"Could not remove shard {shard_path}: {e}")
+
+        shards_dir = self._shards_dir(year)
+        try:
+            if shards_dir.exists() and not any(shards_dir.iterdir()):
+                shards_dir.rmdir()
+        except OSError:
+            pass
+
+        if self.verbose:
+            logger.info(
+                f"Compacted year {year}: merged {merged_from_shards} docs from "
+                f"{len(shard_files)} shards (total on disk: {len(merged_data)})"
             )
 
     async def flush(self, year: int) -> None:
-        """Flush buffered documents for a specific year to disk."""
+        """Flush buffered documents and compact shard files for a year."""
         lock = self._get_year_lock(year)
         async with lock:
             await self._flush_year(year)
+            await self._compact_year(year)
 
     async def flush_all(self) -> None:
         """Flush all buffered documents across all years to disk."""
-        for year in list(self._pending_docs.keys()):
+        years = set(self._pending_docs.keys()) | self._years_with_shards()
+        for year in sorted(years):
             await self.flush(year)
 
     async def save_error(self, data: dict[str, Any], error_message: str = "") -> None:
