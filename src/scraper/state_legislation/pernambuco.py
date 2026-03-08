@@ -1,12 +1,19 @@
-import asyncio
 import re
+from dataclasses import dataclass
 from urllib.parse import urljoin
+
+import aiohttp
 from bs4 import BeautifulSoup, Tag
-from src.scraper.base.scraper import StateScraper
 from loguru import logger
 
+from src.scraper.base.scraper import (
+    DEFAULT_INVALID_SITUATION,
+    DEFAULT_VALID_SITUATION,
+    StateScraper,
+)
+from src.services.request.service import FailedRequest
 
-# Types based on the website dropdown and links
+
 TYPES = {
     "Ato Administrativo Normativo": 0,
     "Ato Administrativo Parlamentar": 1,
@@ -20,62 +27,34 @@ TYPES = {
     "Lei Ordinária": 9,
     "Lei Provincial": 10,
     "Portaria Administrativa da Alepe": 11,
-    "Resolução da Alepe": 12,
-    "Resolução do Poder Judiciário": 13,
+    "Resolução Conjunta": 12,
+    "Resolução da Alepe": 13,
+    "Resolução do Poder Judiciário": 14,
 }
 
-# Pernambuco website doesn't seem to have explicit situation filters. Situation will be inferred from document information.
-VALID_SITUATIONS = []
+# ALEPE does not expose an explicit validity filter on the search form.
+SITUATIONS: dict[str, str] = {}
 
-INVALID_SITUATIONS = []
+_SEARCH_PATH = "/Paginas/pesquisaAvancada.aspx"
+_TEXT_VERSION_PRIORITY = ("TEXTOATUALIZADO", "TEXTOORIGINAL", "TEXTOANOTADO", "")
 
-SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
+
+@dataclass(slots=True)
+class PagerSlot:
+    slot_id: str
+    page_number: int
+    is_active: bool = False
 
 
 class PernambucoAlepeScraper(StateScraper):
-    """Webscraper for Assembleia Legislativa de Pernambuco website (https://legis.alepe.pe.gov.br)
+    """Scraper for Assembleia Legislativa de Pernambuco (ALEPE).
 
-    This website uses ASP.NET forms with viewstate for search functionality.
+    Year start (earliest on source): 1835
 
-    Example search URL: https://legis.alepe.pe.gov.br/pesquisaAvancada.aspx
-
-    payload = {
-        "__EVENTTARGET": "",  # This is usually empty for initial load
-        "__EVENTARGUMENT: "",  # This is usually empty for initial load
-        "__VIEWSTATE": "",  # ASP.NET viewstate
-        "__VIEWSTATEGENERATOR": "",  # ASP.NET viewstate generator
-        "__EVENTVALIDATION": "",  # ASP.NET event validation
-        "ctl00$hfUrl": "https://legis.alepe.pe.gov.br/Paginas/pesquisaAvancada.aspx",
-        "ctl00$tbxLogin": "",
-        "ctl00$tbxSenha": "",
-        "ctl00$conteudo$tbxNumero": "",
-        "ctl00$conteudo$tbxAno": "2001",
-        "ctl00$conteudo$cblTipoNorma$cblTipoNorma_3": "Decreto do Executivo",
-        "ctl00$conteudo$tbxTextoPesquisa": "",
-        "ctl00$conteudo$tbxTextoPesquisaNeg": "",
-        "ctl00$conteudo$cbxlPesquisa$cbxlPesquisa_0": "CONTTXTORIGINAL",
-        "ctl00$conteudo$cbxlPesquisa$cbxlPesquisa_1": "EMENTA",
-        "ctl00$conteudo$cbxlPesquisa$cbxlPesquisa_2": "APELIDO",
-        "ctl00$conteudo$cbxlPesquisa$cbxlPesquisa_3": "NOME",
-        "ctl00$conteudo$tbxThesaurus": "",
-        "ctl00$conteudo$rbOpThesaurus": "Todos",
-        "ctl00$conteudo$tbxAssuntoGeral": "",
-        "ctl00$conteudo$rbOpAssuntoGeral": "Todos",
-        "ctl00$conteudo$tbxDataInicialNorma": "",
-        "ctl00$conteudo$tbxDataFinalNorma": "",
-        "ctl00$conteudo$ddlPublicacao": "",
-        "ctl00$conteudo$tbxDataInicialPublicacao": "",
-        "ctl00$conteudo$tbxDataFinalPublicacao": "",
-        "ctl00$conteudo$tbxIniciativa": "",
-        "ctl00$conteudo$tbxNumeroProjeto": "",
-        "ctl00$conteudo$tbxAnoProjeto": "",
-        "ctl00$conteudo$btnPesquisar": "Pesquisar",
-        "ctl00$tbxNomeErro": "",
-        "ctl00$tbxEmailErro": "",
-        "ctl00$tbxMensagemErro": "",
-        "ctl00$tbxLoginMob": "",
-        "ctl00$tbxSenhaMob": ""
-    }
+    The search form is an ASP.NET postback page. The fastest reliable flow is to
+    search by year only, then infer the norm type from the result row title.
+    ALEPE also exposes multiple text versions per document; this scraper prefers
+    ``TEXTOATUALIZADO`` and falls back to ``TEXTOORIGINAL`` when needed.
     """
 
     def __init__(
@@ -84,15 +63,20 @@ class PernambucoAlepeScraper(StateScraper):
         **kwargs,
     ):
         super().__init__(
-            base_url, types=TYPES, situations=SITUATIONS, name="PERNAMBUCO", **kwargs
+            base_url,
+            types=TYPES,
+            situations=SITUATIONS,
+            name="PERNAMBUCO",
+            **kwargs,
         )
+        self.search_url = urljoin(self.base_url, _SEARCH_PATH)
         self.params = {
             "__EVENTTARGET": "",
             "__EVENTARGUMENT": "",
             "__VIEWSTATE": "",
             "__VIEWSTATEGENERATOR": "",
             "__EVENTVALIDATION": "",
-            "ctl00$hfUrl": "https://legis.alepe.pe.gov.br/Paginas/pesquisaAvancada.aspx",
+            "ctl00$hfUrl": self.search_url,
             "ctl00$tbxLogin": "",
             "ctl00$tbxSenha": "",
             "ctl00$conteudo$tbxNumero": "",
@@ -122,307 +106,493 @@ class PernambucoAlepeScraper(StateScraper):
             "ctl00$tbxLoginMob": "",
             "ctl00$tbxSenhaMob": "",
         }
+        self._known_types = tuple(sorted(TYPES.keys(), key=len, reverse=True))
+
+    @staticmethod
+    def _attr_str(tag: Tag, attr_name: str) -> str:
+        value = tag.get(attr_name, "")
+        return value if isinstance(value, str) else ""
 
     def _get_form_state(self, soup: BeautifulSoup) -> dict[str, str]:
-        """Extract ASP.NET form state from page"""
-        state = {}
-
-        # Get viewstate
-        viewstate_input = soup.find("input", {"name": "__VIEWSTATE"})
-        if viewstate_input and isinstance(viewstate_input, Tag):
-            state["__VIEWSTATE"] = viewstate_input.get("value", "")
-
-        # Get viewstate generator
-        viewstate_gen_input = soup.find("input", {"name": "__VIEWSTATEGENERATOR"})
-        if viewstate_gen_input and isinstance(viewstate_gen_input, Tag):
-            state["__VIEWSTATEGENERATOR"] = viewstate_gen_input.get("value", "")
-
-        # Get event validation
-        event_val_input = soup.find("input", {"name": "__EVENTVALIDATION"})
-        if event_val_input and isinstance(event_val_input, Tag):
-            state["__EVENTVALIDATION"] = event_val_input.get("value", "")
-
+        """Extract the ASP.NET form state from a page."""
+        state: dict[str, str] = {}
+        for field_name in ("__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION"):
+            input_tag = soup.find("input", {"name": field_name})
+            if isinstance(input_tag, Tag):
+                state[field_name] = self._attr_str(input_tag, "value")
         return state
 
-    def _format_search_url(
-        self, norm_type: str, norm_type_id: str, year: int
-    ) -> tuple[str, dict[str, str]]:
-        """Format url for search request"""
-        url = urljoin(self.base_url, "/Paginas/pesquisaAvancada.aspx")
+    def _build_search_payload(
+        self,
+        year: int,
+        form_state: dict[str, str],
+    ) -> dict[str, str]:
+        payload = self.params.copy()
+        payload.update(form_state)
+        payload["ctl00$conteudo$tbxAno"] = str(year)
+        return payload
 
-        params = self.params.copy()
-        params[f"ctl00$conteudo$cblTipoNorma$cblTipoNorma_{norm_type_id}"] = norm_type
-        params["ctl00$conteudo$tbxAno"] = str(year)
+    def _build_postback_payload(
+        self,
+        base_payload: dict[str, str],
+        source_soup: BeautifulSoup,
+        control_id: str,
+    ) -> dict[str, str]:
+        payload = base_payload.copy()
+        payload.update(self._get_form_state(source_soup))
+        payload["__EVENTTARGET"] = (
+            control_id
+            if control_id.startswith("ctl00$")
+            else f"ctl00$conteudo${control_id}"
+        )
+        payload["__EVENTARGUMENT"] = ""
+        payload["__LASTFOCUS"] = ""
+        payload["ctl00$conteudo$hfPage"] = "0"
+        payload.pop("ctl00$conteudo$btnPesquisar", None)
+        return payload
 
-        return url, params
+    async def _post_results_page(self, payload: dict[str, str]) -> BeautifulSoup | None:
+        response = await self.request_service.make_request(
+            self.search_url,
+            method="POST",
+            payload=payload,
+            timeout=60,
+        )
+        if not response:
+            logger.warning(
+                f"PERNAMBUCO | Search POST failed: {getattr(response, 'reason', 'unknown error')}"
+            )
+            return None
+        client_response = response
+        assert isinstance(client_response, aiohttp.ClientResponse)
+        html = await client_response.text(errors="replace")
+        return BeautifulSoup(html, "html.parser")
 
-    def _extract_documents(self, soup: BeautifulSoup) -> list[dict]:
-        """Extract document links from search results page"""
-        docs = []
+    @staticmethod
+    def _extract_text_version(url: str) -> str:
+        upper_url = url.upper()
+        for version in ("TEXTOATUALIZADO", "TEXTOORIGINAL", "TEXTOANOTADO"):
+            if f"TIPO={version}" in upper_url:
+                return version
+        return ""
 
+    def _get_candidate_document_urls(self, row: Tag) -> list[str]:
+        urls_by_version: dict[str, str] = {}
+
+        title_link = row.select_one("span.nome-norma a[href]")
+        if isinstance(title_link, Tag):
+            href = self._attr_str(title_link, "href")
+            if href:
+                urls_by_version[""] = urljoin(self.base_url, href)
+
+        for link in row.select("td.textos a[href], td#textos a[href]"):
+            if not isinstance(link, Tag):
+                continue
+            href = self._attr_str(link, "href")
+            if not href:
+                continue
+            abs_url = urljoin(self.base_url, href)
+            version = self._extract_text_version(abs_url)
+            urls_by_version[version] = abs_url
+
+        ordered_urls: list[str] = []
+        for version in _TEXT_VERSION_PRIORITY:
+            candidate_url = urls_by_version.get(version)
+            if candidate_url and candidate_url not in ordered_urls:
+                ordered_urls.append(candidate_url)
+        return ordered_urls
+
+    def _extract_norm_type(self, title: str) -> str:
+        normalized_title = " ".join(title.split())
+        for norm_type in self._known_types:
+            if normalized_title.startswith(norm_type):
+                return norm_type
+
+        match = re.match(r"(.+?)\s+n[°ºo]", normalized_title, re.IGNORECASE)
+        if match:
+            fallback = match.group(1).strip()
+            logger.warning(f"PERNAMBUCO | Unknown norm type fallback: {fallback}")
+            return fallback
+
+        logger.warning(f"PERNAMBUCO | Could not infer norm type from title: {title}")
+        return normalized_title
+
+    def _extract_documents(self, soup: BeautifulSoup, year: int) -> list[dict]:
+        """Extract document metadata from a result page."""
         div_resultado = soup.find("div", id="divResultado")
-        if not div_resultado:
+        if not isinstance(div_resultado, Tag):
             return []
 
-        table = div_resultado.find("table")
-        if not table:
+        tbody = div_resultado.find("tbody")
+        if not isinstance(tbody, Tag):
             return []
 
-        tbody = table.find("tbody")
-        if not tbody:
-            return []
-
-        items = tbody.find_all("tr")
-
-        for item in items:
-            try:
-                title_span = item.find("span", class_="nome-norma")
-                if not title_span:
-                    continue
-                title = title_span.text.strip()
-
-                summary_div = item.find("div", class_="fLeft")
-                summary = summary_div.text.strip() if summary_div else ""
-
-                additional_data_td = item.find("td", class_="ementa-norma")
-                additional_data_url = ""
-                if additional_data_td:
-                    additional_data_link = additional_data_td.find("a", href=True)
-                    if additional_data_link:
-                        additional_data_url = urljoin(
-                            self.base_url, additional_data_link["href"]
-                        )
-
-                document_link = item.find("a", href=True)
-                document_url = ""
-                if document_link:
-                    document_url = urljoin(self.base_url, document_link["href"])
-
-                if title and document_url:  # Only add if we have essential data
-                    docs.append(
-                        {
-                            "title": title,
-                            "summary": summary,
-                            "additional_data_url": additional_data_url,
-                            "document_url": document_url,
-                        }
-                    )
-            except Exception as e:
-                logger.error(f"Error parsing item: {e}")
+        documents: list[dict] = []
+        for row in tbody.find_all("tr"):
+            if not isinstance(row, Tag):
                 continue
 
-        return docs
+            title_link = row.select_one("span.nome-norma a[href]")
+            if not isinstance(title_link, Tag):
+                continue
 
-    async def _get_additional_data(self, url: str) -> dict[str, str | int | None]:
-        """Get additional data from the document page. Returns a dict with keys 'situation', 'date', 'initiative', 'publication', 'subject', 'updates'."""
-        soup = await self.request_service.get_soup(url)
-        if not soup:
-            logger.warning(f"Failed to retrieve additional data for URL: {url}")
-            return None
+            title = title_link.get_text(" ", strip=True)
+            if not title:
+                continue
 
-        # Extract additional data
-        additional_data = {}
+            candidate_urls = self._get_candidate_document_urls(row)
+            if not candidate_urls:
+                continue
 
-        # Check if the document is revoked
-        revoked_div = soup.find("div", id="divRevogada")
-        if revoked_div:
-            additional_data["situation"] = "Revogada"
-        else:
-            additional_data["situation"] = "Não consta revogação expressa"
-
-        # Extract date
-        date_td = soup.find("td", text=re.compile(r"\d{2}/\d{2}/\d{4}"))
-        additional_data["date"] = date_td.text.strip() if date_td else ""
-
-        # Extract initiative
-        initiative = soup.find("th", text="Iniciativa")
-        if initiative and isinstance(initiative, Tag):
-            additional_data["initiative"] = initiative.find_next_sibling(
-                "td"
-            ).text.strip()
-        else:
-            additional_data["initiative"] = ""
-
-        # Extract publication
-        publication = soup.find("th", text="Publicação")
-        if publication and isinstance(publication, Tag):
-            additional_data["publication"] = publication.find_next_sibling(
-                "td"
-            ).text.strip()
-        else:
-            additional_data["publication"] = ""
-
-        # Extract subject
-        subject = soup.find("th", text="Assunto Geral")
-        if subject and isinstance(subject, Tag):
-            additional_data["subject"] = subject.find_next_sibling("td").text.strip()
-        else:
-            additional_data["subject"] = ""
-
-        # Extract updates
-        updates_div = soup.find("div", class_="lista-atualizacoes")
-        additional_data["updates"] = updates_div.text.strip() if updates_div else ""
-
-        return additional_data
-
-    async def _get_doc_data(self, doc_info: dict, year: int, norm_type: str) -> dict:
-        """Get document data from document link"""
-        url = doc_info.get("document_url")
-
-        if self._is_already_scraped(url, doc_info.get("title", "")):
-            return None
-
-        soup = await self.request_service.get_soup(url)
-        if not soup:
-            logger.error(f"Failed to retrieve document data for URL: {url}")
-            await self._save_doc_error(
-                title=doc_info.get("title", ""),
-                year=doc_info.get("year", ""),
-                html_link=url,
-                error_message="Failed to retrieve document page",
+            summary_div = row.select_one("td.ementa-norma .fLeft")
+            additional_data_link = row.select_one(
+                "td.ementa-norma a[href*='dadosReferenciais.aspx']"
             )
-            return None
+            publication_span = row.select_one("span.publicacao")
 
-        # Extract document content
-        content_div = soup.find("div", class_="WordSection1")
-        if not content_div:
-            logger.warning(f"WordSection1 not found for URL: {url}")
-            await self._save_doc_error(
-                title=doc_info.get("title", ""),
-                year=doc_info.get("year", ""),
-                html_link=url,
-                error_message="Could not find WordSection1 in document page",
+            documents.append(
+                {
+                    "year": year,
+                    "type": self._extract_norm_type(title),
+                    "title": title,
+                    "summary": (
+                        summary_div.get_text(" ", strip=True)
+                        if isinstance(summary_div, Tag)
+                        else ""
+                    ),
+                    "publication": (
+                        publication_span.get_text(" ", strip=True)
+                        if isinstance(publication_span, Tag)
+                        else ""
+                    ),
+                    "document_url": candidate_urls[0],
+                    "additional_data_url": (
+                        urljoin(
+                            self.base_url, self._attr_str(additional_data_link, "href")
+                        )
+                        if isinstance(additional_data_link, Tag)
+                        else ""
+                    ),
+                    "_candidate_document_urls": candidate_urls,
+                }
             )
-            return None
-
-        html_string = content_div.prettify()
-
-        html_string = self._wrap_html(html_string)
-
-        # Use direct HTML content conversion
-        text_markdown = await self._get_markdown(html_content=html_string)
-
-        if not text_markdown:
-            logger.warning(f"Failed to convert HTML to Markdown for URL: {url}")
-            await self._save_doc_error(
-                title=doc_info.get("title", ""),
-                year=doc_info.get("year", ""),
-                html_link=url,
-                error_message="Failed to convert HTML to markdown",
-            )
-            return None
-
-        doc_info["text_markdown"] = text_markdown
-        doc_info["_raw_content"] = html_string.encode("utf-8")
-        doc_info["_content_extension"] = ".html"
-
-        doc_info["year"] = year
-        doc_info["type"] = norm_type
-
-        # Get additional data
-        additional_data = await self._get_additional_data(
-            doc_info.pop("additional_data_url")
-        )
-        if not additional_data:
-            logger.warning(f"Failed to retrieve additional data for URL: {url}")
-            return doc_info
-
-        doc_info.update(additional_data)
-
-        return doc_info
-
-    async def _get_docs_links(
-        self, url: str, base_params: dict, norm_type: str, year: int
-    ) -> list[dict]:
-        """Get document links and metadata by paginating through search results"""
-        # Get initial form state using regular request
-        soup = await self.request_service.get_soup(url)
-        if not soup:
-            logger.warning(f"Failed to retrieve initial page for URL: {url}")
-            return []
-
-        form_state = self._get_form_state(soup)
-        if not form_state:
-            logger.warning(f"Failed to retrieve form state for URL: {url}")
-            return []
-
-        params = base_params.copy()
-        params.update(form_state)
-
-        documents = []
-        current_page = 1
-
-        while True:
-            # For page > 1, update params for pagination
-            if current_page > 1:
-                params["__EVENTTARGET"] = f"ctl00$conteudo$lbtn{current_page}"
-                params["__LASTFOCUS"] = ""
-                params["ctl00$conteudo$hfPage"] = "0"
-                params.pop("ctl00$conteudo$btnPesquisar", None)
-
-            response = await self.request_service.make_request(
-                url, method="POST", payload=params
-            )
-            if not response:
-                logger.error(f"Failed to make POST request for page {current_page}")
-                break
-
-            html = await response.text(errors="replace")
-            page_soup = BeautifulSoup(html, "html.parser")
-
-            docs = self._extract_documents(page_soup)
-            if not docs:
-                break
-
-            documents.extend(docs)
-            if self.verbose:
-                logger.info(
-                    f"PERNAMBUCO | {norm_type} | Year {year} | Page {current_page} | Found {len(docs)} docs on page"
-                )
-
-            # Check if there is a next page
-            next_page = current_page + 1
-            next_btn = page_soup.find("a", id=f"lbtn{next_page}")
-            if not next_btn:
-                break
-
-            # Extract new form state for next request
-            new_state = self._get_form_state(page_soup)
-            params.update(new_state)
-            current_page = next_page
-
-            # Small delay to be polite
-            await asyncio.sleep(1)
 
         return documents
+
+    @staticmethod
+    def _parse_pager_slots(soup: BeautifulSoup) -> list[PagerSlot]:
+        slots: list[PagerSlot] = []
+        for tag in soup.select("a[id^='lbtn'], span[id^='lbtn']"):
+            if not isinstance(tag, Tag):
+                continue
+            slot_id = PernambucoAlepeScraper._attr_str(tag, "id")
+            label = tag.get_text(" ", strip=True)
+            if not slot_id or not label.isdigit():
+                continue
+            slots.append(
+                PagerSlot(
+                    slot_id=slot_id,
+                    page_number=int(label),
+                    is_active="active" in (tag.get("class") or []),
+                )
+            )
+        return slots
+
+    async def _get_docs_links(self, year: int) -> list[dict]:
+        """Fetch all search-result rows for a year-only ALEPE search."""
+        initial_soup = await self.request_service.get_soup(self.search_url)
+        if not initial_soup:
+            logger.warning(
+                f"PERNAMBUCO | Failed to retrieve initial search page: {getattr(initial_soup, 'reason', 'unknown error')}"
+            )
+            return []
+        assert isinstance(initial_soup, BeautifulSoup)
+
+        form_state = self._get_form_state(initial_soup)
+        if not form_state:
+            logger.warning("PERNAMBUCO | Failed to extract search form state")
+            return []
+
+        base_payload = self._build_search_payload(year, form_state)
+        current_page_soup = await self._post_results_page(base_payload)
+        if current_page_soup is None:
+            return []
+
+        documents: list[dict] = []
+        seen_pages: set[int] = set()
+
+        while True:
+            current_slots = self._parse_pager_slots(current_page_soup)
+            current_page_number = next(
+                (slot.page_number for slot in current_slots if slot.is_active),
+                1,
+            )
+
+            if current_page_number not in seen_pages:
+                page_docs = self._extract_documents(current_page_soup, year)
+                documents.extend(page_docs)
+                seen_pages.add(current_page_number)
+                if self.verbose:
+                    logger.info(
+                        f"PERNAMBUCO | Year {year} | Page {current_page_number} | Found {len(page_docs)} docs"
+                    )
+            elif self.verbose:
+                logger.info(
+                    f"PERNAMBUCO | Year {year} | Skipping duplicate page {current_page_number}"
+                )
+
+            for slot in current_slots:
+                if (
+                    slot.page_number <= current_page_number
+                    or slot.page_number in seen_pages
+                ):
+                    continue
+
+                page_soup = await self._post_results_page(
+                    self._build_postback_payload(
+                        base_payload,
+                        current_page_soup,
+                        slot.slot_id,
+                    )
+                )
+                if page_soup is None:
+                    continue
+
+                page_docs = self._extract_documents(page_soup, year)
+                documents.extend(page_docs)
+                seen_pages.add(slot.page_number)
+                if self.verbose:
+                    logger.info(
+                        f"PERNAMBUCO | Year {year} | Page {slot.page_number} | Found {len(page_docs)} docs"
+                    )
+
+            if current_page_soup.find("a", id="lbtnProx") is None:
+                break
+
+            next_block_soup = await self._post_results_page(
+                self._build_postback_payload(
+                    base_payload,
+                    current_page_soup,
+                    "lbtnProx",
+                )
+            )
+            if next_block_soup is None:
+                break
+            current_page_soup = next_block_soup
+
+        return documents
+
+    @staticmethod
+    def _extract_reference_value(soup: BeautifulSoup, label: str) -> str:
+        for header in soup.find_all("th"):
+            if not isinstance(header, Tag):
+                continue
+            if header.get_text(" ", strip=True) != label:
+                continue
+            value_cell = header.find_next_sibling("td")
+            if isinstance(value_cell, Tag):
+                return value_cell.get_text(" ", strip=True)
+        return ""
+
+    @staticmethod
+    def _infer_situation(
+        text_soup: BeautifulSoup | None,
+        reference_soup: BeautifulSoup | None,
+    ) -> str:
+        for soup in (text_soup, reference_soup):
+            if isinstance(soup, BeautifulSoup) and soup.find("div", id="divRevogada"):
+                return DEFAULT_INVALID_SITUATION
+        return DEFAULT_VALID_SITUATION
+
+    def _get_additional_data(
+        self,
+        reference_soup: BeautifulSoup | None,
+        *,
+        text_soup: BeautifulSoup | None = None,
+    ) -> dict[str, str]:
+        data = {
+            "situation": self._infer_situation(text_soup, reference_soup),
+            "date": "",
+            "initiative": "",
+            "publication": "",
+            "subject": "",
+            "updates": "",
+            "indexation": "",
+        }
+        if not isinstance(reference_soup, BeautifulSoup):
+            return data
+
+        data.update(
+            {
+                "date": self._extract_reference_value(reference_soup, "Data"),
+                "initiative": self._extract_reference_value(
+                    reference_soup, "Iniciativa"
+                ),
+                "publication": self._extract_reference_value(
+                    reference_soup, "Publicação"
+                ),
+                "subject": self._extract_reference_value(
+                    reference_soup, "Assunto Geral"
+                ),
+                "updates": self._extract_reference_value(
+                    reference_soup, "Atualizações"
+                ),
+                "indexation": self._extract_reference_value(
+                    reference_soup, "Indexação"
+                ),
+            }
+        )
+
+        summary = self._extract_reference_value(reference_soup, "Ementa")
+        if summary:
+            data["summary"] = summary
+        return data
+
+    async def _fetch_reference_page(
+        self,
+        url: str,
+        *,
+        title: str,
+    ) -> BeautifulSoup | None:
+        last_failure: FailedRequest | None = None
+        for _ in range(2):
+            result = await self.request_service.fetch_bytes(url, timeout=60)
+            if not result:
+                if isinstance(result, FailedRequest):
+                    last_failure = result
+                continue
+            assert not isinstance(result, FailedRequest)
+            body, _ = result
+            return BeautifulSoup(body, "html.parser")
+
+        if last_failure is not None:
+            logger.warning(
+                f"PERNAMBUCO | Failed to retrieve additional data for {title}: {last_failure.reason}"
+            )
+        return None
+
+    async def _get_doc_data(self, doc_info: dict, year: int) -> dict | None:
+        """Fetch one ALEPE norm page, prefer updated text, and save metadata."""
+        title = doc_info.get("title", "")
+        norm_type = doc_info.get("type", "")
+        candidate_urls = list(
+            dict.fromkeys(
+                doc_info.get("_candidate_document_urls")
+                or [doc_info.get("document_url", "")]
+            )
+        )
+        candidate_urls = [url for url in candidate_urls if url]
+
+        if any(self._is_already_scraped(url, title) for url in candidate_urls):
+            return None
+
+        additional_data_url = doc_info.get("additional_data_url", "")
+
+        selected_url = ""
+        selected_body = b""
+        selected_soup: BeautifulSoup | None = None
+        text_markdown = ""
+        last_failure_reason = "Failed to retrieve document page"
+
+        for candidate_url in candidate_urls:
+            fetch_result = await self.request_service.fetch_bytes(
+                candidate_url, timeout=60
+            )
+            if not fetch_result:
+                last_failure_reason = getattr(
+                    fetch_result, "reason", last_failure_reason
+                )
+                continue
+
+            assert not isinstance(fetch_result, FailedRequest)
+            body, _ = fetch_result
+            soup = BeautifulSoup(body, "html.parser")
+            content_div = soup.find("div", class_="WordSection1")
+            if not isinstance(content_div, Tag):
+                last_failure_reason = "Could not find WordSection1 in document page"
+                continue
+
+            self._clean_norm_soup(
+                content_div,
+                remove_disclaimers=True,
+                unwrap_links=True,
+                remove_images=True,
+                remove_empty_tags=True,
+                strip_styles=True,
+            )
+            full_html = self._wrap_html(str(content_div))
+            candidate_markdown = await self._get_markdown(html_content=full_html)
+            valid, reason = self._valid_markdown(candidate_markdown)
+            if not valid:
+                last_failure_reason = f"Invalid markdown: {reason}"
+                continue
+
+            selected_url = candidate_url
+            selected_body = body
+            selected_soup = soup
+            text_markdown = candidate_markdown
+            break
+
+        if selected_soup is None or not selected_url:
+            await self._save_doc_error(
+                title=title,
+                year=year,
+                norm_type=norm_type,
+                html_link=doc_info.get(
+                    "document_url", candidate_urls[0] if candidate_urls else ""
+                ),
+                error_message=last_failure_reason,
+            )
+            return None
+
+        reference_page: BeautifulSoup | None = None
+        if additional_data_url:
+            reference_page = await self._fetch_reference_page(
+                additional_data_url,
+                title=title,
+            )
+
+        result = {
+            **doc_info,
+            "year": year,
+            "type": norm_type,
+            "document_url": selected_url,
+            "text_version": self._extract_text_version(selected_url) or "DEFAULT",
+            "text_markdown": text_markdown,
+            "_mhtml_url": selected_url,
+            "_raw_content": selected_body,
+            "_content_extension": ".html",
+        }
+        result.pop("_candidate_document_urls", None)
+
+        additional_data = self._get_additional_data(
+            reference_page, text_soup=selected_soup
+        )
+        for key, value in additional_data.items():
+            if value or key == "situation":
+                result[key] = value
+
+        if not result.get("situation"):
+            result["situation"] = DEFAULT_VALID_SITUATION
+
+        return result
+
+    async def _scrape_year(self, year: int) -> list[dict]:
+        documents = await self._get_docs_links(year)
+        if not documents:
+            return []
+
+        return await self._process_documents(
+            documents,
+            year=year,
+            norm_type="NA",
+            situation="NA",
+            desc=f"{self.name} | {year}",
+            doc_data_kwargs={"year": year},
+        )
 
     async def _scrape_type(
         self, norm_type: str, norm_type_id: int, year: int
     ) -> list[dict]:
-        """Scrape norms for a specific type and year"""
-        url, base_params = self._format_search_url(norm_type, str(norm_type_id), year)
-
-        documents = await self._get_docs_links(url, base_params, norm_type, year)
-        if not documents:
-            return []
-
-        # Get document data concurrently now that we have all links
-        ctx = {"year": year, "type": norm_type, "situation": "N/A"}
-        tasks = [
-            self._with_save(self._get_doc_data(doc_info, year, norm_type), ctx)
-            for doc_info in documents
-        ]
-        results = await self._gather_results(
-            tasks,
-            context=ctx,
-            desc=f"PERNAMBUCO | {norm_type}",
-        )
-
-        if self.verbose:
-            logger.info(
-                f"Finished scraping for Year: {year} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
-            )
-
-        return results
-
-    # _scrape_year uses default from BaseScraper
+        """Unused: ALEPE is scraped year-by-year, not year-by-type."""
+        return []

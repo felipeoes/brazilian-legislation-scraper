@@ -1,41 +1,57 @@
 import re
-from urllib.parse import urljoin, urlencode
-from bs4 import BeautifulSoup
+from typing import Any, cast
+from urllib.parse import urlencode, urljoin
+
+from bs4 import BeautifulSoup, Tag
 from loguru import logger
-from tenacity import retry, stop_after_attempt, wait_random_exponential
+
 from src.scraper.base.scraper import StateScraper
 
 TYPES = {
-    "Lei Complementar": 11,
+    "Constituição Estadual Atual 1989": 11,
     "Constituição Estadual 1967": 33,
     "Constituição Estadual 1947": 32,
     "Constituição Estadual 1935": 31,
     "Constituição Estadual 1891": 30,
-    "Decreto": 2,
-    "Decreto Financeiro": 1,
-    "Decreto Simples": 3,
     "Emenda Constitucional": 4,
-    "Lei Delegada": 6,
+    "Lei Complementar": 5,
     "Lei Ordinária": 7,
-    "Portaria Casa Civil": 19,
+    "Lei Delegada": 6,
+    "Decreto Financeiro": 1,
+    "Decreto": 2,
+    "Decreto Simples": 3,
+    "Portaria do Gabinete do Governador": 26,
     "Portaria Conjunta Casa Civil": 20,
+    "Portaria Casa Civil": 19,
     "Instrução Normativa Casa Civil": 92,
 }
 
-VALID_SITUATIONS = [
-    "Não consta"
-]  # BahiaLegisla does not have a situation field, invalid norms will have an indication in the document text
+SITUATIONS = {"Não consta": "Não consta"}
 
-INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no longer have legal effect)
-
-# the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
-SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
+_TYPE_LABELS = {name.casefold(): name for name in TYPES}
+_TYPE_LABELS.update(
+    {
+        "emendas constitucionais": "Emenda Constitucional",
+        "leis complementares": "Lei Complementar",
+        "leis ordinárias": "Lei Ordinária",
+        "leis delegadas": "Lei Delegada",
+        "decretos financeiros": "Decreto Financeiro",
+        "decretos numerados": "Decreto",
+        "decretos simples": "Decreto Simples",
+        "portarias do gabinete do governador": "Portaria do Gabinete do Governador",
+        "portarias conjuntas casa civil": "Portaria Conjunta Casa Civil",
+        "portarias casa civil": "Portaria Casa Civil",
+        "instruções normativas casa civil": "Instrução Normativa Casa Civil",
+    }
+)
 
 
 class BahiaLegislaScraper(StateScraper):
     """Webscraper for Bahia state legislation website (https://www.legislabahia.ba.gov.br/)
 
-    Example search request: https://www.legislabahia.ba.gov.br/documentos?categoria%5B%5D=7&num=&ementa=&exp=&data%5Bmin%5D=2025-01-01&data%5Bmax%5D=2025-12-31&page=0
+    Year start (earliest on source): 1891
+
+    Example search request: https://www.legislabahia.ba.gov.br/documentos?num=&ementa=&exp=&data%5Bmin%5D=2025-01-01&data%5Bmax%5D=2025-12-31&page=0
     """
 
     _REVOGADO_RE = re.compile(r"\brevogad[ao]\b", re.IGNORECASE)
@@ -45,14 +61,19 @@ class BahiaLegislaScraper(StateScraper):
         base_url: str = "https://www.legislabahia.ba.gov.br",
         **kwargs,
     ):
-        super().__init__(
-            base_url, name="BAHIA", types=TYPES, situations=SITUATIONS, **kwargs
-        )
+        super().__init__(base_url, name="BAHIA", types=TYPES, situations={}, **kwargs)
 
-    def _build_search_url(self, norm_type_id: str, year: int, page: int) -> str:
+    def _normalize_type(self, raw_type: str) -> str:
+        return super()._normalize_type(raw_type, aliases=_TYPE_LABELS)
+
+    def _build_search_url(
+        self,
+        norm_type_id: int | None,
+        year: int,
+        page: int,
+    ) -> str:
         """Build search URL from arguments (no shared state mutation)."""
         params = {
-            "categoria[]": norm_type_id,
             "num": "",
             "ementa": "",
             "exp": "",
@@ -60,28 +81,48 @@ class BahiaLegislaScraper(StateScraper):
             "data[max]": f"{year}-12-31",
             "page": page,
         }
+        if norm_type_id is not None:
+            params["categoria[]"] = norm_type_id
         return f"{self.base_url}/documentos?{urlencode(params)}"
 
-    @retry(
-        stop=stop_after_attempt(7),
-        wait=wait_random_exponential(multiplier=2, max=30),
-        reraise=True,
-    )
-    async def _fetch_request_with_retry(self, url: str, timeout: int = 120):
-        response = await self.request_service.make_request(url, timeout=timeout)
-        if not response:
-            raise ValueError(f"Failed to fetch document page: {url}")
-        return response
+    @staticmethod
+    def _get_field_item_text(soup: BeautifulSoup | Tag, class_name: str) -> str:
+        field = soup.find("div", class_=class_name)
+        if not field:
+            return ""
+        item = field.find("div", class_="field--item")
+        if not item:
+            return ""
+        return item.get_text(" ", strip=True)
 
-    async def _get_docs_links(self, url: str) -> list:
-        """Get documents html links from given page.
-        Returns a list of dicts with keys 'title', 'html_link'
-        """
-        soup = await self._fetch_soup_with_retry(url)
+    def _get_total_pages(self, soup: BeautifulSoup) -> int:
+        pagination = soup.find("ul", class_="pagination js-pager__items")
+        if not pagination:
+            return 1
 
-        docs = []
+        last_page = 0
+        for page_link in pagination.find_all("a", href=True):
+            href = page_link.get("href")
+            if not isinstance(href, str) or "page=" not in href:
+                continue
+            try:
+                page = int(href.split("page=")[-1].split("&")[0])
+            except ValueError:
+                continue
+            last_page = max(last_page, page)
 
-        # check if the page is empty ("Nenhum resultado encontrado")
+        return last_page + 1
+
+    async def _get_docs_links(
+        self,
+        url: str,
+        *,
+        soup: BeautifulSoup | None = None,
+    ) -> list[dict]:
+        """Get documents html links from a given search page."""
+        if soup is None:
+            soup = await self._fetch_soup_with_retry(url)
+
         if soup.find("td", class_="views-empty"):
             return []
 
@@ -89,28 +130,38 @@ class BahiaLegislaScraper(StateScraper):
         if not tbody:
             return []
 
-        items = tbody.find_all("tr")
-
-        for item in items:
+        docs = []
+        for item in tbody.find_all("tr"):
             tds = item.find_all("td")
             if len(tds) != 2:
                 continue
 
-            title = tds[0].find("b").text
-            html_link = tds[0].find("a")["href"]
+            link_tag = tds[0].find("a", href=True)
+            if not link_tag:
+                continue
+            href = link_tag.get("href")
+            if not isinstance(href, str):
+                continue
+
+            title_tag = tds[0].find("b")
+            title = (title_tag or link_tag).get_text(" ", strip=True)
+            norm_type = self._normalize_type(tds[1].get_text(" ", strip=True))
+            if not title:
+                continue
 
             docs.append(
                 {
-                    "title": title.strip(),
-                    "html_link": html_link,
+                    "title": title,
+                    "type": norm_type,
+                    "html_link": href,
                 }
             )
 
         return docs
 
     async def _get_doc_data(self, doc_info: dict) -> dict | None:
-        """Get document data from given document dict"""
-        # remove html_link from doc_info
+        """Get document data from a given document dict."""
+        doc_info = dict(doc_info)
         html_link = doc_info.pop("html_link")
         url = urljoin(self.base_url, html_link)
 
@@ -118,66 +169,69 @@ class BahiaLegislaScraper(StateScraper):
             return None
 
         try:
-            response = await self._fetch_request_with_retry(url)
-        except Exception as e:
-            logger.error(f"Failed to get document data from URL: {url} | Error: {e}")
+            response = await self.request_service.make_request(url, timeout=120)
+        except Exception as exc:
+            logger.error(f"Failed to get document data from URL: {url} | Error: {exc}")
             await self._save_doc_error(
                 title=doc_info.get("title", "Unknown"),
-                year="",
-                situation="",
-                norm_type="",
+                year=doc_info.get("year", ""),
+                norm_type=doc_info.get("type", ""),
                 html_link=url,
-                error_message="Failed to fetch document page after multiple attempts",
+                error_message=f"Failed to fetch document page: {exc}",
             )
             return None
 
-        content = await response.read()
-        soup = BeautifulSoup(content, "html.parser")
-
-        # get norm_number, date, publication_date and summary
-        norm_number = soup.find("div", class_="field--name-field-numero-doc")
-        if norm_number:
-            norm_number = norm_number.find("div", class_="field--item")  # type: ignore
-
-        date = soup.find("div", class_="field--name-field-data-doc")
-        if date:
-            date = date.find("div", class_="field--item")  # type: ignore
-
-        publication_date = soup.find(
-            "div", class_="field--name-field-data-de-publicacao-no-doe"
-        )
-        if publication_date:
-            publication_date = publication_date.find("div", class_="field--item")  # type: ignore
-
-        summary = soup.find("div", class_="field--name-field-ementa")
-        if summary:
-            summary = summary.find("div", class_="field--item")  # type: ignore
-
-        # get html string and text markdown
-        # class="visivel-separador field field--name-body field--type-text-with-summary field--label-hidden field--item"
-        norm_text_tag = soup.find("div", class_="field--name-body")
-        if not norm_text_tag:
+        if not response or not hasattr(response, "read"):
+            reason = getattr(response, "reason", "Failed to fetch document page")
+            logger.error(
+                f"Failed to get document data from URL: {url} | Error: {reason}"
+            )
             await self._save_doc_error(
                 title=doc_info.get("title", "Unknown"),
-                year="",
-                situation="",
-                norm_type="",
+                year=doc_info.get("year", ""),
+                norm_type=doc_info.get("type", ""),
+                html_link=url,
+                error_message=reason,
+            )
+            return None
+
+        response_obj = cast(Any, response)
+        content = await response_obj.read()
+        soup = BeautifulSoup(content, "html.parser")
+
+        category = self._get_field_item_text(soup, "field--name-field-categoria-doc")
+        if category:
+            doc_info["type"] = self._normalize_type(category)
+
+        norm_number = self._get_field_item_text(soup, "field--name-field-numero-doc")
+        date = self._get_field_item_text(soup, "field--name-field-data-doc")
+        publication_date = self._get_field_item_text(
+            soup, "field--name-field-data-de-publicacao-no-doe"
+        )
+        summary = self._get_field_item_text(soup, "field--name-field-ementa")
+
+        norm_text_tag = soup.find("div", class_="field--name-body")
+        if not isinstance(norm_text_tag, Tag):
+            await self._save_doc_error(
+                title=doc_info.get("title", "Unknown"),
+                year=doc_info.get("year", ""),
+                norm_type=doc_info.get("type", ""),
                 html_link=url,
                 error_message="Could not find div.field--name-body in document page",
             )
-            return None  # invalid norm
+            return None
 
-        # Remove empty heading tags — Word HTML exports often end with <h2></h2>.
-        # markitdown treats any <h2>/<h3>/… as a section boundary and discards
-        # all <p> elements that precede it, so these artifacts must be stripped.
-        for heading in norm_text_tag.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
-            if not heading.get_text(strip=True):
-                heading.decompose()
+        self._clean_norm_soup(
+            norm_text_tag,
+            unwrap_links=False,
+            remove_images=False,
+            strip_styles=True,
+            remove_style_tags=True,
+            remove_script_tags=True,
+        )
 
         html_string = self._wrap_html(norm_text_tag.prettify())
 
-        # Detect revogado/revogada via regex: <span class="revogado"> or
-        # <div class="alteracao"> whose text starts with "revogado/a".
         is_revogado = bool(norm_text_tag.find("span", class_=self._REVOGADO_RE)) or any(
             self._REVOGADO_RE.match(div.get_text(strip=True))
             for div in norm_text_tag.find_all("div", class_="alteracao")
@@ -185,84 +239,50 @@ class BahiaLegislaScraper(StateScraper):
         if is_revogado:
             doc_info["situation"] = "Revogado"
 
-        # Use direct HTML content conversion instead of BytesIO stream
-        text_markdown = await self._get_markdown(html_content=html_string)
+        doc_info["norm_number"] = norm_number
+        doc_info["date"] = date
+        doc_info["publication_date"] = publication_date
+        doc_info["summary"] = summary
+        return await self._process_html_doc(doc_info, html_string, url)
 
-        doc_info["norm_number"] = norm_number.text.strip() if norm_number else ""
-        doc_info["date"] = date.text.strip() if date else ""
-        doc_info["publication_date"] = (
-            publication_date.text.strip() if publication_date else ""
-        )
-        doc_info["summary"] = summary.text.strip() if summary else ""
-        doc_info["text_markdown"] = text_markdown
-        doc_info["document_url"] = url
-        doc_info["_raw_content"] = html_string.encode("utf-8")
-        doc_info["_content_extension"] = ".html"
+    async def _scrape_year(self, year: int) -> list[dict]:
+        """Scrape all norms for a specific year in a single unfiltered listing."""
+        situation = "Não consta"
+        url = self._build_search_url(None, year, 0)
 
-        return doc_info
-
-    async def _scrape_situation_type(
-        self, year: int, situation: str, norm_type: str, norm_type_id: int
-    ) -> list:
-        """Scrape norms for a specific situation and type"""
-        url = self._build_search_url(norm_type_id, year, 0)
-
-        soup = await self._fetch_soup_with_retry(url)
-
-        # get total pages
-        total_pages = 1
-        pagination = soup.find("ul", class_="pagination js-pager__items")
-        if pagination:
-            pages = pagination.find_all("li")
-            # pages[-1] is the "last page" nav button whose href=page=N (0-indexed).
-            # range(N+1) gives pages 0..N inclusive.
-            last_li_a = pages[-1].find("a")
-            if last_li_a:
-                total_pages = int(last_li_a["href"].split("page=")[-1]) + 1
-
-        # Get documents html links
-        documents = []
-        tasks = [
-            self._get_docs_links(
-                self._build_search_url(norm_type_id, year, page),
+        try:
+            soup = await self._fetch_soup_with_retry(url)
+        except Exception as exc:
+            logger.error(f"Failed to fetch year listing for {year}: {exc}")
+            await self._save_doc_error(
+                title=f"Bahia Year {year}",
+                year=year,
+                norm_type="NA",
+                html_link=url,
+                error_message=f"Failed to fetch year listing: {exc}",
             )
-            for page in range(total_pages)
-        ]
-        valid_results = await self._gather_results(
-            tasks,
-            context={"year": year, "type": norm_type, "situation": situation},
-            desc=f"BAHIA | {norm_type} | get_docs_links",
-        )
-        for result in valid_results:
-            if result:
-                documents.extend(result)
+            return []
 
-        # Get document data
-        ctx = {"year": year, "situation": situation, "type": norm_type}
-        tasks = [self._with_save(self._get_doc_data(doc), ctx) for doc in documents]
-        results = await self._gather_results(
-            tasks,
-            context=ctx,
-            desc=f"BAHIA | {norm_type}",
-        )
-
-        if self.verbose:
-            logger.info(
-                f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)}"
+        documents = await self._get_docs_links(url, soup=soup)
+        total_pages = self._get_total_pages(soup)
+        ctx = {"year": year, "type": "NA", "situation": situation}
+        documents.extend(
+            await self._fetch_all_pages(
+                lambda p: self._get_docs_links(self._build_search_url(None, year, p)),
+                total_pages - 1,
+                start_page=1,
+                context=ctx,
+                desc=f"BAHIA | {year} | get_docs_links",
             )
-
-        return results
-
-    async def _scrape_year(self, year: int) -> list:
-        """Scrape norms for a specific year"""
-        tasks = [
-            self._scrape_situation_type(year, situation, norm_type, norm_type_id)
-            for situation in self.situations
-            for norm_type, norm_type_id in self.types.items()
-        ]
-        valid = await self._gather_results(
-            tasks,
-            context={"year": year, "type": "NA", "situation": "NA"},
-            desc=f"{self.name} | Year {year}",
         )
-        return self._flatten_results(valid)
+
+        for doc in documents:
+            doc["year"] = year
+
+        return await self._process_documents(
+            documents,
+            year=year,
+            norm_type="NA",
+            situation=situation,
+            desc=f"BAHIA | {year}",
+        )

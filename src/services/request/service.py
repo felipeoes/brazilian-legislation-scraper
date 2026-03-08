@@ -1,12 +1,11 @@
 import asyncio
 import ssl
 import aiohttp
-from typing import Any
 from aiohttp_socks import ProxyConnector
 from bs4 import BeautifulSoup
 from loguru import logger
 from tenacity import (
-    retry,
+    AsyncRetrying,
     stop_after_attempt,
     wait_exponential,
     retry_if_exception_type,
@@ -70,14 +69,12 @@ class RequestService:
         rps: float = 10,
         verbose: bool = False,
         proxy_service=None,
-        max_workers: int = 10,
-        max_retries: int = 3,
+        max_retries: int = 5,
         verify_ssl: bool = False,
         disable_cookies: bool = False,
     ):
         self.rps = rps
         self.verbose = verbose
-        self.max_workers = max_workers
         self.max_retries = max_retries
         self._ssl_ctx = _make_ssl_context(verify_ssl)
         self.headers = {
@@ -88,11 +85,25 @@ class RequestService:
         self._proxy_sessions: dict[str, aiohttp.ClientSession] = {}
         self._rate_limiter = RateLimiter(rps)
         self.proxy_service = proxy_service
+        self._retry_strategy = AsyncRetrying(
+            stop=stop_after_attempt(max_retries),
+            wait=wait_exponential(multiplier=2, min=2, max=60),
+            retry=retry_if_exception_type(RetryableHTTPError),
+            reraise=True,
+        )
+
+    _MAX_PROXY_SESSIONS = 50
 
     async def _ensure_session(self, proxy: str | None = None) -> aiohttp.ClientSession:
         """Get or create the aiohttp session."""
         if proxy:
             if proxy not in self._proxy_sessions or self._proxy_sessions[proxy].closed:
+                # Evict oldest sessions when the pool grows too large
+                if len(self._proxy_sessions) >= self._MAX_PROXY_SESSIONS:
+                    oldest_key = next(iter(self._proxy_sessions))
+                    old_session = self._proxy_sessions.pop(oldest_key)
+                    if not old_session.closed:
+                        await old_session.close()
                 connector = ProxyConnector.from_url(proxy, ssl=self._ssl_ctx)
                 timeout = aiohttp.ClientTimeout(total=120)
                 self._proxy_sessions[proxy] = aiohttp.ClientSession(
@@ -103,9 +114,7 @@ class RequestService:
             return self._proxy_sessions[proxy]
 
         if self._default_session is None or self._default_session.closed:
-            connector = aiohttp.TCPConnector(
-                ssl=self._ssl_ctx, limit=100, limit_per_host=self.max_workers
-            )
+            connector = aiohttp.TCPConnector(ssl=self._ssl_ctx)
             timeout = aiohttp.ClientTimeout(total=120)
             kwargs: dict = {
                 "headers": self.headers,
@@ -117,12 +126,6 @@ class RequestService:
             self._default_session = aiohttp.ClientSession(**kwargs)
         return self._default_session
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=2, min=2, max=60),
-        retry=retry_if_exception_type(RetryableHTTPError),
-        reraise=True,
-    )
     async def _do_request(
         self,
         url: str,
@@ -162,9 +165,7 @@ class RequestService:
                     **kwargs,
                 )
 
-            retryable = {408, 429, 500, 502, 503, 504}
-            if self.proxy_service:
-                retryable.add(403)
+            retryable = {403, 408, 429, 500, 502, 503, 504}
 
             if resp.status in retryable:
                 resp.release()
@@ -187,13 +188,76 @@ class RequestService:
                 self._proxy_sessions.pop(proxy, None)
             raise RetryableHTTPError(str(e)) from e
 
+    async def _run_with_retry(
+        self, url, method, json, payload, timeout, kwargs, on_response
+    ):
+        """Run a request with the shared tenacity retry loop.
+
+        Calls ``_do_request`` on each attempt, then passes the response to
+        *on_response* which may return a result or raise ``RetryableHTTPError``
+        to trigger another attempt.
+
+        Returns whatever *on_response* returns on success, or a falsy
+        ``FailedRequest`` on permanent failure.
+        """
+        last_error: Exception | None = None
+        attempt_count = 0
+        try:
+            async for attempt in self._retry_strategy:
+                with attempt:
+                    attempt_count += 1
+                    try:
+                        resp = await self._do_request(
+                            url, method, json, payload, timeout, **kwargs
+                        )
+                        return await on_response(resp)
+                    except RetryableHTTPError as e:
+                        last_error = e
+                        raise
+        except RetryableHTTPError:
+            reason = f"{last_error} (failed after {attempt_count} attempt{'s' if attempt_count != 1 else ''})"
+            return FailedRequest(url=url, reason=reason)
+        except Exception as e:
+            return FailedRequest(url=url, reason=str(e))
+
+    async def fetch_bytes(
+        self,
+        url: str,
+        method: str = "GET",
+        json: dict | None = None,
+        payload: list | dict | None = None,
+        timeout: int = 120,
+        **kwargs,
+    ) -> tuple[bytes, aiohttp.ClientResponse] | FailedRequest:
+        """Make a request and read the full response body inside the retry loop.
+
+        Unlike ``make_request``, the body read is part of the retried operation,
+        so ``ContentLengthError`` / ``ClientPayloadError`` (truncated responses)
+        are retried automatically like any other transient network error.
+
+        Returns a ``(bytes, ClientResponse)`` tuple on success so callers can
+        still inspect headers/content-type, or a falsy ``FailedRequest`` on
+        permanent failure.
+        """
+
+        async def _on_response(resp: aiohttp.ClientResponse):
+            try:
+                body = await resp.read()
+            except aiohttp.ClientPayloadError as e:
+                raise RetryableHTTPError(str(e)) from e
+            return body, resp
+
+        return await self._run_with_retry(
+            url, method, json, payload, timeout, kwargs, _on_response
+        )
+
     async def make_request(
         self,
         url: str,
         method: str = "GET",
         json: dict | None = None,
         payload: list | dict | None = None,
-        timeout: int = 60,
+        timeout: int = 120,
         **kwargs,
     ) -> aiohttp.ClientResponse | FailedRequest:
         """Make async HTTP request with automatic retry on transient errors.
@@ -203,18 +267,13 @@ class RequestService:
         to branch on errors and inspect ``resp.status`` / ``resp.reason``
         for diagnostics.
         """
-        try:
-            do_request: Any = self._do_request
-            if self.max_retries != 3:
-                unbound: Any = do_request.retry_with(
-                    stop=stop_after_attempt(self.max_retries)
-                )
-                do_request = unbound.__get__(self, type(self))
-            return await do_request(url, method, json, payload, timeout, **kwargs)
-        except RetryableHTTPError as e:
-            return FailedRequest(url=url, reason=str(e))
-        except Exception as e:
-            return FailedRequest(url=url, reason=str(e))
+
+        async def _on_response(resp: aiohttp.ClientResponse):
+            return resp
+
+        return await self._run_with_retry(
+            url, method, json, payload, timeout, kwargs, _on_response
+        )
 
     async def get_soup(
         self, url: str, method: str = "GET", **kwargs
@@ -224,10 +283,8 @@ class RequestService:
         Returns a ``FailedRequest`` (falsy) instead of ``None`` on failure.
         """
         resp = await self.make_request(url, method=method, **kwargs)
-        if isinstance(resp, FailedRequest):
-            return resp  # propagate the FailedRequest as-is
-        if not isinstance(resp, aiohttp.ClientResponse):
-            return FailedRequest(url=url, reason="Unexpected response type")
+        if not resp:
+            return resp
         body = await resp.text(errors="replace")
         return BeautifulSoup(body, "html.parser")
 

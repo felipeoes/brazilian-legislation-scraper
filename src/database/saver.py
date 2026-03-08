@@ -4,20 +4,18 @@ import asyncio
 import hashlib
 import json
 import re
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from datetime import datetime
 from collections.abc import Callable, Awaitable
 from unidecode import unidecode
-from os import environ
 from pathlib import Path
 from urllib.parse import unquote
-from dotenv import load_dotenv
 from typing import Any
 from loguru import logger
 import aiofiles
 
-load_dotenv()
-
-SAVE_DIR = Path(rf"{environ.get('SAVE_DIR', 'outputs/legislation')}")
-ERROR_LOG_DIR = rf"{environ.get('ERROR_LOG_DIR', 'logs/legislation')}"
+from src.config import SAVE_DIR, ERROR_LOG_DIR
 
 MHTMLCaptureFn = Callable[[str], Awaitable[bytes]]
 
@@ -28,7 +26,7 @@ class FileSaver:
     def __init__(
         self,
         save_dir: Path = SAVE_DIR,
-        error_log_dir: str = ERROR_LOG_DIR,
+        error_log_dir: Path | str = ERROR_LOG_DIR,
         max_path_length: int = 225,
         verbose: bool = False,
         flush_interval: int = 50,
@@ -42,6 +40,7 @@ class FileSaver:
         self.flush_interval = flush_interval
         self.max_workers = max_workers
         self._mhtml_capture_fn = mhtml_capture_fn
+        self._mhtml_capture_disabled = False
 
         self._format_regex_ws = re.compile(r"[\s]+")
         self._format_regex_special = re.compile(r"[^\w\s-]")
@@ -60,12 +59,75 @@ class FileSaver:
         b"<title>403 Forbidden</title>",
         b"<title>Access Denied</title>",
         b"<title>Error</title>",
+        b"Acesso Proibido",
+        b"Erro 403",
+        b"error/error.css",
     )
 
     def _is_error_page(self, content: bytes) -> bool:
         """Return True if *content* looks like a CDN / WAF error page."""
         head = content[:2048]
         return any(marker in head for marker in self._ERROR_PAGE_MARKERS)
+
+    @staticmethod
+    def _should_disable_mhtml_capture(exc: Exception) -> bool:
+        message = str(exc)
+        return (
+            "Executable doesn't exist" in message
+            or "playwright install" in message.lower()
+            or "chrome-headless-shell" in message
+        )
+
+    def _rewrite_mhtml_primary_location(
+        self,
+        content: bytes,
+        capture_url: str,
+        document_url: str,
+    ) -> bytes:
+        if not capture_url or not document_url or capture_url == document_url:
+            return content
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            return content
+
+        text = re.sub(
+            r"^(Snapshot-Content-Location:\s*).*$",
+            rf"\1{document_url}",
+            text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+        text = re.sub(
+            rf"^(Content-Location:\s*){re.escape(capture_url)}$",
+            rf"\1{document_url}",
+            text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+        return text.encode("utf-8")
+
+    def _html_to_mhtml(
+        self,
+        html_content: bytes,
+        capture_url: str,
+        document_url: str,
+    ) -> bytes:
+        """Wrap standalone HTML bytes into a minimal MHTML archive."""
+        location = document_url or capture_url or "about:blank"
+        try:
+            html_text = html_content.decode("utf-8")
+        except UnicodeDecodeError:
+            html_text = html_content.decode("utf-8", errors="replace")
+
+        message = MIMEMultipart("related", type="text/html")
+        message["Subject"] = location
+        message["Snapshot-Content-Location"] = location
+
+        html_part = MIMEText(html_text, "html", "utf-8")
+        html_part["Content-Location"] = location
+        message.attach(html_part)
+        return message.as_bytes()
 
     def _validate_data(self, data: dict[str, Any]) -> bool:
         """Validate that data contains required fields."""
@@ -118,20 +180,26 @@ class FileSaver:
         return document_url, str(item.get("title", ""))
 
     async def _read_items_file(self, file_path: Path) -> list[dict[str, Any]]:
-        """Load a JSON list of documents from disk."""
+        """Load a JSON list of documents from disk.
+
+        Supports both the legacy plain-list format and the new
+        ``{"summary": ..., "documents": [...]}`` envelope.
+        """
         if not file_path.exists():
             return []
         try:
             async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
                 content = await f.read()
             data = json.loads(content)
+            if isinstance(data, dict) and "documents" in data:
+                data = data["documents"]
             if not isinstance(data, list):
                 logger.warning(
                     f"Expected a list in {file_path}, got {type(data).__name__}"
                 )
                 return []
             return [item for item in data if isinstance(item, dict)]
-        except (json.JSONDecodeError, OSError, Exception) as e:
+        except (json.JSONDecodeError, OSError) as e:
             logger.warning(f"Could not read {file_path}: {e}")
             return []
 
@@ -222,6 +290,25 @@ class FileSaver:
 
         return data
 
+    @staticmethod
+    def _build_summary(items: list[dict[str, Any]]) -> dict[str, Any]:
+        """Compute summary statistics for a list of document dicts."""
+        types_summary: dict[str, dict[str, Any]] = {}
+        for doc in items:
+            doc_type = doc.get("type", "Unknown")
+            doc_situation = doc.get("situation", "Unknown")
+            if doc_type not in types_summary:
+                types_summary[doc_type] = {"total": 0, "situations": {}}
+            types_summary[doc_type]["total"] += 1
+            types_summary[doc_type]["situations"][doc_situation] = (
+                types_summary[doc_type]["situations"].get(doc_situation, 0) + 1
+            )
+        return {
+            "count": len(items),
+            "types_summary": types_summary,
+            "last_updated": datetime.now().isoformat(),
+        }
+
     async def _write_year_data(
         self, year: int, data: dict[tuple[str, str], dict]
     ) -> None:
@@ -231,9 +318,13 @@ class FileSaver:
         main_file = self._main_data_file(year)
         temp_file = year_dir / "data.json.tmp"
         all_items = list(data.values())
+        envelope = {
+            "summary": self._build_summary(all_items),
+            "documents": all_items,
+        }
         async with aiofiles.open(temp_file, "w", encoding="utf-8") as f:
             await f.write(
-                json.dumps(all_items, ensure_ascii=False, indent=2, sort_keys=True)
+                json.dumps(envelope, ensure_ascii=False, indent=2, sort_keys=True)
             )
         temp_file.replace(main_file)
 
@@ -243,6 +334,13 @@ class FileSaver:
         async with lock:
             data = await self._load_year_data(year)
             return set(data.keys())
+
+    async def get_year_documents(self, year: int) -> list[dict[str, Any]]:
+        """Return all saved document rows for a given year."""
+        lock = self._get_year_lock(year)
+        async with lock:
+            data = await self._load_year_data(year)
+            return list(data.values())
 
     async def save_document(
         self,
@@ -262,25 +360,42 @@ class FileSaver:
             raw_content
             and content_extension
             and content_extension.lstrip(".") == "html"
-            and self._mhtml_capture_fn
         ):
-            doc_url = doc_data.get("document_url", "")
-            if doc_url:
-                try:
-                    mhtml_bytes = await self._mhtml_capture_fn(doc_url)
-                    if self._is_error_page(mhtml_bytes):
+            capture_url = doc_data.get("_mhtml_url") or doc_data.get("document_url", "")
+            document_url = doc_data.get("document_url", "")
+            if capture_url:
+                used_browser_capture = False
+                if self._mhtml_capture_fn and not self._mhtml_capture_disabled:
+                    try:
+                        mhtml_bytes = await self._mhtml_capture_fn(capture_url)
+                        if self._is_error_page(mhtml_bytes):
+                            logger.debug(
+                                f"MHTML captured an error page for {capture_url}, "
+                                "falling back to synthesized MHTML from raw HTML"
+                            )
+                        else:
+                            raw_content = self._rewrite_mhtml_primary_location(
+                                mhtml_bytes,
+                                capture_url,
+                                document_url,
+                            )
+                            content_extension = ".mhtml"
+                            used_browser_capture = True
+                    except Exception as e:
                         logger.debug(
-                            f"MHTML captured an error page for {doc_url}, "
-                            "falling back to raw HTML"
+                            f"MHTML capture failed for {capture_url}, "
+                            f"falling back to synthesized MHTML from raw HTML: {e}"
                         )
-                    else:
-                        raw_content = mhtml_bytes
-                        content_extension = ".mhtml"
-                except Exception as e:
-                    logger.debug(
-                        f"MHTML capture failed for {doc_url}, "
-                        f"falling back to raw HTML: {e}"
+                        if self._should_disable_mhtml_capture(e):
+                            self._mhtml_capture_disabled = True
+
+                if not used_browser_capture:
+                    raw_content = self._html_to_mhtml(
+                        raw_content,
+                        capture_url,
+                        document_url,
                     )
+                    content_extension = ".mhtml"
 
         year = int(doc_data["year"])
         lock = self._get_year_lock(year)
@@ -413,8 +528,8 @@ class FileSaver:
     async def flush_all(self) -> None:
         """Flush all buffered documents across all years to disk."""
         years = set(self._pending_docs.keys()) | self._years_with_shards()
-        for year in sorted(years):
-            await self.flush(year)
+        if years:
+            await asyncio.gather(*(self.flush(year) for year in sorted(years)))
 
     async def save_error(self, data: dict[str, Any], error_message: str = "") -> None:
         """Save error data to file (async)."""

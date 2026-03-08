@@ -89,7 +89,7 @@ When `--verbose` is not specified, scrapers only log warnings, errors, and show 
 ### Run specific scrapers by name
 
 ```bash
-uv run main.py --scrapers MTAlmtScraper ConamaScraper SaoPauloAlespScraper
+uv run main.py --scrapers MTAlmt Conama SaoPauloAlesp
 ```
 
 ### Overwrite previously scraped data
@@ -189,11 +189,24 @@ uv run ruff check --fix src/ main.py
 uv run ruff format src/ main.py
 ```
 
+Run tests:
+
+```bash
+uv run pytest tests/                          # run all tests (including integration)
+uv run pytest tests/test_core.py             # run a single test file
+uv run pytest tests/ -m "not integration"    # skip live-network integration tests
+uv run pytest tests/ -m integration          # run only integration tests (requires network)
+```
+
+Integration tests make real network requests to live legislative websites. They require internet access and (for Snowflake tests) valid credentials in `.env`. Deselect them with `-m "not integration"` for offline or CI runs.
+
 Run pre-commit hooks on all files:
 
 ```bash
 uv run pre-commit run --all-files
 ```
+
+Pre-commit runs trailing-whitespace, end-of-file, large-file checks, ruff linting/formatting, and the full pytest suite (including integration tests) on every commit.
 
 ## License
 

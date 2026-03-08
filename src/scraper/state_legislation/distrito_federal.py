@@ -1,7 +1,13 @@
+import json
+import re
 from io import BytesIO
+from typing import cast
 
+import aiohttp
+import fitz
 from bs4 import BeautifulSoup
 from loguru import logger
+
 from src.scraper.base.scraper import StateScraper
 
 TYPES = {
@@ -64,79 +70,52 @@ INVALID_SITUATIONS = {
     "Suspenso": "suspenso",
     "Sustado(a)": "sustado",
     "Tornado sem efeito": "tornadosemefeito",
-}  # norms with these situations are invalid norms (no longer have legal effect)
+}  # kept as reference for site taxonomy documentation
 
-# the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
 SITUATIONS = VALID_SITUATIONS | INVALID_SITUATIONS
 
 
 class DFSinjScraper(StateScraper):
     """Webscraper for Distrito Federal state legislation website (https://www.sinj.df.gov.br/sinj/)
 
-    Example search request: https://www.sinj.df.gov.br/sinj/ashx/Datatable/ResultadoDePesquisaNormaDatatable.ashx
+    Year start (earliest on source): 1922
 
-    payload: {
-        "bbusca": "sinj_norma",
-        "iColumns": 9,
-        "sColumns": ",,,,,,,,",
-        "iDisplayStart": 0,
-        "iDisplayLength": 100,
-        "mDataProp_0": "_score",
-        "sSearch_0": "",
-        "bRegex_0": False,
-        "bSearchable_0": True,
-        "bSortable_0": False,
-        "mDataProp_1": "_score",
-        "sSearch_1": "",
-        "bRegex_1": False,
-        "bSearchable_1": True,
-        "bSortable_1": True,
-        "mDataProp_2": "nm_tipo_norma",
-        "sSearch_2": "",
-        "bRegex_2": False,
-        "bSearchable_2": True,
-        "bSortable_2": True,
-        "mDataProp_3": "dt_assinatura",
-        "sSearch_3": "",
-        "bRegex_3": False,
-        "bSearchable_3": True,
-        "bSortable_3": True,
-        "mDataProp_4": "origens",
-        "sSearch_4": "",
-        "bRegex_4": False,
-        "bSearchable_4": True,
-        "bSortable_4": False,
-        "mDataProp_5": "ds_ementa",
-        "sSearch_5": "",
-        "bRegex_5": False,
-        "bSearchable_5": True,
-        "bSortable_5": False,
-        "mDataProp_6": "nm_situacao",
-        "sSearch_6": "",
-        "bRegex_6": False,
-        "bSearchable_6": True,
-        "bSortable_6": True,
-        "mDataProp_7": 7,
-        "sSearch_7": "",
-        "bRegex_7": False,
-        "bSearchable_7": True,
-        "bSortable_7": False,
-        "mDataProp_8": 8,
-        "sSearch_8": "",
-        "bRegex_8": False,
-        "bSearchable_8": True,
-        "bSortable_8": False,
-        "sSearch": "",
-        "bRegex": False,
-        "iSortCol_0": 1,
-        "sSortDir_0": "desc",
-        "iSortingCols": 1,
-        "tipo_pesquisa": "avancada",
-        "argumento": "autocomplete#ch_situacao#Situação#igual#igual a#semrevogacaoexpressa#Sem Revogação Expressa#E",
-        "argumento": "number#ano_assinatura#Ano de Assinatura#igual#igual a#1960#1960#E",
-        "ch_tipo_norma": 27000000,
-    }
+    The SINJ datatable endpoint supports broad year-only searches. This scraper
+    therefore fetches a whole year at a time and accepts every type/situation
+    returned by the source, keeping ``TYPES`` and ``SITUATIONS`` only as source
+    taxonomy documentation.
     """
+
+    _iterate_situations = True
+    _TEXT_ENDPOINT = "TextoArquivoNorma.aspx?id_file={id_file}"
+    _RAW_ENDPOINT = "Norma/{ch_norma}/arquivo"
+    _DETAILS_ENDPOINT = "DetalhesDeNorma.aspx?id_norma={ch_norma}"
+    _DIARY_ENDPOINT = "BaixarArquivoDiario.aspx?id_file={id_file}"
+    _SITE_CHROME_PATTERNS = (
+        "Texto Compilado",
+        "Visitar o SINJ-DF",
+        "!print",
+    )
+    _TEXT_HEADER_RE = re.compile(
+        r"^(?:Sistema Integrado de Normas Jurídicas do Distrito Federal\s*[\-–­]?\s*SINJ-DF|Legislação correlata\s*-\s*[^\n]+)\s*",
+        re.IGNORECASE,
+    )
+    _DISCLAIMER_RE = re.compile(
+        r"(?:Est[ea]|Ess[ea])\s+texto\s+n[aã]o\s+substitui",
+        re.IGNORECASE,
+    )
+    _MAINTENANCE_RE = re.compile(
+        r"TEXTO\s+EM\s+MANUTEN(?:Ç|C)(?:Ã|A)O",
+        re.IGNORECASE,
+    )
+    _MAINTENANCE_DETAIL_RE = re.compile(
+        r"TEXTO\s+DA\s+NORMA\s+EST(?:Á|A)\s+SENDO\s+(?:REVISAD|ATUALIZAD)|"
+        r"INFORMA(?:Ç|C)(?:Õ|O)ES\s+IMPRECISAS",
+        re.IGNORECASE,
+    )
+    _TYPE_ALIASES = {
+        "ADI": ("Ação Direta de Inconstitucionalidade",),
+    }
 
     def __init__(
         self,
@@ -150,317 +129,521 @@ class DFSinjScraper(StateScraper):
             situations=SITUATIONS,
             **kwargs,
         )
-        self._base_params = {
-            "bbusca": "sinj_norma",
-            "iColumns": 9,
-            "sColumns": ",,,,,,,,",
-            "mDataProp_0": "_score",
-            "sSearch_0": "",
-            "bRegex_0": False,
-            "bSearchable_0": True,
-            "bSortable_0": False,
-            "mDataProp_1": "_score",
-            "sSearch_1": "",
-            "bRegex_1": False,
-            "bSearchable_1": True,
-            "bSortable_1": True,
-            "mDataProp_2": "nm_tipo_norma",
-            "sSearch_2": "",
-            "bRegex_2": False,
-            "bSearchable_2": True,
-            "bSortable_2": True,
-            "mDataProp_3": "dt_assinatura",
-            "sSearch_3": "",
-            "bRegex_3": False,
-            "bSearchable_3": True,
-            "bSortable_3": True,
-            "mDataProp_4": "origens",
-            "sSearch_4": "",
-            "bRegex_4": False,
-            "bSearchable_4": True,
-            "bSortable_4": False,
-            "mDataProp_5": "ds_ementa",
-            "sSearch_5": "",
-            "bRegex_5": False,
-            "bSearchable_5": True,
-            "bSortable_5": False,
-            "mDataProp_6": "nm_situacao",
-            "sSearch_6": "",
-            "bRegex_6": False,
-            "bSearchable_6": True,
-            "bSortable_6": True,
-            "mDataProp_7": 7,
-            "sSearch_7": "",
-            "bRegex_7": False,
-            "bSearchable_7": True,
-            "bSortable_7": False,
-            "mDataProp_8": 8,
-            "sSearch_8": "",
-            "bRegex_8": False,
-            "bSearchable_8": True,
-            "bSortable_8": False,
-            "sSearch": "",
-            "bRegex": False,
-            "iSortCol_0": 1,
-            "sSortDir_0": "desc",
-            "iSortingCols": 1,
-            "tipo_pesquisa": "avancada",
-        }
-        self._display_length = 100
-        self.total_pages_url = "https://www.sinj.df.gov.br/sinj/ashx/Consulta/TotalConsulta.ashx?bbusca=sinj_norma"
-        self.session_id_created = False
+        self.search_url = (
+            f"{self.base_url}/ashx/Datatable/ResultadoDePesquisaNormaDatatable.ashx"
+        )
+        self._display_length = 5000
+        self._document_batch_size = max(self.max_workers * 10, 200)
 
     def _build_payload(
         self,
-        situation: str,
-        situation_id: str,
-        norm_type_id: str,
         year: int,
-        page: int = 1,
-    ) -> list[tuple]:
-        """Build a fresh POST payload for a specific query (no shared state mutation)."""
-        display_start = (page - 1) * self._display_length
-        # Start with base params (immutable keys)
-        payload = [(key, value) for key, value in self._base_params.items()]
-        # Add mutable fields
-        payload.append(("iDisplayStart", display_start))
-        payload.append(("iDisplayLength", self._display_length))
-        payload.append(("ch_tipo_norma", norm_type_id))
-        payload.append(
-            (
-                "argumento",
-                f"number#ano_assinatura#Ano de Assinatura#igual#igual a#{year}#{year}#E",
-            )
-        )
-        payload.append(
-            (
-                "argumento",
-                f"autocomplete#ch_situacao#Situ\u00e7\u00e3o#igual#igual a#{situation_id}#{situation}#E",
-            )
-        )
-        return payload
-
-    async def _get_docs_links(self, url: str, payload: list[tuple]) -> list:
-        """Get document links from search request. Returns a list of dicts with keys 'title', 'summary', 'date', 'html_link'"""
-        response = await self.request_service.make_request(
-            url,
-            method="POST",
-            payload=payload,
-        )
-        if not response:
-            return []
-
-        def transform_norm_type(norm_type: str) -> str:
-            # change all special characters to _
-            new_chars = []
-            for char in norm_type:
-                if char.isalnum():
-                    new_chars.append(char)
-                else:
-                    new_chars.append("_")
-
-            return "".join(new_chars)
-
-        data = await response.json()
-
-        docs = []
-        for item in data["aaData"]:
-            item_info = item["_source"]
-            title = f"{item_info['nm_tipo_norma']} {item_info['nr_norma']} de {item_info['dt_assinatura']}"
-            norm_number = item_info["nr_norma"]
-            ch_norma = item_info["ch_norma"]
-            norm_type = item_info["nm_tipo_norma"]
-            dt_assinatura = item_info["dt_assinatura"]
-
-            transformed_tipo_norma = transform_norm_type(norm_type)
-
-            html_link = f"{self.base_url}/Norma/{ch_norma}/{transformed_tipo_norma}_{norm_number}_{dt_assinatura.replace('/', '_')}.html"
-            docs.append(
-                {
-                    "title": title,
-                    "summary": item_info["ds_ementa"],
-                    "date": dt_assinatura,
-                    "html_link": html_link,
-                }
-            )
-
-        return docs
-
-    async def _get_doc_data(self, doc_info: dict) -> dict:
-        """Get document data from html link"""
-
-        try:
-            # remove html link from doc_info
-            html_link = doc_info.pop("html_link")
-
-            if self._is_already_scraped(html_link, doc_info.get("title", "")):
-                return None
-
-            response = await self.request_service.make_request(html_link)
-            if not response:
-                raise RuntimeError(f"No response for {html_link}")
-
-            body = await response.read()
-            soup = BeautifulSoup(body, "html.parser")
-
-            # get id="div_texto"
-            norm_text_tag = soup.find("div", id="div_texto")
-            text_markdown = None
-            raw_content = None
-            content_ext = None
-            if not norm_text_tag:
-                # it may be a pdf file, try to get text markdown instead (without using LLM for image extraction)
-                text_markdown = await self._get_markdown(stream=BytesIO(body))
-                raw_content = body
-                content_ext = ".pdf"
-
-                if not text_markdown:
-                    await self._save_doc_error(
-                        title=doc_info.get("title", "Unknown"),
-                        year="",
-                        situation="",
-                        norm_type="",
-                        html_link=html_link,
-                        error_message="Could not find div_texto and markdown extraction failed",
-                    )
-                    return None
-            else:
-                # Remove the "Este texto não substitui..." footer disclaimer
-                for tag in norm_text_tag.find_all(
-                    "p", style=lambda s: s and "text-align:right" in s
-                ):
-                    if tag.find("a", href=lambda h: h and "BaixarArquivoDiario" in h):
-                        tag.decompose()
-
-                html_string = f"<html>{norm_text_tag.prettify()}</html>"
-
-                # get markdown text
-                text_markdown = (
-                    await self._get_markdown(html_content=html_string)
-                    if not text_markdown
-                    else text_markdown
-                )
-
-                raw_content = html_string.encode("utf-8")
-                content_ext = ".html"
-
-            doc_info["text_markdown"] = text_markdown
-            doc_info["document_url"] = html_link
-            if raw_content is not None:
-                doc_info["_raw_content"] = raw_content
-                doc_info["_content_extension"] = content_ext
-
-            return doc_info
-        except Exception as e:
-            logger.error(f"Error getting document data: {e}")
-            await self._save_doc_error(
-                title=doc_info.get("title", "Unknown"),
-                year="",
-                situation="",
-                norm_type="",
-                html_link=doc_info.get("html_link", ""),
-                error_message=str(e),
-            )
-            return None
-
-    async def _scrape_situation_type(
-        self,
-        situation: str,
-        situation_id: str,
-        norm_type: str,
-        norm_type_id: str,
-        year: int,
-    ) -> list:
-        """Scrape norms for a specific situation and type"""
-        # need to make a get request first to create the session ID ( will be used in all subsequent requests)
-        if not self.session_id_created:
-            get_url = (
-                self.base_url
-                + "/ashx/Cadastro/HistoricoDePesquisaIncluir.ashx?tipo_pesquisa=avancada&argumento=autocomplete%23ch_situacao%23Situa%C3%A7%C3%A3o%23igual%23igual+a%23semrevogacaoexpressa%23Sem+Revoga%C3%A7%C3%A3o+Expressa%23E&ch_tipo_norma=46000000&consulta=tipo_pesquisa=avancada&consulta=argumento=autocomplete%23ch_situacao%23Situa%C3%A7%C3%A3o%23igual%23igual+a%23semrevogacaoexpressa%23Sem+Revoga%C3%A7%C3%A3o+Expressa%23E&consulta=ch_tipo_norma=46000000&chave=6c31e2b0c76d4aa227cd6804bc4fc59f&total={%22nm_base%22:%22sinj_norma%22,%22ds_base%22:%22Normas%22,%22nr_total%22:6008}&_=1741738478078"
-            )
-            await self.request_service.make_request(get_url)
-            self.session_id_created = True
-
-        # try using payload tuples
-        total_pages_request_params = [
+        *,
+        offset: int = 0,
+        limit: int | None = None,
+    ) -> list[tuple[str, object]]:
+        """Build the minimal datatable payload needed for a year-wide search."""
+        display_length = limit or self._display_length
+        return [
+            ("bbusca", "sinj_norma"),
             ("tipo_pesquisa", "avancada"),
             (
                 "argumento",
                 f"number#ano_assinatura#Ano de Assinatura#igual#igual a#{year}#{year}#E",
             ),
-            (
-                "argumento",
-                f"autocomplete#ch_situacao#Situação#igual#igual a#{situation_id}#{situation}#E",
-            ),
-            ("ch_tipo_norma", norm_type_id),
+            ("iDisplayStart", offset),
+            ("iDisplayLength", display_length),
         ]
 
+    @staticmethod
+    def _pick_file_info(item_info: dict) -> dict:
+        current_file = item_info.get("ar_atualizado") or {}
+        if current_file.get("id_file"):
+            return current_file
+
+        for source in item_info.get("fontes") or []:
+            file_info = (source or {}).get("ar_fonte") or {}
+            if file_info.get("id_file"):
+                return file_info
+
+        return {}
+
+    @classmethod
+    def _build_text_url(cls, base_url: str, file_id: str) -> str:
+        return f"{base_url}/{cls._TEXT_ENDPOINT.format(id_file=file_id)}"
+
+    @classmethod
+    def _build_raw_url(cls, base_url: str, ch_norma: str) -> str:
+        return f"{base_url}/{cls._RAW_ENDPOINT.format(ch_norma=ch_norma)}"
+
+    @staticmethod
+    def _number_pattern(number: str) -> str:
+        normalized = re.sub(r"\W+", "", number or "")
+        if not normalized:
+            return ""
+        return r"\W*".join(re.escape(ch) for ch in normalized)
+
+    def _iter_title_patterns(self, doc_info: dict) -> list[str]:
+        norm_type = (doc_info.get("type") or "").strip()
+        number_pattern = self._number_pattern(str(doc_info.get("number") or ""))
+        type_variants = [norm_type]
+        type_variants.extend(self._TYPE_ALIASES.get(norm_type, ()))
+
+        patterns = []
+        for type_variant in type_variants:
+            if not type_variant:
+                continue
+            if number_pattern:
+                patterns.append(
+                    rf"\b{re.escape(type_variant)}\b\s*(?:N(?:[º°o]|o)?\.?\s*)?{number_pattern}"
+                )
+            if not (
+                number_pattern
+                and type_variant.isupper()
+                and len(type_variant.replace(" ", "")) <= 4
+            ):
+                patterns.append(rf"\b{re.escape(type_variant)}\b")
+
+        return patterns
+
+    def _trim_to_title(
+        self,
+        text: str,
+        doc_info: dict,
+        *,
+        max_start: int | None = 400,
+    ) -> str:
+        for pattern in self._iter_title_patterns(doc_info):
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match and (max_start is None or match.start() <= max_start):
+                return text[match.start() :]
+
+        return text
+
+    def _clean_extracted_text(self, text: str, doc_info: dict) -> str:
+        cleaned = text.replace("\r", "\n").replace("\x0c", "\n")
+        cleaned = cleaned.replace("\u00ad", "")
+        cleaned = self._trim_to_title(cleaned, doc_info)
+        cleaned = self._TEXT_HEADER_RE.sub("", cleaned, count=1).strip()
+
+        disclaimer_match = self._DISCLAIMER_RE.search(cleaned)
+        if disclaimer_match:
+            cleaned = cleaned[: disclaimer_match.start()].rstrip()
+
+        cleaned = re.sub(r"[ \t]+", " ", cleaned)
+        cleaned = re.sub(r"\n[ \t]+", "\n", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
+    async def _extract_html_markdown(self, body: bytes, doc_info: dict) -> str:
+        soup = BeautifulSoup(body, "html.parser")
+        norm_text_tag = soup.find("div", id="div_texto")
+        if not norm_text_tag:
+            return ""
+
+        text_markdown = self._clean_extracted_text(
+            norm_text_tag.get_text("\n", strip=False),
+            doc_info,
+        )
+        if self._valid_markdown(text_markdown)[0]:
+            return text_markdown
+
+        cleaned_tag = self._clean_norm_soup(
+            norm_text_tag,
+            remove_disclaimers=True,
+            unwrap_links=True,
+            remove_images=True,
+            remove_empty_tags=True,
+            strip_styles=True,
+            remove_style_tags=True,
+            remove_script_tags=True,
+        )
+        html_string = self._wrap_html(str(cleaned_tag))
+        text_markdown = await self._get_markdown(html_content=html_string)
+        return self._clean_extracted_text(text_markdown, doc_info)
+
+    def _clean_pdf_fallback_text(self, text: str, doc_info: dict) -> str:
+        cleaned = text.replace("\r", "\n").replace("\x0c", "\n")
+        cleaned = cleaned.replace("\u00ad", "")
+        cleaned = self._trim_to_title(cleaned, doc_info, max_start=None)
+
+        stop_markers = []
+        next_heading_types = sorted(
+            {
+                *TYPES.keys(),
+                *self._TYPE_ALIASES.keys(),
+                *(
+                    alias
+                    for aliases in self._TYPE_ALIASES.values()
+                    for alias in aliases
+                ),
+            },
+            key=len,
+            reverse=True,
+        )
+        stop_markers.append(
+            re.compile(
+                rf"\n(?:{'|'.join(re.escape(item) for item in next_heading_types)})\b\s*(?:N(?:[º°o]|o)?\.?\s*)?\d",
+                re.IGNORECASE,
+            )
+        )
+        stop_markers.append(
+            re.compile(r"\nATOS?\s+DA\s+[A-ZÁÉÍÓÚÂÊÔÃÕÇ\s-]{3,}", re.IGNORECASE)
+        )
+        stop_markers.append(
+            re.compile(r"\nDocumento\s+assinado\s+digitalmente", re.IGNORECASE)
+        )
+
+        cut_positions = []
+        for pattern in stop_markers:
+            match = pattern.search(cleaned[1:])
+            if match:
+                cut_positions.append(match.start() + 1)
+        if cut_positions:
+            cleaned = cleaned[: min(cut_positions)].rstrip()
+
+        disclaimer_match = self._DISCLAIMER_RE.search(cleaned)
+        if disclaimer_match:
+            cleaned = cleaned[: disclaimer_match.start()].rstrip()
+
+        cleaned = re.sub(r"[ \t]+", " ", cleaned)
+        cleaned = re.sub(r"\n[ \t]+", "\n", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
+    @classmethod
+    def _has_maintenance_placeholder(cls, body: bytes) -> bool:
+        soup = BeautifulSoup(body, "html.parser")
+        text = soup.get_text(" ", strip=True)
+        if not text:
+            return False
+        return bool(cls._MAINTENANCE_RE.search(text)) and bool(
+            cls._MAINTENANCE_DETAIL_RE.search(text)
+        )
+
+    @classmethod
+    def _looks_like_site_chrome(cls, text_markdown: str) -> bool:
+        return any(pattern in text_markdown for pattern in cls._SITE_CHROME_PATTERNS)
+
+    @classmethod
+    def _build_details_url(cls, base_url: str, ch_norma: str) -> str:
+        return f"{base_url}/{cls._DETAILS_ENDPOINT.format(ch_norma=ch_norma)}"
+
+    @classmethod
+    def _build_diary_url(cls, base_url: str, file_id: str) -> str:
+        return f"{base_url}/{cls._DIARY_ENDPOINT.format(id_file=file_id)}"
+
+    async def _fetch_details_json(self, ch_norma: str) -> dict:
+        details_url = self._build_details_url(self.base_url, ch_norma)
+        response = await self.request_service.make_request(details_url)
+        if not response:
+            return {}
+
+        client_response = cast(aiohttp.ClientResponse, response)
+        html = await client_response.text(errors="replace")
+        match = re.search(
+            r"json_norma\s*=\s*(\{.*?\});\s*var\s+highlight",
+            html,
+            flags=re.DOTALL,
+        )
+        if not match:
+            return {}
+
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            return {}
+
+    @staticmethod
+    def _parse_diary_pages(page_text: str) -> list[int]:
+        page_numbers = [int(number) for number in re.findall(r"\d+", page_text or "")]
+        if not page_numbers:
+            return []
+
+        lower = (page_text or "").lower()
+        if " a " in lower or " até " in lower or "-" in lower:
+            start, end = page_numbers[0], page_numbers[-1]
+            if start <= end:
+                return list(range(start, end + 1))
+
+        return sorted(set(page_numbers))
+
+    @staticmethod
+    def _extract_pdf_pages(pdf_bytes: bytes, pages: list[int]) -> bytes:
+        if not pages:
+            return pdf_bytes
+
+        source = fitz.open(stream=pdf_bytes, filetype="pdf")
+        extracted = fitz.open()
+        try:
+            for page_number in pages:
+                page_index = page_number - 1
+                if 0 <= page_index < source.page_count:
+                    extracted.insert_pdf(
+                        source, from_page=page_index, to_page=page_index
+                    )
+            if extracted.page_count == 0:
+                return pdf_bytes
+            return extracted.tobytes(garbage=4, deflate=True)
+        finally:
+            extracted.close()
+            source.close()
+
+    async def _fetch_diary_pdf_fallback(
+        self, doc: dict
+    ) -> tuple[str, bytes, str] | None:
+        ch_norma = str(doc.get("ch_norma") or "")
+        if not ch_norma:
+            return None
+
+        details = await self._fetch_details_json(ch_norma)
+        for source in details.get("fontes") or []:
+            diary_file = (source or {}).get("ar_diario") or {}
+            diary_file_id = str(diary_file.get("id_file") or "").strip()
+            if not diary_file_id:
+                continue
+
+            diary_url = self._build_diary_url(self.base_url, diary_file_id)
+            response = await self.request_service.make_request(diary_url)
+            if not response:
+                continue
+
+            client_response = cast(aiohttp.ClientResponse, response)
+            pdf_bytes = await client_response.read()
+            page_numbers = self._parse_diary_pages(
+                str((source or {}).get("nr_pagina") or "")
+            )
+            pdf_slice = self._extract_pdf_pages(pdf_bytes, page_numbers)
+            text_markdown = await self._get_markdown(
+                stream=BytesIO(pdf_slice),
+                filename=diary_file.get("filename") or "diario.pdf",
+            )
+            text_markdown = self._clean_pdf_fallback_text(text_markdown, doc)
+            valid, _ = self._valid_markdown(text_markdown)
+            if valid:
+                return text_markdown, pdf_slice, ".pdf"
+
+        return None
+
+    async def _fetch_search_page(
+        self,
+        payload: list[tuple[str, object]],
+    ) -> tuple[list[dict], int]:
         response = await self.request_service.make_request(
-            self.total_pages_url,
+            self.search_url,
             method="POST",
-            payload=total_pages_request_params,
+            payload=payload,
         )
         if not response:
+            return [], 0
+
+        client_response = cast(aiohttp.ClientResponse, response)
+        data = await client_response.json()
+        docs = []
+        for item in data.get("aaData") or []:
+            item_info = item.get("_source") or {}
+            ch_norma = str(item_info.get("ch_norma") or "").strip()
+            if not ch_norma:
+                continue
+
+            file_info = self._pick_file_info(item_info)
+            fallback_url = self._build_raw_url(self.base_url, ch_norma)
+            title = (
+                f"{item_info.get('nm_tipo_norma', 'Norma')} "
+                f"{item_info.get('nr_norma', '')} de {item_info.get('dt_assinatura', '')}"
+            ).strip()
+
+            docs.append(
+                {
+                    "title": title,
+                    "summary": item_info.get("ds_ementa", ""),
+                    "date": item_info.get("dt_assinatura", ""),
+                    "number": item_info.get("nr_norma", ""),
+                    "type": item_info.get("nm_tipo_norma") or "NA",
+                    "situation": item_info.get("nm_situacao") or "NA",
+                    "document_url": fallback_url,
+                    "file_id": file_info.get("id_file") or "",
+                    "file_name": file_info.get("filename") or "",
+                    "file_mimetype": file_info.get("mimetype") or "",
+                    "ch_norma": ch_norma,
+                }
+            )
+
+        total = int(data.get("iTotalDisplayRecords") or len(docs) or 0)
+        return docs, total
+
+    async def _get_docs_links(
+        self, url: str, payload: list[tuple[str, object]]
+    ) -> list[dict]:
+        """Return document metadata rows from the SINJ datatable endpoint."""
+        if url != self.search_url:
+            logger.warning(
+                f"Ignoring custom DF search URL {url}; using {self.search_url}"
+            )
+        docs, _ = await self._fetch_search_page(payload)
+        return docs
+
+    @staticmethod
+    def _iter_batches(items: list[dict], batch_size: int):
+        for start in range(0, len(items), batch_size):
+            yield items[start : start + batch_size]
+
+    async def _get_doc_data(self, doc_info: dict) -> dict | None:
+        """Fetch a single norm, preferring the HTML text endpoint over raw PDFs."""
+        doc = dict(doc_info)
+        document_url = doc.get("document_url", "")
+        title = doc.get("title", "Unknown")
+        file_id = str(doc.get("file_id") or "").strip()
+        fallback_url = document_url or self._build_raw_url(
+            self.base_url, str(doc.get("ch_norma") or "")
+        )
+
+        if self._is_already_scraped(fallback_url, title):
+            return None
+
+        try:
+            if file_id:
+                text_url = self._build_text_url(self.base_url, file_id)
+                response = await self.request_service.make_request(text_url)
+                if response:
+                    client_response = cast(aiohttp.ClientResponse, response)
+                    body = await client_response.read()
+                    if self._has_maintenance_placeholder(body):
+                        await self._save_doc_error(
+                            title=title,
+                            year=doc.get("year", ""),
+                            situation=doc.get("situation", ""),
+                            norm_type=doc.get("type", ""),
+                            html_link=fallback_url,
+                            error_message="Norm text is in maintenance on SINJ",
+                        )
+                        return None
+                    text_markdown = await self._extract_html_markdown(body, doc)
+                    valid, _ = self._valid_markdown(text_markdown)
+                    if valid and not self._looks_like_site_chrome(text_markdown):
+                        doc["text_markdown"] = text_markdown
+                        doc["document_url"] = fallback_url
+                        doc["_mhtml_url"] = text_url
+                        doc["_raw_content"] = body
+                        doc["_content_extension"] = ".html"
+                        return doc
+
+            response = await self.request_service.make_request(fallback_url)
+            if not response:
+                raise RuntimeError(f"No response for {fallback_url}")
+
+            client_response = cast(aiohttp.ClientResponse, response)
+            body = await client_response.read()
+            if self._has_maintenance_placeholder(body):
+                await self._save_doc_error(
+                    title=title,
+                    year=doc.get("year", ""),
+                    situation=doc.get("situation", ""),
+                    norm_type=doc.get("type", ""),
+                    html_link=fallback_url,
+                    error_message="Norm text is in maintenance on SINJ",
+                )
+                return None
+            filename, content_type = self.request_service.detect_content_info(
+                client_response
+            )
+
+            text_markdown = await self._extract_html_markdown(body, doc)
+            valid, reason = self._valid_markdown(text_markdown)
+            if valid and not self._looks_like_site_chrome(text_markdown):
+                doc["text_markdown"] = text_markdown
+                doc["document_url"] = fallback_url
+                doc["_mhtml_url"] = fallback_url
+                doc["_raw_content"] = body
+                doc["_content_extension"] = ".html"
+                return doc
+
+            diary_fallback = await self._fetch_diary_pdf_fallback(doc)
+            if diary_fallback is not None:
+                text_markdown, raw_content, content_ext = diary_fallback
+                doc["text_markdown"] = text_markdown
+                doc["document_url"] = fallback_url
+                doc["_raw_content"] = raw_content
+                doc["_content_extension"] = content_ext
+                return doc
+
+            text_markdown = await self._get_markdown(
+                stream=BytesIO(body),
+                filename=filename or doc.get("file_name") or "document.pdf",
+            )
+            valid, reason = self._valid_markdown(text_markdown)
+            if not valid or self._looks_like_site_chrome(text_markdown):
+                await self._save_doc_error(
+                    title=title,
+                    year=doc.get("year", ""),
+                    situation=doc.get("situation", ""),
+                    norm_type=doc.get("type", ""),
+                    html_link=fallback_url,
+                    error_message=f"Could not extract valid markdown: {reason}",
+                )
+                return None
+
+            doc["text_markdown"] = text_markdown
+            doc["document_url"] = fallback_url
+            doc["_raw_content"] = body
+            doc["_content_extension"] = self._detect_extension(content_type, filename)
+            return doc
+        except Exception as exc:
+            logger.error(f"Error getting document data for {fallback_url}: {exc}")
+            await self._save_doc_error(
+                title=title,
+                year=doc.get("year", ""),
+                situation=doc.get("situation", ""),
+                norm_type=doc.get("type", ""),
+                html_link=fallback_url,
+                error_message=str(exc),
+            )
+            return None
+
+    async def _scrape_year(self, year: int) -> list[dict]:
+        """Scrape a whole SINJ year in broad listing batches."""
+        first_page_docs, total = await self._fetch_search_page(
+            self._build_payload(year)
+        )
+        if total == 0:
             return []
 
-        data = await response.json()
+        documents = list(first_page_docs)
+        if total > len(first_page_docs):
+            offsets = range(len(first_page_docs), total, self._display_length)
+            page_results = await self._gather_results(
+                [
+                    self._get_docs_links(
+                        self.search_url, self._build_payload(year, offset=o)
+                    )
+                    for o in offsets
+                ],
+                context={"year": year, "type": "NA", "situation": "NA"},
+                desc=f"DISTRITO FEDERAL | {year} | get_docs_links",
+            )
+            for page_docs in page_results:
+                if page_docs:
+                    documents.extend(page_docs)
 
-        total_norms = data["counts"][0]["count"]
-        # if count is 0, skip
-        if total_norms == 0:
+        for doc in documents:
+            doc["year"] = year
+
+        if not documents:
             return []
 
-        pages = total_norms // self._display_length
-        if total_norms % self._display_length:
-            pages += 1
-
-        norms = []
-        search_url = (
-            f"{self.base_url}/ashx/Datatable/ResultadoDePesquisaNormaDatatable.ashx"
-        )
-
-        # get all norms
-        tasks = [
-            self._get_docs_links(
-                search_url,
-                self._build_payload(situation, situation_id, norm_type_id, year, page),
+        results: list[dict] = []
+        total_batches = self._calc_pages(len(documents), self._document_batch_size)
+        for index, batch in enumerate(
+            self._iter_batches(documents, self._document_batch_size),
+            start=1,
+        ):
+            batch_results = await self._process_documents(
+                batch,
+                year=year,
+                norm_type="NA",
+                situation="NA",
+                desc=f"DISTRITO FEDERAL | {year} | docs {index}/{total_batches}",
             )
-            for page in range(1, pages + 1)
-        ]
-        valid_results = await self._gather_results(
-            tasks,
-            context={"year": year, "type": norm_type, "situation": situation},
-            desc=f"DISTRITO FEDERAL | {norm_type} | get_docs_links",
-        )
-        for result in valid_results:
-            norms.extend(result)
-
-        # get all norm data
-        ctx = {"year": year, "type": norm_type, "situation": situation}
-        tasks = [self._with_save(self._get_doc_data(norm), ctx) for norm in norms]
-        results = await self._gather_results(
-            tasks,
-            context=ctx,
-            desc=f"DISTRITO FEDERAL | {norm_type}",
-        )
-
-        if self.verbose:
-            logger.info(
-                f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)}"
-            )
+            results.extend(batch_results)
 
         return results
-
-    async def _scrape_year(self, year: int) -> list:
-        """Scrape norms for a specific year"""
-        tasks = [
-            self._scrape_situation_type(sit, sit_id, nt, nt_id, year)
-            for sit, sit_id in self.situations.items()
-            for nt, nt_id in self.types.items()
-        ]
-        valid = await self._gather_results(
-            tasks,
-            context={"year": year, "type": "NA", "situation": "NA"},
-            desc=f"{self.name} | Year {year}",
-        )
-        return self._flatten_results(valid)

@@ -92,7 +92,6 @@ class BrowserService:
         if target_page is None:
             raise RuntimeError("Playwright page is not initialized.")
         await target_page.goto(url, wait_until="domcontentloaded")
-        await asyncio.sleep(1)
         content = await target_page.content()
         return BeautifulSoup(content, "html.parser")
 

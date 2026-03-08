@@ -7,7 +7,8 @@ import base64
 
 import aiohttp
 import fitz
-from src.services.ocr.protocol import LLMClient
+from src.services.ocr.config import LLMConfig
+from src.services.ocr.protocol import LLMClient, LLMUsage
 from src.scraper.base.concurrency import RateLimiter
 from src.utils import clean_md_tag
 from loguru import logger
@@ -36,40 +37,75 @@ class LLMOCRService:
 
     Args:
         prompt: Instruction prompt sent with every image.
-        llm_config: Dictionary containing LLM configurations (llm_client, llm_model,
-            llm_kwargs, and optionally llm_rps).
+        llm_config: Typed LLM configuration dataclass.
         verbose: Enable verbose logging.
     """
 
     def __init__(
         self,
         prompt: str,
-        llm_config: dict | None = None,
+        llm_config: LLMConfig | None = None,
         verbose: bool = False,
         timeout: int = 180,
     ) -> None:
-        self.llm_config = llm_config or {}
-        self.client: LLMClient | None = self.llm_config.get("llm_client")
-        raw_model = self.llm_config.get("llm_model", "")
-        if isinstance(raw_model, str):
-            self.models = [m.strip() for m in raw_model.split(",") if m.strip()]
-        else:
-            self.models = raw_model if isinstance(raw_model, list) else []
+        self.client: LLMClient | None = llm_config.client if llm_config else None
+        raw_model = llm_config.model if llm_config else ""
+        self.models = [m.strip() for m in raw_model.split(",") if m.strip()]
 
         self.prompt = prompt
         self.verbose = verbose
         self.timeout = timeout
 
-        effective_rps = self.llm_config.get("llm_rps", 10)
-        self._rate_limiter = self.llm_config.get("llm_rate_limiter") or RateLimiter(
-            effective_rps
-        )
-        self.batch_size = self.llm_config.get("llm_batch_size", 5)
-        self.raw = self.llm_config.get("llm_raw", False)
+        effective_rps = llm_config.rps if llm_config else 10
+        self._rate_limiter = (
+            llm_config.rate_limiter if llm_config else None
+        ) or RateLimiter(effective_rps)
+        self.batch_size = llm_config.batch_size if llm_config else 5
+        self.raw = llm_config.raw if llm_config else False
+        self._usage: dict[str, dict] = {}
+        self._pdf_semaphore = asyncio.Semaphore(4)
+        self._retry_strategy = self._create_retry_strategy()
         if verbose:
             logger.info(
                 f"Initialized LLMOCRService with models: {self.models} | RPS: {effective_rps} | batch_size: {self.batch_size} | Timeout: {timeout}s | Raw: {self.raw}"
             )
+
+    # ------------------------------------------------------------------
+    # Usage tracking
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _default_usage_bucket() -> dict[str, int]:
+        return {
+            "requests": 0,
+            "successful_requests": 0,
+            "failed_requests": 0,
+            "input_tokens": 0,
+            "cached_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_tokens": 0,
+        }
+
+    def _usage_bucket(self, model_id: str) -> dict[str, int]:
+        return self._usage.setdefault(model_id, self._default_usage_bucket())
+
+    def _record_attempt(self, model_id: str) -> None:
+        self._usage_bucket(model_id)["requests"] += 1
+
+    def _record_failure(self, model_id: str) -> None:
+        self._usage_bucket(model_id)["failed_requests"] += 1
+
+    def _accumulate_usage(self, model_id: str, usage: LLMUsage) -> None:
+        b = self._usage_bucket(model_id)
+        b["successful_requests"] += 1
+        b["input_tokens"] += usage.input_tokens
+        b["cached_tokens"] += usage.cached_tokens
+        b["output_tokens"] += usage.output_tokens
+        b["reasoning_tokens"] += usage.reasoning_tokens
+
+    @property
+    def usage_stats(self) -> dict[str, dict]:
+        return {model_id: dict(usage) for model_id, usage in self._usage.items()}
 
     # ------------------------------------------------------------------
     # Helpers
@@ -114,22 +150,30 @@ class LLMOCRService:
             raise RuntimeError("LLM client or models are not initialized.")
 
         timeout = timeout or self.timeout
+        response_text = ""
         try:
-            async for attempt in self._create_retry_strategy():
-                with attempt:
-                    await self._rate_limiter.acquire()
-                    attempt_num = attempt.retry_state.attempt_number
-                    model = self.models[(attempt_num - 1) % len(self.models)]
-                    if self.verbose and attempt_num > 6:
-                        logger.info(
-                            f"Sending {desc} to LLM | Attempt {attempt_num} | Model: {model}"
-                        )
-                    response_text = await self.client.generate(
-                        messages=messages,
-                        model_id=model,
-                        timeout=timeout,
+            async for attempt in self._retry_strategy:
+                await self._rate_limiter.acquire()
+                attempt_num = attempt.retry_state.attempt_number
+                model = self.models[(attempt_num - 1) % len(self.models)]
+                if self.verbose and attempt_num > 6:
+                    logger.info(
+                        f"Sending {desc} to LLM | Attempt {attempt_num} | Model: {model}"
                     )
-            return clean_md_tag(response_text or "")
+                self._record_attempt(model)
+
+                with attempt:
+                    try:
+                        response_text, usage = await self.client.generate(
+                            messages=messages,
+                            model_id=model,
+                            timeout=timeout,
+                        )
+                    except Exception:
+                        self._record_failure(model)
+                        raise
+                    self._accumulate_usage(model, usage)
+                    return clean_md_tag(response_text or "")
         except RetryError as e:
             last_exc = e.last_attempt.exception() if e.last_attempt else e
             logger.error(f"{desc} failed after retries: {last_exc}")
@@ -161,7 +205,7 @@ class LLMOCRService:
         )
 
     async def documents_to_markdown(
-        self, docs: list[bytes], format: str = "pdf", timeout: int | None = None
+        self, docs: list[bytes], doc_format: str = "pdf", timeout: int | None = None
     ) -> str:
         """Convert a batch of documents to markdown via the LLM in a single request."""
         if not docs:
@@ -175,7 +219,7 @@ class LLMOCRService:
                     "type": "document",
                     "document": {
                         "name": f"document_{i}",
-                        "format": format,
+                        "format": doc_format,
                         "source": {"bytes": doc_b64},
                     },
                 }
@@ -185,6 +229,20 @@ class LLMOCRService:
         return await self._call_with_retry(
             messages, desc=f"{len(docs)} documents", timeout=timeout
         )
+
+    async def _sem_documents_to_markdown(
+        self, docs: list[bytes], doc_format: str = "pdf", timeout: int | None = None
+    ) -> str:
+        async with self._pdf_semaphore:
+            return await self.documents_to_markdown(
+                docs, doc_format=doc_format, timeout=timeout
+            )
+
+    async def _sem_images_to_markdown(
+        self, images: list[bytes], timeout: int | None = None
+    ) -> str:
+        async with self._pdf_semaphore:
+            return await self.images_to_markdown(images, timeout=timeout)
 
     async def pdf_to_markdown(self, content: bytes, timeout: int | None = None) -> str:
         """Convert PDF bytes to markdown. If llm_raw=True, sends PDF bytes directly in batches."""
@@ -210,7 +268,9 @@ class LLMOCRService:
 
             results = await asyncio.gather(
                 *[
-                    self.documents_to_markdown([chunk], format="pdf", timeout=timeout)
+                    self._sem_documents_to_markdown(
+                        [chunk], doc_format="pdf", timeout=timeout
+                    )
                     for chunk in pdf_chunks
                 ]
             )
@@ -230,7 +290,7 @@ class LLMOCRService:
         ]
 
         results = await asyncio.gather(
-            *[self.images_to_markdown(batch, timeout=timeout) for batch in batches]
+            *[self._sem_images_to_markdown(batch, timeout=timeout) for batch in batches]
         )
 
         markdown = "\n\n".join(r for r in results if r.strip())

@@ -1,8 +1,6 @@
 import re
-from io import BytesIO
 from urllib.parse import urljoin, urlencode
 from bs4 import BeautifulSoup
-import asyncio
 from loguru import logger
 from src.scraper.base.scraper import StateScraper
 
@@ -29,15 +27,13 @@ HISTORIC_TYPES = {
 }  # types to be used when scraping historic data (https://www.al.mt.gov.br/norma-juridica/pesquisa-historica)
 
 # situations are gotten from doc data while scraping
-VALID_SITUATIONS = []
-INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no longer have legal effect)
-
-# the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
-SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
+SITUATIONS = {}
 
 
 class MTAlmtScraper(StateScraper):
     """Webscraper for Mato Grosso state legislation website (https://www.al.mt.gov.br/norma-juridica)
+
+    Year start (earliest on source): 2017
 
     Example search request: https://www.al.mt.gov.br/norma-juridica
 
@@ -90,9 +86,6 @@ class MTAlmtScraper(StateScraper):
         self.min_year = 1979
         self.token = None
         self.regex_total_items = re.compile(r"Total de registros:\s+([\d.]+)")
-        self.header_remove_regex = re.compile(
-            r"http://www.al.mt.gov.br/TNX/viewLegislacao.php\?cod=\d+"
-        )
 
     async def _set_token(self):
         """Get token for search request (optional — field was removed from the form)."""
@@ -162,59 +155,54 @@ class MTAlmtScraper(StateScraper):
 
         return 0
 
-    async def _get_docs_links(self, url: str, is_historic: bool = False) -> list:
-        """Get documents html links from given page.
-        Returns a list of dicts with keys 'title', 'summary', 'norm_link', 'document_url'
+    def _extract_docs_from_soup(
+        self, soup: BeautifulSoup, is_historic: bool = False
+    ) -> list:
+        """Parse document list from a search-results soup.
+
+        Extracts norm_type from each item's title (format: "Lei Ordinária - 12383/2023")
+        and includes it as ``"type"`` so _merge_context can override the context type.
         """
-        soup = await self.request_service.get_soup(url)
-
-        if not soup:
-            logger.error(f"Failed to get soup for url: {url}")
-            return []
-
-        # check if the page is empty (no norms found for the given search)
-        total_items = self._get_total_norms(soup)
-        if total_items == 0:
-            return []
-
-        docs = []
-        # items = soup.find_all("div", class_="col-12")
-        # exact match for class name == "col-12"
         items = soup.find_all(
             lambda tag: tag.name == "div" and tag.get("class") == ["col-12"]
         )
-
-        # last item is the pagination, remove it
-        items = items[:-1]
-        # for non-historic search, skip two first items (they are not norms)
+        items = items[:-1]  # last item is pagination
         if not is_historic:
-            items = items[2:]
+            items = items[2:]  # first two are not norms
 
+        docs = []
         for item in items:
-            title = item.find("h5").text.strip()
+            title_raw = item.find("h5").text.strip()
+            norm_type = title_raw.split(" - ")[0].strip() if " - " in title_raw else ""
             summary = item.find("div", class_="text-muted").text.strip()
             links = item.find_all("a", href=True)
-
-            if len(links) < 2:  # some documents are not available, so we skip them
+            if len(links) < 2:
                 continue
-            document_url = links[0]["href"]
             norm_link = links[-1]["href"]
-            # last link is the one to the norm, some norms include a link for proposition, that's why we need to get the last link
             docs.append(
                 {
-                    "title": title,
+                    "title": title_raw,
+                    "type": norm_type,
                     "summary": summary,
                     "norm_link": norm_link,
-                    "document_url": urljoin(self.base_url, document_url),
+                    "document_url": urljoin(self.base_url, norm_link),
                 }
             )
-
         return docs
+
+    async def _get_docs_links(self, url: str, is_historic: bool = False) -> list:
+        """Fetch a search-results page and return document dicts."""
+        soup = await self.request_service.get_soup(url)
+        if not soup:
+            logger.error(f"Failed to get soup for url: {url}")
+            return []
+        return self._extract_docs_from_soup(soup, is_historic)
 
     async def _get_doc_data(
         self, doc_info: dict, is_historic: bool = False
     ) -> dict | None:
         """Get document data from given document dict"""
+        doc_info = dict(doc_info)
         norm_link = doc_info.pop("norm_link")
 
         if self._is_already_scraped(
@@ -222,109 +210,96 @@ class MTAlmtScraper(StateScraper):
         ):
             return None
 
-        if is_historic:
-            url = urljoin(self.base_url, norm_link)
-        else:
-            url = f"{urljoin(self.base_url, norm_link)}/ficha-tecnica?exibirAnotacao=1"
+        # Derive marcoHistorico date from URN path (e.g. "lei.ordinaria:2020-12-30;11281")
+        date_match = re.search(r":(\d{4}-\d{2}-\d{2});", norm_link)
+        marco = date_match.group(1) if date_match else ""
+        norm_base_url = urljoin(self.base_url, norm_link)
 
-        soup = await self.request_service.get_soup(url)
-        if not soup:
-            logger.error(f"Error getting soup for {url}")
+        if is_historic:
+            ficha_url = norm_base_url
+        else:
+            ficha_url = f"{norm_base_url}/ficha-tecnica?exibirAnotacao=1"
+        compilado_url = (
+            f"{norm_base_url}/compilado?exibirAnotacao=1&marcoHistorico={marco}"
+        )
+
+        ficha_soup = await self.request_service.get_soup(ficha_url)
+        compilado_soup = await self.request_service.get_soup(compilado_url)
+
+        if not ficha_soup:
+            logger.error(f"Error getting soup for {ficha_url}")
             await self._save_doc_error(
                 title=doc_info.get("title", ""),
                 year=doc_info.get("year", ""),
-                html_link=url,
+                html_link=ficha_url,
                 error_message="Failed to get document page",
             )
             return None
 
-        # autor or autores
-        author = soup.find("strong", text=re.compile(r"Autor:|Autores:"))
+        # Extract metadata from ficha_soup
+        author = ficha_soup.find("strong", string=re.compile(r"Autor:|Autores:"))
         if author:
             author = author.find_parent("li").text
             author = re.sub(r"Autor:|Autores:", "", author).strip()
 
-        publication = soup.find("strong", text="Publicação:")
+        publication = ficha_soup.find("strong", string="Publicação:")
         if publication:
             publication = (
                 publication.find_parent("li").text.replace("Publicação:", "").strip()
             )
-        date = soup.find("strong", text="Data da promulgação:")
+        date = ficha_soup.find("strong", string="Data da promulgação:")
         if date:
             date = (
                 date.find_parent("li").text.replace("Data da promulgação:", "").strip()
             )
 
         subject_regex = re.compile(r"Assunto:|Assuntos:")
-        subject = soup.find("strong", text=subject_regex)
+        subject = ficha_soup.find("strong", string=subject_regex)
         if subject:
             subject = subject.find_parent("li").text
             subject = re.sub(subject_regex, "", subject).strip()
 
-        tags = soup.find("strong", text="Tags:")
+        tags = ficha_soup.find("strong", string="Tags:")
         if tags:
             tags = tags.find_parent("li").text.replace("Tags:", "").strip()
-        situation = soup.find("strong", text="Situação:")
+        situation = ficha_soup.find("strong", string="Situação:")
         if situation:
             situation = (
                 situation.find_parent("li").text.replace("Situação:", "").strip()
             )
 
-        pdf_response = await self.request_service.make_request(doc_info["document_url"])
-        if not pdf_response:
-            logger.error(f"Error getting pdf content for {doc_info['document_url']}")
+        if not compilado_soup:
             await self._save_doc_error(
                 title=doc_info.get("title", ""),
                 year=doc_info.get("year", ""),
-                html_link=doc_info.get("document_url", url),
-                error_message="Failed to download PDF content",
+                html_link=compilado_url,
+                error_message="Failed to get compilado page",
             )
-            return
+            return None
 
-        raw_content = await pdf_response.read()
-        content_ext = ".pdf"
-        text_markdown = await self._get_markdown(stream=BytesIO(raw_content))
-
-        # text_markdown = self._get_markdown(doc_info["document_url"])
-        # remove header with link at beginning of document
-        # http://www.al.mt.gov.br/TNX/viewLegislacao.php?cod=44
-
-        text_markdown = self.header_remove_regex.sub("", text_markdown).strip()
-
-        # 150 comes from empirical results. Docs with less than this length are usually pdf images
-        if (
-            "Powered by TCPDF".lower() in text_markdown.lower()
-            or len(text_markdown) < 150
-        ):
-            # probably pdf is an image
-
-            pdf_content_response = await self.request_service.make_request(
-                doc_info["document_url"]
-            )
-            if not pdf_content_response:
-                await self._save_doc_error(
-                    title=doc_info.get("title", ""),
-                    year=doc_info.get("year", ""),
-                    html_link=doc_info.get("document_url", url),
-                    error_message="Failed to download PDF for image extraction",
-                )
-                return
-
-            pdf_content = await pdf_content_response.read()
-            raw_content = pdf_content
-
-            text_markdown = (
-                (await self._get_markdown(stream=BytesIO(pdf_content)))
-                .replace("Powered by TCPDF (www.tcpdf.org)", "")
-                .strip()
-            )
-
-        if not text_markdown:
+        frame = compilado_soup.find("turbo-frame")
+        if not frame:
             await self._save_doc_error(
                 title=doc_info.get("title", ""),
                 year=doc_info.get("year", ""),
-                html_link=doc_info.get("document_url", url),
-                error_message="Empty markdown after processing",
+                html_link=compilado_url,
+                error_message="turbo-frame not found in compilado page",
+            )
+            return None
+
+        self._strip_html_chrome(frame)
+        html_str = str(frame)
+        text_markdown = await self._get_markdown(html_content=html_str)
+        raw_content = html_str.encode("utf-8")
+        content_ext = ".html"
+
+        valid, reason = self._valid_markdown(text_markdown)
+        if not valid:
+            await self._save_doc_error(
+                title=doc_info.get("title", ""),
+                year=doc_info.get("year", ""),
+                html_link=doc_info.get("document_url", compilado_url),
+                error_message=reason,
             )
             return None
 
@@ -344,100 +319,43 @@ class MTAlmtScraper(StateScraper):
         return doc_data
 
     async def _scrape_year(self, year: int) -> list[dict]:
-        """Scrape norms for a specific year"""
-        # Build list of all types (regular + historic)
-        all_types = []
-        for norm_type, norm_type_id in self.types.items():
-            all_types.append(
-                {
-                    "id": norm_type_id,
-                    "norm_type": norm_type,
-                    "is_historic": False,
-                }
-            )
+        """Scrape all norms for a specific year using a single all-types search."""
+        if not self.token:
+            await self._set_token()
 
-        for norm_type, norm_type_id in self.historic_types.items():
-            all_types.append(
-                {
-                    "id": norm_type_id,
-                    "norm_type": norm_type,
-                    "is_historic": True,
-                }
-            )
+        is_historic = year <= self.max_year_historic
 
-        async def _scrape_type(norm_type_data: dict) -> list[dict]:
-            """Scrape a single type (historic or regular) for the given year."""
-            is_historic = norm_type_data["is_historic"]
+        # Page 1: fetch once for total count + first page of docs
+        url_p1 = self._build_search_url("", year, 1, is_historic)
+        soup_p1 = await self.request_service.get_soup(url_p1)
+        total_items = self._get_total_norms(soup_p1)
+        if total_items == 0:
+            return []
 
-            if is_historic and year > self.max_year_historic:
-                return []
-            elif not is_historic and year < self.min_year:
-                return []
+        pages = self._calc_pages(total_items, 10)
+        documents = self._extract_docs_from_soup(soup_p1, is_historic)
 
-            if not self.token:
-                await self._set_token()
-
-            norm_type = norm_type_data["norm_type"]
-            norm_type_id = norm_type_data["id"]
-            url = self._build_search_url(norm_type_id, year, 1, is_historic)
-            soup = await self.request_service.get_soup(url)
-
-            # get total pages (always 10 records per page)
-            total_items = self._get_total_norms(soup)
-
-            if total_items == 0:
-                return []
-
-            pages = total_items // 10 + 1
-
-            documents = []
+        # Pages 2..N: fetch concurrently
+        if pages > 1:
             tasks = [
                 self._get_docs_links(
-                    self._build_search_url(norm_type_id, year, page, is_historic),
-                    is_historic,
+                    self._build_search_url("", year, page, is_historic), is_historic
                 )
-                for page in range(1, pages + 1)
+                for page in range(2, pages + 1)
             ]
             valid_results = await self._gather_results(
                 tasks,
-                context={"year": year, "type": norm_type, "situation": "N/A"},
-                desc=f"MATO GROSSO | {norm_type} | get_docs_links",
+                context={"year": year, "type": "", "situation": "NA"},
+                desc=f"MATO GROSSO | {year} | get_docs_links",
             )
             for result in valid_results:
                 if result:
                     documents.extend(result)
 
-            results = []
-            ctx = {"year": year, "type": norm_type, "situation": "Não consta"}
-            tasks = [
-                self._with_save(
-                    self._get_doc_data(doc_info, is_historic=is_historic), ctx
-                )
-                for doc_info in documents
-            ]
-            results = await self._gather_results(
-                tasks,
-                context=ctx,
-                desc=f"MATO GROSSO | {norm_type}",
-            )
-
-            if self.verbose:
-                logger.info(
-                    f"Finished scraping for Year: {year} | Type: {norm_type} | Results: {len(results)}"
-                )
-
-            return results
-
-        # Scrape all types concurrently
-        tasks = [_scrape_type(type_data) for type_data in all_types]
-        all_type_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Flatten results and handle errors
-        all_results = []
-        for type_result in all_type_results:
-            if isinstance(type_result, Exception):
-                logger.error(f"Error scraping type for year {year}: {type_result}")
-                continue
-            all_results.extend(type_result)
-
-        return all_results
+        return await self._process_documents(
+            documents,
+            year=year,
+            norm_type="",
+            situation="Não consta",
+            doc_data_kwargs={"is_historic": is_historic},
+        )

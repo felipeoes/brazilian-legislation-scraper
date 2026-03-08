@@ -1,8 +1,36 @@
+import re
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 from loguru import logger
 from src.scraper.base.scraper import StateScraper
+
+_PT_MONTHS = {
+    "janeiro": "01",
+    "fevereiro": "02",
+    "março": "03",
+    "abril": "04",
+    "maio": "05",
+    "junho": "06",
+    "julho": "07",
+    "agosto": "08",
+    "setembro": "09",
+    "outubro": "10",
+    "novembro": "11",
+    "dezembro": "12",
+}
+
+
+def _parse_pt_date(text: str) -> str | None:
+    """Parse 'Publicada em DD de mês de YYYY' → 'YYYY-MM-DD'."""
+    m = re.search(r"(\d{1,2})\s+de\s+(\w+)\s+de\s+(\d{4})", text, re.IGNORECASE)
+    if not m:
+        return None
+    day = m.group(1).zfill(2)
+    month = _PT_MONTHS.get(m.group(2).lower())
+    year = m.group(3)
+    return f"{year}-{month}-{day}" if month else None
+
 
 TYPES = {
     "Decreto Legislativo": 41535,
@@ -16,23 +44,16 @@ TYPES = {
     "Constituição Estadual": "12/1989/10/746",  # texto completo, modificar a lógica no scraper
 }
 
-VALID_SITUATIONS = [
-    "Não consta"
-]  # Conama does not have a situation field, invalid norms will have an indication in the document text
-
-INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no longer have legal effect)
-
-# the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
-SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
+SITUATIONS = {"Não consta": "Não consta"}
 
 
 class LegislaAMScraper(StateScraper):
     """Webscraper for Amazonas state legislation website (https://legisla.imprensaoficial.am.gov.br/)
 
+    Year start (earliest on source): 1956
+
     Example search request: https://legisla.imprensaoficial.am.gov.br/diario_am/41535/2022?page=1
     """
-
-    # TODO: Change scraper to be based on https://sapl.al.am.leg.br/norma/pesquisar
 
     def __init__(
         self,
@@ -40,9 +61,9 @@ class LegislaAMScraper(StateScraper):
         **kwargs,
     ):
         super().__init__(
-            base_url, name="AMAZONAS", types=TYPES, situations=SITUATIONS, **kwargs
+            base_url, name="AMAZONAS", types=TYPES, situations={}, **kwargs
         )
-        self.fetched_constitution = False
+        self._scraped_constitution = False
 
     def _format_search_url(self, norm_type_id: str, year: int, page: int) -> str:
         """Format url for search request"""
@@ -54,6 +75,8 @@ class LegislaAMScraper(StateScraper):
         with keys 'title', 'summary', 'html_link' and reached_end indicates
         there are no more pages."""
         soup = await self.request_service.get_soup(url)
+        if not soup:
+            return [], True
 
         # check if the page is empty (error)
         container = soup.find("div", id="container")
@@ -62,9 +85,11 @@ class LegislaAMScraper(StateScraper):
             if error and error.text == "Error":
                 return [], True
 
-        docs = []
         items = soup.find_all("li", class_="item-li")
+        if not items:
+            return [], True
 
+        docs = []
         for item in items:
             title = item.find("h5").text
             html_link = item.find("a")
@@ -72,11 +97,15 @@ class LegislaAMScraper(StateScraper):
                 continue
             html_link = html_link.get("href")
 
+            date_tag = item.find("p")
+            date_str = _parse_pt_date(date_tag.text) if date_tag else None
+
             docs.append(
                 {
                     "title": title,
                     "summary": "",  # legislaAM does not provide a summary
                     "html_link": html_link,
+                    "date": date_str,
                 }
             )
 
@@ -85,19 +114,17 @@ class LegislaAMScraper(StateScraper):
     def _get_norm_text(self, soup: BeautifulSoup) -> BeautifulSoup:
         """Get norm text from given document soup"""
         norm_element = soup.find("div", class_="materia rounded")
+        if norm_element is None:
+            return None
+
         norm_text = norm_element.text
 
         # check if norm_text length is less than 50 characters, if so, it is an invalid norm (doesn't have any text, just a title)
         if len(norm_text) < 70:
             return None
 
-        # Remove the "Este texto não substitui o publicado no DOL/DOE..." disclaimer
-        # It always appears as the last non-empty paragraph inside the materia div.
-        for tag in norm_element.find_all(["p", "span", "div"]):
-            txt = tag.get_text(strip=True)
-            if txt.lower().startswith("este texto não substitui"):
-                tag.decompose()
-                break
+        # Remove the "Este texto não substitui..." disclaimer and other common artifacts.
+        self._clean_norm_soup(norm_element, remove_images=False)
 
         # add html tags to the text
         empty_soup = BeautifulSoup(
@@ -108,17 +135,24 @@ class LegislaAMScraper(StateScraper):
 
     async def _get_doc_data(self, doc_info: dict) -> dict:
         """Get document data from given document dict"""
-        # remove html_link from doc_info
+        doc_info = dict(doc_info)
         html_link = doc_info.pop("html_link")
-
         url = urljoin(self.base_url, html_link)
 
         if self._is_already_scraped(url, doc_info.get("title", "")):
             return None
 
-        soup = await self.request_service.get_soup(url)
+        resp = await self.request_service.get_soup(url)
+        if not resp:
+            await self._save_doc_error(
+                title=doc_info.get("title", ""),
+                year=doc_info.get("year", ""),
+                html_link=url,
+                error_message=f"Failed to fetch page: {resp.reason}",
+            )
+            return None
 
-        html_content = self._get_norm_text(soup)
+        html_content = self._get_norm_text(resp)
         if html_content is None:
             await self._save_doc_error(
                 title=doc_info.get("title", ""),
@@ -127,29 +161,20 @@ class LegislaAMScraper(StateScraper):
                 error_message="No norm text found in page",
             )
             return None
-        html_string = html_content.prettify()
 
-        text_markdown = await self._get_markdown(html_content=html_string)
+        return await self._process_html_doc(doc_info, str(html_content), url)
 
-        doc_info["text_markdown"] = text_markdown
-        doc_info["document_url"] = url
-        doc_info["_raw_content"] = html_string.encode("utf-8")
-        doc_info["_content_extension"] = ".html"
-
-        return doc_info
-
-    async def _scrape_situation_type(
-        self, situation: str, norm_type: str, norm_type_id: str, year: str
-    ) -> list:
-        """Scrape norms for a specific situation and type"""
-        if not self.fetched_constitution and norm_type == "Constituição Estadual":
+    async def _scrape_type(self, norm_type: str, norm_type_id, year: int) -> list:
+        """Scrape norms for a specific type and year"""
+        situation = "Não consta"
+        if not self._scraped_constitution and norm_type == "Constituição Estadual":
             url = f"{self.base_url}/diario_am/{norm_type_id}"
             doc_info = {
-                "year": year,
+                "year": 1989,
+                "date": "1989-10-05",
                 "situation": situation,
                 "type": norm_type,
                 "title": "Constituição Estadual",
-                "date": year,
                 "summary": "",
                 "html_link": url,
             }
@@ -158,76 +183,26 @@ class LegislaAMScraper(StateScraper):
             if doc_info is None:
                 return []
 
-            self.fetched_constitution = True
+            self._scraped_constitution = True
             logger.info("Scraped state constitution")
             await self._save_doc_result(doc_info)
             return [doc_info]
 
-        total_pages = 30
-        reached_end_page = False
-
-        # Get documents html links
-        documents = []
-        start_page = 1
-        while not reached_end_page:
-            tasks = [
-                self._get_docs_links(
-                    self._format_search_url(norm_type_id, year, page),
-                )
-                for page in range(start_page, total_pages + 1)
-            ]
-            valid_results = await self._gather_results(
-                tasks,
-                context={
-                    "year": year,
-                    "type": norm_type,
-                    "situation": situation,
-                },
-                desc=f"AMAZONAS | {norm_type} | get_docs_links",
-            )
-            for result in valid_results:
-                docs, ended = result
-                if ended:
-                    reached_end_page = True
-                if docs:
-                    documents.extend(docs)
-
-            start_page += total_pages
-            total_pages += 10
-
-            if (
-                start_page > total_pages
-            ):  # adding this condition to avoid infinite loop for some buggy pages
-                reached_end_page = True
+        ctx = {"year": year, "type": norm_type, "situation": situation}
+        documents = await self._paginate_until_end(
+            make_task=lambda p: self._get_docs_links(
+                self._format_search_url(norm_type_id, year, p)
+            ),
+            context=ctx,
+            desc=f"AMAZONAS | {norm_type} | get_docs_links",
+            initial_batch=30,
+            batch_growth=10,
+        )
 
         # Get document data
-        ctx = {"year": year, "situation": situation, "type": norm_type}
-        tasks = [
-            self._with_save(self._get_doc_data(doc_info), ctx) for doc_info in documents
-        ]
-        results = await self._gather_results(
-            tasks,
-            context=ctx,
-            desc=f"AMAZONAS | {norm_type}",
+        return await self._process_documents(
+            documents,
+            year=year,
+            norm_type=norm_type,
+            situation=situation,
         )
-
-        if self.verbose:
-            logger.info(
-                f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)}"
-            )
-
-        return results
-
-    async def _scrape_year(self, year: str) -> list:
-        """Scrape norms for a specific year"""
-        tasks = [
-            self._scrape_situation_type(sit, nt, ntid, year)
-            for sit in self.situations
-            for nt, ntid in self.types.items()
-        ]
-        valid = await self._gather_results(
-            tasks,
-            context={"year": year, "type": "NA", "situation": "NA"},
-            desc=f"{self.name} | Year {year}",
-        )
-        return self._flatten_results(valid)

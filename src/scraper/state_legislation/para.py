@@ -1,6 +1,8 @@
 import re
+
 from bs4 import BeautifulSoup
 from loguru import logger
+
 from src.scraper.base.scraper import StateScraper
 
 TYPES = {
@@ -12,25 +14,38 @@ TYPES = {
     "Resolução": 10,
 }
 
-VALID_SITUATIONS = [
-    "Não consta"
-]  # Alepa does not have a situation field, invalid norms will have an indication in the document text
+SITUATIONS = {"Não consta": "Não consta"}
 
-INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no longer in effect)
+_TYPE_NORMALIZE: dict[str, str] = {name.casefold(): name for name in TYPES}
+_TYPE_NORMALIZE.update(
+    {
+        "emendas constitucionais estaduais": "Emenda Constitucional",
+        "resoluções": "Resolução",
+    }
+)
 
-# the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
-SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
+# Federal types to skip (handled by federal legislation scraper)
+_FEDERAL_TYPES = {"emendas constitucionais federais"}
 
 
 class ParaAlepaScraper(StateScraper):
     """Webscraper for Para state legislation website (http://bancodeleis.alepa.pa.gov.br)
+
+    Year start (earliest on source): 1990
+
+    Optimization: a single POST with ``tipo=""`` fetches all document types
+    at once. The type is extracted per-document from the HTML response.
+
+    ``tipo=12`` ("Emendas Constitucionais Federais") exists on the server
+    but is intentionally excluded — federal legislation is handled by the
+    separate federal legislation scraper.
 
     Example search request: http://bancodeleis.alepa.pa.gov.br/index.php
 
     payload = {
         numero:
         anoLei: 2000
-        tipo: 2
+        tipo:
         pChave:
         verifica: 1
         button: Buscar
@@ -43,13 +58,23 @@ class ParaAlepaScraper(StateScraper):
         base_url: str = "http://bancodeleis.alepa.pa.gov.br",
         **kwargs,
     ):
-        super().__init__(
-            base_url, types=TYPES, situations=SITUATIONS, name="PARA", **kwargs
-        )
-        self.fetched_constitution = False
+        super().__init__(base_url, types=TYPES, situations={}, name="PARA", **kwargs)
         self.regex_total_count = re.compile(r"Total de Registros:\s+(\d+)")
 
-    def _build_params(self, norm_type_id: int, year: int) -> dict:
+    def _normalize_type(self, raw_type: str) -> str | None:
+        """Normalize an HTML type label to the canonical TYPES name.
+
+        Returns ``None`` for federal types (to be filtered out).
+        Unknown types fall back to the raw string (future-proof).
+        """
+        cleaned = re.sub(r"\s+", " ", raw_type or "").strip()
+        if not cleaned:
+            return ""
+        if cleaned.casefold() in _FEDERAL_TYPES:
+            return None
+        return super()._normalize_type(raw_type, aliases=_TYPE_NORMALIZE)
+
+    def _build_params(self, year: int, norm_type_id: int | str = "") -> dict:
         """Build a fresh params dict for a specific type/year query (no shared state)."""
         return {
             "numero": "",
@@ -60,9 +85,12 @@ class ParaAlepaScraper(StateScraper):
             "button": "Buscar",
         }
 
-    async def _get_docs_links(self, url: str, params: dict, norm_type: str) -> list:
+    async def _get_docs_links(self, url: str, params: dict) -> list:
         """Get documents html links from given page.
-        Returns a list of dicts with keys 'title', 'summary', 'pdf_link'
+
+        Extracts type and number per-document from the HTML. Federal types
+        are filtered out. Returns a list of dicts with keys ``title``,
+        ``summary``, ``pdf_link``, ``type``, and ``norm_number``.
         """
         response = await self.request_service.make_request(
             url, method="POST", payload=params
@@ -88,88 +116,81 @@ class ParaAlepaScraper(StateScraper):
         for item in items:
             tds = item.find_all("td")
             if len(tds) == 2:
-                title = tds[0].find("strong").next_sibling.strip()
+                # Extract type from "Tipo da Lei:" strong tag
+                raw_type = ""
+                norm_number = ""
+                for strong in tds[0].find_all("strong"):
+                    label = strong.get_text(strip=True)
+                    value = ""
+                    if strong.next_sibling:
+                        value = str(strong.next_sibling).strip()
+                    if "Tipo da Lei:" in label:
+                        raw_type = value
+                    elif "Nº da Lei:" in label:
+                        norm_number = value
+
+                norm_type = self._normalize_type(raw_type)
+                if norm_type is None:
+                    # Federal type — skip
+                    continue
+
+                # Fallback: use norm_number from the first strong's sibling
+                # (old format where the first strong has no label text)
+                if not norm_number:
+                    first_strong = tds[0].find("strong")
+                    if first_strong and first_strong.next_sibling:
+                        norm_number = str(first_strong.next_sibling).strip()
+
+                title = (
+                    f"{norm_type} {norm_number}".strip() if norm_type else norm_number
+                )
+
                 pdf_link = tds[1].find("a")
                 summary = pdf_link.text.strip()
                 pdf_link = pdf_link["href"]
 
                 docs.append(
                     {
-                        "title": f"{norm_type} {title}",
+                        "title": title,
                         "summary": summary,
                         "pdf_link": pdf_link,
+                        "type": norm_type,
+                        "norm_number": norm_number,
                     }
                 )
 
         return docs
 
     async def _get_doc_data(self, doc_info: dict) -> dict | None:
-        """Get document data from given document dict"""
-        # remove pdf_link from doc_info
-        pdf_link = doc_info.pop("pdf_link")
+        """Get document data from given document dict."""
+        return await self._process_pdf_doc(doc_info)
 
-        if self._is_already_scraped(pdf_link, doc_info.get("title", "")):
-            return None
+    async def _scrape_year(self, year: int) -> list[dict]:
+        """Scrape all types for a year in a single POST with tipo=''.
 
-        text_markdown, raw_content, content_ext = await self._download_and_convert(
-            pdf_link
-        )
-
-        if not text_markdown or not text_markdown.strip():
-            logger.error(f"Error getting markdown from pdf: {pdf_link}")
-            await self._save_doc_error(
-                title=doc_info.get("title", ""),
-                year=doc_info.get("year", ""),
-                html_link=pdf_link,
-                error_message="Empty markdown from PDF",
-            )
-            return None
-
-        doc_info["text_markdown"] = text_markdown
-        doc_info["document_url"] = pdf_link
-        doc_info["_raw_content"] = raw_content
-        doc_info["_content_extension"] = content_ext
-        return doc_info
-
-    def _scrape_constitution(self):
-        """Scrape the constitution"""
-
-    async def _scrape_situation_type(
-        self, situation: str, norm_type: str, norm_type_id: int, year: int
-    ) -> list:
-        """Scrape norms for a specific situation and type"""
-        # all docs are fetched in one single page
-        params = self._build_params(norm_type_id, year)
+        Results are grouped by type and processed via ``_process_documents``
+        for proper context/logging per type.
+        """
+        params = self._build_params(year)
         url = f"{self.base_url}/index.php"
-        docs = await self._get_docs_links(url, params, norm_type)
+        all_docs = await self._get_docs_links(url, params)
+        if not all_docs:
+            return []
 
-        ctx = {"year": year, "situation": situation, "type": norm_type}
+        # Group by type for proper context in _process_documents
+        docs_by_type: dict[str, list[dict]] = {}
+        for doc in all_docs:
+            docs_by_type.setdefault(doc.get("type", "Desconhecido"), []).append(doc)
+
         tasks = [
-            self._with_save(self._get_doc_data(doc_info), ctx) for doc_info in docs
+            self._process_documents(
+                docs, year=year, norm_type=nt, situation="Não consta"
+            )
+            for nt, docs in docs_by_type.items()
         ]
         results = await self._gather_results(
             tasks,
-            context=ctx,
-            desc=f"PARA | {norm_type}",
+            context={"year": year, "type": "NA", "situation": "Não consta"},
+            desc=f"PARA | Year {year}",
         )
-
-        if self.verbose:
-            logger.info(
-                f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)}"
-            )
-
-        return results
-
-    async def _scrape_year(self, year: int) -> list[dict]:
-        """Scrape norms for a specific year"""
-        tasks = [
-            self._scrape_situation_type(sit, nt, ntid, year)
-            for sit in self.situations
-            for nt, ntid in self.types.items()
-        ]
-        valid = await self._gather_results(
-            tasks,
-            context={"year": year, "type": "N/A", "situation": "N/A"},
-            desc=f"{self.name} | Year {year}",
-        )
-        return self._flatten_results(valid)
+        return self._flatten_results(results)

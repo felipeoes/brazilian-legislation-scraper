@@ -1,8 +1,10 @@
-from urllib.parse import urljoin
+import re
 from io import BytesIO
+from urllib.parse import urlencode, urljoin
 
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
+
 from src.scraper.base.scraper import StateScraper
 
 
@@ -21,10 +23,9 @@ INVALID_SITUATIONS = {
     "Anulada": 6,
 }  # norms with these situations are invalid norms (no longer have legal effect)
 
-# the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
 SITUATIONS = {**VALID_SITUATIONS, **INVALID_SITUATIONS}
 
-TYPES = {  # dict with norm type and its id
+TYPES = {  # dict with norm type and its id (kept as reference metadata)
     "Decreto": 3,
     "Decreto Legislativo": 28,
     "Decreto-Lei": 25,
@@ -45,7 +46,9 @@ TYPES = {  # dict with norm type and its id
 class SaoPauloAlespScraper(StateScraper):
     """Webscraper for Alesp (Assembleia Legislativa do Estado de São Paulo) website (https://www.al.sp.gov.br/)
 
-    Example search request url: # https://www.al.sp.gov.br/norma/resultados?page=0&size=500&tipoPesquisa=E&buscaLivreEscape=&buscaLivreDecode=&_idsTipoNorma=1&idsTipoNorma=3&nuNorma=&ano=&complemento=&dtNormaInicio=&dtNormaFim=&idTipoSituacao=1&_idsTema=1&palavraChaveEscape=&palavraChaveDecode=&_idsAutorPropositura=1&_temQuestionamentos=on&_pesquisaAvancada=on
+    Year start (earliest on source): 1835
+
+    Example search request url: # https://www.al.sp.gov.br/norma/resultados?page=0&size=500&tipoPesquisa=E&buscaLivreEscape=&buscaLivreDecode=&_idsTipoNorma=1&nuNorma=&ano=2020&complemento=&dtNormaInicio=&dtNormaFim=&idTipoSituacao=0&_idsTema=1&palavraChaveEscape=&palavraChaveDecode=&_idsAutorPropositura=1&_temQuestionamentos=on&_pesquisaAvancada=on
     """
 
     def __init__(
@@ -63,28 +66,27 @@ class SaoPauloAlespScraper(StateScraper):
             **kwargs,
         )
         self._page_size = 500
+        self._site_base = "https://www.al.sp.gov.br"
         self.headers = {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
                 (KHTML, like Gecko) Chrome/51.0.2704.103 Safari/537.36"
         }
 
-    def _build_search_url(
-        self, year: str, norm_type_id: int, norm_situation_id: int
-    ) -> str:
-        """Build search URL from arguments (no shared state mutation)."""
+    def _build_search_url(self, year: int, page: int = 0) -> str:
+        """Build search URL for all types/situations (idTipoSituacao=0)."""
         params = {
+            "page": page,
             "size": self._page_size,
             "tipoPesquisa": "E",
             "buscaLivreEscape": "",
             "buscaLivreDecode": "",
             "_idsTipoNorma": 1,
-            "idsTipoNorma": norm_type_id,
             "nuNorma": "",
             "ano": year,
             "complemento": "",
             "dtNormaInicio": "",
             "dtNormaFim": "",
-            "idTipoSituacao": norm_situation_id,
+            "idTipoSituacao": 0,
             "_idsTema": 1,
             "palavraChaveEscape": "",
             "palavraChaveDecode": "",
@@ -92,21 +94,20 @@ class SaoPauloAlespScraper(StateScraper):
             "_temQuestionamentos": "on",
             "_pesquisaAvancada": "on",
         }
-        return (
-            self.base_url
-            + "?"
-            + "&".join([f"{key}={value}" for key, value in params.items()])
-        )
+        return f"{self.base_url}?{urlencode(params)}"
 
-    async def _get_docs_links(self, url: str) -> list:
-        """Get documents html links from given page.
-        Returns a list of dicts with keys 'title', 'summary', 'html_link'"""
-        soup = await self.request_service.get_soup(url)
+    @staticmethod
+    def _extract_result_counts(soup) -> tuple[int, int] | None:
+        """Extract total result and page counts from the results header."""
+        for bold_tag in soup.find_all("b"):
+            text = " ".join(bold_tag.stripped_strings)
+            match = re.search(r"Resultado:\s*(\d+)\s+normas\s+em\s+(\d+)", text)
+            if match:
+                return int(match.group(1)), int(match.group(2))
+        return None
 
-        if not soup:
-            return []
-
-        # Get all documents html links from page
+    def _parse_docs_from_soup(self, soup) -> list[dict]:
+        """Extract doc entries from a pre-fetched result page soup."""
         trs = soup.find_all("tr")
         docs_html_links = []
         for tr in trs:
@@ -116,13 +117,10 @@ class SaoPauloAlespScraper(StateScraper):
                     continue
                 title = tds[0].find("span").text
                 summary = tds[1].find("span").text
-                # first <a> tag which contains the html link for the html document
-                url = tds[0].find("a", href=True)["href"]
-                norm_link = tds[0].find("a", class_="link_norma", href=True)
-                norm_link = urljoin(
-                    self.base_url.replace("/norma/resultados", ""), norm_link["href"]
-                )
-                html_link = urljoin(self.base_url.replace("/norma/resultados", ""), url)
+                doc_href = tds[0].find("a", href=True)["href"]
+                norm_link_tag = tds[0].find("a", class_="link_norma", href=True)
+                norm_link = urljoin(self._site_base, norm_link_tag["href"])
+                html_link = urljoin(self._site_base, doc_href)
                 docs_html_links.append(
                     {
                         "title": title,
@@ -131,8 +129,15 @@ class SaoPauloAlespScraper(StateScraper):
                         "norm_link": norm_link,
                     }
                 )
-
         return docs_html_links
+
+    async def _get_docs_links(self, url: str) -> list:
+        """Get documents html links from given page.
+        Returns a list of dicts with keys 'title', 'summary', 'html_link', 'norm_link'"""
+        soup = await self.request_service.get_soup(url)
+        if not soup:
+            return []
+        return self._parse_docs_from_soup(soup)
 
     @retry(
         stop=stop_after_attempt(3),
@@ -147,45 +152,53 @@ class SaoPauloAlespScraper(StateScraper):
         if not soup:
             return {}
 
-        # get "promulgacao", "projeto", "temas", "palavras-chave" if they exist
-        promulgacao = soup.find("label", text="Promulgação")
+        # get "promulgacao", "projeto", "temas", "palavras-chave", "situacao" if they exist
+        promulgacao = soup.find("label", string="Promulgação")
         if promulgacao:
             promulgacao = promulgacao.find_next("label").text
             if not promulgacao:
                 promulgacao = ""
 
-        projeto = soup.find("label", text="Projeto")
+        projeto = soup.find("label", string="Projeto")
         if projeto:
             projeto = projeto.find_next("label").text
             if not projeto:
                 projeto = ""
 
-        temas = soup.find("label", text="Temas")
+        temas = soup.find("label", string="Temas")
         if temas:
             temas = [
                 button.text for button in temas.find_next("div").find_all("button")
             ]
 
-        palavras_chave = soup.find("label", text="Palavras-chave")
+        palavras_chave = soup.find("label", string="Palavras-chave")
         if palavras_chave:
             palavras_chave = [
                 a.text for a in palavras_chave.find_next("div").find_all("a")
             ]
+
+        situacao = soup.find("label", string="Situação")
+        if situacao:
+            situacao = situacao.find_next("label").text or ""
 
         return {
             "promulgation": promulgacao,
             "project": projeto,
             "themes": temas,
             "keywords": palavras_chave,
+            "situation": situacao,
         }
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=2, min=2, max=15),
-        reraise=True,
-    )
+    @staticmethod
+    def _infer_type(title: str) -> str:
+        """Infer norm type from title (longest match first to avoid prefix collisions)."""
+        for type_name in sorted(TYPES, key=len, reverse=True):
+            if title.lower().startswith(type_name.lower()):
+                return type_name
+        return "Legislação"
+
     async def _get_doc_data(
-        self, doc_info: dict, norm_type: str, year: str = ""
+        self, doc_info: dict, norm_type: str = "NA", year: str = ""
     ) -> dict | None:
         """Get document data from given html link"""
         doc_html_link = doc_info["html_link"]
@@ -193,6 +206,8 @@ class SaoPauloAlespScraper(StateScraper):
 
         if self._is_already_scraped(doc_html_link, title):
             return None
+
+        norm_type = self._infer_type(title)
 
         # get norm data
         norm_link = doc_info["norm_link"]
@@ -202,12 +217,16 @@ class SaoPauloAlespScraper(StateScraper):
             logger.error(f"Failed to fetch norm data after retries: {e}")
             norm_data = {}
 
+        situation = norm_data.pop("situation", "Não consta") or "Não consta"
+
         data = {
             "year": year,
             "title": title,
+            "type": norm_type,
             "summary": doc_info["summary"],
             "text_markdown": "",
             "document_url": doc_html_link,
+            "situation": situation,
             **norm_data,
         }
 
@@ -229,15 +248,14 @@ class SaoPauloAlespScraper(StateScraper):
                 content_ext = ".html"
                 text_markdown = await self._get_markdown(html_content=text_markdown)
 
-            if not text_markdown or not text_markdown.strip():
+            valid, reason = self._valid_markdown(text_markdown)
+            if not valid:
                 logger.error(f"Failed to get markdown for PDF: {doc_html_link}")
                 await self._save_doc_error(
                     title=title,
-                    year="",
-                    situation="",
                     norm_type=norm_type,
                     html_link=doc_html_link,
-                    error_message="Failed to extract markdown from PDF",
+                    error_message=f"Failed to extract markdown from PDF: {reason}",
                 )
                 return None
 
@@ -249,38 +267,50 @@ class SaoPauloAlespScraper(StateScraper):
 
         soup = await self.request_service.get_soup(doc_html_link)
         if not soup or not soup.body:
-            raise Exception(f"Failed to get valid soup for {doc_html_link}")
+            await self._save_doc_error(
+                title=title,
+                norm_type=norm_type,
+                html_link=doc_html_link,
+                error_message=f"Failed to get valid soup for {doc_html_link}",
+            )
+            return None
 
         # check if pdf embedded in iframe
         panel_div = soup.find("div", id="UpdatePanel1")
         if panel_div:
             iframe = panel_div.find("iframe", src=True)
-            pdf_link = iframe["src"]
-            pdf_link = urljoin(doc_html_link, pdf_link)
-            if self.verbose:
-                logger.info(f"Found PDF link in iframe: {pdf_link}")
-            pdf_response = await self.request_service.make_request(pdf_link)
-            if not pdf_response:
-                raise Exception(f"No response downloading iframe PDF: {pdf_link}")
-            pdf_content = await pdf_response.read()
-            text_markdown = await self._get_markdown(stream=BytesIO(pdf_content))
-            if not text_markdown or not text_markdown.strip():
-                logger.error(f"Failed to get markdown for PDF: {pdf_link}")
-                await self._save_doc_error(
-                    title=title,
-                    year="",
-                    situation="",
-                    norm_type=norm_type,
-                    html_link=pdf_link,
-                    error_message="Failed to extract markdown from iframe PDF",
-                )
-                return None
+            if iframe:
+                pdf_link = iframe["src"]
+                pdf_link = urljoin(doc_html_link, pdf_link)
+                if self.verbose:
+                    logger.info(f"Found PDF link in iframe: {pdf_link}")
+                pdf_response = await self.request_service.make_request(pdf_link)
+                if not pdf_response:
+                    await self._save_doc_error(
+                        title=title,
+                        norm_type=norm_type,
+                        html_link=pdf_link,
+                        error_message=f"No response downloading iframe PDF: {pdf_link}",
+                    )
+                    return None
+                pdf_content = await pdf_response.read()
+                text_markdown = await self._get_markdown(stream=BytesIO(pdf_content))
+                valid, reason = self._valid_markdown(text_markdown)
+                if not valid:
+                    logger.error(f"Failed to get markdown for PDF: {pdf_link}")
+                    await self._save_doc_error(
+                        title=title,
+                        norm_type=norm_type,
+                        html_link=pdf_link,
+                        error_message=f"Failed to extract markdown from iframe PDF: {reason}",
+                    )
+                    return None
 
-            data["text_markdown"] = text_markdown
-            data["_raw_content"] = pdf_content
-            data["_content_extension"] = ".pdf"
+                data["text_markdown"] = text_markdown
+                data["_raw_content"] = pdf_content
+                data["_content_extension"] = ".pdf"
 
-            return data
+                return data
 
         # remove a tags with 'Assembleia Legislativa do Estado de São Paulo' and 'Ficha informativa'
         for a in soup.find_all("a"):
@@ -336,103 +366,53 @@ class SaoPauloAlespScraper(StateScraper):
                     else:
                         logger.error(f"Failed to get markdown for image: {img_url}")
 
-        result = {
-            "year": year,
-            "title": title,
-            "summary": doc_info["summary"],
-            "text_markdown": text_markdown,
-            "document_url": doc_html_link,
-            "_raw_content": raw_content,
-            "_content_extension": content_ext,
-            **norm_data,
-        }
+        valid, reason = self._valid_markdown(text_markdown)
+        if not valid:
+            await self._save_doc_error(
+                title=title,
+                norm_type=norm_type,
+                html_link=doc_html_link,
+                error_message=f"Invalid markdown from HTML: {reason}",
+            )
+            return None
 
-        return result
+        data["text_markdown"] = text_markdown
+        data["_raw_content"] = raw_content
+        data["_content_extension"] = content_ext
 
-    async def _scrape_situation_type(
-        self,
-        year: str,
-        situation: str,
-        situation_id: int,
-        norm_type: str,
-        norm_type_id: int,
-    ) -> list[dict]:
-        """Scrape norms for a specific situation and type"""
-        url = self._build_search_url(year, norm_type_id, situation_id)
-        soup = await self.request_service.get_soup(url)
+        return data
 
+    async def _scrape_year(self, year: int) -> list[dict]:
+        """Fetch all norms for a year in a single paginated query (idTipoSituacao=0)."""
+        url_page0 = self._build_search_url(year, page=0)
+        soup = await self.request_service.get_soup(url_page0)
         if not soup:
             return []
-
-        # check if <div class="card cinza text-center">Nenhuma norma encontrada como os parâmetros informados</div> exists
-        if (
-            "Nenhuma norma encontrada como os parâmetros informados".lower()
-            in soup.text.lower()
-        ):
+        if "Nenhuma norma encontrada".lower() in soup.text.lower():
             return []
 
-        # get number of pages
-        total = soup.find("span", text="página")
-        if total is None:
-            total = soup.find("span", text="páginas")
-
-        if not total:
+        counts = self._extract_result_counts(soup)
+        if not counts or counts[0] == 0:
             return []
+        _, pages = counts
 
-        total = total.previous_sibling.previous_sibling.text
-        total = int(total.strip().split()[-1])
-
-        if total == 0:
-            if self.verbose:
-                logger.info(
-                    f"No results for {norm_type} in {year} with situation {situation}"
-                )
-            return []
-
-        pages = total // self._page_size + 1
-
-        # Get documents html links from all pages
-        documents_html_links = []
-        tasks = [self._get_docs_links(url + f"&page={page}") for page in range(pages)]
-        valid_results = await self._gather_results(
-            tasks,
-            context={"year": year, "type": norm_type, "situation": situation},
-            desc=f"SAO PAULO | {norm_type} | get_docs_links",
-        )
-        for result in valid_results:
-            documents_html_links.extend(result)
-
-        # Get data from all documents text links
-        ctx = {"year": year, "type": norm_type, "situation": situation}
-        tasks = [
-            self._with_save(self._get_doc_data(doc_html_link, norm_type, year), ctx)
-            for doc_html_link in documents_html_links
-        ]
-        results = await self._gather_results(
-            tasks,
-            context=ctx,
-            desc=f"SAO PAULO | {norm_type}",
-        )
-
-        if self.verbose:
-            logger.info(
-                f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)}"
+        # Reuse already-fetched page-0 soup (avoids double fetch)
+        documents = self._parse_docs_from_soup(soup)
+        ctx = {"year": year, "type": "NA", "situation": "NA"}
+        documents.extend(
+            await self._fetch_all_pages(
+                lambda p: self._get_docs_links(self._build_search_url(year, page=p)),
+                pages - 1,
+                start_page=1,
+                context=ctx,
+                desc=f"SAO_PAULO | {year} | get_docs_links",
             )
-
-        return results
-
-    async def _scrape_year(self, year: str) -> list[dict]:
-        """Scrape norms for a specific year"""
-        tasks = [
-            self._scrape_situation_type(
-                year, situation, situation_id, norm_type, norm_type_id
-            )
-            for situation, situation_id in self.situations.items()
-            for norm_type, norm_type_id in self.types.items()
-        ]
-        valid = await self._gather_results(
-            tasks,
-            context={"year": year, "type": "N/A", "situation": "N/A"},
-            desc=f"{self.name} | Year {year}",
         )
-        return self._flatten_results(valid)
+
+        return await self._process_documents(
+            documents,
+            year=year,
+            norm_type="NA",
+            situation="NA",
+            doc_data_kwargs={"year": year},
+        )

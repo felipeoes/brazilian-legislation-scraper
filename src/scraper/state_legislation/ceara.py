@@ -1,10 +1,12 @@
-from collections import defaultdict
-from urllib.parse import urljoin, urlencode
-
+import asyncio
 import re
+from collections import defaultdict
 from datetime import datetime
+from urllib.parse import urlencode, urljoin
+
 from bs4 import BeautifulSoup
 from loguru import logger
+
 from src.scraper.base.scraper import StateScraper
 
 TYPES = {
@@ -18,18 +20,13 @@ TYPES = {
 }
 
 
-VALID_SITUATIONS = [
-    "Não consta"
-]  # Alece does not have a situation field, invalid norms will have an indication in the document text
-
-INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no longer have legal effect)
-
-# the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
-SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
+SITUATIONS = {"Não consta": "Não consta"}
 
 
 class CearaAleceScraper(StateScraper):
     """Webscraper for Ceara state legislation website (https://www.al.ce.gov.br/)
+
+    Year start (earliest on source): 1968
 
     Example search request: https://www.al.ce.gov.br/legislativo/leis-e-normativos-internos?categoria=ato-normativo&page=1
     """
@@ -60,16 +57,20 @@ class CearaAleceScraper(StateScraper):
 
     def _format_search_url(self, norm_type_id: str, page: int) -> str:
         """Format url for search request"""
-        self.params["categoria"] = norm_type_id
-        self.params["page"] = page
-        return f"{self.base_url}/leis-e-normativos-internos?{urlencode(self.params)}"
+        params = {**self.params, "categoria": norm_type_id, "page": page}
+        return f"{self.base_url}/leis-e-normativos-internos?{urlencode(params)}"
 
-    async def _get_docs_links(self, norm_type: str, url: str) -> list:
+    async def _get_docs_links(
+        self, norm_type: str, url: str, soup: BeautifulSoup | None = None
+    ) -> list:
         """Get documents html links from given page.
         Returns a list of dicts with keys 'title', 'year', 'norm_number', 'summary', 'document_url'
         """
 
-        soup = await self.request_service.get_soup(url, timeout=60)
+        if soup is None:
+            soup = await self.request_service.get_soup(url, timeout=60)
+        if not soup:
+            return []
         docs = []
 
         # check if the page is empty
@@ -116,13 +117,34 @@ class CearaAleceScraper(StateScraper):
         # Use the /visualizar HTML page to avoid needing OCR on the PDF download.
         visualizar_url = doc_info["document_url"].rstrip("/") + "/visualizar"
         soup = await self.request_service.get_soup(visualizar_url)
+        if not soup:
+            await self._save_doc_error(
+                title=doc_info.get("title", "Unknown"),
+                year=doc_info.get("year", ""),
+                norm_type=doc_info.get("norm_type", ""),
+                html_link=visualizar_url,
+                error_message="Failed to fetch document page",
+            )
+            return None
 
         content = soup.find("div", class_="card-body") or soup.find("main") or soup
-        for img in content.find_all("img"):
-            img.decompose()
+        self._clean_norm_soup(content, unwrap_links=False)
 
         html_string = str(content)
         text_markdown = await self._get_markdown(html_content=html_string)
+
+        valid, reason = self._valid_markdown(text_markdown)
+        if not valid:
+            logger.error(f"Invalid markdown for {visualizar_url}: {reason}")
+            await self._save_doc_error(
+                title=doc_info.get("title", "Unknown"),
+                year=doc_info.get("year", ""),
+                norm_type=doc_info.get("norm_type", ""),
+                html_link=visualizar_url,
+                error_message=reason,
+            )
+            return None
+
         doc_info["text_markdown"] = text_markdown
         doc_info["_raw_content"] = html_string.encode("utf-8")
         doc_info["_content_extension"] = ".html"
@@ -134,13 +156,27 @@ class CearaAleceScraper(StateScraper):
 
         The ALECE website does not support server-side year filtering for
         Ato Deliberativo, Ato Normativo, and Resolução. This method fetches
-        all pages up-front and buckets documents into ``_prefetched_docs``
-        so ``_scrape_type`` can process them year-by-year.
+        page 1 of all types concurrently, then fetches remaining pages in a
+        single batch, and buckets documents into ``_prefetched_docs``.
         """
-        for norm_type in self.PAGINATED_TYPES:
+        # Phase 1: fetch page 1 of all types concurrently
+        type_list = list(self.PAGINATED_TYPES)
+        first_page_urls = {
+            nt: self._format_search_url(self.types[nt], 1) for nt in type_list
+        }
+        first_soups = await asyncio.gather(
+            *(
+                self.request_service.get_soup(first_page_urls[nt], timeout=60)
+                for nt in type_list
+            )
+        )
+
+        # Phase 2: discover total pages and build remaining-page tasks
+        remaining_tasks: list[tuple[str, object]] = []  # (norm_type, coro)
+        for norm_type, soup in zip(type_list, first_soups):
+            if not soup:
+                continue
             norm_type_id = self.types[norm_type]
-            url = self._format_search_url(norm_type_id, 1)
-            soup = await self.request_service.get_soup(url, timeout=60)
 
             pagination = soup.find("ul", class_="pagination")
             if pagination:
@@ -150,38 +186,47 @@ class CearaAleceScraper(StateScraper):
             else:
                 total_pages = 1
 
-            tasks = [
-                self._get_docs_links(
-                    norm_type,
-                    self._format_search_url(norm_type_id, page),
-                )
-                for page in range(1, total_pages + 1)
-            ]
-            valid_results = await self._gather_results(
-                tasks,
-                context={"year": "NA", "type": norm_type, "situation": "NA"},
-                desc=f"CEARA | {norm_type} | prefetch_links",
+            # Bucket page-1 results immediately
+            docs_p1 = await self._get_docs_links(
+                norm_type, first_page_urls[norm_type], soup=soup
             )
+            self._bucket_prefetched(docs_p1, norm_type, resume_from)
 
-            count = 0
-            for result in valid_results:
-                for doc in result:
-                    year = int(doc["year"])
-                    if year < resume_from:
-                        continue
-                    self._prefetched_docs[year][norm_type].append(doc)
-                    count += 1
-
-            if self.verbose:
-                logger.info(
-                    f"Prefetched {count} links for {norm_type} (pages: {total_pages})"
+            for page in range(2, total_pages + 1):
+                remaining_tasks.append(
+                    (
+                        norm_type,
+                        self._get_docs_links(
+                            norm_type,
+                            self._format_search_url(norm_type_id, page),
+                        ),
+                    )
                 )
+
+        if remaining_tasks:
+            results = await self._gather_results(
+                [t[1] for t in remaining_tasks],
+                context={"year": "NA", "type": "paginated", "situation": "NA"},
+                desc="CEARA | paginated | prefetch_links",
+            )
+            for (norm_type, _), result in zip(remaining_tasks, results):
+                self._bucket_prefetched(result, norm_type, resume_from)
+
+    def _bucket_prefetched(self, docs: list, norm_type: str, resume_from: int) -> None:
+        """Sort fetched document links into ``_prefetched_docs`` by year."""
+        for doc in docs:
+            year = int(doc["year"])
+            if year < resume_from or year > self.year_end:
+                continue
+            self._prefetched_docs[year][norm_type].append(doc)
 
     async def _fetch_lei_ordinaria_years(self) -> list[int]:
         """Return sorted list of available years for Lei Ordinária."""
         norm_type_id = self.types["Lei Ordinária"]
         url = f"https://www2.al.ce.gov.br/legislativo/{norm_type_id}"
         soup = await self.request_service.get_soup(url)
+        if not soup:
+            return []
         table = soup.find("table", {"class": "MsoNormalTable"})
         rows = table.find_all("tr")
         years = []
@@ -199,17 +244,14 @@ class CearaAleceScraper(StateScraper):
         if not docs:
             return []
 
-        situation = self.situations[0]
-
-        ctx = {"year": year, "situation": situation, "type": norm_type}
-        tasks = [self._with_save(self._get_doc_data(doc), ctx) for doc in docs]
-        results = await self._gather_results(
-            tasks,
-            context=ctx,
+        situation = next(iter(self.situations), "Não consta")
+        return await self._process_documents(
+            docs,
+            year=year,
+            norm_type=norm_type,
+            situation=situation,
             desc=f"CEARA | {norm_type} | Year {year}",
         )
-
-        return results
 
     async def _scrape_type(
         self, norm_type: str, norm_type_id: str, year: int
@@ -218,7 +260,7 @@ class CearaAleceScraper(StateScraper):
         if norm_type in self.PAGINATED_TYPES:
             return await self._scrape_paginated_type(norm_type, year)
 
-        situation = self.situations[0]
+        situation = next(iter(self.situations), "Não consta")
 
         if norm_type == "Lei Ordinária":
             if year not in self._lei_ordinaria_years:
@@ -228,18 +270,17 @@ class CearaAleceScraper(StateScraper):
             )
 
         if norm_type in self.STATIC_INDEX_TYPES:
-            # These are single-page indexes without year filtering.
-            # Only scrape once (on the first year that reaches here).
-            cache_key = f"_scraped_{norm_type}"
-            if getattr(self, cache_key, False):
+            docs = self._prefetched_docs.get(year, {}).get(norm_type, [])
+            if not docs:
                 return []
-            setattr(self, cache_key, True)
-            results = await self._scrape_laws_constitution_amendments(
-                situation, norm_type, norm_type_id
+            return await self._process_documents(
+                docs,
+                year=year,
+                norm_type=norm_type,
+                situation=situation,
+                doc_data_fn=self._get_laws_constitution_amendments_doc_data,
+                doc_data_kwargs={"norm_type": norm_type, "year": year},
             )
-            # Filter to year range since the index page returns all years
-            year_set = set(self.years)
-            return [r for r in results if r.get("year") in year_set]
 
         return []
 
@@ -250,6 +291,8 @@ class CearaAleceScraper(StateScraper):
         Returns a list of dicts with keys 'title', 'year', 'summary', 'html_link'
         """
         soup = await self.request_service.get_soup(url)
+        if not soup:
+            return []
         docs = []
 
         table = soup.find_all("table")
@@ -258,13 +301,7 @@ class CearaAleceScraper(StateScraper):
         else:
             table = table[0]
         items = table.find_all("tr")
-        for index in range(len(items)):
-            # skip first row since it's the header
-            if index == 0:
-                continue
-
-            item = items[index]
-
+        for item in items[1:]:
             tds = item.find_all("td")
 
             # for leis ordinarias, the table has at most 3 columns
@@ -366,8 +403,7 @@ class CearaAleceScraper(StateScraper):
         self, doc_info: dict, norm_type: str, year: int | None = None
     ) -> dict | None:
         """Get document data from given document dict"""
-        # html_link will be a link to the document page
-
+        doc_info = dict(doc_info)
         html_link = doc_info.pop("html_link")
         url = self.construct_url(norm_type, html_link, year)
 
@@ -383,7 +419,6 @@ class CearaAleceScraper(StateScraper):
             await self._save_doc_error(
                 title=doc_info.get("title", "Unknown"),
                 year=year or "",
-                situation="",
                 norm_type=norm_type,
                 html_link=url,
                 error_message="Failed to fetch document page",
@@ -415,7 +450,6 @@ class CearaAleceScraper(StateScraper):
             await self._save_doc_error(
                 title=doc_info.get("title", "Unknown"),
                 year=year or "",
-                situation="",
                 norm_type=norm_type,
                 html_link=url,
                 error_message="Invalid document (NÄO EXISTE LEI COM ESTE NÚMERO)",
@@ -425,15 +459,15 @@ class CearaAleceScraper(StateScraper):
         # Use direct HTML content conversion
         text_markdown = await self._get_markdown(html_content=html_string)
 
-        if not text_markdown:
-            logger.error(f"Error converting document to markdown: {url}. Year: {year}")
+        valid, reason = self._valid_markdown(text_markdown)
+        if not valid:
+            logger.error(f"Invalid markdown for {url} (year={year}): {reason}")
             await self._save_doc_error(
                 title=doc_info.get("title", "Unknown"),
                 year=year or "",
-                situation="",
                 norm_type=norm_type,
                 html_link=url,
-                error_message="Markdown conversion returned empty result",
+                error_message=reason,
             )
             return None
 
@@ -467,41 +501,52 @@ class CearaAleceScraper(StateScraper):
 
         docs = await self._get_laws_constitution_amendments_docs_links(url, norm_type)
 
-        ctx = {"year": year, "situation": situation, "type": norm_type}
-        tasks = [
-            self._with_save(
-                self._get_laws_constitution_amendments_doc_data(doc, norm_type, year),
-                ctx,
-            )
-            for doc in docs
-        ]
-        results = await self._gather_results(
-            tasks,
-            context=ctx,
-            desc=f"CEARA | {norm_type}",
+        return await self._process_documents(
+            docs,
+            year=year,
+            norm_type=norm_type,
+            situation=situation,
+            doc_data_fn=self._get_laws_constitution_amendments_doc_data,
+            doc_data_kwargs={"norm_type": norm_type, "year": year},
         )
 
-        if self.verbose:
-            logger.info(
-                f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)} | Total: {self.count}"
+    async def _prefetch_static_index_links(self) -> None:
+        """Prefetch links for static index types and bucket by year."""
+        tasks = []
+        type_list = []
+        for norm_type in self.STATIC_INDEX_TYPES:
+            norm_type_id = self.types[norm_type]
+            url = f"https://www2.al.ce.gov.br/legislativo/{norm_type_id}"
+            tasks.append(
+                self._get_laws_constitution_amendments_docs_links(url, norm_type)
             )
+            type_list.append(norm_type)
 
-        return results
+        results = await asyncio.gather(*tasks)
+        for norm_type, docs in zip(type_list, results):
+            for doc in docs:
+                year = doc.get("year")
+                if year is None or year < self.year_start or year > self.year_end:
+                    continue
+                self._prefetched_docs[year][norm_type].append(doc)
 
-    async def scrape(self) -> list:
+    async def scrape(self) -> int:
         """Scrape data from all years.
 
-        Prefetches all document links for paginated categories, groups them
-        by year, then delegates to BaseScraper.scrape() for year-sequential
-        processing with document-level resumability.
+        Prefetches all document links for paginated and static index
+        categories, groups them by year, then delegates to
+        BaseScraper.scrape() for year-sequential processing with
+        document-level resumability.
         """
-        # Prefetch links for paginated categories (grouped by year)
-        await self._prefetch_paginated_links(self.year_start)
-
-        # Fetch available Lei Ordinária years
-        self._lei_ordinaria_years: set[int] = set(
-            await self._fetch_lei_ordinaria_years()
+        # Prefetch paginated links and Lei Ordinária years concurrently
+        _, lei_ord_years = await asyncio.gather(
+            self._prefetch_paginated_links(self.year_start),
+            self._fetch_lei_ordinaria_years(),
         )
+        self._lei_ordinaria_years: set[int] = set(lei_ord_years)
+
+        # Prefetch static index links (cheap — only fetches link lists)
+        await self._prefetch_static_index_links()
 
         # Build the set of years that actually have data, bounded by year range
         all_years = set(self._prefetched_docs.keys()) | self._lei_ordinaria_years

@@ -11,8 +11,11 @@ PowerBI dashboard:
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
+from typing import cast
 
+import aiohttp
 from bs4 import BeautifulSoup
 from loguru import logger
 
@@ -52,11 +55,13 @@ VALID_SITUATIONS = [
 ]
 INVALID_SITUATIONS = ["revogado", "vencido", "sem efeito"]
 
-SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
+SITUATIONS = {s: s for s in VALID_SITUATIONS + INVALID_SITUATIONS}
 
 
 class ICMBioScraper(BaseScraper):
     """Scraper for ICMBio normative acts via the PowerBI querydata API.
+
+    Year start (earliest on source): 2016
 
     Instead of driving a Playwright browser through the PowerBI dashboard,
     this scraper calls the underlying REST API directly.  Each API request
@@ -193,9 +198,17 @@ class ICMBioScraper(BaseScraper):
         Args:
             ds: The DS object from the DSR response.
             accumulated_dicts: Merged ValueDicts from all pages seen so far.
+                               When non-empty, takes priority over the page's
+                               own ``ValueDicts`` so that cross-page index
+                               references resolve correctly.
         """
         ph_rows = ds["PH"][0]["DM0"]
-        value_dicts: dict[str, list] = accumulated_dicts or ds.get("ValueDicts", {})
+        # Use the caller-supplied accumulated dicts when available; fall back
+        # to this page's own ValueDicts only on the very first page (where
+        # accumulated_dicts is still an empty dict).
+        value_dicts: dict[str, list] = (
+            accumulated_dicts if accumulated_dicts else ds.get("ValueDicts", {})
+        )
 
         # Parse schema from the first row that has an 'S' key
         schema: list[dict] = []
@@ -287,7 +300,7 @@ class ICMBioScraper(BaseScraper):
             return None, None, True
 
         # Response content-type is text/plain, so read as text then parse
-        text = await response.text()
+        text = await cast(aiohttp.ClientResponse, response).text()
         data = json.loads(text)
 
         dsr = data["results"][0]["result"]["data"]["dsr"]
@@ -339,9 +352,16 @@ class ICMBioScraper(BaseScraper):
 
     @staticmethod
     def _classify_type(title: str) -> str:
-        """Determine the document type from its title."""
+        """Determine the document type from its title.
+
+        Uses ``instrução normativa`` substring match or a numeric ``IN``
+        prefix (e.g. "IN 42, de ...") to identify normative instructions.
+        The ``lower.startswith("in ")`` shorthand is intentionally avoided
+        because it would match portarias whose titles start with that
+        sequence for unrelated reasons.
+        """
         lower = title.lower()
-        if "instrução normativa" in lower or lower.startswith("in "):
+        if "instrução normativa" in lower or re.match(r"^in\s+\d+", lower):
             return "Instrução Normativa"
         if "portaria" in lower:
             return "Portaria"
@@ -355,6 +375,12 @@ class ICMBioScraper(BaseScraper):
         parts = (row.get("link_dou") or "").split()
         link_dou = parts[0].strip() if parts else ""
         if not link_dou or "in.gov.br" not in link_dou:
+            title = row.get("ato", "<sem título>")
+            raw_link = row.get("link_dou", "")
+            logger.debug(
+                f"ICMBIO | Skipping row without valid DOU link "
+                f"| title={title!r} | link_dou={raw_link!r}"
+            )
             return None
 
         title = row.get("ato", "")
@@ -371,7 +397,7 @@ class ICMBioScraper(BaseScraper):
             situation = "não consta"
 
         return {
-            "year": str(year),
+            "year": year,
             "title": title,
             "summary": row.get("ementa", ""),
             "type": self._classify_type(title),
@@ -380,6 +406,36 @@ class ICMBioScraper(BaseScraper):
             "subject": row.get("assunto", ""),
             "publication_info": row.get("instrumento", ""),
         }
+
+    # ── One-time data prefetch ─────────────────────────────────────
+
+    async def _before_scrape(self) -> None:
+        """Fetch and index all PowerBI rows before year iteration begins.
+
+        Overrides the no-op hook in ``BaseScraper`` so that the bulk API
+        call happens exactly once, up-front, rather than being guarded by
+        ``hasattr`` inside ``_scrape_year``.
+        """
+        logger.info("ICMBIO | Fetching all rows from PowerBI API...")
+        all_rows = await self._fetch_all_rows()
+        logger.info(f"ICMBIO | Total rows fetched: {len(all_rows)}")
+
+        docs_by_year: dict[int, list[dict]] = {}
+        skipped = 0
+        for row in all_rows:
+            doc = self._row_to_doc(row)
+            if not doc:
+                skipped += 1
+                continue
+            docs_by_year.setdefault(doc["year"], []).append(doc)
+
+        self._docs_by_year = docs_by_year
+        parsed = sum(len(v) for v in docs_by_year.values())
+        logger.info(
+            f"ICMBIO | Parsed {parsed} valid docs into "
+            f"{len(docs_by_year)} yearly buckets "
+            f"({skipped} rows skipped — no valid DOU link)"
+        )
 
     # ── Document content fetching ─────────────────────────────────
 
@@ -421,7 +477,7 @@ class ICMBioScraper(BaseScraper):
             )
             return None
 
-        html = await response.text()
+        html = await cast(aiohttp.ClientResponse, response).text()
         soup = BeautifulSoup(html, "html.parser")
         text_div = soup.find("div", class_="texto-dou")
 
@@ -437,9 +493,27 @@ class ICMBioScraper(BaseScraper):
             )
             return None
 
-        html_string = self._wrap_html(text_div.prettify())
+        # Strip elements already captured in dedicated fields:
+        #   <p class="identifica"> → duplicates `title`
+        #   <p class="ementa">     → duplicates `summary`
+        for p in text_div.find_all("p", class_="identifica"):
+            p.decompose()
+        for p in text_div.find_all("p", class_="ementa"):
+            p.decompose()
 
-        text_markdown = await self._get_markdown(html_content=html_string)
+        # Structural cleanup before conversion: unwrap links, strip disclaimer
+        # notices, remove images and empty tags.
+        text_div = self._clean_norm_soup(
+            cast(BeautifulSoup, text_div),
+            unwrap_links=True,
+            remove_disclaimers=True,
+            remove_images=True,
+            remove_empty_tags=True,
+        )
+
+        # _html_to_markdown wraps the fragment, converts via MarkItDown, and
+        # applies _clean_markdown — all in one step.
+        text_markdown = await self._html_to_markdown(text_div.prettify())
         if not text_markdown or not text_markdown.strip():
             logger.warning(f"Empty markdown from {document_url}")
             await self._save_doc_error(
@@ -464,6 +538,8 @@ class ICMBioScraper(BaseScraper):
             )
             return None
 
+        # Preserve the cleaned HTML fragment as the raw source file.
+        html_string = self._wrap_html(text_div.prettify())
         result = {
             **doc_info,
             "text_markdown": text_markdown,
@@ -477,32 +553,7 @@ class ICMBioScraper(BaseScraper):
 
     async def _scrape_year(self, year: int):
         """Scrape all ICMBio documents for a specific year."""
-        year_int = int(year)
-
-        # Fetch all rows from the API and pre-index by year once.
-        if not hasattr(self, "_docs_by_year"):
-            logger.info("ICMBIO | Fetching all rows from PowerBI API...")
-            all_rows = await self._fetch_all_rows()
-            logger.info(f"ICMBIO | Total rows fetched: {len(all_rows)}")
-
-            docs_by_year: dict[int, list[dict]] = {}
-            parsed_docs = 0
-            for row in all_rows:
-                doc = self._row_to_doc(row)
-                if not doc:
-                    continue
-                doc_year = int(doc["year"])
-                docs_by_year.setdefault(doc_year, []).append(doc)
-                parsed_docs += 1
-
-            self._docs_by_year = docs_by_year
-            if self.verbose:
-                logger.info(
-                    f"ICMBIO | Parsed {parsed_docs} valid docs into "
-                    f"{len(docs_by_year)} yearly buckets"
-                )
-
-        docs = list(self._docs_by_year.get(year_int, []))
+        docs = list(self._docs_by_year.get(year, []))
 
         if not docs:
             logger.warning(f"No documents found for year {year}")
@@ -510,12 +561,16 @@ class ICMBioScraper(BaseScraper):
 
         logger.info(f"ICMBIO | Year {year}: {len(docs)} documents to process")
 
-        # Process documents concurrently
+        # _get_doc_data calls _save_doc_result internally, so documents are
+        # already persisted before _gather_results validates them.  Pass
+        # min_length=0 to skip the redundant re-validation that would cause
+        # already-saved documents to be double-counted as errors.
         tasks = [self._get_doc_data(doc) for doc in docs]
         valid_results = await self._gather_results(
             tasks,
-            context={"year": year, "type": "NA", "situation": "NA"},
+            context={"year": year, "type": "mixed", "situation": "mixed"},
             desc=f"ICMBIO | Processing docs for {year}",
+            min_length=0,
         )
 
         results = [r for r in valid_results if r is not None]

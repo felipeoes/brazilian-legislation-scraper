@@ -28,7 +28,7 @@ The project relies on `uv` for dependency management and execution.
     ```
 *   **Run specific scrapers by name:**
     ```bash
-    uv run main.py --scrapers <ScraperName1> <ScraperName2>
+    uv run main.py --scrapers Conama SaoPauloAlesp
     ```
 *   **List all available scrapers:**
     ```bash

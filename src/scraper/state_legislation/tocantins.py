@@ -1,7 +1,8 @@
 import re
 from io import BytesIO
-from typing import Any
+from typing import Any, cast
 
+import aiohttp
 from bs4 import BeautifulSoup, Tag
 from loguru import logger
 from src.scraper.base.scraper import StateScraper
@@ -18,11 +19,13 @@ VALID_SITUATIONS = ["Não consta"]
 
 INVALID_SITUATIONS = []
 
-SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
+SITUATIONS = {s: s for s in VALID_SITUATIONS + INVALID_SITUATIONS}
 
 
 class TocantinsScraper(StateScraper):
     """Webscraper for Tocantins state legislation website (https://www.al.to.leg.br/)
+
+    Year start (earliest on source): 1989
 
     Example search request: POST to https://www.al.to.leg.br/legislacaoEstadual
     """
@@ -67,7 +70,8 @@ class TocantinsScraper(StateScraper):
         if not response:
             return []
 
-        return self._extract_docs_from_soup(await response.read())
+        client_response = cast(aiohttp.ClientResponse, response)
+        return self._extract_docs_from_soup(await client_response.read())
 
     def _extract_docs_from_soup(self, html_content: bytes) -> list[dict]:
         """Extract document information from HTML content"""
@@ -143,6 +147,62 @@ class TocantinsScraper(StateScraper):
 
         return docs
 
+    @staticmethod
+    def _extract_total_count(soup: BeautifulSoup) -> int | None:
+        """Extract the total result count from the search results banner."""
+        for div in soup.find_all("div"):
+            text = div.get_text(" ", strip=True)
+            if "Registros encontrados" not in text:
+                continue
+
+            strong_tag = div.find("strong")
+            if not strong_tag or not isinstance(strong_tag, Tag):
+                continue
+
+            digits = re.sub(r"\D", "", strong_tag.get_text(strip=True))
+            if digits:
+                return int(digits)
+
+        return None
+
+    @staticmethod
+    def _has_table_artifacts(text_markdown: str) -> bool:
+        """Detect markitdown outputs that are mostly broken pipe tables."""
+        if not text_markdown:
+            return False
+
+        pipe_count = text_markdown.count("|")
+        pipe_lines = sum(
+            1 for line in text_markdown.splitlines() if line.lstrip().startswith("|")
+        )
+        return pipe_count >= 80 or pipe_lines >= 8
+
+    @staticmethod
+    def _normalize_table_markdown(text_markdown: str) -> str:
+        """Collapse broken markdown tables into plain text lines."""
+        cleaned_lines = []
+        for raw_line in text_markdown.splitlines():
+            line = raw_line.strip()
+            if not line:
+                cleaned_lines.append("")
+                continue
+
+            if re.fullmatch(r"\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?", line):
+                continue
+
+            if "|" in line:
+                cells = [cell.strip() for cell in line.strip("|").split("|")]
+                cells = [cell for cell in cells if cell and set(cell) != {"-"}]
+                if cells:
+                    cleaned_lines.append(" ".join(cells))
+                continue
+
+            cleaned_lines.append(raw_line)
+
+        normalized = "\n".join(cleaned_lines)
+        normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+        return normalized.strip()
+
     async def _get_total_pages(self, norm_type_id: str, year: int) -> int:
         """Get total number of pages for a search"""
         payload = self._format_search_payload(norm_type_id, year, 1)
@@ -153,7 +213,16 @@ class TocantinsScraper(StateScraper):
         if not response:
             return 1
 
-        soup = BeautifulSoup(await response.read(), "html.parser")
+        client_response = cast(aiohttp.ClientResponse, response)
+        html_content = await client_response.read()
+        soup = BeautifulSoup(html_content, "html.parser")
+
+        total_count = self._extract_total_count(soup)
+        first_page_docs = self._extract_docs_from_soup(html_content)
+        first_page_size = len(first_page_docs)
+
+        if total_count and first_page_size:
+            return max(1, self._calc_pages(total_count, first_page_size))
 
         # Look for pagination navigation with "Grupo paginação"
         nav = soup.find("nav", {"aria-label": "Grupo paginação"})
@@ -163,7 +232,6 @@ class TocantinsScraper(StateScraper):
         # Find pagination links
         pagination_links = nav.find_all("a", class_="page-link")
         max_page = 1
-        max_range_end = 0
 
         for link in pagination_links:
             if not isinstance(link, Tag):
@@ -171,16 +239,6 @@ class TocantinsScraper(StateScraper):
             text = link.get_text(strip=True)
             if text.isdigit():
                 max_page = max(max_page, int(text))
-                continue
-
-            # Some pages show record ranges like "1-10", "11-20", etc.
-            range_match = re.fullmatch(r"(\d+)\s*-\s*(\d+)", text)
-            if range_match:
-                max_range_end = max(max_range_end, int(range_match.group(2)))
-
-        if max_page == 1 and max_range_end > 0:
-            # Range labels refer to record offsets; convert to page count.
-            return (max_range_end + 9) // 10
 
         return max_page
 
@@ -202,7 +260,7 @@ class TocantinsScraper(StateScraper):
         ]
         valid_results = await self._gather_results(
             tasks,
-            context={"year": year, "type": "N/A", "situation": "N/A"},
+            context={"year": year, "type": "NA", "situation": "NA"},
             desc="TOCANTINS | get_docs_links",
         )
         for result in valid_results:
@@ -239,17 +297,22 @@ class TocantinsScraper(StateScraper):
                 )
                 return None
 
-            pdf_content = await pdf_response.read()
+            pdf_client_response = cast(aiohttp.ClientResponse, pdf_response)
+            pdf_content = await pdf_client_response.read()
 
             # Convert PDF to markdown
             text_markdown = await self._get_markdown(stream=BytesIO(pdf_content))
 
-            if not text_markdown or not text_markdown.strip():
+            if text_markdown and self._has_table_artifacts(text_markdown):
+                text_markdown = self._normalize_table_markdown(text_markdown)
+
+            valid, reason = self._valid_markdown(text_markdown)
+            if not valid:
                 await self._save_doc_error(
                     title=title,
                     year=doc_info.get("year", ""),
                     html_link=pdf_link,
-                    error_message="Empty markdown from PDF",
+                    error_message=f"Invalid markdown: {reason}",
                 )
                 return None
 
@@ -278,41 +341,13 @@ class TocantinsScraper(StateScraper):
 
     async def _fetch_constitution(self):
         """Fetch the Tocantins state constitution"""
-        pdf_link = f"{self.base_url}/arquivos/documento_68367.PDF#dados"
-        title = "Constituição Estadual de Tocantins"
-
-        if self._is_already_scraped(pdf_link, title):
-            if self.verbose:
-                logger.info("Tocantins constitution already scraped, skipping")
-            return
-
-        text_markdown, raw_content, content_ext = await self._download_and_convert(
-            pdf_link
+        await self._fetch_and_save_constitution(
+            url=f"{self.base_url}/arquivos/documento_68367.PDF#dados",
+            title="Constituição Estadual de Tocantins",
+            year=1989,
+            summary="Constituição do Estado do Tocantins",
+            date="05/10/1989",
         )
-        if not text_markdown or not text_markdown.strip():
-            logger.error("Failed to fetch Tocantins constitution text")
-            return
-
-        doc_info = {
-            "title": title,
-            "summary": "Constituição do Estado do Tocantins",
-            "type": "Constituição Estadual",
-            "date": "05/10/1989",
-            "year": 1989,
-            "situation": "Não consta revogação expressa",
-            "text_markdown": text_markdown,
-            "document_url": pdf_link,
-            "_raw_content": raw_content,
-            "_content_extension": content_ext,
-        }
-
-        saved = await self._save_doc_result(doc_info)
-        if saved is not None:
-            doc_info = saved
-        self._track_results([doc_info])
-        self.count += 1
-        if self.verbose:
-            logger.info("Fetched Tocantins constitution successfully")
 
     async def _scrape_type(
         self, norm_type: str, norm_type_id: str, year: int
@@ -327,23 +362,11 @@ class TocantinsScraper(StateScraper):
 
             for doc in documents:
                 doc["year"] = year
-            ctx = {"year": year, "type": norm_type, "situation": "N/A"}
-            tasks = [
-                self._with_save(self._get_doc_data(doc_info.copy()), ctx)
-                for doc_info in documents
-            ]
-            results = await self._gather_results(
-                tasks,
-                context=ctx,
-                desc=f"TOCANTINS | {norm_type}",
+            return await self._process_documents(
+                [doc.copy() for doc in documents],
+                year=year,
+                norm_type=norm_type,
             )
-
-            if self.verbose:
-                logger.info(
-                    f"Finished scraping for Year: {year} | Type: {norm_type} | Results: {len(results)}"
-                )
-
-            return results
 
         except Exception as e:
             logger.error(
@@ -351,9 +374,5 @@ class TocantinsScraper(StateScraper):
             )
             return []
 
-    async def _scrape_year(self, year: int) -> list[dict]:
-        """Scrape norms for a specific year, fetching constitution on first call."""
-        if not hasattr(self, "_constitution_fetched"):
-            await self._fetch_constitution()
-            self._constitution_fetched = True
-        return await super()._scrape_year(year)
+    async def _before_scrape(self) -> None:
+        await self._fetch_constitution()

@@ -18,6 +18,9 @@ import uuid
 import snowflake.connector
 from loguru import logger
 
+from ..protocol import LLMUsage
+from ..utils import parse_base64_data_uri
+
 
 class SnowflakeClient:
     """Async client for Snowflake Cortex AI (AI_COMPLETE).
@@ -38,7 +41,7 @@ class SnowflakeClient:
         database: str,
         schema: str,
         stage: str,
-        pool_size: int = 4,
+        pool_size: int = 20,
         **_kwargs,
     ) -> None:
         self.account = account
@@ -68,12 +71,17 @@ class SnowflakeClient:
         )
 
     async def _ensure_pool(self) -> None:
-        """Lazily populate the connection pool on first use."""
+        """Lazily populate the connection pool on first use (connections created in parallel)."""
         if self._pool_initialized:
             return
         self._pool_initialized = True
-        for _ in range(self._pool_size):
-            conn = await asyncio.to_thread(self._create_connection)
+        connections = await asyncio.gather(
+            *[
+                asyncio.to_thread(self._create_connection)
+                for _ in range(self._pool_size)
+            ]
+        )
+        for conn in connections:
             self._pool.put_nowait(conn)
 
     async def _acquire_connection(self) -> snowflake.connector.SnowflakeConnection:
@@ -108,7 +116,7 @@ class SnowflakeClient:
         messages: list[dict],
         model_id: str,
         timeout: int | None = None,
-    ) -> str:
+    ) -> tuple[str, LLMUsage]:
         """Send images to Snowflake Cortex AI and return the text response."""
         prompt, image_bytes_list = self._extract_content(messages)
 
@@ -139,15 +147,12 @@ class SnowflakeClient:
                 prompt,
                 model_id,
             )
-        except Exception:
+        finally:
             self._release_connection(conn)
-            self._schedule_cleanup(None, filenames, tmp_dir)
-            raise
 
-        self._release_connection(conn)
-        self._schedule_cleanup(None, filenames, tmp_dir)
+        self._schedule_cleanup(filenames, tmp_dir)
 
-        return response_text
+        return response_text, LLMUsage()  # no token data from AI_COMPLETE
 
     # ------------------------------------------------------------------
     # Content extraction
@@ -170,15 +175,7 @@ class SnowflakeClient:
                         prompt = block["text"]
                     elif block_type == "image_url":
                         data_url = block["image_url"]["url"]
-                        match = re.match(
-                            r"data:image/[a-zA-Z0-9]+;base64,(.+)",
-                            data_url,
-                            re.DOTALL,
-                        )
-                        if match:
-                            img_b64 = match.group(1)
-                        else:
-                            img_b64 = data_url
+                        _, img_b64 = parse_base64_data_uri(data_url)
                         images.append(base64.standard_b64decode(img_b64))
 
         return prompt, images
@@ -217,25 +214,10 @@ class SnowflakeClient:
 
     def _cleanup_stage_sync(
         self,
-        conn: snowflake.connector.SnowflakeConnection | None,
         filenames: list[str],
         tmp_dir: str,
     ) -> None:
-        """Remove images from the stage and delete local temp files (blocking)."""
-        if conn is not None:
-            try:
-                cursor = conn.cursor()
-                try:
-                    escaped = [re.escape(f) for f in filenames]
-                    regex_group = "|".join(escaped)
-                    regex_pattern = f".*({regex_group})"
-                    remove_query = f"REMOVE @{self.stage} PATTERN = '{regex_pattern}'"
-                    cursor.execute(remove_query)
-                finally:
-                    cursor.close()
-            except Exception as e:
-                logger.warning(f"Snowflake stage cleanup failed: {e}")
-
+        """Remove local temp files (blocking)."""
         try:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception as e:
@@ -272,7 +254,6 @@ class SnowflakeClient:
 
     def _schedule_cleanup(
         self,
-        conn: snowflake.connector.SnowflakeConnection | None,
         filenames: list[str],
         tmp_dir: str,
     ) -> None:
@@ -280,7 +261,7 @@ class SnowflakeClient:
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(
-                asyncio.to_thread(self._cleanup_stage_sync, conn, filenames, tmp_dir)
+                asyncio.to_thread(self._cleanup_stage_sync, filenames, tmp_dir)
             )
         except RuntimeError:
             shutil.rmtree(tmp_dir, ignore_errors=True)

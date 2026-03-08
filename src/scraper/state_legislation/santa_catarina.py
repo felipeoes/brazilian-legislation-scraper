@@ -12,8 +12,6 @@ import re
 from typing import Any
 from urllib.parse import urljoin
 
-from loguru import logger
-
 from src.scraper.base.scraper import StateScraper
 
 _RE_TYPE_FROM_TITLE = re.compile(
@@ -28,28 +26,19 @@ _ABBREV_TO_TYPE = {
     "PRT-": "Portaria",
 }
 
-_SEARCH_PATHS: dict[str, str] = {
-    "legislativo": "/legislativo",
-    "executivo": "/executivo",
-}
-
 TYPES = {
-    "Lei Ordinária": "legislativo",
-    "Lei Complementar": "legislativo",
-    "Decreto Legislativo": "legislativo",
-    "Decreto-Lei": "legislativo",
-    "Emenda Constitucional": "legislativo",
-    "Resolução": "legislativo",
-    "Portaria": "legislativo",
-    "Instrução Normativa": "legislativo",
-    "Decreto Executivo": "executivo",
+    "Legislativo": "legislativo",
+    "Executivo": "executivo",
 }
 
 SITUATIONS: list[str] = []
 
 
 class SantaCatarinaScraper(StateScraper):
-    """Scraper for Santa Catarina legislation (leis.alesc.sc.gov.br)."""
+    """Scraper for Santa Catarina legislation (leis.alesc.sc.gov.br).
+
+    Year start (earliest on source): 1946
+    """
 
     def __init__(
         self,
@@ -72,7 +61,7 @@ class SantaCatarinaScraper(StateScraper):
         all_docs: list[dict] = []
         seen_hrefs: set[str] = set()
         page = 1
-        max_empty = 3
+        max_empty = 1
         empty_streak = 0
 
         while True:
@@ -143,18 +132,8 @@ class SantaCatarinaScraper(StateScraper):
             )
             return None
 
-        html_content = soup.prettify()
-        html_string = self._wrap_html(html_content)
-
-        text_markdown = await self._get_markdown(html_content=html_string)
-        if not text_markdown or not text_markdown.strip():
-            await self._save_doc_error(
-                title=title,
-                year=doc_info.get("year", ""),
-                html_link=document_url,
-                error_message="Empty markdown from document",
-            )
-            return None
+        self._strip_html_chrome(soup)
+        html_content = str(soup)
 
         norm_type = "Legislação"
         m = _RE_TYPE_FROM_TITLE.match(title)
@@ -162,17 +141,9 @@ class SantaCatarinaScraper(StateScraper):
             matched = m.group(1)
             norm_type = _ABBREV_TO_TYPE.get(matched.upper(), matched.title())
 
-        doc_info.update(
-            {
-                "type": norm_type,
-                "situation": "Não consta",
-                "text_markdown": text_markdown,
-                "_raw_content": html_content.encode("utf-8"),
-                "_content_extension": ".html",
-            }
-        )
-
-        return doc_info
+        doc_info["type"] = norm_type
+        doc_info["situation"] = "Não consta"
+        return await self._process_html_doc(doc_info, html_content, document_url)
 
     async def _scrape_type(
         self, norm_type: str, norm_type_id: str, year: int
@@ -185,35 +156,8 @@ class SantaCatarinaScraper(StateScraper):
 
         for doc in documents:
             doc["year"] = year
-        ctx = {"year": year, "type": norm_type, "situation": "N/A"}
-        tasks = [
-            self._with_save(self._get_doc_data(doc_info), ctx) for doc_info in documents
-        ]
-        results = await self._gather_results(
-            tasks,
-            context=ctx,
-            desc=f"SANTA CATARINA | {norm_type}",
+        return await self._process_documents(
+            documents,
+            year=year,
+            norm_type=norm_type,
         )
-
-        if self.verbose:
-            logger.info(
-                f"Finished scraping Year: {year} | Type: {norm_type} | "
-                f"Results: {len(results)}"
-            )
-
-        return results
-
-    async def _scrape_year(self, year: int) -> list[dict]:
-        """Override to deduplicate search paths (legislativo/executivo)."""
-        scraped_paths: set[str] = set()
-        all_results: list[dict] = []
-
-        for norm_type, search_path in self.types.items():
-            if search_path in scraped_paths:
-                continue
-            scraped_paths.add(search_path)
-
-            results = await self._scrape_type(norm_type, search_path, year)
-            all_results.extend(results)
-
-        return all_results

@@ -1,14 +1,15 @@
 import base64
-import math
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote
 
-from loguru import logger
 from src.scraper.base.scraper import StateScraper
 
+# Documentation-only reference — the API does not require filtering by type.
+# An unfiltered request per year returns all norm types at once; each row
+# carries its type in ``tipoDocumento.descricao``.
 TYPES = {
-    "Consituição Estadual": "TIP080",
+    "Constituição Estadual": "TIP080",
     "Decreto": "TIP002",
     "Decreto Autônomo": "TIP045",
     "Emenda Constitucional": "TIP081",
@@ -18,32 +19,37 @@ TYPES = {
     "Lei Ordinária": "TIP043",
 }
 
-VALID_SITUATIONS = [
-    "Não consta"
-]  # Conama does not have a situation field, invalid norms will have an indication in the document text
-
-INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no longer have legal effect)
-
-# the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
-SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
-
 
 class AlagoasSefazScraper(StateScraper):
-    """Webscraper for Alagoas Sefaz website (https://gcs2.sefaz.al.gov.br/#/administrativo/documentos/consultar-gabinete)
+    """Webscraper for Alagoas Sefaz website.
 
-    Example search request: https://gcs2.sefaz.al.gov.br/sfz-gcs-api/api/administrativo/documento/consultar?pagina=1
+    Portal: https://gcs2.sefaz.al.gov.br/#/administrativo/documentos/consultar-gabinete
 
-    Payload: {
-            "palavraChave": null,
-            "periodoInicial": "2024-01-01T03:00:00.000+0000",
-            "periodoFinal": "2024-12-31T03:00:00.000+0000",
-            "numero": null,
-            "especieLegislativa": "TIP002",
-            "codigoCategoria": "CAT017",
-            "codigoSetor": null
+    Example search request (POST):
+        https://gcs2.sefaz.al.gov.br/sfz-gcs-api/api/administrativo/documento/consultar
+
+    Payload::
+
+        {
+            "periodoInicial": "2024-01-01T00:00:00.000-0300",
+            "periodoFinal":   "2024-12-31T00:00:00.000-0300",
+            "numero":         null,
+            "codigoCategoria":"CAT017",
+            "codigoSetor":    null
         }
 
-    Observation: Alagoas Sefaz does not have a situation field
+    The API does not require an ``especieLegislativa`` (type) filter — a
+    single unfiltered POST per year returns all norm types at once.  Each
+    document row carries its type in ``tipoDocumento.descricao``.
+
+    Year start (earliest on source): 1942
+
+    ``year_start`` is set to 1942 in the scraper config.  Earlier years
+    exist on the website but their document texts contain incorrect dates,
+    so 1942 is the safe starting point for reliable content.
+
+    The site has no *situation* (revogação) concept, so ``situations`` is
+    empty and no situation iteration is performed.
     """
 
     def __init__(
@@ -51,168 +57,167 @@ class AlagoasSefazScraper(StateScraper):
         base_url: str = "https://gcs2.sefaz.al.gov.br/sfz-gcs-api/api/administrativo/documento/consultar",
         **kwargs,
     ):
-        super().__init__(
-            base_url, name="ALAGOAS", types=TYPES, situations=SITUATIONS, **kwargs
-        )
+        super().__init__(base_url, name="ALAGOAS", types=TYPES, situations={}, **kwargs)
         self.view_doc_url = "https://gcs2.sefaz.al.gov.br/sfz-gcs-api/api/documentos/visualizarDocumento?"
 
-    def _build_params(self, norm_type_id: str, year: int) -> dict:
-        """Build a fresh params dict for a specific type/year query (no shared state)."""
+    def _build_params(self, year: int) -> dict:
+        """Build a fresh POST body for an unfiltered year query."""
         return {
             "periodoInicial": f"{year}-01-01T00:00:00.000-0300",
             "periodoFinal": f"{year}-12-31T00:00:00.000-0300",
             "numero": None,
-            "especieLegislativa": norm_type_id,
             "codigoCategoria": "CAT017",
             "codigoSetor": None,
         }
 
     def _build_url(self, page: int = 1) -> str:
-        """Build the request URL, adding pagination query param when needed."""
+        """Build the request URL, appending the pagination query param when needed."""
         if page > 1:
             return self.base_url + f"?pagina={page}"
         return self.base_url
 
-    async def _get_docs_links(
-        self, url: str, params: dict, norms: list
-    ) -> list[dict | None]:
-        """Get document links from search request"""
+    async def _fetch_page_norms(self, page: int, params: dict) -> list[dict]:
+        """Fetch a single page of norm listings and return the document rows.
+
+        Returns an empty list on failure so callers can safely extend their
+        collection without additional error handling.
+        """
         try:
             response = await self.request_service.make_request(
-                url, method="POST", json=params
+                self._build_url(page), method="POST", json=params
             )
-
             if not response:
-                return
-
+                return []
             data = await response.json()
-            norms.extend(data["documentos"])
-
-        except Exception as e:
-            logger.error(f"Error getting document links from url: {url} | Error: {e}")
+            return data.get("documentos") or []
+        except Exception:
+            return []
 
     async def _get_doc_data(self, doc_info: dict) -> dict | None:
-        """Get document data from norm dict. Download url for pdf will follow the pattern: ttps://gcs2.sefaz.al.gov.br/#/documentos/visualizar-documento?acess={acess}&key={key}"""
+        """Fetch and convert a single Alagoas norm.
 
-        key = quote(
-            quote(doc_info["link"]["key"])
-        )  # need to double encode otherwise it will return 404
+        Download URL pattern:
+            https://gcs2.sefaz.al.gov.br/sfz-gcs-api/api/documentos/visualizarDocumento?acess={acess}&key={key}
+
+        The document key must be double-URL-encoded, otherwise the API
+        returns 404.  The response contains a base64-encoded file payload.
+        """
+        key = quote(quote(doc_info["link"]["key"]))
         doc_link = f"{self.view_doc_url}acess={doc_info['link']['acess']}&key={key}"
+
         if self._is_already_scraped(doc_link):
             return None
-        filename = ""
+
+        year = doc_info.get("_year", "")
+        title = ""
         ext = ".pdf"
         pdf_bytes = b""
+
         try:
-            # get text markdown
             response = await self.request_service.make_request(doc_link)
             if not response:
-                raise RuntimeError(f"No response received for {doc_link}")
-            response = await response.json()
-            base64_data = response["arquivo"]["base64"]
+                await self._save_doc_error(
+                    title=title,
+                    year=year,
+                    html_link=doc_link,
+                    error_message="Failed request fetching document",
+                )
+                return None
 
-            full_filename = response["arquivo"]["nomeArquivo"]
-            ext = Path(full_filename).suffix.lower()
-            if not ext:
-                ext = ".pdf"
-            filename = Path(full_filename).stem
+            data = await response.json()
+            full_filename = data["arquivo"]["nomeArquivo"]
+            ext = Path(full_filename).suffix.lower() or ".pdf"
+            title = Path(full_filename).stem
 
-            pdf_bytes = base64.b64decode(base64_data)
+            pdf_bytes = base64.b64decode(data["arquivo"]["base64"])
             text_markdown = await self._get_markdown(
                 stream=BytesIO(pdf_bytes), filename=full_filename
             )
 
         except Exception as e:
-            logger.error(f"Error getting markdown from url: {doc_link} | Error: {e}")
-            text_markdown = None
-
-        if text_markdown is None:
             await self._save_doc_error(
-                title=doc_info.get("title", filename),
-                year=doc_info.get("year", ""),
+                title=title,
+                year=year,
                 html_link=doc_link,
-                error_message="Failed to extract markdown from document",
+                error_message=f"Error processing document: {e}",
+            )
+            return None
+
+        if not text_markdown:
+            await self._save_doc_error(
+                title=title,
+                year=year,
+                html_link=doc_link,
+                error_message="Empty markdown extracted from document",
+            )
+            return None
+
+        valid, reason = self._valid_markdown(text_markdown)
+        if not valid:
+            await self._save_doc_error(
+                title=title,
+                year=year,
+                html_link=doc_link,
+                error_message=f"Invalid markdown: {reason}",
             )
             return None
 
         return {
             "id": doc_info["numeroDocumento"],
-            "title": filename,
-            "summary": doc_info["textoEmenta"],
-            "category": doc_info["categoria"]["descricao"],
-            "publication_date": doc_info["dataPublicacao"],
+            "number": doc_info["numeroDocumento"],
+            "title": title,
+            "type": (doc_info.get("tipoDocumento") or {}).get("descricao", ""),
+            "summary": doc_info.get("textoEmenta", ""),
+            "category": (doc_info.get("categoria") or {}).get("descricao", ""),
+            "publication_date": doc_info.get("dataPublicacao", ""),
             "text_markdown": text_markdown,
             "document_url": doc_link,
             "_raw_content": pdf_bytes,
             "_content_extension": ext,
         }
 
-    async def _scrape_situation_type(
-        self, situation: str, norm_type: str, norm_type_id: str, year: str
-    ) -> list:
-        """Scrape norms for a specific situation and type"""
-        params = self._build_params(norm_type_id, year)
-        url = self._build_url()
+    async def _scrape_year(self, year: int) -> list[dict]:
+        """Scrape all norms for a given year in a single unfiltered request batch."""
+        params = self._build_params(year)
 
         response = await self.request_service.make_request(
-            url, method="POST", json=params
+            self._build_url(), method="POST", json=params
         )
-
         if not response:
             return []
 
-        data = await response.json()
-        total_norms = data["registrosTotais"]
+        try:
+            data = await response.json()
+        except Exception:
+            return []
 
+        total_norms = data.get("registrosTotais")
         if not total_norms:
             return []
 
-        pages = math.ceil(total_norms / 10)
+        per_page = data.get("registrosPorPagina") or 10
+        pages = self._calc_pages(total_norms, per_page)
 
-        norms = []
-        norms.extend(data["documentos"])
+        norms: list[dict] = list(data.get("documentos") or [])
 
-        # get all norms (page 1 already fetched above; fetch pages 2…pages)
-        tasks = [
-            self._get_docs_links(
-                self._build_url(page),
-                params,
-                norms,
+        # Fetch pages 2..N concurrently
+        if pages > 1:
+            extra_pages = await self._gather_results(
+                [self._fetch_page_norms(page, params) for page in range(2, pages + 1)],
+                context={"year": year, "type": "NA", "situation": "NA"},
+                desc=f"ALAGOAS | {year} | get_docs_links",
             )
-            for page in range(2, pages + 1)
-        ]
-        await self._gather_results(
-            tasks,
-            context={"year": year, "type": norm_type, "situation": situation},
-            desc=f"ALAGOAS | {norm_type} | get_docs_links",
+            for page_rows in extra_pages:
+                if isinstance(page_rows, list):
+                    norms.extend(page_rows)
+
+        # Inject year so _get_doc_data can use it in error logs
+        for doc in norms:
+            doc["_year"] = year
+
+        return await self._process_documents(
+            norms,
+            year=year,
+            norm_type="NA",
+            situation="NA",
         )
-
-        # get all norm data
-        ctx = {"year": year, "type": norm_type, "situation": situation}
-        tasks = [self._with_save(self._get_doc_data(norm), ctx) for norm in norms]
-        results = await self._gather_results(
-            tasks,
-            context=ctx,
-            desc=f"ALAGOAS | {norm_type}",
-        )
-
-        if self.verbose:
-            logger.info(
-                f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)}"
-            )
-
-        return results
-
-    async def _scrape_year(self, year: str) -> list[dict]:
-        """Scrape norms for a specific year"""
-        tasks = [
-            self._scrape_situation_type(sit, nt, ntid, year)
-            for sit in self.situations
-            for nt, ntid in self.types.items()
-        ]
-        valid = await self._gather_results(
-            tasks,
-            context={"year": year, "type": "NA", "situation": "NA"},
-            desc=f"{self.name} | Year {year}",
-        )
-        return self._flatten_results(valid)

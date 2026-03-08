@@ -1,70 +1,95 @@
-import asyncio
-from urllib.parse import urljoin
+from urllib.parse import unquote, urljoin
+from typing import cast
+
+from bs4 import BeautifulSoup, Tag
 from loguru import logger
-from tenacity import retry, stop_after_attempt, wait_exponential
 from src.scraper.base.scraper import BaseScraper
 
+# ---------------------------------------------------------------------------
+# Situation constants — kept for documentation and downstream filtering.
+# NOT used as search query filters anymore; situations are read directly from
+# each listing-page result item (p.busca-resultados__situacao).
+# ---------------------------------------------------------------------------
+
 VALID_SITUATIONS = [
-    "Não%20consta%20revogação%20expressa",
-    "Não%20Informado",  # since there is no explicit information about it's not valid, we consider it valid
-    "Convertida%20em%20Lei",
+    "Não consta revogação expressa",
+    "Não Informado",  # no explicit revocation info → treated as valid
+    "Convertida em Lei",
     "Reeditada",
-    "Reeditada%20com%20alteração",
-]  # only norms with these situations (are actually valid norms)
+    "Reeditada com alteração",
+]
 
 INVALID_SITUATIONS = [
     "Arquivada",
     "Rejeitada",
     "Revogada",
-    "Sem%20Eficácia",
-]  # norms with these situations are invalid norms (no longer have legal effect)
-
-# the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
-SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
-
-# OBS: empty string means all (Toda legislação). OPTIONS: 'Legislação+Interna' 'OR Legislação+Federal'
-COVERAGE = [""]
-
-TYPES = [
-    "Alvará",
-    "Ato+Conjunto",
-    "Ato+Declaratório+do+Presidente+da+Mesa",
-    "Ato+do+Presidente+da+Mesa",
-    "Carta%20Régia",
-    "Carta+Imperial",
-    "Constitui%C3%A7%C3%A3o",
-    "Decisão",
-    "Decreto",
-    "Decreto+Legislativo",
-    "Decreto+Sem+N%C3%BAmero",
-    "Decreto-Lei",
-    "Emenda+Constitucional",
-    "Instrução",
-    "Lei+Complementar",
-    "Lei+Ordin%C3%A1ria",
-    "Manifesto",
-    "Mensagem",
-    "Pacto",
-    "Proclamação",
-    "Protocolo",
-    "Medida+Provis%C3%B3ria",
-    "Ordem+de+Serviço",
-    "Portaria",
-    "Regulamento",
-    "Resolu%C3%A7%C3%A3o+da+Assembl%C3%A9ia+Nacional+Constituinte",
-    "Resolu%C3%A7%C3%A3o+da+C%C3%A2mara+dos+Deputados",
-    "Resolução+da+Mesa",
-    "Resolu%C3%A7%C3%A3o+do+Congresso+Nacional",
-    "Resolu%C3%A7%C3%A3o+do+Senado+Federal",
+    "Sem Eficácia",
 ]
+
+# Kept for reference / downstream consumers.
+SITUATIONS = {s: s for s in VALID_SITUATIONS + INVALID_SITUATIONS}
+
+# Empty string → search returns all coverage (Toda legislação).
+# OPTIONS: 'Legislação Interna' or 'Legislação Federal'
+COVERAGE = ""
+
+# Human-readable label → URL-encoded value used as the `tipo` query param.
+TYPES = {
+    "Alvará": "Álvará",
+    "Ato": "Ato",
+    "Ato Conjunto": "Ato+Conjunto",
+    "Ato da Mesa": "Ato+da+Mesa",
+    "Ato da Presidência Sem Número": "Ato+da+Presid%C3%AAncia+Sem+N%C3%BAmero",
+    "Ato Declaratório do Presidente da Mesa": "Ato+Declaratório+do+Presidente+da+Mesa",
+    "Ato do Presidente da Mesa": "Ato+do+Presidente+da+Mesa",
+    "Ato do Presidente Sem Número": "Ato+do+Presidente+Sem+N%C3%BAmero",
+    "Ato Sem Número": "Ato+Sem+N%C3%BAmero",
+    "Carta Régia": "Carta%20Régia",
+    "Carta Imperial": "Carta+Imperial",
+    "Constituição": "Constitui%C3%A7%C3%A3o",
+    "Decisão da Mesa Sem Número": "Decis%C3%A3o+da+Mesa+Sem+N%C3%BAmero",
+    "Decisão": "Decisão",
+    "Decreto": "Decreto",
+    "Decreto Legislativo": "Decreto+Legislativo",
+    "Decreto Sem Número": "Decreto+Sem+N%C3%BAmero",
+    "Decreto-Lei": "Decreto-Lei",
+    "Emenda Constitucional": "Emenda+Constitucional",
+    "Instrução": "Instrução",
+    "Lei Complementar": "Lei+Complementar",
+    "Lei Ordinária": "Lei+Ordin%C3%A1ria",
+    "Manifesto": "Manifesto",
+    "Mensagem": "Mensagem",
+    "Pacto": "Pacto",
+    "Proclamação": "Proclamação",
+    "Protocolo": "Protocolo",
+    "Medida Provisória": "Medida+Provis%C3%B3ria",
+    "Ordem de Serviço": "Ordem+de+Serviço",
+    "Portaria": "Portaria",
+    "Regulamento": "Regulamento",
+    "Resolução": "Resolu%C3%A7%C3%A3o",
+    "Resolução da Assembleia Nacional Constituinte": "Resolu%C3%A7%C3%A3o+da+Assembl%C3%A9ia+Nacional+Constituinte",
+    "Resolução da Câmara dos Deputados": "Resolu%C3%A7%C3%A3o+da+C%C3%A2mara+dos+Deputados",
+    "Resolução da Mesa": "Resolução+da+Mesa",
+    "Resolução do Congresso Nacional": "Resolu%C3%A7%C3%A3o+do+Congresso+Nacional",
+    "Resolução do Senado Federal": "Resolu%C3%A7%C3%A3o+do+Senado+Federal",
+}
+
 ORDERING = "data%3AASC"
 YEAR_START = 1808
+EXPORT_MAX_DOCS = 300
 
 
 class CamaraDepScraper(BaseScraper):
     """Webscraper for Camara dos Deputados website (https://www.camara.leg.br/legislacao/)
 
-    Example search request url: https://www.camara.leg.br/legislacao/busca?geral=&ano=&situacao=&abrangencia=&tipo=Decreto%2CDecreto+Legislativo%2CDecreto-Lei%2CEmenda+Constitucional%2CLei+Complementar%2CLei+Ordin%C3%A1ria%2CMedida+Provis%C3%B3ria%2CResolu%C3%A7%C3%A3o+da+C%C3%A2mara+dos+Deputados%2CConstitui%C3%A7%C3%A3o%2CLei%2CLei+Constitucional%2CPortaria%2CRegulamento%2CResolu%C3%A7%C3%A3o+da+Assembl%C3%A9ia+Nacional+Constituinte%2CResolu%C3%A7%C3%A3o+do+Congresso+Nacional%2CResolu%C3%A7%C3%A3o+do+Senado+Federal&origem=&numero=&ordenacao=data%3AASC
+    Year start (earliest on source): 1808
+
+    Situation is NOT used as a search filter — it is read directly from each
+    listing-page result item (p.busca-resultados__situacao).
+
+    Example search request url:
+      https://www.camara.leg.br/legislacao/busca?abrangencia=&geral=&ano=2020
+        &situacao=&origem=&numero=&ordenacao=data%3AASC&tipo=Decreto
     """
 
     def __init__(
@@ -72,103 +97,264 @@ class CamaraDepScraper(BaseScraper):
         base_url: str = "https://www.camara.leg.br/legislacao/",
         **kwargs,
     ):
+        coverage = kwargs.pop("coverage", COVERAGE)
+        ordering = kwargs.pop("ordering", ORDERING)
+        export_max_docs = kwargs.pop("export_max_docs", EXPORT_MAX_DOCS)
         super().__init__(
             base_url,
             name="LEGISLACAO_FEDERAL",
             types=TYPES,
-            situations=SITUATIONS,
+            situations={},  # situations read from listing page, not used as filter
             **kwargs,
         )
-        self.base_url = base_url
-        self.coverage = kwargs.get("coverage", COVERAGE)
-        self.ordering = kwargs.get("ordering", ORDERING)
+        self.coverage = coverage
+        self.ordering = ordering
+        self.export_max_docs = export_max_docs
+        self._metadata_to_text_url: dict[str, str] = {}
 
-    def _format_search_url(self, year: str, situation: str, norm_type: str) -> str:
-        """Format search url with given year"""
+    async def _load_scraped_keys(self, year: int) -> None:
+        await super()._load_scraped_keys(year)
+        self._metadata_to_text_url = {}
+        if not self.saver:
+            return
+
+        year_docs = await self.saver.get_year_documents(year)
+        for doc in year_docs:
+            metadata_url = str(doc.get("metadata_url", "") or "")
+            document_url = str(doc.get("document_url", "") or "")
+            if metadata_url and document_url:
+                self._metadata_to_text_url[metadata_url] = document_url
+
+        if self.verbose and self._metadata_to_text_url:
+            logger.info(
+                f"{self.__class__.__name__} | Year {year}: loaded "
+                f"{len(self._metadata_to_text_url)} metadata->text URL mappings"
+            )
+
+    def _format_search_url(self, year: str, norm_type_id: str) -> str:
+        """Format search URL for a given year and norm type (URL-encoded value)."""
         params = {
-            "abrangencia": self.coverage[0],
+            "abrangencia": self.coverage,
             "geral": "",
             "ano": year,
-            "situacao": situation,
+            "situacao": "",  # no situation filter — all situations returned
             "origem": "",
             "numero": "",
             "ordenacao": self.ordering,
-            "tipo": norm_type,
+            "tipo": norm_type_id,
         }
-
         return (
             self.base_url
             + "busca?"
             + "&".join(f"{key}={value}" for key, value in params.items())
         )
 
-    @retry(
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=2, min=2, max=30),
-        reraise=True,
-    )
-    async def _get_documents_html_links(self, url: str) -> "list[dict]":
-        """Get html links from given url. Returns a list of dictionaries in the format {
-            "title": str,
-            "summary": str,
-            "html_link": str
-        }"""
-        documents_html_links_info = []
+    def _format_export_url(self, year: str, norm_type_id: str) -> str:
+        """Format export URL for a given year and norm type."""
+        params = {
+            "geral": "",
+            "ano": year,
+            "ordenacao": unquote(self.ordering),
+            "abrangencia": self.coverage,
+            "tipo": norm_type_id,
+            "origem": "",
+            "situacao": "",
+            "numero": "",
+        }
+        return (
+            self.base_url
+            + "busca/exportar?&"
+            + "&".join(f"{key}={value}" for key, value in params.items())
+        )
 
-        # Get soup from url
-        soup = await self.request_service.get_soup(url)
+    @staticmethod
+    def _extract_total_results(soup: BeautifulSoup) -> int | None:
+        total_element = soup.find(
+            "div",
+            class_="busca-info__resultado busca-info__resultado--informado",
+        )
+        if total_element is None:
+            return None
 
-        if not soup:
-            return documents_html_links_info
+        try:
+            return int(total_element.get_text(" ", strip=True).split()[-1])
+        except (TypeError, ValueError, IndexError):
+            return None
 
-        # Get all documents html links from page
+    @staticmethod
+    def _strip_prefix(value: str, prefix: str) -> str:
+        value = value.strip()
+        if value.lower().startswith(prefix.lower()):
+            return value[len(prefix) :].strip()
+        return value
+
+    def _parse_listing_page_documents(self, soup: BeautifulSoup) -> list[dict]:
+        """Parse one standard search-results page into document metadata."""
+        documents_metadata = []
         documents = soup.find_all("li", class_="busca-resultados__item")
         for document in documents:
-            a_tag = document.find("h3", class_="busca-resultados__cabecalho").find("a")
-            document_html_link = a_tag["href"]
-            title = a_tag.text.strip()
-            summary = document.find(
+            heading = document.find("h3", class_="busca-resultados__cabecalho")
+            if not heading:
+                continue
+            a_tag = heading.find("a", href=True)
+            if not a_tag:
+                continue
+
+            metadata_url = a_tag["href"]
+            title = a_tag.get_text(" ", strip=True)
+
+            summary_tag = document.find(
                 "p", class_="busca-resultados__descricao js-fade-read-more"
-            ).text.strip()
-            documents_html_links_info.append(
+            )
+            summary = ""
+            if summary_tag:
+                summary = self._strip_prefix(
+                    summary_tag.get_text(" ", strip=True), "Ementa:"
+                )
+
+            situation_tag = document.find("p", class_="busca-resultados__situacao")
+            situation = ""
+            if situation_tag:
+                situation = self._strip_prefix(
+                    situation_tag.get_text(" ", strip=True), "Situação:"
+                )
+
+            documents_metadata.append(
                 {
                     "title": title,
                     "summary": summary,
-                    "html_link": document_html_link,
+                    "metadata_url": metadata_url,
+                    "situation": situation,
                 }
             )
-        if not documents_html_links_info:
-            if self.verbose:
-                logger.info(f"No documents found for url: {url}")
-            return documents_html_links_info
+
+        return documents_metadata
+
+    def _parse_export_documents(self, soup: BeautifulSoup) -> list[dict]:
+        """Parse the export HTML page into document metadata."""
+        container = soup.find("div", id="impressaoPDF") or soup
+        documents_metadata = []
+
+        for document in container.find_all("li"):
+            a_tag = document.find("a", href=True)
+            if not a_tag:
+                continue
+
+            title = a_tag.get_text(" ", strip=True)
+            metadata_url = a_tag["href"]
+            summary = ""
+            situation = ""
+
+            for paragraph in document.find_all("p"):
+                text = paragraph.get_text(" ", strip=True)
+                lowered = text.lower()
+                if lowered.startswith("ementa:"):
+                    summary = self._strip_prefix(text, "Ementa:")
+                elif lowered.startswith("situação:") or lowered.startswith("situacao:"):
+                    situation = self._strip_prefix(text, "Situação:")
+                    if situation == text:
+                        situation = self._strip_prefix(text, "Situacao:")
+
+            documents_metadata.append(
+                {
+                    "title": title,
+                    "summary": summary,
+                    "metadata_url": metadata_url,
+                    "situation": situation,
+                }
+            )
+
+        return documents_metadata
+
+    async def _get_docs_links(self, url: str) -> list[dict]:
+        """Fetch one search-results page and return document metadata.
+
+        Returns a list of dicts:
+            {title, summary, metadata_url, situation}
+
+        On failed fetch, logs an error and returns [].
+        """
+        soup = await self.request_service.get_soup(url)
+
+        if not soup:
+            logger.error(f"Could not fetch listing page: {url}")
+            await self._save_doc_error(
+                title=url,
+                error_message="Could not fetch listing page",
+            )
+            return []
+
+        soup = cast(BeautifulSoup, soup)
+        documents_html_links_info = self._parse_listing_page_documents(soup)
+
+        if not documents_html_links_info and self.verbose:
+            logger.info(f"No documents found for url: {url}")
 
         return documents_html_links_info
 
+    async def _get_export_docs_links(self, url: str) -> list[dict]:
+        """Fetch the export page and return document metadata."""
+        soup = await self.request_service.get_soup(url)
+
+        if not soup:
+            logger.warning(f"Could not fetch export page: {url}")
+            return []
+
+        soup = cast(BeautifulSoup, soup)
+        documents_metadata = self._parse_export_documents(soup)
+        if not documents_metadata and self.verbose:
+            logger.info(f"No documents found in export page: {url}")
+
+        return documents_metadata
+
     async def _get_document_text_link(
         self,
-        document_html_link: str,
-        title: str,
-        summary: str,
+        doc: dict,
         year: int,
-        situation: str,
         norm_type: str,
     ) -> dict | None:
-        """Get proper document text link from given document html link"""
+        """Resolve the actual text URL from a document's metadata page.
 
-        soup = await self.request_service.get_soup(document_html_link)
+        Priority: "texto - republicação" > "texto - publicação original" > "texto -" > "texto"
+        """
+        title = doc.get("title", "")
+        summary = doc.get("summary", "")
+        situation = doc.get("situation", "")
+        metadata_url = doc.get("metadata_url", "")
+
+        cached_text_url = self._metadata_to_text_url.get(metadata_url)
+        if cached_text_url:
+            return {
+                "title": title,
+                "summary": summary,
+                "situation": situation,
+                "metadata_url": metadata_url,
+                "document_url": cached_text_url,
+            }
+
+        soup = await self.request_service.get_soup(metadata_url)
         if not soup:
-            logger.error(f"Could not get soup for document: {title}")
+            reason = getattr(soup, "reason", "unknown")
+            status = getattr(soup, "status", None)
+            detail = f"HTTP {status} — {reason}" if status else reason
+            logger.error(
+                f"Could not fetch metadata page: {title} | {detail} | {metadata_url}"
+            )
             await self._save_doc_error(
                 title=title,
                 year=year,
                 situation=situation,
                 norm_type=norm_type,
-                html_link=document_html_link,
-                error_message="Could not fetch page HTML",
+                html_link=metadata_url,
+                error_message=f"Could not fetch page HTML: {detail}",
             )
             return None
 
-        not_found = soup.find("h1", text="Not Found")
+        soup = cast(BeautifulSoup, soup)
+        not_found = any(
+            heading.get_text(" ", strip=True) == "Not Found"
+            for heading in soup.find_all("h1")
+        )
         if not_found:
             logger.warning(f"Document not found: {title}")
             await self._save_doc_error(
@@ -176,88 +362,85 @@ class CamaraDepScraper(BaseScraper):
                 year=year,
                 situation=situation,
                 norm_type=norm_type,
-                html_link=document_html_link,
+                html_link=metadata_url,
                 error_message="Document text not found (404)",
             )
             return None
 
-        document_text_links = soup.find("div", class_="sessao")
-        if not document_text_links:
+        sessao_divs = soup.find_all("div", class_="sessao")
+        if not sessao_divs:
             logger.error(f"Could not find text link for document: {title}")
             await self._save_doc_error(
                 title=title,
                 year=year,
                 situation=situation,
                 norm_type=norm_type,
-                html_link=document_html_link,
+                html_link=metadata_url,
                 error_message="Could not find text link div.sessao in page",
             )
             return None
 
-        document_text_link = None
+        original_links = []
+        repub_links = []
+        other_links = []
 
-        if document_text_links and hasattr(document_text_links, "find_all"):
-            original_doc_text_links = []
-            repub_doc_text_links = []
-            doc_text_links_list = []
-
-            for link in document_text_links.find_all("a"):
-                link_text = link.text.strip().lower()
+        for sessao_div in sessao_divs:
+            for link in sessao_div.find_all("a", href=True):
+                link_text = link.get_text(" ", strip=True).lower()
                 if "texto - publicação original" in link_text:
-                    original_doc_text_links.append(link)
+                    original_links.append(link)
                 elif "texto - republicação" in link_text:
-                    repub_doc_text_links.append(link)
-                elif "texto -" in link_text:
-                    doc_text_links_list.append(link)
-                elif "texto" in link_text:
-                    doc_text_links_list.append(link)
+                    repub_links.append(link)
+                elif "texto -" in link_text or "texto" in link_text:
+                    other_links.append(link)
 
-            # priority for the link with "texto - republicação", then "texto - publicação original", and then any link with "texto -"
-            if repub_doc_text_links:
-                # if there is a link with "texto - republicação" text, use it
-                document_text_link = repub_doc_text_links[-1]["href"]
-                document_text_link = urljoin(document_html_link, document_text_link)
-            elif original_doc_text_links:
-                # if there is a link with "texto - publicação original" text, use it
-                document_text_link = original_doc_text_links[-1]["href"]
-                document_text_link = urljoin(document_html_link, document_text_link)
-            elif doc_text_links_list:
-                # if there is a link with "texto -" or just "texto" in the text, use it
-                document_text_link = doc_text_links_list[-1]["href"]
-                document_text_link = urljoin(document_html_link, document_text_link)
+        # Priority: republicação > publicação original > any "texto" link
+        chosen = None
+        if repub_links:
+            chosen = repub_links[-1]["href"]
+        elif original_links:
+            chosen = original_links[-1]["href"]
+        elif other_links:
+            chosen = other_links[-1]["href"]
 
-        if document_text_link is None:
+        if chosen is None:
             logger.error(f"Could not find text link for document: {title}")
             await self._save_doc_error(
                 title=title,
                 year=year,
                 situation=situation,
                 norm_type=norm_type,
-                html_link=document_html_link,
+                html_link=metadata_url,
                 error_message="No text link found in page anchors",
             )
             return None
 
-        return {"title": title, "summary": summary, "html_link": document_text_link}
+        text_url = urljoin(metadata_url, chosen)
+        self._metadata_to_text_url[metadata_url] = text_url
+        return {
+            "title": title,
+            "summary": summary,
+            "situation": situation,
+            "metadata_url": metadata_url,
+            "document_url": text_url,
+        }
 
-    async def _get_document_data(
-        self,
-        document_text_link: str,
-        title: str,
-        summary: str,
-        year: int,
-        situation: str,
-        norm_type: str,
-    ) -> dict | None:
-        """Get data from given document text link using BS4 cleaning + markitdown.
-        Data will be in the format {
-            "title": str,
-            "summary": str,
-            "text_markdown": str,
-            "document_url": str
-        }"""
+    async def _get_doc_data(self, doc: dict, year: int, norm_type: str) -> dict | None:
+        """Fetch and convert document text to markdown.
+
+        ``doc`` is a dict with keys: title, summary, metadata_url, document_url, situation.
+
+        Returns:
+             {title, summary, situation, text_markdown, document_url,
+              _raw_content, _content_extension}
+        """
+        title = doc.get("title", "")
+        summary = doc.get("summary", "")
+        metadata_url = doc.get("metadata_url", "")
+        document_text_link = doc.get("document_url", "")
+        situation = doc.get("situation", "")
+
         try:
-            # Fetch and clean HTML with BS4
             soup = await self.request_service.get_soup(document_text_link)
             if not soup:
                 logger.warning(f"Could not fetch document page: {title}")
@@ -267,58 +450,75 @@ class CamaraDepScraper(BaseScraper):
                     situation=situation,
                     norm_type=norm_type,
                     html_link=document_text_link,
+                    metadata_url=metadata_url,
                     error_message="Could not fetch document page",
                 )
                 return None
 
-            # Extract only the main content area (div#content) to avoid
-            # navigation menus, headers, footers, and other portal chrome
-            content_div = soup.find("div", id="content")
-            if content_div is None:
-                content_div = soup.find("div", class_="textoNorma")
-            if content_div is None:
-                # Fallback: use entire page but aggressively strip chrome
-                content_div = soup
+            soup = cast(BeautifulSoup, soup)
+            # Extract main content area; fall back progressively
+            content_div = cast(
+                BeautifulSoup | Tag,
+                soup.find("div", id="content")
+                or soup.find("div", class_="textoNorma")
+                or soup,
+            )
 
-            # Remove boilerplate sections within content
-            for selector in [
-                {"class_": "vejaTambem"},
-                {"class_": "documentFirstHeading"},
-                {"class_": "rodapeTexto"},
-                {"class_": "publicacoesTI"},
-            ]:
-                for el in content_div.find_all(True, **selector):
-                    el.decompose()
+            # Remove portal chrome and boilerplate
+            self._strip_html_chrome(
+                content_div,
+                extra_selectors=[
+                    {"class_": "vejaTambem"},
+                    {"class_": "documentFirstHeading"},
+                    {"class_": "rodapeTexto"},
+                    {"class_": "publicacoesTI"},
+                ],
+            )
+            self._clean_norm_soup(content_div, remove_images=False)
 
-            # Remove page-chrome elements (safety net for fallback path)
-            for tag_name in ["header", "footer", "nav", "script", "style", "aside"]:
-                for el in content_div.find_all(tag_name):
-                    el.decompose()
+            # Strip elements already captured in dedicated fields:
+            #   <h1>  → duplicates `title`
+            #   <p class="ementa"> → duplicates `summary`
+            for h1 in content_div.find_all("h1"):
+                h1.decompose()
 
-            # Remove all hyperlinks (unwrap <a> tags, keeping inner text)
-            for a_tag in content_div.find_all("a"):
-                a_tag.unwrap()
+            ementa_nodes = content_div.find_all("p", class_="ementa")
+            html_with_ementa = content_div.prettify()
+
+            for ementa in ementa_nodes:
+                ementa.decompose()
 
             html_string = content_div.prettify()
 
-            # Convert cleaned HTML to markdown
             text_markdown = await self._get_markdown(html_content=html_string)
 
             if not text_markdown or not text_markdown.strip():
-                logger.warning(f"Document text is empty after conversion: {title}")
-                await self._save_doc_error(
-                    title=title,
-                    year=year,
-                    situation=situation,
-                    norm_type=norm_type,
-                    html_link=document_text_link,
-                    error_message="Document text is empty after conversion",
-                )
-                return None
+                if ementa_nodes:
+                    fallback_markdown = await self._get_markdown(
+                        html_content=html_with_ementa
+                    )
+                    if fallback_markdown and fallback_markdown.strip():
+                        text_markdown = fallback_markdown
+                        html_string = html_with_ementa
+
+                if not text_markdown or not text_markdown.strip():
+                    logger.warning(f"Document text is empty after conversion: {title}")
+                    await self._save_doc_error(
+                        title=title,
+                        year=year,
+                        situation=situation,
+                        norm_type=norm_type,
+                        html_link=document_text_link,
+                        metadata_url=metadata_url,
+                        error_message="Document text is empty after conversion",
+                    )
+                    return None
 
             return {
                 "title": title,
                 "summary": summary,
+                "situation": situation,
+                "metadata_url": metadata_url,
                 "text_markdown": text_markdown.strip(),
                 "document_url": document_text_link,
                 "_raw_content": html_string.encode("utf-8"),
@@ -332,115 +532,163 @@ class CamaraDepScraper(BaseScraper):
                 situation=situation,
                 norm_type=norm_type,
                 html_link=document_text_link,
+                metadata_url=metadata_url,
                 error_message=str(e),
             )
             return None
 
-    async def _scrape_situation_type(
-        self, year: int, situation: str, norm_type: str
+    async def _scrape_type(
+        self,
+        norm_type: str,
+        norm_type_id,
+        year: int,
+        seen_urls: set[str] | None = None,
     ) -> list:
-        """Scrape data for a specific year, situation, and type combination"""
+        """Scrape all documents of a single norm type for the given year.
+
+        Phase 1: fetch all listing pages (concurrent) → list of
+                 {title, summary, metadata_url, situation}
+        Phase 2: resolve text URLs (concurrent) → list of
+                 {title, summary, situation, metadata_url, document_url}
+        Phase 3: fetch + convert content, save (via _process_documents)
+
+        ``seen_urls`` is a shared set of already-processed text URLs (by
+        reference) used to deduplicate across norm types within the same year.
+        Documents whose resolved text URL is already in ``seen_urls`` are
+        silently skipped before Phase 3, preventing duplicate content when
+        the same document appears under multiple ``tipo`` query values.
+        """
         results = []
 
-        url = self._format_search_url(str(year), situation, norm_type)
+        url = self._format_search_url(str(year), norm_type_id)
         per_page = 20
-        soup = await self.request_service.get_soup(url)
 
+        soup = await self.request_service.get_soup(url)
         if not soup:
             logger.warning(f"Could not get soup for url: {url}")
             return results
 
-        total_element = soup.find(
-            "div",
-            class_="busca-info__resultado busca-info__resultado--informado",
-        )
-
-        if total_element is None:
+        soup = cast(BeautifulSoup, soup)
+        total = self._extract_total_results(soup)
+        if total is None:
             logger.warning(f"Could not find total element for url: {url}")
             return results
 
-        total = total_element.text
-        total = int(total.strip().split()[-1])
-
         if total == 0:
             return results
-        pages = (total + per_page - 1) // per_page
 
-        # Get documents html links from all pages
+        pages = self._calc_pages(total, per_page)
+
+        # --- Phase 1: collect all listing-page metadata ---
         documents_html_links_info = []
-        tasks = [
-            self._get_documents_html_links(url + f"&pagina={page}")
-            for page in range(1, pages + 1)
-        ]
-        page_results = await asyncio.gather(*tasks, return_exceptions=True)
-        documents_html_links_info.extend(self._flatten_results(page_results))
+        used_export = False
 
-        # Get proper document text link from each document html link
-        documents_text_links = []
-        tasks = [
-            self._get_document_text_link(
-                document_html_link.get("html_link"),
-                document_html_link.get("title"),
-                document_html_link.get("summary"),
-                year,
-                situation,
-                norm_type,
-            )
-            for document_html_link in documents_html_links_info
-            if document_html_link is not None
-        ]
-        text_link_results = await asyncio.gather(*tasks)
-        for result in text_link_results:
-            documents_text_links.append(result)
+        if total <= self.export_max_docs:
+            export_url = self._format_export_url(str(year), norm_type_id)
+            export_docs = await self._get_export_docs_links(export_url)
+            if len(export_docs) == total:
+                documents_html_links_info = export_docs
+                used_export = True
+            else:
+                logger.warning(
+                    f"Export count mismatch for {norm_type} {year}: "
+                    f"expected {total}, got {len(export_docs)}; falling back to pagination"
+                )
 
-        # Get data from all documents text links
-        tasks = [
-            self._get_document_data(
-                document_text_link.get("html_link"),
-                document_text_link.get("title"),
-                document_text_link.get("summary"),
-                year,
-                situation,
-                norm_type,
+        if not used_export:
+            documents_html_links_info = self._parse_listing_page_documents(soup)
+            page_tasks = [
+                self._get_docs_links(url + f"&pagina={page}")
+                for page in range(2, pages + 1)
+            ]
+            page_results = await self._gather_results(
+                page_tasks,
+                context={"year": year, "type": norm_type, "situation": ""},
+                desc=f"{self.name} | {norm_type} | get_html_links",
             )
-            for document_text_link in documents_text_links
-            if document_text_link is not None
-            and not self._is_already_scraped(
-                document_text_link.get("html_link", ""),
-                document_text_link.get("title", ""),
-            )
-        ]
-        doc_data_results = await asyncio.gather(*tasks)
-        for result in doc_data_results:
-            if result is None:
-                continue
+            documents_html_links_info.extend(self._flatten_results(page_results))
 
-            queue_item = {
-                "year": year,
-                "situation": situation,
-                "type": norm_type,
-                **result,
+        # --- Phase 2: resolve text URLs ---
+        resolved_docs = []
+        text_link_tasks = [
+            self._get_document_text_link(doc, year, norm_type)
+            for doc in documents_html_links_info
+            if doc is not None
+            and doc.get("metadata_url", "") not in self._metadata_to_text_url
+        ]
+        resolved_docs.extend(
+            {
+                **doc,
+                "document_url": self._metadata_to_text_url[doc.get("metadata_url", "")],
             }
-            await self._save_doc_result(queue_item)
-            results.append(queue_item)
+            for doc in documents_html_links_info
+            if doc is not None
+            and doc.get("metadata_url", "") in self._metadata_to_text_url
+        )
+        text_link_results = await self._gather_results(
+            text_link_tasks,
+            context={"year": year, "type": norm_type, "situation": ""},
+            desc=f"{self.name} | {norm_type} | get_text_links",
+        )
+        resolved_docs.extend(text_link_results)
+
+        # Filter already-scraped documents and cross-type duplicates before Phase 3.
+        # seen_urls is mutated in-place so subsequent _scrape_type calls for the
+        # same year skip URLs that were already processed by an earlier type.
+        documents_to_fetch = []
+        for doc in resolved_docs:
+            if doc is None:
+                continue
+            text_url = doc.get("document_url", "")
+            if self._is_already_scraped(text_url, doc.get("title", "")):
+                continue
+            if seen_urls is not None:
+                if text_url in seen_urls:
+                    if self.verbose:
+                        logger.debug(f"Skipping duplicate URL across types: {text_url}")
+                    continue
+                seen_urls.add(text_url)
+            documents_to_fetch.append(doc)
+
+        # --- Phase 3: fetch content, convert to markdown, save ---
+        results = await self._process_documents(
+            documents_to_fetch,
+            year=year,
+            norm_type=norm_type,
+            situation="",  # each doc carries its own situation field
+            desc=f"{self.name} | {norm_type} | get_doc_data",
+            doc_data_fn=lambda doc: self._get_doc_data(
+                doc, year=year, norm_type=norm_type
+            ),
+        )
 
         if self.verbose:
             logger.info(
-                f"Finished scraping for Year: {year} | Situation: {situation} | Type: {norm_type} | Results: {len(results)}"
+                f"Finished scraping | Year: {year} | Type: {norm_type} "
+                f"| Results: {len(results)}"
             )
 
         return results
 
-    async def _scrape_year(self, year: int) -> list:
-        """Scrape data from given year"""
+    async def _scrape_year(self, year: int) -> list[dict]:
+        """Scrape all norm types for a year with cross-type URL deduplication.
+
+        Overrides the base implementation to pass a shared ``seen_urls`` set
+        into every ``_scrape_type`` call.  Because types are scraped
+        concurrently, the set is populated as each Phase-2 result is resolved;
+        any text URL that was already claimed by a concurrent or earlier type
+        is silently skipped before Phase 3, so no document is fetched or saved
+        twice even when the same norm appears under multiple ``tipo`` queries.
+        """
+        seen_urls: set[str] = set()
+        type_items = cast(dict[str, str], self.types)
         tasks = [
-            self._scrape_situation_type(year, situation, norm_type)
-            for situation in self.situations
-            for norm_type in self.types
+            self._scrape_type(nt, nt_id, year, seen_urls=seen_urls)
+            for nt, nt_id in type_items.items()
         ]
         valid = await self._gather_results(
             tasks,
-            context={"year": year, "type": "", "situation": ""},
+            context={"year": year, "type": "NA", "situation": "NA"},
             desc=f"{self.name} | Year {year}",
         )
         return self._flatten_results(valid)

@@ -18,11 +18,22 @@ TYPES = {
 }
 
 
-class RoraimaAlpbScraper(SAPLBaseScraper):
+class RoraimaAlerScraper(SAPLBaseScraper):
     """Webscraper for Roraima state legislation website (https://sapl.al.rr.leg.br/)
+
+    Year start (earliest on source): 1991
 
     Example search request: https://sapl.al.rr.leg.br/api/norma/normajuridica/?tipo=2&page=3&ano=2025
     """
+
+    _FOOTER_BLOCK_PATTERNS = SAPLBaseScraper._FOOTER_BLOCK_PATTERNS + (
+        "sei/grr",
+        "al.rr.leg.br",
+        "al.rr. lea.br",
+        "ale-rr na internet",
+        "praça do centro cívico",
+        "praca do centro civico",
+    )
 
     def __init__(
         self,

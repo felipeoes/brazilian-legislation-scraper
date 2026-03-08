@@ -6,23 +6,18 @@ from src.scraper.base.scraper import StateScraper
 from loguru import logger
 
 # ALRS does not have a type field, norm type is gotten while scraping
-TYPES = []
+TYPES = {}
 
 # ALRS does not have a situation field, cannot distinguish between valid and invalid norms
-VALID_SITUATIONS = ["Não consta"]
-
-INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no longer have legal effect)
-
-# the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
-SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
+SITUATIONS = {"Não consta": "Não consta"}
 
 
 class RSAlrsScraper(StateScraper):
     """Webscraper for Rio Grande do Sul state legislation website (https://www.al.rs.gov.br/legis)
 
+    Year start (earliest on source): 1830
 
     Example search request (GET): https://www.al.rs.gov.br/legis/M010/M0100008.asp?txthNRO_PROPOSICAO=&txthAdin=&txthQualquerPalavra=&cboTipoNorma=&TxtNumero_Norma=&TxtAno=1830&txtData=&txtDataInicial=&txtDataFinal=&txtPalavraChave=&TxtQualquerPalavra=&CmbPROPOSICAO=&txtProcAdin=&cmbNumero_Docs=50&txtOrdenacao=data&txtOperacaoFormulario=Pesquisar&pagina=1
-
     """
 
     def __init__(
@@ -37,10 +32,18 @@ class RSAlrsScraper(StateScraper):
             name="RIO_GRANDE_DO_SUL",
             **kwargs,
         )
-        self.fetched_constitution = False
 
-    def _build_search_url(self, year: int, page: int) -> str:
-        """Build search URL from arguments (no shared state mutation)."""
+    def _build_search_url(self, year: int, page: int = 1) -> str:
+        """Build search URL for page 1 (initial search with year filter).
+
+        Page 1 uses the search form endpoint (M0100008.asp) with all filter params.
+        Pages 2+ use the pagination endpoint (M0100017.asp?txtPage=N) which relies
+        on the server-side session state set by the page-1 request.
+        """
+        if page > 1:
+            return (
+                f"{self.base_url}/legis/M010/M0100017.asp?txtPage={page}&txtNumDocs=50"
+            )
         params = {
             "txthNRO_PROPOSICAO": "",
             "txthAdin": "",
@@ -58,16 +61,18 @@ class RSAlrsScraper(StateScraper):
             "cmbNumero_Docs": 50,
             "txtOrdenacao": "data",
             "txtOperacaoFormulario": "Pesquisar",
-            "pagina": page,
         }
         return f"{self.base_url}/legis/M010/M0100008.asp?{urlencode(params)}"
 
-    async def _get_docs_links(self, url: str) -> list:
+    async def _get_docs_links(
+        self, url: str, soup: BeautifulSoup | None = None
+    ) -> list:
         """Get documents html links from given page.
         Returns a list of dicts with keys 'type', 'title', 'date',  'summary', 'html_link'
         """
 
-        soup = await self.request_service.get_soup(url)
+        if soup is None:
+            soup = await self.request_service.get_soup(url)
         table = soup.find("table", class_="TableResultado")
         items = table.find_all("tr")
 
@@ -105,6 +110,23 @@ class RSAlrsScraper(StateScraper):
 
         return html_links
 
+    @staticmethod
+    def _clean_rs_markdown(text: str) -> str:
+        """Remove RS ALRS PDF footer artifacts that leak between pages.
+
+        The footer of every page in the RS ALRS PDFs contains the URL
+        http://www.al.rs.gov.br/legis which markitdown extracts at each
+        page break in several forms:
+          - bare line:            'http://www.al.rs.gov.br/legis'
+          - with page number:     'http://www.al.rs.gov.br/legis  4'
+          - inside a table row:   '| http://www.al.rs.gov.br/legis  | … | 3 |'
+        Matching the whole line (any leading chars, URL, any trailing chars)
+        covers all observed variants.
+        """
+        return re.sub(
+            r"\n?[^\n]*https?://www\.al\.rs\.gov\.br/legis[^\n]*", "", text
+        ).strip()
+
     def _get_html_string(self, soup: BeautifulSoup) -> str:
         "Get html string from soup"
 
@@ -129,18 +151,26 @@ class RSAlrsScraper(StateScraper):
 
     async def _get_doc_data(self, doc_info: dict) -> dict | None:
         """Get document data from given document dict"""
-
-        # remove html_link from doc_info
+        doc_info = dict(doc_info)
         html_link = doc_info.pop("html_link")
         soup = await self.request_service.get_soup(html_link)
 
         # check for error (some documents are not available)
-        if not soup or "a página não pode ser exibida" in soup.prettify().lower():
+        if not soup:
             logger.error(f"Error getting document data: {html_link}")
             await self._save_doc_error(
                 title=doc_info.get("title", "Unknown"),
-                year="",
-                situation="",
+                norm_type=doc_info.get("type", ""),
+                html_link=html_link,
+                error_message="Page could not be displayed or soup is None",
+            )
+            return None
+
+        soup_text = soup.prettify().lower()
+        if "a página não pode ser exibida" in soup_text:
+            logger.error(f"Error getting document data: {html_link}")
+            await self._save_doc_error(
+                title=doc_info.get("title", "Unknown"),
                 norm_type=doc_info.get("type", ""),
                 html_link=html_link,
                 error_message="Page could not be displayed or soup is None",
@@ -148,15 +178,15 @@ class RSAlrsScraper(StateScraper):
             return None
 
         # get situation, subject and pdf_link.
-        situation = soup.find("td", text="Situação:")
+        situation = soup.find("td", string="Situação:")
         if situation:
             situation = situation.find_next("td").text.strip()
 
-        subject = soup.find("td", text="Assunto:")
+        subject = soup.find("td", string="Assunto:")
         if subject:
             subject = subject.find_next("td").text.strip()
         html_link = (
-            soup.find("td", text=re.compile(r"Links:"))
+            soup.find("td", string=re.compile(r"Links:"))
             .find_next("td")
             .find("a")["href"]
         )
@@ -170,15 +200,19 @@ class RSAlrsScraper(StateScraper):
         soup = await self.request_service.get_soup(html_link)
 
         # invalid norm
-        if (
-            not soup
-            or "norma sem texto" in soup.prettify().lower()
-            or "sem texto para exibi" in soup.prettify().lower()
-        ):
+        if not soup:
             await self._save_doc_error(
                 title=doc_info.get("title", "Unknown"),
-                year="",
-                situation="",
+                norm_type=doc_info.get("type", ""),
+                html_link=html_link,
+                error_message="Norm has no text content",
+            )
+            return None
+
+        soup_text = soup.prettify().lower()
+        if "norma sem texto" in soup_text or "sem texto para exibi" in soup_text:
+            await self._save_doc_error(
+                title=doc_info.get("title", "Unknown"),
                 norm_type=doc_info.get("type", ""),
                 html_link=html_link,
                 error_message="Norm has no text content",
@@ -193,9 +227,17 @@ class RSAlrsScraper(StateScraper):
                 pdf_link = pdf_link["src"]
             else:
                 # pdf_link may be in the form of a javascript window.open
-                # get the link from the javascript
-                pdf_link = re.search(r"window\.open\('([^']+)'", soup.prettify())
-                pdf_link = pdf_link.group(1)
+                m = re.search(r"window\.open\('([^']+)'", soup_text)
+                if not m:
+                    logger.error(f"Could not find PDF link for document: {html_link}")
+                    await self._save_doc_error(
+                        title=doc_info.get("title", "Unknown"),
+                        norm_type=doc_info.get("type", ""),
+                        html_link=html_link,
+                        error_message="No PDF link found (no iframe, no window.open)",
+                    )
+                    return None
+                pdf_link = m.group(1)
 
         document_url = pdf_link if pdf_link else html_link
 
@@ -212,15 +254,15 @@ class RSAlrsScraper(StateScraper):
                 pdf_link
             )
 
-        if not text_markdown or not text_markdown.strip():
+        text_markdown = self._clean_rs_markdown(text_markdown)
+        valid, reason = self._valid_markdown(text_markdown)
+        if not valid:
             logger.error(f"Error getting markdown from pdf: {pdf_link}")
             await self._save_doc_error(
                 title=doc_info.get("title", "Unknown"),
-                year="",
-                situation="",
                 norm_type=doc_info.get("type", ""),
                 html_link=pdf_link if pdf_link else html_link,
-                error_message="Failed to extract markdown from document",
+                error_message=f"Invalid markdown: {reason}",
             )
             return None
 
@@ -236,48 +278,18 @@ class RSAlrsScraper(StateScraper):
 
         return result
 
-    async def scrape_constitution(self):
-        """Scrape constitution data"""
-        url = "https://ww2.al.rs.gov.br/dal/LinkClick.aspx?fileticket=9p-X_3esaNg%3d&tabid=3683&mid=5358"
-
-        title = "Constituição do Estado do Rio Grande do Sul"
-        if self._is_already_scraped(url, title):
-            self.fetched_constitution = True
-            return None
-
-        text_markdown, raw_content, content_ext = await self._download_and_convert(url)
-        if not text_markdown or not text_markdown.strip():
-            logger.error("Error getting markdown for state constitution")
-            return None
-
-        # save to one drive
-        queue_item = {
-            "year": 1989,
-            "type": "Constituição Estadual",
-            "title": title,
-            "date": "",
-            "summary": "Texto constitucional de 3 de outubro de 1989 com as alterações adotadas pelas Emendas Constitucionais de n.º 1, de 1991, a 85, de 2023",
-            "situation": "Sem revogação expressa",
-            "text_markdown": text_markdown.strip(),
-            "document_url": url,
-            "_raw_content": raw_content,
-            "_content_extension": content_ext,
-        }
-
-        saved = await self._save_doc_result(queue_item)
-        if saved is not None:
-            queue_item = saved
-
-        self._track_results([queue_item])
-        self.count += 1
-
-        self.fetched_constitution = True
+    async def _before_scrape(self) -> None:
+        await self._fetch_and_save_constitution(
+            url="https://ww2.al.rs.gov.br/dal/LinkClick.aspx?fileticket=9p-X_3esaNg%3d&tabid=3683&mid=5358",
+            title="Constituição do Estado do Rio Grande do Sul",
+            year=1989,
+            date="",
+            summary="Texto constitucional de 3 de outubro de 1989 com as alterações adotadas pelas Emendas Constitucionais de n.º 1, de 1991, a 85, de 2023",
+            situation="Sem revogação expressa",
+        )
 
     async def _scrape_year(self, year: int) -> list[dict]:
         """Scrape norms for a specific year"""
-        if not self.fetched_constitution:
-            await self.scrape_constitution()
-
         # get total pages
         url = self._build_search_url(year, 1)
         soup = await self.request_service.get_soup(url)
@@ -289,37 +301,27 @@ class RSAlrsScraper(StateScraper):
         else:
             total_pages = 0  # no documents for this year
 
-        # Get documents html links
-        tasks = [
-            self._get_docs_links(
-                self._build_search_url(year, page),
+        if total_pages == 0:
+            return []
+
+        ctx = {"year": year, "type": "NA", "situation": "NA"}
+        documents = await self._get_docs_links(url, soup=soup) or []
+        documents.extend(
+            await self._fetch_all_pages(
+                lambda p: self._get_docs_links(self._build_search_url(year, p)),
+                total_pages,
+                context=ctx,
+                desc="RIO GRANDE DO SUL | get_docs_links",
             )
-            for page in range(1, total_pages + 1)
-        ]
-        valid_results = await self._gather_results(
-            tasks,
-            context={"year": year, "type": "N/A", "situation": "N/A"},
-            desc="RIO GRANDE DO SUL | get_docs_links",
         )
-        documents = []
-        for result in valid_results:
-            documents.extend(result)
 
         for doc in documents:
             doc["year"] = year
-        ctx = {"year": year, "type": "N/A", "situation": "N/A"}
-        tasks = [
-            self._with_save(self._get_doc_data(doc_info), ctx) for doc_info in documents
-        ]
-        results = await self._gather_results(
-            tasks,
-            context=ctx,
+        results = await self._process_documents(
+            documents,
+            year=year,
+            norm_type="NA",
             desc="RIO GRANDE DO SUL",
         )
-
-        if self.verbose:
-            logger.info(
-                f"Finished scraping for Year: {year} | Results: {len(results)} | Total: {self.count}"
-            )
 
         return results

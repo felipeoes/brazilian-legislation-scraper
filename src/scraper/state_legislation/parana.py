@@ -22,7 +22,7 @@ from src.scraper.base.scraper import (
 TYPES = {
     "Lei": 1,
     "Lei Complementar": 3,
-    "Consituição Estadual": 10,
+    "Constituição Estadual": 10,
     "Decreto": 11,
     "Emenda Constitucional": 9,
     "Resolução": 13,
@@ -33,7 +33,7 @@ TYPES = {
 # from the document text (e.g. "Revogado pelo …").
 VALID_SITUATIONS: list[str] = []
 INVALID_SITUATIONS: list[str] = []
-SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
+SITUATIONS = {s: s for s in VALID_SITUATIONS + INVALID_SITUATIONS}
 
 _RE_LIST_ITEMS = re.compile(r"list_cor_(sim|nao)")
 _RE_INVALID = re.compile(r"(Revogado pelo|Revogada pela|Revogado por|Revogada por)")
@@ -43,6 +43,8 @@ _RE_TOTAL_RECORDS = re.compile(r"Total de (\d+) registros")
 
 class ParanaCVScraper(StateScraper):
     """Scraper for Paraná state legislation (Casa Civil).
+
+    Year start (earliest on source): 2025
 
     Uses plain HTTP POST requests against the J2EE search form at
     ``legislacao.pr.gov.br``.  No Playwright / VPN needed.
@@ -204,7 +206,7 @@ class ParanaCVScraper(StateScraper):
             ]
             page_results = await self._gather_results(
                 tasks,
-                context={"year": year, "type": str(norm_type_id), "situation": "N/A"},
+                context={"year": year, "type": str(norm_type_id), "situation": "NA"},
                 desc=f"PARANA | type {norm_type_id} | pages",
             )
             for page_soup in page_results:
@@ -242,8 +244,6 @@ class ParanaCVScraper(StateScraper):
             await self._save_doc_error(
                 title=doc_title,
                 year=doc_info.get("date", "")[-4:],
-                situation="",
-                norm_type="",
                 html_link=html_link,
                 error_message=f"HTTP {status}",
             )
@@ -258,8 +258,6 @@ class ParanaCVScraper(StateScraper):
             await self._save_doc_error(
                 title=doc_title,
                 year=doc_info.get("date", "")[-4:],
-                situation="",
-                norm_type="",
                 html_link=html_link,
                 error_message="No pesquisarAtoForm found",
             )
@@ -277,8 +275,9 @@ class ParanaCVScraper(StateScraper):
         situation = self._infer_situation(soup)
 
         text_markdown = (await self._get_markdown(html_content=html_string)).strip()
-        if not text_markdown:
-            logger.warning(f"Empty markdown for doc {cod_ato}")
+        valid, reason = self._valid_markdown(text_markdown)
+        if not valid:
+            logger.warning(f"Invalid markdown for doc {cod_ato}: {reason}")
             return None
 
         result = {
@@ -305,20 +304,10 @@ class ParanaCVScraper(StateScraper):
 
         for doc in docs:
             doc["year"] = year
-        ctx = {"year": year, "type": norm_type, "situation": "N/A"}
-        tasks = [self._with_save(self._get_doc_data(doc), ctx) for doc in docs]
-        results = await self._gather_results(
-            tasks,
-            context=ctx,
-            desc=f"PARANA | {norm_type}",
+        return await self._process_documents(
+            docs,
+            year=year,
+            norm_type=norm_type,
         )
-
-        if self.verbose:
-            logger.info(
-                f"Finished scraping Year: {year} | Type: {norm_type} | "
-                f"Results: {len(results)} | Total: {self.count}"
-            )
-
-        return results
 
     # _scrape_year uses default from StateScraper

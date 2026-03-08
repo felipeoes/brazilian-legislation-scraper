@@ -9,22 +9,18 @@ from src.scraper.base.scraper import StateScraper
 TYPES = {
     "Lei Ordinária": "lei_ordinarias",
     "Lei Complementar": "lei_complementares",
-    "Constituição Estadual": "detalhar_constituicao",  # texto completo, modificar a lógica no scraper
+    "Constituição Estadual": "detalhar_constituicao",  # texto completo, handled separately
     "Decreto": "lei_decretos",
+    "Emenda Constitucional": "emendas",
 }
 
-VALID_SITUATIONS = [
-    "Não consta revogação expressa",
-]  # Legis - Acre only publishes norms that are currently valid (no explicit revocation)
-
-INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no longer have legal effect)
-
-# the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
-SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
+SITUATIONS = {"Não consta revogação expressa": "Não consta revogação expressa"}
 
 
 class AcreLegisScraper(StateScraper):
     """Webscraper for Legis - Acre website (https://legis.ac.gov.br)
+
+    Year start (earliest on source): 1963
 
     Example search request: https://legis.ac.gov.br/principal/1
     """
@@ -66,7 +62,8 @@ class AcreLegisScraper(StateScraper):
             title = a.text.strip()
             html_link = a["href"]
             summary = tr.find("td").find_next("td").text.strip()
-            year = self.year_regex.search(title.split(",")[-1]).group()
+            m = self.year_regex.search(title.split(",")[-1])
+            year = m.group() if m else "0000"
             html_links.append(
                 {
                     "title": title,
@@ -78,12 +75,28 @@ class AcreLegisScraper(StateScraper):
 
         return html_links
 
+    def _clean_acre_html(self, soup: "BeautifulSoup") -> str:
+        """Extract and clean HTML content from an Acre legislation page."""
+        html_tag = soup.find("div", id="body-law") or soup.find("div", id="exportacao")
+        if not html_tag:
+            return ""
+
+        for row in html_tag.find_all("div", class_="row"):
+            row.decompose()
+        doe_span = html_tag.find("span", id="texto_publicado_doe")
+        if doe_span:
+            doe_span.decompose()
+
+        # Reuse base helpers: unwrap links and remove disclaimer notices
+        self._clean_norm_soup(html_tag, unwrap_links=True, remove_disclaimers=True)
+
+        return html_tag.prettify()
+
     async def _get_doc_data(self, doc_info: dict) -> dict:
         """Get document data from given html link"""
         doc_html_link = doc_info["html_link"]
         doc_title = doc_info["title"]
         doc_year = doc_info["year"]
-        doc_summary = doc_info["summary"]
 
         if self._is_already_scraped(doc_html_link, doc_title):
             return None
@@ -99,95 +112,10 @@ class AcreLegisScraper(StateScraper):
             return None
 
         soup = BeautifulSoup(await response.text(), "html.parser")
-        html_string = soup.find("div", id="body-law")
-        if not html_string:
-            html_string = soup.find("div", id="exportacao")
+        html_string = self._clean_acre_html(soup)
 
-        if html_string:
-            # Remove attachments table
-            for row in html_string.find_all("div", class_="row"):
-                row.decompose()
-            # Remove the "texto_publicado_doe" span
-            doe_span = html_string.find("span", id="texto_publicado_doe")
-            if doe_span:
-                doe_span.decompose()
-
-        if html_string:
-            # Remove hyperlinks (unwrap <a> tags, keeping inner text)
-            for a_tag in html_string.find_all("a"):
-                a_tag.unwrap()
-
-        html_string = html_string.prettify() if html_string else ""
-
-        # get text markdown from extracted HTML
-        text_markdown = await self._get_markdown(
-            html_content=html_string,
-        )
-
-        if text_markdown is None:
-            await self._save_doc_error(
-                title=doc_title,
-                year=doc_year,
-                html_link=doc_html_link,
-                error_message="Failed to convert document to markdown",
-            )
-            return None
-
-        return {
-            "title": doc_title,
-            "year": doc_year,
-            "summary": doc_summary,
-            "text_markdown": text_markdown,
-            "document_url": doc_html_link,
-            "_raw_content": html_string.encode("utf-8"),
-            "_content_extension": ".html",
-        }
-
-    async def _get_state_constitution(self, norm_type_id: str) -> dict:
-        """Get state constitution data"""
-        document_url = f"{self.base_url.replace('/principal', '')}/{norm_type_id}"
-        if self._is_already_scraped(document_url, "Constituição Estadual"):
-            return None
-        response = await self.request_service.make_request(document_url)
-        if not response:
-            return {
-                "title": "Constituição Estadual",
-                "year": datetime.now().year,
-                "summary": "Constituição Estadual do Estado do Acre",
-                "text_markdown": None,
-                "document_url": document_url,
-            }
-
-        soup = BeautifulSoup(await response.text(), "html.parser")
-        html_string = soup.find("div", id="exportacao")
-
-        if html_string:
-            for row in html_string.find_all("div", class_="row"):
-                row.decompose()
-            doe_span = html_string.find("span", id="texto_publicado_doe")
-            if doe_span:
-                doe_span.decompose()
-
-        if html_string:
-            for a_tag in html_string.find_all("a"):
-                a_tag.unwrap()
-
-        html_string = html_string.prettify() if html_string else ""
-
-        # get text markdown
-        text_markdown = await self._get_markdown(
-            html_content=html_string,
-        )
-
-        return {
-            "title": "Constituição Estadual",
-            "year": datetime.now().year,
-            "summary": "Constituição Estadual do Estado do Acre",
-            "text_markdown": text_markdown,
-            "document_url": document_url,
-            "_raw_content": html_string.encode("utf-8"),
-            "_content_extension": ".html",
-        }
+        doc_data = {k: v for k, v in doc_info.items() if k != "html_link"}
+        return await self._process_html_doc(doc_data, html_string, doc_html_link)
 
     async def _prefetch_all_links(self) -> None:
         """Fetch all document links from the single page and group by year.
@@ -207,50 +135,44 @@ class AcreLegisScraper(StateScraper):
                 continue
 
             html_links = await self._get_docs_links(soup, norm_type_id)
-            count = 0
             for doc in html_links:
                 year = int(doc["year"])
                 self._prefetched_docs[year][norm_type].append(doc)
-                count += 1
 
             if self.verbose:
-                logger.info(f"Prefetched {count} links for {norm_type}")
+                logger.info(f"Prefetched {len(html_links)} links for {norm_type}")
 
     async def _scrape_type(
         self, norm_type: str, norm_type_id: str, year: int
     ) -> list[dict]:
         """Scrape all documents of a single type for a year."""
-        situation = self.situations[0]
+        situation = next(iter(self.situations), "Não consta")
 
         if norm_type == "Constituição Estadual":
             # Scrape once on the first year that reaches here
             if getattr(self, "_scraped_constitution", False):
                 return []
             self._scraped_constitution = True
-            doc_info = await self._get_state_constitution(norm_type_id)
-            if doc_info is None:
-                return []
-            doc_info["situation"] = situation
-            doc_info["type"] = norm_type
-            await self._save_doc_result(doc_info)
-            return [doc_info]
+            document_url = f"{self.base_url.replace('/principal', '')}/{norm_type_id}"
+            doc = await self._fetch_and_save_constitution(
+                url=document_url,
+                title="Constituição Estadual",
+                year=datetime.now().year,
+                summary="Constituição Estadual do Estado do Acre",
+            )
+            return [doc] if doc else []
 
         docs = self._prefetched_docs.get(year, {}).get(norm_type, [])
         if not docs:
             return []
 
-        ctx = {"year": year, "situation": situation, "type": norm_type}
-
-        tasks = [self._with_save(self._get_doc_data(doc), ctx) for doc in docs]
-        valid_results = await self._gather_results(
-            tasks,
-            context=ctx,
+        return await self._process_documents(
+            docs,
+            year=year,
+            norm_type=norm_type,
+            situation=situation,
             desc=f"ACRE | {norm_type} | Year {year}",
         )
-
-        results = list(valid_results)
-
-        return results
 
     async def scrape(self) -> list:
         """Scrape data from all years.

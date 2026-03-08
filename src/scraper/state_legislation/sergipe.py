@@ -1,6 +1,8 @@
+import re
 from io import BytesIO
-from typing import Any
+from typing import Any, cast
 
+import aiohttp
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
 from src.scraper.base.scraper import StateScraper
@@ -33,6 +35,8 @@ SITUATIONS = VALID_SITUATIONS | INVALID_SITUATIONS
 class SergipeLegsonScraper(StateScraper):
     """Webscraper for Sergipe state legislation website (https://legison.pge.se.gov.br/)
 
+    Year start (earliest on source): 1940
+
     Example search request: POST to https://legison.pge.se.gov.br/Public/Consulta
     """
 
@@ -47,12 +51,51 @@ class SergipeLegsonScraper(StateScraper):
         self.search_url = f"{self.base_url}/Public/Consulta"
         self.doc_content_url = f"{self.base_url}/Public/GetConteudoAto"
 
+    def _clean_legison_markdown(self, text_markdown: str) -> str:
+        """Remove LegisOn portal boilerplate from extracted text."""
+        cleaned = self._clean_markdown(
+            text_markdown,
+            replace=[
+                (
+                    r"\n?Extra[ií]do do Portal de Legisla[cç][aã]o do Governo de Sergipe - LegisOn\s*https?://legislacao\.se\.gov\.br/?\s*",
+                    "\n",
+                ),
+                (r"\n?https?://legislacao\.se\.gov\.br/?\s*", "\n"),
+                (
+                    r"\n?Este texto n[aã]o substitui o publicado no Di[aá]rio Oficial do Estado\.?\s*",
+                    "\n",
+                ),
+                (r"\n?P[aá]gina\s+\d+(?:\s+de\s+\d+)?\s*", "\n"),
+            ],
+        )
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
+    def _extract_content_markdown(self, data: dict) -> str:
+        """Extract plain-text content exposed directly by the API."""
+        contents = data.get("content")
+        if not isinstance(contents, list):
+            return ""
+
+        text_parts = []
+        for item in contents:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("conteudo")
+            if isinstance(text, str) and text.strip():
+                text_parts.append(text.strip())
+
+        if not text_parts:
+            return ""
+
+        return self._clean_legison_markdown("\n\n".join(text_parts))
+
     def _format_search_url(self, _norm_type_id: str, _year: int, _page: int = 1) -> str:
         """Format url for search request - returns the search URL"""
         return self.search_url
 
     def _format_search_payload(
-        self, norm_type_id: str, year: int, page: int = 1
+        self, norm_type_id: int | str, year: int, page: int = 1
     ) -> dict:
         """Format payload for search request"""
         return {
@@ -83,23 +126,31 @@ class SergipeLegsonScraper(StateScraper):
             return []
 
         try:
-            data = await response.json()
+            client_response = cast(aiohttp.ClientResponse, response)
+            data = await client_response.json()
         except Exception as e:
             logger.error(f"Error parsing JSON response: {e}")
             return []
 
-        if "result" not in data:
+        if not isinstance(data, dict) or "result" not in data:
             return []
 
         docs = []
         for item in data["result"]:
+            if not isinstance(item, dict):
+                continue
+
+            item = cast(dict[str, Any], item)
+
             # Extract document information
             doc_id = item.get("id")
             numero = item.get("numero", "")
             data_ato = item.get("dataAto", "")
             ementa = item.get("ementa", "")
             tipo_ato = item.get("tipoAto", {})
-            tipo_descricao = tipo_ato.get("descricao", "") if tipo_ato else ""
+            tipo_descricao = (
+                tipo_ato.get("descricao", "") if isinstance(tipo_ato, dict) else ""
+            )
 
             # Format title
             title = f"{tipo_descricao} {numero}"
@@ -111,7 +162,11 @@ class SergipeLegsonScraper(StateScraper):
             # Determine situation based on situacao ID
             situacao = item.get("situacao", {})
             situation = "Não consta"  # Default
-            if "id" in situacao:
+            if (
+                isinstance(situacao, dict)
+                and isinstance(self.situations, dict)
+                and "id" in situacao
+            ):
                 situation = self.situations.get(situacao["id"], "Não consta")
 
             doc = {
@@ -133,6 +188,7 @@ class SergipeLegsonScraper(StateScraper):
     )
     async def _get_doc_data(self, doc_info: dict) -> dict | None:
         """Get document data by fetching PDF content and converting to markdown"""
+        doc_info = dict(doc_info)
         doc_id = doc_info.pop("doc_id", None)
         title = doc_info.get("title", "")
         if not doc_id:
@@ -151,10 +207,29 @@ class SergipeLegsonScraper(StateScraper):
             raise Exception(f"Failed to get document content for doc_id={doc_id}")
 
         try:
-            data = await response.json()
+            client_response = cast(aiohttp.ClientResponse, response)
+            data = await client_response.json()
         except Exception as e:
             logger.error(f"Error parsing content JSON response: {e}")
             raise
+
+        if not isinstance(data, dict):
+            raise TypeError(f"Unexpected content payload for doc_id={doc_id}")
+
+        if self._is_already_scraped(content_url, title):
+            return None
+
+        content_markdown = self._extract_content_markdown(data)
+        if content_markdown:
+            doc_info.update(
+                {
+                    "text_markdown": content_markdown,
+                    "document_url": content_url,
+                    "_raw_content": content_markdown.encode("utf-8"),
+                    "_content_extension": ".txt",
+                }
+            )
+            return doc_info
 
         # Get PDF path from files section
         if "files" in data and data["files"]:
@@ -171,13 +246,16 @@ class SergipeLegsonScraper(StateScraper):
                 # Download and process PDF
                 pdf_response = await self.request_service.make_request(pdf_url)
                 if pdf_response:
-                    pdf_content = await pdf_response.read()
+                    pdf_client_response = cast(aiohttp.ClientResponse, pdf_response)
+                    pdf_content = await pdf_client_response.read()
                     # Convert PDF to markdown
                     text_markdown = await self._get_markdown(
                         stream=BytesIO(pdf_content)
                     )
+                    text_markdown = self._clean_legison_markdown(text_markdown)
 
-                    if text_markdown and text_markdown.strip():
+                    valid, reason = self._valid_markdown(text_markdown)
+                    if valid:
                         doc_info.update(
                             {
                                 "text_markdown": text_markdown,
@@ -193,7 +271,7 @@ class SergipeLegsonScraper(StateScraper):
             title=title,
             year=doc_info.get("year", ""),
             html_link=content_url,
-            error_message="No text extracted from document",
+            error_message="No API content or extractable PDF found for document",
         )
         return None
 
@@ -202,7 +280,7 @@ class SergipeLegsonScraper(StateScraper):
         wait=wait_exponential(multiplier=2, min=2, max=30),
         reraise=True,
     )
-    async def _get_total_count(self, norm_type_id: str, year: int) -> int:
+    async def _get_total_count(self, norm_type_id: int | str, year: int) -> int:
         """Get total count of documents for a type and year"""
         payload = self._format_search_payload(norm_type_id, year, 1)
 
@@ -216,12 +294,15 @@ class SergipeLegsonScraper(StateScraper):
             raise Exception(error_msg)
 
         try:
-            data = await response.json()
-            return data.get("count", 0)
+            client_response = cast(aiohttp.ClientResponse, response)
+            data = await client_response.json()
+            if isinstance(data, dict):
+                return int(data.get("count", 0) or 0)
+            return 0
         except Exception:
             return 0
 
-    async def _get_all_pages_docs(self, norm_type_id: str, year: int) -> list:
+    async def _get_all_pages_docs(self, norm_type_id: int | str, year: int) -> list:
         """Get documents from all pages for a given type and year"""
         # Get total count first
         total_count = await self._get_total_count(norm_type_id, year)
@@ -230,7 +311,7 @@ class SergipeLegsonScraper(StateScraper):
 
         # Calculate total pages (assuming 10 items per page based on API behavior)
         page_size = 10
-        total_pages = (total_count + page_size - 1) // page_size
+        total_pages = self._calc_pages(total_count, page_size)
 
         all_docs = []
 
@@ -241,7 +322,7 @@ class SergipeLegsonScraper(StateScraper):
         ]
         valid_results = await self._gather_results(
             tasks,
-            context={"year": year, "type": "N/A", "situation": "N/A"},
+            context={"year": year, "type": "NA", "situation": "NA"},
             desc="SERGIPE | get_docs_links",
         )
         for result in valid_results:
@@ -255,7 +336,11 @@ class SergipeLegsonScraper(StateScraper):
         constitution_url = f"{self.base_url}/Public/GetConstituicao"
         response = await self.request_service.make_request(constitution_url)
 
-        data = await response.json() if response else {}
+        if response:
+            constitution_response = cast(aiohttp.ClientResponse, response)
+            data = await constitution_response.json()
+        else:
+            data = {}
 
         file_path = data.get("arquivoAtualizado")
         doc_id = data.get("id")
@@ -273,6 +358,14 @@ class SergipeLegsonScraper(StateScraper):
             text_markdown, raw_content, content_ext = await self._download_and_convert(
                 file_url
             )
+            text_markdown = self._clean_legison_markdown(text_markdown)
+
+            valid, reason = self._valid_markdown(text_markdown)
+            if not valid:
+                logger.warning(
+                    f"Constitution markdown invalid: {reason} | URL: {file_url}"
+                )
+                return
 
             doc_info = {
                 "id": doc_id,
@@ -317,23 +410,11 @@ class SergipeLegsonScraper(StateScraper):
 
             for doc in documents:
                 doc["year"] = year
-            ctx = {"year": year, "type": norm_type, "situation": "N/A"}
-            tasks = [
-                self._with_save(self._get_doc_data(doc_info.copy()), ctx)
-                for doc_info in documents
-            ]
-            results = await self._gather_results(
-                tasks,
-                context=ctx,
-                desc=f"SERGIPE | {norm_type}",
+            return await self._process_documents(
+                [doc.copy() for doc in documents],
+                year=year,
+                norm_type=norm_type,
             )
-
-            if self.verbose:
-                logger.info(
-                    f"Finished scraping for Year: {year} | Type: {norm_type} | Results: {len(results)}"
-                )
-
-            return results
 
         except Exception as e:
             logger.error(
@@ -341,9 +422,5 @@ class SergipeLegsonScraper(StateScraper):
             )
             return []
 
-    async def _scrape_year(self, year: int) -> list[dict]:
-        """Scrape norms for a specific year, fetching constitution on first call."""
-        if not hasattr(self, "_constitution_fetched"):
-            await self._fetch_constitution()
-            self._constitution_fetched = True
-        return await super()._scrape_year(year)
+    async def _before_scrape(self) -> None:
+        await self._fetch_constitution()

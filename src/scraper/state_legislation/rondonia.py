@@ -1,10 +1,8 @@
 from datetime import datetime
-from io import BytesIO
 from typing import Any
 from urllib.parse import urljoin
 
 from bs4 import Tag
-from loguru import logger
 from src.scraper.base.scraper import StateScraper
 
 
@@ -22,6 +20,8 @@ SITUATIONS = []
 class RondoniaCotelScraper(StateScraper):
     """Webscraper for Rondônia state legislation website (http://ditel.casacivil.ro.gov.br/)
 
+    Year start (earliest on source): 1981
+
     Example search request: http://ditel.casacivil.ro.gov.br/COTEL/Livros/listdeclei.aspx?ano=2025
     """
 
@@ -33,7 +33,6 @@ class RondoniaCotelScraper(StateScraper):
         super().__init__(
             base_url, types=TYPES, situations=SITUATIONS, name="RONDONIA", **kwargs
         )
-        self._constitution_fetched = False
 
     def _format_search_url(self, norm_type_id: str, year: int) -> str:
         """Format url for search request"""
@@ -131,129 +130,37 @@ class RondoniaCotelScraper(StateScraper):
 
         return docs
 
-    async def _process_pdf(
-        self, pdf_link: str, pdf_len_threshold: int = 99
-    ) -> dict | None:
-        """Process PDF and return text markdown."""
-        response = await self.request_service.make_request(pdf_link)
-        if not response:
-            return None
-
-        content = await response.read()
-        if not content:
-            return None
-
-        text_markdown = await self._get_markdown(stream=BytesIO(content))
-        text_markdown = text_markdown.strip() if text_markdown else ""
-        if not text_markdown or len(text_markdown) <= pdf_len_threshold:
-            return None
-
-        return {
-            "text_markdown": text_markdown,
-            "document_url": pdf_link,
-            "_raw_content": content,
-            "_content_extension": ".pdf",
-        }
-
     async def _get_doc_data(self, doc_info: dict) -> dict | None:
-        """Get document data"""
-        pdf_link = doc_info.pop("pdf_link")
-        title = doc_info.get("title", "")
-
-        if self._is_already_scraped(pdf_link, title):
-            return None
-
-        processed_pdf = await self._process_pdf(pdf_link)
-
-        if processed_pdf is None:
-            await self._save_doc_error(
-                title=title,
-                year=doc_info.get("year", ""),
-                html_link=pdf_link,
-                error_message="Failed to process PDF",
-            )
-            return None
-
-        doc_info.update(processed_pdf)
-
-        return doc_info
+        """Get document data."""
+        return await self._process_pdf_doc(doc_info)
 
     async def _fetch_constitution(self):
         """Fetch the state constitution if available."""
-        pdf_url = f"{self.base_url}/Livros/CE1989-2014.pdf"
-        title = "Constituição do Estado de Rondônia"
-
-        if self._is_already_scraped(pdf_url, title):
-            if self.verbose:
-                logger.info("State constitution already scraped, skipping")
-            return
-
-        text_markdown, raw_content, content_ext = await self._download_and_convert(
-            pdf_url
+        await self._fetch_and_save_constitution(
+            url=f"{self.base_url}/Livros/CE1989-2014.pdf",
+            title="Constituição do Estado de Rondônia",
+            year=datetime.now().year,
+            norm_number="CE1989-2014",
+            summary="Constituição do Estado de Rondônia",
         )
-
-        doc_info = {
-            "year": datetime.now().year,
-            "type": "Constituição Estadual",
-            "title": title,
-            "norm_number": "CE1989-2014",
-            "situation": "Não consta revogação expressa",
-            "summary": "Constituição do Estado de Rondônia",
-            "text_markdown": text_markdown,
-            "document_url": pdf_url,
-            "_raw_content": raw_content,
-            "_content_extension": content_ext,
-        }
-
-        saved = await self._save_doc_result(doc_info)
-        if saved is not None:
-            doc_info = saved
-        self._track_results([doc_info])
-        self.count += 1
-        if self.verbose:
-            logger.info("Scraped state constitution")
 
     async def _scrape_type(
         self, norm_type: str, norm_type_id: str, year: int
     ) -> list[dict]:
         """Scrape norms for a specific type and year"""
         url = self._format_search_url(norm_type_id, year)
+        documents = await self._get_docs_links(url)
 
-        try:
-            documents = await self._get_docs_links(url)
-
-            if not documents:
-                return []
-
-            for doc in documents:
-                doc["year"] = year
-            ctx = {"year": year, "type": norm_type, "situation": "N/A"}
-            doc_data_tasks = [
-                self._with_save(self._get_doc_data(doc_info), ctx)
-                for doc_info in documents
-            ]
-            results = await self._gather_results(
-                doc_data_tasks,
-                context=ctx,
-                desc=f"RONDONIA | {norm_type}",
-            )
-
-            if self.verbose:
-                logger.info(
-                    f"Finished scraping for Year: {year} | Type: {norm_type} | Results: {len(results)}"
-                )
-
-            return results
-
-        except Exception as e:
-            logger.error(
-                f"Error scraping Year: {year} | Type: {norm_type} | Error: {e}"
-            )
+        if not documents:
             return []
 
-    async def _scrape_year(self, year: int) -> list[dict]:
-        """Scrape norms for a specific year, fetching constitution on first call."""
-        if not self._constitution_fetched:
-            await self._fetch_constitution()
-            self._constitution_fetched = True
-        return await super()._scrape_year(year)
+        for doc in documents:
+            doc["year"] = year
+        return await self._process_documents(
+            documents,
+            year=year,
+            norm_type=norm_type,
+        )
+
+    async def _before_scrape(self) -> None:
+        await self._fetch_constitution()

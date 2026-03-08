@@ -6,11 +6,14 @@ makes HTTP requests via the shared ``RequestService``.
 
 from __future__ import annotations
 
-import re
 from urllib.parse import quote
 
+
 from loguru import logger
-from ..request.service import RequestService
+from src.services.request.service import RequestService
+
+from ..protocol import LLMUsage
+from ..utils import parse_base64_data_uri
 
 
 class BedrockClient:
@@ -93,18 +96,7 @@ class BedrockClient:
 
         if block_type == "image_url":
             data_url = block["image_url"]["url"]
-            # Parse data URI: data:image/<format>;base64,<data>
-            match = re.match(
-                r"data:image/([a-zA-Z0-9]+);base64,(.+)", data_url, re.DOTALL
-            )
-            if match:
-                img_format = match.group(1).lower()
-                img_b64 = match.group(2)
-            else:
-                # Fallback: treat the whole thing as base64 PNG
-                img_format = "png"
-                img_b64 = data_url
-
+            img_format, img_b64 = parse_base64_data_uri(data_url)
             return {
                 "image": {
                     "format": img_format,
@@ -161,7 +153,7 @@ class BedrockClient:
 
     async def generate(
         self, messages: list[dict], model_id: str, timeout: int | None = None
-    ) -> str:
+    ) -> tuple[str, LLMUsage]:
         """Send messages to the Bedrock Converse API and return the text response.
 
         Args:
@@ -169,7 +161,7 @@ class BedrockClient:
             model_id: Full model ARN or inference-profile ARN.
 
         Returns:
-            The model's text response.
+            A tuple of (text response, token usage).
 
         Raises:
             RuntimeError: If the API call fails or the response is malformed.
@@ -208,8 +200,9 @@ class BedrockClient:
         response = await self.request_service.make_request(**kwargs)
 
         if not response:
+            reason = getattr(response, "reason", "no response")
             raise RuntimeError(
-                f"Bedrock Converse API returned no response for {endpoint_url}"
+                f"Bedrock Converse API returned no response for {endpoint_url}: {reason}"
             )
 
         if response.status != 200:
@@ -217,7 +210,19 @@ class BedrockClient:
             raise RuntimeError(f"Bedrock Converse API error {response.status}: {body}")
 
         data = await response.json()
-        return self._extract_text(data)
+        text = self._extract_text(data)
+        raw = data.get("usage", {})
+        usage = LLMUsage(
+            input_tokens=raw.get("inputTokens", 0),
+            cached_tokens=raw.get("cacheReadInputTokens", 0),
+            output_tokens=raw.get("outputTokens", 0),
+            reasoning_tokens=0,
+        )
+        return text, usage
+
+    async def close(self) -> None:
+        """Close the shared HTTP request service."""
+        await self.request_service.cleanup()
 
     @staticmethod
     def _extract_text(data: dict) -> str:

@@ -1,4 +1,3 @@
-from io import BytesIO
 from typing import Any
 
 from src.scraper.base.sapl_scraper import SAPLBaseScraper
@@ -23,36 +22,25 @@ TYPES = {
 class ParaibaAlpbScraper(SAPLBaseScraper):
     """Webscraper for Paraíba state legislation website (https://sapl3.al.pb.leg.br/)
 
-    Example search request: https://sapl3.al.pb.leg.br/api/norma/normajuridica/?tipo=2&page=3&ano=2025
+    Year start (earliest on source): 1991
+
+    Example search request: https://sapl3.al.pb.leg.br/api/norma/normajuridica/?page=1&ano=2025
     """
 
     def __init__(
         self,
         base_url: str = "https://sapl3.al.pb.leg.br",
+        max_workers: int = 2,
+        rps: float = 1,
+        max_retries: int = 3,
         **kwargs: Any,
     ):
-        super().__init__(base_url, name="PARAIBA", types=TYPES, **kwargs)
-
-    async def _process_pdf(self, pdf_link: str, year: int) -> dict | None:
-        """Year-aware PDF processing: old PDFs (≤1990) go straight to OCR."""
-        response = await self.request_service.make_request(pdf_link)
-        if not response:
-            return None
-        content = await response.read()
-        if not content:
-            return None
-
-        if year <= 1990:
-            text_markdown = await self._get_markdown(stream=BytesIO(content))
-        else:
-            text_markdown = await self._get_markdown(stream=BytesIO(content))
-
-        if not text_markdown or not text_markdown.strip():
-            return None
-
-        return {
-            "text_markdown": text_markdown,
-            "document_url": pdf_link,
-            "_raw_content": content,
-            "_content_extension": ".pdf",
-        }
+        super().__init__(
+            base_url,
+            name="PARAIBA",
+            types=TYPES,
+            max_workers=max_workers,
+            rps=rps,
+            max_retries=max_retries,
+            **kwargs,
+        )

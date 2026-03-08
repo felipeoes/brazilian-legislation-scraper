@@ -1,3 +1,3 @@
-from .service import RequestService
+from .service import FailedRequest, RequestService
 
-__all__ = ["RequestService"]
+__all__ = ["FailedRequest", "RequestService"]

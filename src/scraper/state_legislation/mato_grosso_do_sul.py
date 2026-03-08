@@ -1,6 +1,8 @@
+import xml.etree.ElementTree as ET
 from collections import defaultdict
+
 from loguru import logger
-from urllib.parse import urlencode, urljoin
+
 from src.scraper.base.scraper import StateScraper
 
 TYPES = {
@@ -17,27 +19,29 @@ TYPES = {
     "Resolução Conjunta": "/Web%5CResolução%20Conjunta",
 }
 
-VALID_SITUATIONS = [
-    "Não consta"
-]  # Alems does not have a situation field, invalid norms will have an indication in the document text
+SITUATIONS = {"Não consta": "Não consta"}
 
-INVALID_SITUATIONS = []  # norms with these situations are invalid norms (no longer have legal effect)
-
-# the reason to have invalid situations is in case we need to train a classifier to predict if a norm is valid or something else similar
-SITUATIONS = VALID_SITUATIONS + INVALID_SITUATIONS
+_NSF_BASE = "/appls/legislacao/secoge/govato.nsf"
 
 
 class MSAlemsScraper(StateScraper):
-    """Webscraper for Mato Grosso do Sul state legislation website (https://www.al.ms.gov.br/)
+    """Webscraper for Mato Grosso do Sul state legislation (Domino/Notes web server).
 
-    Example search request: http://aacpdappls.net.ms.gov.br/appls/legislacao/secoge/govato.nsf/Emenda?OpenView&Start=1&Count=30&Expand=1#1
+    Year start (earliest on source): 1979
 
-    OBS: Start=1&Count=30&Expand=1#1, for Expand 1 is the index related to the year
+    Uses the Domino ``?ReadViewEntries`` XML API to list documents per type and
+    year without relying on session-based full-text search or HTML view parsing.
+
+    Example entry endpoint:
+        GET https://aacpdappls.net.ms.gov.br/appls/legislacao/secoge/govato.nsf/Lei%20Estadual?ReadViewEntries&Count=200&Start=2&Expand=2
+
+    Documents are fetched by UNID:
+        GET https://aacpdappls.net.ms.gov.br/appls/legislacao/secoge/govato.nsf/0/{UNID}?OpenDocument
     """
 
     def __init__(
         self,
-        base_url: str = "http://aacpdappls.net.ms.gov.br",
+        base_url: str = "https://aacpdappls.net.ms.gov.br",
         **kwargs,
     ):
         super().__init__(
@@ -47,140 +51,226 @@ class MSAlemsScraper(StateScraper):
             name="MATO_GROSSO_DO_SUL",
             **kwargs,
         )
-        self.params = {
-            "OpenView": "",
-            "Start": 1,
-            "Count": 10000,
-            "Expand": "",
-        }
-        # year→expand_index mapping per norm type, built during prefetch
-        self._year_index_map: dict[str, dict[int, int]] = defaultdict(dict)
+        self._nsf = f"{self.base_url}{_NSF_BASE}"
 
-    def _format_search_url(self, norm_type_id: str, year_index: int) -> str:
-        """Format url for search request"""
-        return f"{self.base_url}/appls/legislacao/secoge/govato.nsf/{norm_type_id}?{urlencode(self.params)}{year_index}"
+    # ------------------------------------------------------------------
+    # URL helpers
+    # ------------------------------------------------------------------
 
-    async def _get_docs_links(self, url: str) -> list:
-        """Get documents html links from given page.
-        Returns a list of dicts with keys 'title', 'summary', 'html_link'
-        """
+    def _view_entries_url(
+        self,
+        type_path: str,
+        start: int = 1,
+        count: int = 200,
+        expand: int | None = None,
+    ) -> str:
+        """Build a ``?ReadViewEntries`` URL for a given type view."""
+        url = f"{self._nsf}{type_path}?ReadViewEntries&Count={count}&Start={start}"
+        if expand is not None:
+            url += f"&Expand={expand}"
+        return url
 
-        soup = await self.request_service.get_soup(url)
-        docs = []
+    def _doc_url(self, unid: str) -> str:
+        return f"{self._nsf}/0/{unid}?OpenDocument"
 
-        table = soup.find("table", border="0", cellpadding="2", cellspacing="0")
+    # ------------------------------------------------------------------
+    # XML parsing helpers
+    # ------------------------------------------------------------------
 
-        items = table.find_all("tr", valign="top")
-        for index, item in enumerate(items):
-            # don't get tr's with colspan="4" since they are links to other years
-            if item.find("td", colspan="4"):
+    @staticmethod
+    def _entry_text(entry, col_name: str) -> str:
+        for data in entry.findall("entrydata"):
+            if data.get("name") == col_name:
+                el = data.find("text")
+                if el is None:
+                    el = data.find("number")
+                return (el.text or "").strip() if el is not None else ""
+        return ""
+
+    # ------------------------------------------------------------------
+    # Per-type year listing
+    # ------------------------------------------------------------------
+
+    async def _get_type_year_docs(
+        self, type_name: str, type_path: str, year: int
+    ) -> list[dict]:
+        """Return all documents for *type_name* + *year* using ReadViewEntries."""
+        # --- Step 1: find which expand position corresponds to *year* ---
+        cat_url = self._view_entries_url(type_path, start=1, count=200)
+        cat_resp = await self.request_service.make_request(cat_url)
+        if not cat_resp:
+            logger.warning(f"MSAlems | {type_name} | Failed to fetch category list")
+            return []
+
+        cat_xml = await cat_resp.text()
+        try:
+            cat_root = ET.fromstring(cat_xml)
+        except ET.ParseError as exc:
+            logger.warning(
+                f"MSAlems | {type_name} | XML parse error on categories: {exc}"
+            )
+            return []
+
+        expand_pos: int | None = None
+        doc_count: int = 0
+        for entry in cat_root.findall("viewentry"):
+            for data in entry.findall("entrydata"):
+                if data.get("name") == "wano" and data.get("columnnumber") == "0":
+                    num_el = data.find("number")
+                    if num_el is not None:
+                        try:
+                            if int(num_el.text) == year:
+                                expand_pos = int(entry.get("position", 0))
+                                doc_count = int(entry.get("descendants", 0))
+                        except (ValueError, TypeError):
+                            pass
+
+        if expand_pos is None:
+            return []
+
+        if doc_count == 0:
+            return []
+
+        # --- Step 2: fetch all document entries in one request ---
+        docs_url = self._view_entries_url(
+            type_path,
+            start=expand_pos,
+            count=doc_count + 1,  # +1 for the category header row
+            expand=expand_pos,
+        )
+        docs_resp = await self.request_service.make_request(docs_url)
+        if not docs_resp:
+            logger.warning(
+                f"MSAlems | {type_name} | Failed to fetch entries for {year}"
+            )
+            return []
+
+        docs_xml = await docs_resp.text()
+        try:
+            docs_root = ET.fromstring(docs_xml)
+        except ET.ParseError as exc:
+            logger.warning(f"MSAlems | {type_name} | XML parse error on entries: {exc}")
+            return []
+
+        prefix = f"{expand_pos}."
+        docs: list[dict] = []
+        for entry in docs_root.findall("viewentry"):
+            pos = entry.get("position", "")
+            if not pos.startswith(prefix):
+                continue
+            unid = entry.get("unid")
+            if not unid:
                 continue
 
-            tds = item.find_all("td")
-            if len(tds) < 5:  # skip invalid rows, valid documents have 5 or 6 tds
+            title = self._entry_text(entry, "wnumero")
+            summary = self._entry_text(entry, "wementa")
+            if not title:
                 continue
 
-            title = tds[2].text.strip()
-            summary = tds[3].text.strip()
-
-            html_link = tds[2].find("a", href=True)
-            html_link = html_link["href"]
-
-            docs.append({"title": title, "summary": summary, "html_link": html_link})
+            docs.append(
+                {
+                    "title": title,
+                    "summary": summary,
+                    "html_link": self._doc_url(unid),
+                }
+            )
 
         return docs
 
-    async def _get_doc_data(self, doc_info: dict) -> dict:
-        """Get document data from given doc info"""
-        # remove html_link from doc_info
-        html_link = doc_info.pop("html_link")
-        url = urljoin(self.base_url, html_link)
+    # ------------------------------------------------------------------
+    # Document data
+    # ------------------------------------------------------------------
+
+    async def _get_doc_data(self, doc_info: dict) -> dict | None:
+        """Fetch and convert an individual document page to markdown.
+
+        Domino documents use ``<font>``/``<table>``/``<ul>`` instead of ``<p>``
+        tags.  We strip the navigation ``<form>`` and use the remaining body
+        content for conversion.
+        """
+        doc_info = dict(doc_info)
+        url = doc_info.pop("html_link")
 
         if self._is_already_scraped(url, doc_info.get("title", "")):
             return None
 
         soup = await self.request_service.get_soup(url)
-
-        # norm text will be the first p tag in the document
-        norm_text_tag = soup.find("p")
-        html_string = norm_text_tag.prettify().strip()
-
-        html_string = self._wrap_html(html_string)
-
-        # get text markdown
-        text_markdown = await self._get_markdown(html_content=html_string)
-
-        doc_info["text_markdown"] = text_markdown
-        doc_info["document_url"] = url
-        doc_info["_raw_content"] = html_string.encode("utf-8")
-        doc_info["_content_extension"] = ".html"
-
-        return doc_info
-
-    async def _get_available_years(self, norm_type_id: str) -> list[int]:
-        """Get available years for given norm type and build the year→expand_index map."""
-        url = f"{self.base_url}/appls/legislacao/secoge/govato.nsf/{norm_type_id}?OpenView?Start=1&Count=10000"
-        soup = await self.request_service.get_soup(url)
-
-        years_desc: list[int] = []
-        table = soup.find("table", border="0", cellpadding="2", cellspacing="0")
-        items = table.find_all("tr", valign="top")
-        for item in items:
-            td = item.find("td")
-            year = td.text.strip()
-            if not year:
-                continue
-            years_desc.append(int(year))
-
-        # years come in descending order; Expand index is 1-based position
-        for idx_0, year in enumerate(years_desc):
-            self._year_index_map[norm_type_id][year] = idx_0 + 1
-
-        return years_desc
-
-    async def _prefetch_year_indexes(self) -> None:
-        """Fetch year→index mappings for every norm type and build self.years."""
-        all_years: set[int] = set()
-        for norm_type_id in self.types.values():
-            years = await self._get_available_years(norm_type_id)
-            all_years.update(years)
-            logger.info(
-                f"Prefetched {len(years)} years for {norm_type_id} "
-                f"(range {min(years)}–{max(years)})"
+        if not soup:
+            await self._save_doc_error(
+                title=doc_info.get("title", ""),
+                year=doc_info.get("year", ""),
+                html_link=url,
+                error_message="Failed to retrieve document page",
             )
+            return None
 
-        self.years = sorted(
-            y for y in all_years if self.year_start <= y <= self.year_end
+        # All document content sits inside a single <form action=""> element.
+        # Only strip the action-bar navigation table (border="1") and non-content
+        # elements; do NOT remove the form itself.
+        for tag in soup.find_all(["script", "applet"]):
+            tag.decompose()
+        for table in soup.find_all("table", border="1"):
+            table.decompose()
+
+        body = soup.find("body")
+        if not body:
+            await self._save_doc_error(
+                title=doc_info.get("title", ""),
+                year=doc_info.get("year", ""),
+                html_link=url,
+                error_message="No <body> tag found in document page",
+            )
+            return None
+
+        html_string = self._wrap_html(body.decode_contents())
+        return await self._process_html_doc(doc_info, html_string, url)
+
+    # ------------------------------------------------------------------
+    # Year-level scrape (overrides base class)
+    # ------------------------------------------------------------------
+
+    async def _scrape_year(self, year: int) -> list[dict]:
+        """List all types for *year* via ReadViewEntries, then process docs."""
+        situation = next(iter(self.situations), "Não consta")
+
+        # Fetch document listings for all types concurrently
+        listing_tasks = [
+            self._get_type_year_docs(type_name, type_path, year)
+            for type_name, type_path in self.types.items()
+        ]
+        listing_results = await self._gather_results(
+            listing_tasks,
+            context={"year": year, "type": "NA", "situation": situation},
+            desc=f"MATO GROSSO DO SUL | {year} | listing",
         )
 
-    async def _scrape_type(
-        self, norm_type: str, norm_type_id: str, year: int
-    ) -> list[dict]:
-        """Scrape documents of a single type for a given year."""
-        expand_index = self._year_index_map.get(norm_type_id, {}).get(year)
-        if expand_index is None:
+        by_type: dict[str, list] = defaultdict(list)
+        for i, (type_name, _) in enumerate(self.types.items()):
+            docs = listing_results[i] if i < len(listing_results) else None
+            if docs:
+                for doc in docs:
+                    # Filter already-scraped before processing
+                    if not self._is_already_scraped(
+                        doc.get("html_link", ""), doc.get("title", "")
+                    ):
+                        by_type[type_name].append(doc)
+
+        if not by_type:
             return []
 
-        url = self._format_search_url(norm_type_id, expand_index)
-        docs = await self._get_docs_links(url)
-        if not docs:
-            return []
-
-        situation = self.situations[0] if self.situations else "Não consta"
-        ctx = {"year": year, "situation": situation, "type": norm_type}
-        tasks = [self._with_save(self._get_doc_data(doc), ctx) for doc in docs]
-        results = await self._gather_results(
-            tasks,
-            context=ctx,
-            desc=f"MATO GROSSO DO SUL | {norm_type} {year}",
+        process_tasks = [
+            self._process_documents(
+                type_docs,
+                year=year,
+                norm_type=nt,
+                situation=situation,
+                desc=f"MATO GROSSO DO SUL | {nt} {year}",
+            )
+            for nt, type_docs in by_type.items()
+        ]
+        valid = await self._gather_results(
+            process_tasks,
+            context={"year": year, "type": "NA", "situation": situation},
+            desc=f"MATO GROSSO DO SUL | Year {year}",
         )
-
-        if self.verbose:
-            logger.info(f"Year: {year} | Type: {norm_type} | Results: {len(results)}")
-
-        return results
-
-    async def scrape(self) -> list:
-        """Prefetch year indexes then delegate to BaseScraper's year-sequential flow."""
-        await self._prefetch_year_indexes()
-        return await super().scrape()
+        return self._flatten_results(valid)
