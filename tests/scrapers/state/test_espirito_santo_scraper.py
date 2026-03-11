@@ -40,6 +40,8 @@ from src.scraper.state_legislation.espirito_santo import (
     TYPES,
     VALID_SITUATIONS,
     INVALID_SITUATIONS,
+    _clean_markdown,
+    _VERTICAL_WATERMARK_RE,
 )
 from base_tests import TypesConstantTests, SituationsConstantTests, ScraperClassTests
 from conftest import make_base_scraper, make_failed_request, assert_resume_skips
@@ -347,13 +349,13 @@ class TestFetchFirstPage:
 
 
 # ---------------------------------------------------------------------------
-# _fetch_next_page
+# _fetch_postback
 # ---------------------------------------------------------------------------
 
 
-class TestFetchNextPage:
+class TestFetchPostback:
     @pytest.mark.asyncio
-    async def test_posts_lbnext_and_returns_new_state(self):
+    async def test_posts_generic_target_and_returns_new_state(self):
         scraper = _make_scraper()
         page_bytes = _make_listing_html(1, has_next=False)
         resp = MagicMock()
@@ -361,8 +363,8 @@ class TestFetchNextPage:
         resp.read = AsyncMock(return_value=page_bytes)
         scraper.request_service.make_request = AsyncMock(return_value=resp)
 
-        content, vs, ev = await scraper._fetch_next_page(
-            "http://example.com", "old_vs", "old_ev"
+        content, vs, ev = await scraper._fetch_postback(
+            "http://example.com", "old_vs", "old_ev", "my_target", "my_arg", "100"
         )
         assert content == page_bytes
         assert vs == "vs_val"
@@ -373,8 +375,10 @@ class TestFetchNextPage:
             if len(call_kwargs.args) > 1
             else call_kwargs.kwargs["payload"]
         )
-        assert payload["__EVENTTARGET"] == "ctl00$ContentPlaceHolder1$lbNext"
+        assert payload["__EVENTTARGET"] == "my_target"
+        assert payload["__EVENTARGUMENT"] == "my_arg"
         assert payload["__VIEWSTATE"] == "old_vs"
+        assert payload["ctl00$ContentPlaceHolder1$ddl_ItensExibidos"] == "100"
 
     @pytest.mark.asyncio
     async def test_returns_none_on_request_failure(self):
@@ -382,8 +386,8 @@ class TestFetchNextPage:
         failed = make_failed_request()
         scraper.request_service.make_request = AsyncMock(return_value=failed)
 
-        content, vs, ev = await scraper._fetch_next_page(
-            "http://example.com", "vs", "ev"
+        content, vs, ev = await scraper._fetch_postback(
+            "http://example.com", "vs", "ev", "target"
         )
         assert content is None
 
@@ -395,33 +399,27 @@ class TestFetchNextPage:
 
 class TestScrapeYear:
     @pytest.mark.asyncio
-    async def test_two_page_mock_calls_fetch_first_once_and_next_once(self):
+    async def test_year_full_flow_calls_methods_correctly(self):
         scraper = _make_scraper()
-        page1 = _make_listing_html(2, has_next=True)
-        page2 = _make_listing_html(2, has_next=False)
+        page1_10 = _make_listing_html(1, has_next=False)
+        page1_100 = _make_listing_html(2, has_next=False)
 
-        scraper._fetch_first_page = AsyncMock(return_value=(page1, "vs1", "ev1"))
-        scraper._fetch_next_page = AsyncMock(return_value=(page2, "vs2", "ev2"))
+        scraper._fetch_first_page = AsyncMock(return_value=(page1_10, "vs1", "ev1"))
+        scraper._fetch_postback = AsyncMock(return_value=(page1_100, "vs2", "ev2"))
+        scraper._gather_results = AsyncMock(return_value=[])
         scraper._process_documents = AsyncMock(return_value=[])
 
         await scraper._scrape_year(2010)
 
         scraper._fetch_first_page.assert_called_once()
-        scraper._fetch_next_page.assert_called_once_with(
-            scraper._format_search_url(2010), "vs1", "ev1"
+        scraper._fetch_postback.assert_called_once_with(
+            scraper._format_search_url(2010),
+            "vs1",
+            "ev1",
+            "ctl00$ContentPlaceHolder1$ddl_ItensExibidos",
+            arg="",
+            items_per_page="100",
         )
-
-    @pytest.mark.asyncio
-    async def test_single_page_does_not_call_fetch_next(self):
-        scraper = _make_scraper()
-        page1 = _make_listing_html(2, has_next=False)
-        scraper._fetch_first_page = AsyncMock(return_value=(page1, "vs1", "ev1"))
-        scraper._fetch_next_page = AsyncMock()
-        scraper._process_documents = AsyncMock(return_value=[])
-
-        await scraper._scrape_year(2010)
-
-        scraper._fetch_next_page.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_first_page_failure_returns_empty(self):
@@ -436,8 +434,11 @@ class TestScrapeYear:
     @pytest.mark.asyncio
     async def test_year_injected_into_each_doc(self):
         scraper = _make_scraper()
-        page1 = _make_listing_html(2, has_next=False)
-        scraper._fetch_first_page = AsyncMock(return_value=(page1, "vs1", "ev1"))
+        page1_10 = _make_listing_html(1, has_next=False)
+        page1_100 = _make_listing_html(2, has_next=False)
+        scraper._fetch_first_page = AsyncMock(return_value=(page1_10, "vs1", "ev1"))
+        scraper._fetch_postback = AsyncMock(return_value=(page1_100, "vs2", "ev2"))
+        scraper._gather_results = AsyncMock(return_value=[])
         captured_docs = []
 
         async def fake_process(docs, **kwargs):
@@ -452,8 +453,11 @@ class TestScrapeYear:
     @pytest.mark.asyncio
     async def test_process_documents_called_with_correct_kwargs(self):
         scraper = _make_scraper()
-        page1 = _make_listing_html(1, has_next=False)
-        scraper._fetch_first_page = AsyncMock(return_value=(page1, "vs1", "ev1"))
+        page1_10 = _make_listing_html(1, has_next=False)
+        page1_100 = _make_listing_html(1, has_next=False)
+        scraper._fetch_first_page = AsyncMock(return_value=(page1_10, "vs1", "ev1"))
+        scraper._fetch_postback = AsyncMock(return_value=(page1_100, "vs2", "ev2"))
+        scraper._gather_results = AsyncMock(return_value=[])
         captured = {}
 
         async def fake_process(docs, **kwargs):
@@ -505,37 +509,44 @@ class TestGetDocData:
         doc_info = {"title": "Lei 001", "doc_link": "/pdf/lei1.pdf"}
         result = await scraper._get_doc_data(doc_info)
         assert result is not None
-        assert result["text_markdown"] == valid_md
+        assert result["text_markdown"] == valid_md.strip()
         assert result["_content_extension"] == ".pdf"
 
     @pytest.mark.asyncio
     async def test_pdf_invalid_markdown_tries_ocr_fallback(self):
-        """When _download_and_convert gives short MD, it tries direct download."""
+        """When _download_and_convert gives invalid MD, reuses raw_content for LLM OCR."""
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
         scraper._download_and_convert = AsyncMock(
             return_value=("short", b"raw", ".pdf")
         )
 
-        resp = MagicMock()
-        resp.__bool__ = lambda s: True
-        resp.read = AsyncMock(return_value=b"%PDF-1.4")
-        scraper.request_service.make_request = AsyncMock(return_value=resp)
         valid_md = "# Lei\n\n" + "Texto via OCR. " * 20
         scraper._get_markdown = AsyncMock(return_value=valid_md)
 
         doc_info = {"title": "Lei 001", "doc_link": "/pdf/lei1.pdf"}
         result = await scraper._get_doc_data(doc_info)
         assert result is not None
-        assert result["text_markdown"] == valid_md
+        assert result["text_markdown"] == valid_md.strip()
+        # Verify _get_markdown was called with raw_content bytes (no re-download).
+        from io import BytesIO
+
+        scraper._get_markdown.assert_called_once()
+        call_kwargs = scraper._get_markdown.call_args
+        stream_arg = call_kwargs.kwargs.get("stream") or (
+            call_kwargs.args[0] if call_kwargs.args else None
+        )
+        assert isinstance(stream_arg, BytesIO)
+        assert stream_arg.read() == b"raw"
 
     @pytest.mark.asyncio
     async def test_pdf_download_failure_returns_none(self):
+        """When both _download_and_convert and OCR fallback give invalid MD, returns None."""
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
         scraper._download_and_convert = AsyncMock(return_value=("short", b"", ".pdf"))
-        failed = make_failed_request()
-        scraper.request_service.make_request = AsyncMock(return_value=failed)
+        # OCR fallback also fails (returns invalid markdown).
+        scraper._get_markdown = AsyncMock(return_value="short")
         scraper._save_doc_error = AsyncMock()
         doc_info = {"title": "Lei 001", "doc_link": "/pdf/lei1.pdf"}
         result = await scraper._get_doc_data(doc_info)
@@ -547,8 +558,7 @@ class TestGetDocData:
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
         scraper._download_and_convert = AsyncMock(return_value=("short", b"", ".pdf"))
-        failed = make_failed_request()
-        scraper.request_service.make_request = AsyncMock(return_value=failed)
+        scraper._get_markdown = AsyncMock(return_value="short")
         scraper._save_doc_error = AsyncMock()
         doc_info = {"title": "Lei 001", "doc_link": "/pdf/lei1.pdf", "year": 2023}
         await scraper._get_doc_data(doc_info)
@@ -559,8 +569,7 @@ class TestGetDocData:
     async def test_html_path_request_failure_returns_none(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        failed = make_failed_request()
-        scraper.request_service.make_request = AsyncMock(return_value=failed)
+        scraper.request_service.get_soup = AsyncMock(return_value=make_failed_request())
         scraper._save_doc_error = AsyncMock()
         doc_info = {"title": "Lei 001", "doc_link": "/html/lei1.html"}
         result = await scraper._get_doc_data(doc_info)
@@ -571,10 +580,9 @@ class TestGetDocData:
     async def test_html_path_invalid_markdown_returns_none(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        resp = MagicMock()
-        resp.__bool__ = lambda s: True
-        resp.read = AsyncMock(return_value=b"<html><body></body></html>")
-        scraper.request_service.make_request = AsyncMock(return_value=resp)
+        scraper.request_service.get_soup = AsyncMock(
+            return_value=BeautifulSoup("<html><body></body></html>", "html.parser")
+        )
         scraper._get_markdown = AsyncMock(return_value="short")
         scraper._save_doc_error = AsyncMock()
         doc_info = {"title": "Lei 001", "doc_link": "/html/lei1.html"}
@@ -586,16 +594,14 @@ class TestGetDocData:
     async def test_html_path_valid_returns_correct_shape(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        resp = MagicMock()
-        resp.__bool__ = lambda s: True
-        resp.read = AsyncMock(return_value=b"<html><body><p>Texto</p></body></html>")
-        scraper.request_service.make_request = AsyncMock(return_value=resp)
+        soup = BeautifulSoup("<html><body><p>Texto</p></body></html>", "html.parser")
+        scraper.request_service.get_soup = AsyncMock(return_value=soup)
         valid_md = "# Lei\n\n" + "Texto da lei. " * 20
         scraper._get_markdown = AsyncMock(return_value=valid_md)
         doc_info = {"title": "Lei 001", "doc_link": "/html/lei1.html"}
         result = await scraper._get_doc_data(doc_info)
         assert result is not None
-        assert result["text_markdown"] == valid_md
+        assert result["text_markdown"] == valid_md.strip()
         assert result["_content_extension"] == ".html"
         assert isinstance(result["_raw_content"], bytes)
         assert "document_url" in result
@@ -606,14 +612,13 @@ class TestGetDocData:
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
         html_with_img = (
-            b"<html><body>"
-            b'<img src="logo.png" alt="Garbage \\\\path\\logo.png">'
-            b"<p>Lei text</p></body></html>"
+            "<html><body>"
+            '<img src="logo.png" alt="Garbage \\\\path\\logo.png">'
+            "<p>Lei text</p></body></html>"
         )
-        resp = MagicMock()
-        resp.__bool__ = lambda s: True
-        resp.read = AsyncMock(return_value=html_with_img)
-        scraper.request_service.make_request = AsyncMock(return_value=resp)
+        scraper.request_service.get_soup = AsyncMock(
+            return_value=BeautifulSoup(html_with_img, "html.parser")
+        )
         captured_html = {}
 
         async def capture_html(**kwargs):
@@ -626,6 +631,237 @@ class TestGetDocData:
         assert "<img" not in captured_html.get("html", "")
         assert "Garbage" not in captured_html.get("html", "")
 
+    @pytest.mark.asyncio
+    async def test_type_set_from_norm_type(self):
+        """_get_doc_data should set 'type' from 'norm_type' and drop 'norm_type'."""
+        scraper = _make_scraper()
+        scraper._is_already_scraped = MagicMock(return_value=False)
+        valid_md = "# Lei\n\n" + "Texto da lei. " * 20
+        scraper._download_and_convert = AsyncMock(
+            return_value=(valid_md, b"raw", ".pdf")
+        )
+        doc_info = {
+            "title": "Lei 001",
+            "doc_link": "/pdf/lei1.pdf",
+            "norm_type": "Lei Ordinária",
+        }
+        result = await scraper._get_doc_data(doc_info)
+        assert result is not None
+        assert result["type"] == "Lei Ordinária"
+        assert "norm_type" not in result
+
+    @pytest.mark.asyncio
+    async def test_type_falls_back_to_title_inference_when_norm_type_missing(self):
+        scraper = _make_scraper()
+        scraper._is_already_scraped = MagicMock(return_value=False)
+        valid_md = "# Lei\n\n" + "Texto da lei. " * 20
+        scraper._download_and_convert = AsyncMock(
+            return_value=(valid_md, b"raw", ".pdf")
+        )
+        doc_info = {
+            "title": "Lei Ordinária n° 1/2025",
+            "doc_link": "/pdf/lei1.pdf",
+            "norm_type": "",
+        }
+
+        result = await scraper._get_doc_data(doc_info)
+
+        assert result is not None
+        assert result["type"] == "Lei Ordinária"
+
+    @pytest.mark.asyncio
+    async def test_summary_not_in_result(self):
+        """'summary' key must be absent from the returned doc dict."""
+        scraper = _make_scraper()
+        scraper._is_already_scraped = MagicMock(return_value=False)
+        valid_md = "# Lei\n\n" + "Texto da lei. " * 20
+        scraper._download_and_convert = AsyncMock(
+            return_value=(valid_md, b"raw", ".pdf")
+        )
+        doc_info = {
+            "title": "Lei 001",
+            "doc_link": "/pdf/lei1.pdf",
+            "summary": "Texto da lei listing excerpt.",
+        }
+        result = await scraper._get_doc_data(doc_info)
+        assert result is not None
+        assert "summary" not in result
+
+    @pytest.mark.asyncio
+    async def test_vertical_watermark_stripped_from_pdf(self):
+        """Runs of single-char lines (digital-cert watermark) must be removed."""
+        scraper = _make_scraper()
+        scraper._is_already_scraped = MagicMock(return_value=False)
+        # 16 single-char lines — exceeds the {15,} threshold
+        watermark = "\n9\nD\nB\n7\n5\nC\nA\nA\n6\n4\n8\n7\nC\n3\n1\n8"
+        valid_md_with_watermark = "# Lei\n\n" + "Texto da lei. " * 5 + watermark
+        scraper._download_and_convert = AsyncMock(
+            return_value=(valid_md_with_watermark, b"raw", ".pdf")
+        )
+        doc_info = {"title": "Lei 001", "doc_link": "/pdf/lei1.pdf"}
+        result = await scraper._get_doc_data(doc_info)
+        assert result is not None
+        assert "\n9\nD\nB" not in result["text_markdown"]
+
+    @pytest.mark.asyncio
+    async def test_summary_stripped_from_beginning_of_text_markdown(self):
+        """Summary text found near the start of text_markdown should be removed."""
+        scraper = _make_scraper()
+        scraper._is_already_scraped = MagicMock(return_value=False)
+        summary = "NOMEAR JOAO SILVA PARA O CARGO EM COMISSAO"
+        # Use enough body text so valid_markdown accepts it.
+        body = "\n\nPalácio Domingos Martins.\n\n" + "Texto legal de conclusão. " * 15
+        valid_md = summary + body
+        scraper._download_and_convert = AsyncMock(
+            return_value=(valid_md, b"raw", ".pdf")
+        )
+        doc_info = {
+            "title": "Ato 001",
+            "doc_link": "/pdf/ato1.pdf",
+            "summary": summary,
+        }
+        result = await scraper._get_doc_data(doc_info)
+        assert result is not None
+        assert not result["text_markdown"].upper().startswith(summary.upper())
+        assert "Palácio" in result["text_markdown"]
+
+
+# ---------------------------------------------------------------------------
+# _clean_markdown / _strip_summary unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestCleanMarkdown:
+    def test_watermark_removed(self):
+        # 16 single-char lines — exceeds the {15,} threshold
+        text = "# Lei\n\nTexto." + "\n9\nD\nB\n7\n5\nC\nA\nA\n6\n4\n8\n7\nC\n3\n1\n8"
+        result = _clean_markdown(text)
+        assert "\n9\nD\nB" not in result
+        assert "Texto." in result
+
+    def test_clean_text_unchanged(self):
+        text = "# Lei\n\nTexto da lei normal.\n\nPalavras legais."
+        assert _clean_markdown(text) == text.strip()
+
+    def test_summary_stripped_when_at_start(self):
+        summary = "NOMEAR JOAO SILVA PARA O CARGO"
+        text = summary + "\n\nPalácioDomingos."
+        result = _clean_markdown(text, summary)
+        assert not result.upper().startswith(summary.upper())
+        assert "Paláci" in result
+
+    def test_summary_not_stripped_when_far_from_start(self):
+        summary = "NOMEAR JOAO SILVA"
+        # Place summary well past the 300-char threshold
+        text = "A" * 400 + summary + "\n\nTexto final."
+        result = _clean_markdown(text, summary)
+        assert summary in result
+
+    def test_empty_summary_does_nothing(self):
+        text = "# Lei\n\nTexto."
+        assert _clean_markdown(text, "") == text.strip()
+
+    def test_vertical_watermark_regex_matches_real_pattern(self):
+        # 16 single-char lines — exceeds the {15,} threshold
+        watermark = "\n9\nD\nB\n7\n5\nC\nA\nA\n6\n4\n8\n7\nC\n3\n1\n8"
+        assert _VERTICAL_WATERMARK_RE.search(watermark) is not None
+
+    def test_short_single_char_runs_below_threshold_preserved(self):
+        # 10 single-char lines + "Fim" (2 chars matched) = 11 total — below {15,}
+        text = "# Lei\n\nTexto.\na\nb\nc\nd\ne\nf\ng\nh\ni\nj\nFim."
+        result = _clean_markdown(text)
+        assert "a\nb\nc" in result
+
+    @pytest.mark.asyncio
+    async def test_digital_aspx_pdf_url_resolved(self):
+        """Processo2/Digital.aspx URLs with a PDF arquivo param should be fetched as PDF."""
+        scraper = _make_scraper()
+        scraper._is_already_scraped = MagicMock(return_value=False)
+        valid_md = "# Lei\n\n" + "Texto da lei. " * 20
+        scraper._download_and_convert = AsyncMock(
+            return_value=(valid_md, b"raw", ".pdf")
+        )
+        digital_aspx_link = (
+            "/Sistema/Protocolo/Processo2/Digital.aspx"
+            "?id=438815"
+            "&arquivo=Arquivo/Documents/RNSG/RNSG952025/doc.pdf"
+            "&identificador=abc"
+        )
+        doc_info = {"title": "Lei 001", "doc_link": digital_aspx_link}
+        result = await scraper._get_doc_data(doc_info)
+        assert result is not None
+        # Should resolve to the direct PDF URL
+        assert result["document_url"].endswith(".pdf")
+        assert "Digital.aspx" not in result["document_url"]
+        assert "RNSG952025/doc.pdf" in result["document_url"]
+
+    @pytest.mark.asyncio
+    async def test_digital_aspx_non_pdf_arquivo_returns_none(self):
+        """Processo2/Digital.aspx URLs where arquivo is not a PDF should return None."""
+        scraper = _make_scraper()
+        scraper._is_already_scraped = MagicMock(return_value=False)
+        digital_aspx_link = (
+            "/Sistema/Protocolo/Processo2/Digital.aspx"
+            "?id=12345"
+            "&arquivo=Arquivo/Documents/XPTO/doc.docx"
+        )
+        doc_info = {"title": "Lei 001", "doc_link": digital_aspx_link}
+        result = await scraper._get_doc_data(doc_info)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_digital_aspx_missing_arquivo_returns_none(self):
+        """Processo2/Digital.aspx URLs without an arquivo param should return None."""
+        scraper = _make_scraper()
+        scraper._is_already_scraped = MagicMock(return_value=False)
+        digital_aspx_link = "/Sistema/Protocolo/Processo2/Digital.aspx?id=12345"
+        doc_info = {"title": "Lei 001", "doc_link": digital_aspx_link}
+        result = await scraper._get_doc_data(doc_info)
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# parse_base64_data_uri tests
+# ---------------------------------------------------------------------------
+
+
+class TestParseBase64DataUri:
+    def test_valid_uri_parsed_correctly(self):
+        from src.services.ocr.utils import parse_base64_data_uri
+        import base64
+
+        raw = b"PNG bytes here"
+        b64 = base64.standard_b64encode(raw).decode()
+        fmt, data = parse_base64_data_uri(f"data:image/png;base64,{b64}")
+        assert fmt == "png"
+        assert data == b64
+
+    def test_empty_base64_returns_empty_string(self):
+        """An empty base64 section (blank PDF page) must return '' not the full URI."""
+        from src.services.ocr.utils import parse_base64_data_uri
+
+        fmt, data = parse_base64_data_uri("data:image/png;base64,")
+        assert fmt == "png"
+        assert data == ""
+
+    def test_invalid_uri_raises_value_error(self):
+        from src.services.ocr.utils import parse_base64_data_uri
+
+        with pytest.raises(ValueError, match="Not a valid data URI"):
+            parse_base64_data_uri("not-a-data-uri")
+
+    def test_jpeg_format_preserved(self):
+        from src.services.ocr.utils import parse_base64_data_uri
+
+        fmt, _ = parse_base64_data_uri("data:image/jpeg;base64,abc")
+        assert fmt == "jpeg"
+
+    def test_whitespace_stripped_from_base64(self):
+        from src.services.ocr.utils import parse_base64_data_uri
+
+        fmt, data = parse_base64_data_uri("data:image/png;base64,abc123  ")
+        assert data == "abc123"
+
 
 # ---------------------------------------------------------------------------
 # Integration tests (live site)
@@ -636,7 +872,7 @@ class TestGetDocData:
 async def test_year_only_url_first_page_returns_results():
     """ES ALES year-only URL should return at least one document on first page."""
     with tempfile.TemporaryDirectory() as tmp:
-        scraper = ESAlesScraper(save_dir=tmp, verbose=False)
+        scraper = ESAlesScraper(docs_save_dir=tmp, verbose=False)
         url = scraper._format_search_url(2010)
         content, vs, ev = await scraper._fetch_first_page(url)
         assert content is not None
@@ -652,7 +888,7 @@ async def test_year_only_url_first_page_returns_results():
 async def test_get_doc_data_returns_valid_markdown():
     """Fetching the first doc from 2010 first page should yield non-empty markdown."""
     with tempfile.TemporaryDirectory() as tmp:
-        scraper = ESAlesScraper(save_dir=tmp, verbose=False)
+        scraper = ESAlesScraper(docs_save_dir=tmp, verbose=False)
         url = scraper._format_search_url(2010)
         content, _vs, _ev = await scraper._fetch_first_page(url)
         assert content is not None

@@ -5,10 +5,12 @@ from io import BytesIO
 from bs4 import BeautifulSoup
 from loguru import logger
 
+from src.scraper.base.converter import strip_html_chrome, valid_markdown
 from src.scraper.base.scraper import (
     DEFAULT_INVALID_SITUATION,
     DEFAULT_VALID_SITUATION,
     BaseScraper,
+    flatten_results,
 )
 
 # Kept for documentation / downstream reference — not used to filter API requests.
@@ -100,11 +102,14 @@ class ConamaScraper(BaseScraper):
         (r".rg.o:.*?Meio Ambiente.*?\n+", "", 0),
         (r"https?://www\.in\.gov\.br/\S+", "", 0),
         (r"\n\d+/\d+\s*$", "\n", re.MULTILINE),
+        # Leading page number left by PDF extraction — must run last so
+        # earlier patterns (e.g. DOU date stamp) can expose it first.
+        (r"^\s*\d{1,4}\s*\n+", "", 0),
     ]
 
     def _clean_dou_html(self, soup: BeautifulSoup) -> BeautifulSoup:
         """Remove DOU website chrome from HTML before markdown conversion."""
-        self._strip_html_chrome(soup)
+        strip_html_chrome(soup)
 
         # Remove <title> tag (contains duplicated title + "DOU - Imprensa Nacional")
         for el in soup.find_all("title"):
@@ -166,7 +171,7 @@ class ConamaScraper(BaseScraper):
             text = re.sub(pattern, replacement, text, flags=flags)
         for pat in self._DISCLAIMER_PATTERNS:
             text = pat.sub("", text)
-        return text
+        return text.strip()
 
     async def _get_doc_data(self, doc_info: dict) -> dict | None:
         """Fetch and convert a single CONAMA norm.
@@ -194,7 +199,6 @@ class ConamaScraper(BaseScraper):
         )
 
         if self._is_already_scraped(doc_url, title):
-            logger.debug(f"Skipping already scraped: {title}")
             return None
 
         doc_description = doc_info.get("descricao", "")
@@ -221,14 +225,26 @@ class ConamaScraper(BaseScraper):
         is_html = "html" in content_type
 
         if is_html:
-            body = await resp.read()
-            soup = BeautifulSoup(body, "html.parser")
+            try:
+                soup, mhtml = await self._fetch_soup_and_mhtml(doc_url)
+            except Exception as exc:
+                logger.warning(
+                    f"Browser fetch failed for {doc_type} CONAMA Nº {doc_number}/{doc_year}: {exc}"
+                )
+                await self._save_doc_error(
+                    title=title,
+                    year=doc_year,
+                    norm_type=doc_type,
+                    html_link=doc_url,
+                    error_message=f"Browser fetch failed: {exc}",
+                )
+                return None
             soup = self._clean_dou_html(soup)
             # str(soup) is compact and avoids the prettify() indentation overhead.
             # _get_markdown already applies _clean_markdown internally — no second call.
             text_markdown = await self._get_markdown(html_content=str(soup))
-            raw_content = body  # original downloaded bytes, not re-encoded
-            content_ext = ".html"
+            raw_content = mhtml
+            content_ext = ".mhtml"
         else:
             body = await resp.read()
             # _get_markdown applies _clean_markdown internally; _clean_pdf_markdown
@@ -237,6 +253,8 @@ class ConamaScraper(BaseScraper):
             text_markdown = self._clean_pdf_markdown(text_markdown)
             raw_content = body
             content_ext = ".pdf"
+
+        text_markdown = text_markdown.strip() if text_markdown else text_markdown
 
         if text_markdown is None or not text_markdown.strip():
             logger.warning(
@@ -257,7 +275,7 @@ class ConamaScraper(BaseScraper):
 
         # _valid_markdown also catches server-error strings (via _SERVER_ERROR_PATTERNS)
         # so no separate PHP-error check is needed here.
-        is_valid, reason = self._valid_markdown(text_markdown, 200)
+        is_valid, reason = valid_markdown(text_markdown, 200)
         if not is_valid:
             logger.warning(
                 f"Markdown text for {doc_type} CONAMA Nº {doc_number}/{doc_year} "
@@ -340,7 +358,7 @@ class ConamaScraper(BaseScraper):
                 context={"year": year_str, "type": "NA", "situation": "NA"},
                 desc=f"CONAMA | {year_str} | pagination",
             )
-            norms.extend(self._flatten_results(page_results))
+            norms.extend(flatten_results(page_results))
 
         return await self._process_documents(
             norms,

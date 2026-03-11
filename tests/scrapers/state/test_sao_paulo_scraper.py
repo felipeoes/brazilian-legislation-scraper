@@ -310,9 +310,9 @@ class TestInferType:
         result = SaoPauloAlespScraper._infer_type("Decisão da Mesa 1311/2005")
         assert result == "Decisão da Mesa"
 
-    def test_unknown_falls_back_to_legislacao(self):
+    def test_unknown_falls_back_to_title_prefix(self):
         result = SaoPauloAlespScraper._infer_type("Norma Desconhecida 1/2020")
-        assert result == "Legislação"
+        assert result == "Norma Desconhecida"
 
     def test_case_insensitive(self):
         result = SaoPauloAlespScraper._infer_type("LEI 1/2020")
@@ -419,12 +419,12 @@ class TestGetDocData:
 
         html = "<html><body><p>Texto da lei.</p></body></html>"
         soup = BeautifulSoup(html, "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
 
         result = await scraper._get_doc_data(self._base_doc_info(), year=2020)
         assert result is not None
         assert result["text_markdown"] == valid_md
-        assert result["_content_extension"] == ".html"
+        assert result["_content_extension"] == ".mhtml"
 
     @pytest.mark.asyncio
     async def test_html_path_invalid_markdown_returns_none(self):
@@ -436,7 +436,7 @@ class TestGetDocData:
 
         html = "<html><body><p>Texto.</p></body></html>"
         soup = BeautifulSoup(html, "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b""))
 
         result = await scraper._get_doc_data(self._base_doc_info(), year=2020)
         assert result is None
@@ -456,7 +456,7 @@ class TestGetDocData:
             </div>
         </body></html>"""
         soup = BeautifulSoup(html, "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
 
         pdf_resp = MagicMock()
         pdf_resp.__bool__ = lambda s: True
@@ -482,11 +482,11 @@ class TestGetDocData:
             <p>Texto da lei.</p>
         </body></html>"""
         soup = BeautifulSoup(html, "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
 
         result = await scraper._get_doc_data(self._base_doc_info(), year=2020)
         assert result is not None
-        assert result["_content_extension"] == ".html"
+        assert result["_content_extension"] == ".mhtml"
 
     @pytest.mark.asyncio
     async def test_iframe_failed_request_returns_none_and_saves_error(self):
@@ -501,7 +501,7 @@ class TestGetDocData:
             </div>
         </body></html>"""
         soup = BeautifulSoup(html, "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
         failed = make_failed_request()
         scraper.request_service.make_request = AsyncMock(return_value=failed)
 
@@ -515,8 +515,7 @@ class TestGetDocData:
         scraper._is_already_scraped = MagicMock(return_value=False)
         scraper._get_norm_data = AsyncMock(return_value={})
         scraper._save_doc_error = AsyncMock()
-        failed = make_failed_request()
-        scraper.request_service.get_soup = AsyncMock(return_value=failed)
+        scraper._fetch_soup_and_mhtml = AsyncMock(side_effect=Exception("fetch failed"))
         result = await scraper._get_doc_data(self._base_doc_info(), year=2020)
         assert result is None
         scraper._save_doc_error.assert_called_once()
@@ -539,7 +538,7 @@ class TestGetDocData:
 
         html = "<html><body><p>Texto da lei.</p></body></html>"
         soup = BeautifulSoup(html, "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
 
         result = await scraper._get_doc_data(self._base_doc_info(), year=2020)
         assert result is not None
@@ -555,7 +554,7 @@ class TestGetDocData:
 
         html = "<html><body><p>Texto da lei.</p></body></html>"
         soup = BeautifulSoup(html, "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
 
         result = await scraper._get_doc_data(self._base_doc_info(), year=2020)
         assert result is not None
@@ -571,7 +570,7 @@ class TestGetDocData:
 
         html = "<html><body><p>Texto da lei complementar.</p></body></html>"
         soup = BeautifulSoup(html, "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
 
         doc = {
             "title": "Lei Complementar 42/2020",

@@ -16,11 +16,24 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from loguru import logger
+from src.scraper.base.converter import valid_markdown
 from src.scraper.base.scraper import (
     DEFAULT_INVALID_SITUATION,
     DEFAULT_VALID_SITUATION,
     StateScraper,
+    flatten_results,
 )
+
+
+def normalize_title_text(text: str) -> str:
+    """Normalize a title-ish line for loose comparisons."""
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", text.casefold())).strip()
+
+
+def norm_line(raw: str) -> tuple[str, str]:
+    """Return ``(compact, lower)`` for *raw*, where compact collapses whitespace."""
+    compact = " ".join(raw.split())
+    return compact, compact.lower()
 
 
 class SAPLBaseScraper(StateScraper):
@@ -81,15 +94,10 @@ class SAPLBaseScraper(StateScraper):
     _SEI_TIMESTAMP_RE = re.compile(r"^\d{1,2}/\d{1,2}/\d{4},\s*\d{1,2}:\d{2}$")
     _SEI_VERSION_RE = re.compile(r"^\d[\dv\s]{6,}$", re.IGNORECASE)
 
-    @staticmethod
-    def _normalize_title_text(text: str) -> str:
-        """Normalize a title-ish line for loose comparisons."""
-        return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", text.casefold())).strip()
-
     def _title_match_score(self, line: str, expected_title: str) -> int:
         """Score how well a line matches the expected document title."""
-        normalized_line = self._normalize_title_text(line)
-        normalized_expected = self._normalize_title_text(expected_title)
+        normalized_line = normalize_title_text(line)
+        normalized_expected = normalize_title_text(expected_title)
         line_tokens = {
             token for token in re.findall(r"\w+", normalized_line) if len(token) > 1
         }
@@ -254,17 +262,11 @@ class SAPLBaseScraper(StateScraper):
             ),
         )
 
-    @staticmethod
-    def _norm_line(raw: str) -> tuple[str, str]:
-        """Return ``(compact, lower)`` for *raw*, where compact collapses whitespace."""
-        compact = " ".join(raw.split())
-        return compact, compact.lower()
-
     def _strip_sei_noise(self, lines: list[str]) -> list[str]:
         """Remove SEI verification, signature, and page-counter lines."""
         out: list[str] = []
         for raw_line in lines:
-            compact, lower = self._norm_line(raw_line)
+            compact, lower = norm_line(raw_line)
             if not compact:
                 out.append("")
                 continue
@@ -285,7 +287,7 @@ class SAPLBaseScraper(StateScraper):
         no reliable start can be found.
         """
         normalized_expected = (
-            self._normalize_title_text(expected_title) if expected_title else ""
+            normalize_title_text(expected_title) if expected_title else ""
         )
         # Precompute compact form once for all lines (used by multiple branches below)
         compact_lines = [" ".join(line.split()) for line in lines]
@@ -298,7 +300,7 @@ class SAPLBaseScraper(StateScraper):
 
         if normalized_expected:
             for idx, compact in enumerate(compact_lines):
-                norm_line = self._normalize_title_text(compact)
+                norm_line = normalize_title_text(compact)
                 if norm_line and (
                     norm_line == normalized_expected
                     or norm_line.startswith(normalized_expected)
@@ -399,7 +401,7 @@ class SAPLBaseScraper(StateScraper):
         start = self._find_content_start(lines, expected_title)
         if start:
             lines = lines[start:]
-        line_tuples = [(line, *self._norm_line(line)) for line in lines]
+        line_tuples = [(line, *norm_line(line)) for line in lines]
         filtered_tuples = self._filter_footer_blocks(line_tuples)
         lines = self._truncate_extra_documents(filtered_tuples)
 
@@ -472,7 +474,7 @@ class SAPLBaseScraper(StateScraper):
                 text_markdown,
                 expected_title=title,
             )
-            valid, _ = self._valid_markdown(text_markdown)
+            valid, _ = valid_markdown(text_markdown)
             if not valid:
                 continue
             return {
@@ -564,7 +566,7 @@ class SAPLBaseScraper(StateScraper):
         if not data.get("results"):
             return []
 
-        total_pages = data["pagination"]["total_pages"]
+        total_pages = data.get("pagination", {}).get("total_pages", 1)
 
         link_tasks = [self._get_docs_links(url, data=data)]
         link_tasks.extend(
@@ -602,7 +604,7 @@ class SAPLBaseScraper(StateScraper):
             context={"year": year, "type": "NA", "situation": "NA"},
             desc=f"{self.name} | Year {year}",
         )
-        return self._flatten_results(valid)
+        return flatten_results(valid)
 
     # ------------------------------------------------------------------
     # Hooks

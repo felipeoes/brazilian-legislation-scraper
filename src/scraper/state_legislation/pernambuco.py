@@ -6,6 +6,7 @@ import aiohttp
 from bs4 import BeautifulSoup, Tag
 from loguru import logger
 
+from src.scraper.base.converter import valid_markdown, wrap_html
 from src.scraper.base.scraper import (
     DEFAULT_INVALID_SITUATION,
     DEFAULT_VALID_SITUATION,
@@ -37,6 +38,24 @@ SITUATIONS: dict[str, str] = {}
 
 _SEARCH_PATH = "/Paginas/pesquisaAvancada.aspx"
 _TEXT_VERSION_PRIORITY = ("TEXTOATUALIZADO", "TEXTOORIGINAL", "TEXTOANOTADO", "")
+_TYPE_ALIASES = {
+    "ato administrativo normativo": "Ato Administrativo Normativo",
+    "ato administrativo parlamentar": "Ato Administrativo Parlamentar",
+    "constituição estadual": "Constituição Estadual",
+    "constituição do estado": "Constituição Estadual",
+    "decreto do executivo": "Decreto do Executivo",
+    "decreto legislativo": "Decreto Legislativo",
+    "decreto-lei": "Decreto-Lei",
+    "emenda constitucional": "Emenda Constitucional",
+    "lei complementar": "Lei Complementar",
+    "lei delegada": "Lei Delegada",
+    "lei ordinária": "Lei Ordinária",
+    "lei provincial": "Lei Provincial",
+    "portaria administrativa da alepe": "Portaria Administrativa da Alepe",
+    "resolução conjunta": "Resolução Conjunta",
+    "resolução da alepe": "Resolução da Alepe",
+    "resolução do poder judiciário": "Resolução do Poder Judiciário",
+}
 
 
 @dataclass(slots=True)
@@ -204,14 +223,28 @@ class PernambucoAlepeScraper(StateScraper):
 
     def _extract_norm_type(self, title: str) -> str:
         normalized_title = " ".join(title.split())
+        lowered = normalized_title.casefold()
+
+        for alias, canonical in sorted(
+            _TYPE_ALIASES.items(), key=lambda item: len(item[0]), reverse=True
+        ):
+            if lowered.startswith(alias):
+                return canonical
+
         for norm_type in self._known_types:
             if normalized_title.startswith(norm_type):
                 return norm_type
 
         match = re.match(r"(.+?)\s+n[°ºo]", normalized_title, re.IGNORECASE)
         if match:
-            fallback = match.group(1).strip()
+            fallback = " ".join(match.group(1).split())
             logger.warning(f"PERNAMBUCO | Unknown norm type fallback: {fallback}")
+            return fallback
+
+        match = re.match(r"(.+?)\s+de\s+\d{4}$", normalized_title, re.IGNORECASE)
+        if match:
+            fallback = " ".join(match.group(1).split())
+            logger.warning(f"PERNAMBUCO | Unknown year-title fallback: {fallback}")
             return fallback
 
         logger.warning(f"PERNAMBUCO | Could not infer norm type from title: {title}")
@@ -332,12 +365,11 @@ class PernambucoAlepeScraper(StateScraper):
                 page_docs = self._extract_documents(current_page_soup, year)
                 documents.extend(page_docs)
                 seen_pages.add(current_page_number)
-                if self.verbose:
-                    logger.info(
-                        f"PERNAMBUCO | Year {year} | Page {current_page_number} | Found {len(page_docs)} docs"
-                    )
-            elif self.verbose:
-                logger.info(
+                logger.debug(
+                    f"PERNAMBUCO | Year {year} | Page {current_page_number} | Found {len(page_docs)} docs"
+                )
+            else:
+                logger.debug(
                     f"PERNAMBUCO | Year {year} | Skipping duplicate page {current_page_number}"
                 )
 
@@ -361,10 +393,9 @@ class PernambucoAlepeScraper(StateScraper):
                 page_docs = self._extract_documents(page_soup, year)
                 documents.extend(page_docs)
                 seen_pages.add(slot.page_number)
-                if self.verbose:
-                    logger.info(
-                        f"PERNAMBUCO | Year {year} | Page {slot.page_number} | Found {len(page_docs)} docs"
-                    )
+                logger.debug(
+                    f"PERNAMBUCO | Year {year} | Page {slot.page_number} | Found {len(page_docs)} docs"
+                )
 
             if current_page_soup.find("a", id="lbtnProx") is None:
                 break
@@ -489,7 +520,6 @@ class PernambucoAlepeScraper(StateScraper):
         additional_data_url = doc_info.get("additional_data_url", "")
 
         selected_url = ""
-        selected_body = b""
         selected_soup: BeautifulSoup | None = None
         text_markdown = ""
         last_failure_reason = "Failed to retrieve document page"
@@ -520,15 +550,14 @@ class PernambucoAlepeScraper(StateScraper):
                 remove_empty_tags=True,
                 strip_styles=True,
             )
-            full_html = self._wrap_html(str(content_div))
+            full_html = wrap_html(str(content_div))
             candidate_markdown = await self._get_markdown(html_content=full_html)
-            valid, reason = self._valid_markdown(candidate_markdown)
+            valid, reason = valid_markdown(candidate_markdown)
             if not valid:
                 last_failure_reason = f"Invalid markdown: {reason}"
                 continue
 
             selected_url = candidate_url
-            selected_body = body
             selected_soup = soup
             text_markdown = candidate_markdown
             break
@@ -552,6 +581,19 @@ class PernambucoAlepeScraper(StateScraper):
                 title=title,
             )
 
+        try:
+            mhtml = await self._capture_mhtml(selected_url)
+        except Exception as exc:
+            logger.warning(f"MHTML capture failed for {selected_url}: {exc}")
+            await self._save_doc_error(
+                title=title,
+                year=year,
+                norm_type=norm_type,
+                html_link=selected_url,
+                error_message=f"MHTML capture failed: {exc}",
+            )
+            return None
+
         result = {
             **doc_info,
             "year": year,
@@ -559,9 +601,8 @@ class PernambucoAlepeScraper(StateScraper):
             "document_url": selected_url,
             "text_version": self._extract_text_version(selected_url) or "DEFAULT",
             "text_markdown": text_markdown,
-            "_mhtml_url": selected_url,
-            "_raw_content": selected_body,
-            "_content_extension": ".html",
+            "_raw_content": mhtml,
+            "_content_extension": ".mhtml",
         }
         result.pop("_candidate_document_urls", None)
 

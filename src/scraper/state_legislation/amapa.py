@@ -10,7 +10,12 @@ from urllib.parse import urlencode, urljoin
 from bs4 import BeautifulSoup, Tag
 from loguru import logger
 
-from src.scraper.base.scraper import StateScraper
+from src.scraper.base.converter import (
+    calc_pages,
+    valid_markdown,
+    wrap_html,
+)
+from src.scraper.base.scraper import StateScraper, flatten_results
 
 
 TYPES = {
@@ -228,7 +233,32 @@ class AmapaAlapScraper(StateScraper):
             lines.append(text)
         return "\n\n".join(lines)
 
-    async def _extract_source_content(self, source_url: str) -> dict | None:
+    def _remove_summary_element(
+        self, container: Tag | BeautifulSoup, summary: str
+    ) -> None:
+        if not summary:
+            return
+        normalized_summary = self._clean_text(summary).casefold()
+        if not normalized_summary:
+            return
+
+        candidates: list[tuple[int, Tag]] = []
+        for tag in container.find_all(["p", "td", "div", "span", "font", "table"]):
+            tag_text = self._clean_text(tag.get_text(" ", strip=True))
+            normalized_tag = tag_text.casefold()
+            if normalized_summary not in normalized_tag:
+                continue
+            if "art." in tag_text.lower():
+                continue
+            candidates.append((len(normalized_tag), tag))
+
+        if candidates:
+            _, best = min(candidates, key=lambda x: x[0])
+            best.decompose()
+
+    async def _extract_source_content(
+        self, source_url: str, summary: str = ""
+    ) -> dict | None:
         response = await self.request_service.make_request(source_url)
         if not response or not hasattr(response, "read"):
             return None
@@ -244,18 +274,19 @@ class AmapaAlapScraper(StateScraper):
             unwrap_fonts=True,
             strip_styles=True,
         )
+        self._remove_summary_element(cast(BeautifulSoup, container), summary)
         container_text = self._clean_text(container.get_text(" ", strip=True))
         if not container_text:
             return None
 
-        html_string = self._wrap_html(container.decode_contents())
+        html_string = wrap_html(container.decode_contents())
         text_markdown = await self._get_markdown(html_content=html_string)
         if len((text_markdown or "").strip()) < 100:
             fallback_markdown = self._paragraphs_to_markdown(container)
             if fallback_markdown:
                 text_markdown = fallback_markdown
 
-        valid, reason = self._valid_markdown(text_markdown)
+        valid, reason = valid_markdown(text_markdown)
         return {
             "source_url": source_url,
             "html_string": html_string,
@@ -290,8 +321,8 @@ class AmapaAlapScraper(StateScraper):
 
             self._global_scraped_keys = scraped_keys
             self._global_scraped_keys_loaded = True
-            if scraped_keys and self.verbose:
-                logger.info(
+            if scraped_keys:
+                logger.debug(
                     f"{self.__class__.__name__}: loaded {len(scraped_keys)} global scraped keys"
                 )
 
@@ -345,7 +376,7 @@ class AmapaAlapScraper(StateScraper):
                 situation=doc_data.get("situation", "Não consta"),
                 norm_type=doc_data.get("type", "Legislação"),
                 html_link="",
-                error_message="Document row has no text link",
+                error_message="No text link found for document",
             )
             return None
 
@@ -359,7 +390,9 @@ class AmapaAlapScraper(StateScraper):
         invalid_sources: list[str] = []
         selected_content: dict | None = None
         for source_url in source_links:
-            extracted = await self._extract_source_content(source_url)
+            extracted = await self._extract_source_content(
+                source_url, summary=doc_data.get("summary", "")
+            )
             if extracted is None:
                 invalid_sources.append(f"{source_url}: empty or inaccessible content")
                 continue
@@ -386,12 +419,25 @@ class AmapaAlapScraper(StateScraper):
 
         doc_data["text_markdown"] = selected_content["text_markdown"]
         doc_data["document_url"] = document_url
-        if selected_content["source_url"] != document_url:
-            doc_data["content_source_url"] = selected_content["source_url"]
+        capture_url = selected_content["source_url"]
+        if capture_url != document_url:
+            doc_data["content_source_url"] = capture_url
 
-        doc_data["_mhtml_url"] = selected_content["source_url"]
-        doc_data["_raw_content"] = selected_content["html_string"].encode("utf-8")
-        doc_data["_content_extension"] = ".html"
+        try:
+            mhtml = await self._capture_mhtml(capture_url)
+            doc_data["_raw_content"] = mhtml
+            doc_data["_content_extension"] = ".mhtml"
+        except Exception as exc:
+            await self._save_doc_error(
+                title=title,
+                year=doc_data.get("year", ""),
+                situation=doc_data.get("situation", "Não consta"),
+                norm_type=doc_data.get("type", "Legislação"),
+                html_link=capture_url,
+                error_message=f"MHTML capture failed: {exc}",
+            )
+            return None
+
         return doc_data
 
     async def _get_year_documents(self, year: int) -> list[dict]:
@@ -402,7 +448,7 @@ class AmapaAlapScraper(StateScraper):
 
         documents = self._parse_listing_documents(first_soup, query_year=year)
         total_results = self._parse_total_results(first_soup)
-        total_pages = self._calc_pages(total_results, _RESULTS_PER_PAGE)
+        total_pages = calc_pages(total_results, _RESULTS_PER_PAGE)
         if total_pages <= 1:
             return documents
 
@@ -418,7 +464,7 @@ class AmapaAlapScraper(StateScraper):
             context=context,
             desc=f"AMAPA | Year {year} | listings",
         )
-        documents.extend(self._flatten_results(remaining_pages))
+        documents.extend(flatten_results(remaining_pages))
         return documents
 
     async def _scrape_year(self, year: int) -> list[dict]:

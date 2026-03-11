@@ -414,6 +414,7 @@ class TestGetDocData:
                 (_make_doc_html(), MagicMock()),
             ]
         )
+        scraper._capture_mhtml = AsyncMock(return_value=b"fake-mhtml")
         scraper._fetch_reference_page = AsyncMock(return_value=_make_reference_html())
         scraper._get_markdown = AsyncMock(return_value="# Lei\n\n" + "Texto. " * 30)
         doc = {
@@ -447,6 +448,7 @@ class TestGetDocData:
                 MagicMock(),
             )
         )
+        scraper._capture_mhtml = AsyncMock(return_value=b"fake-mhtml")
         scraper._fetch_reference_page = AsyncMock(return_value=_make_reference_html())
         valid_md = "# Lei Ordinária 1/2020\n\n" + "Texto da lei. " * 30
         scraper._get_markdown = AsyncMock(return_value=valid_md)
@@ -466,9 +468,8 @@ class TestGetDocData:
         assert result["year"] == 2020
         assert result["type"] == "Lei Ordinária"
         assert result["text_version"] == "TEXTOATUALIZADO"
-        assert result["_content_extension"] == ".html"
-        assert result["_mhtml_url"] == result["document_url"]
-        assert isinstance(result["_raw_content"], bytes)
+        assert result["_content_extension"] == ".mhtml"
+        assert result["_raw_content"] == b"fake-mhtml"
         assert result["initiative"] == "Poder Executivo"
         assert result["date"] == "22/12/2020"
         assert result["indexation"] == "INDICE 1."
@@ -483,6 +484,7 @@ class TestGetDocData:
                 MagicMock(),
             )
         )
+        scraper._capture_mhtml = AsyncMock(return_value=b"fake-mhtml")
         scraper._fetch_reference_page = AsyncMock(return_value=_make_reference_html())
         scraper._get_markdown = AsyncMock(return_value="# Lei\n\n" + "Texto. " * 30)
         doc = {

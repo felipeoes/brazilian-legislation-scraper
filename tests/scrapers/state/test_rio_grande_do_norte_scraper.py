@@ -112,6 +112,25 @@ class TestFormatSearchUrl:
         assert url.startswith("https://www.al.rn.leg.br")
 
 
+class TestInferNormType:
+    def test_matches_titles_without_space_before_number(self):
+        assert (
+            RNAlrnScraper._infer_norm_type("Lei Ordinária12.029,de 30.12.2024")
+            == "Lei Ordinária"
+        )
+
+    def test_matches_lei_complementar_abbreviation(self):
+        assert (
+            RNAlrnScraper._infer_norm_type("Lei Comp12,de 2024") == "Lei Complementar"
+        )
+
+    def test_unknown_prefix_falls_back_to_title_prefix(self):
+        assert (
+            RNAlrnScraper._infer_norm_type("Norma Especial99,de 2024")
+            == "Norma Especial"
+        )
+
+
 # ---------------------------------------------------------------------------
 # _get_docs_links
 # ---------------------------------------------------------------------------

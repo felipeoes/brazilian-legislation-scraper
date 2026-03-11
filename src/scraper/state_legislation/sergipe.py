@@ -5,6 +5,7 @@ from typing import Any, cast
 import aiohttp
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
+from src.scraper.base.converter import calc_pages, clean_markdown, valid_markdown
 from src.scraper.base.scraper import StateScraper
 
 
@@ -53,7 +54,7 @@ class SergipeLegsonScraper(StateScraper):
 
     def _clean_legison_markdown(self, text_markdown: str) -> str:
         """Remove LegisOn portal boilerplate from extracted text."""
-        cleaned = self._clean_markdown(
+        cleaned = clean_markdown(
             text_markdown,
             replace=[
                 (
@@ -254,7 +255,7 @@ class SergipeLegsonScraper(StateScraper):
                     )
                     text_markdown = self._clean_legison_markdown(text_markdown)
 
-                    valid, reason = self._valid_markdown(text_markdown)
+                    valid, reason = valid_markdown(text_markdown)
                     if valid:
                         doc_info.update(
                             {
@@ -299,7 +300,8 @@ class SergipeLegsonScraper(StateScraper):
             if isinstance(data, dict):
                 return int(data.get("count", 0) or 0)
             return 0
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Failed to parse Sergipe total count response: {e}")
             return 0
 
     async def _get_all_pages_docs(self, norm_type_id: int | str, year: int) -> list:
@@ -311,7 +313,7 @@ class SergipeLegsonScraper(StateScraper):
 
         # Calculate total pages (assuming 10 items per page based on API behavior)
         page_size = 10
-        total_pages = self._calc_pages(total_count, page_size)
+        total_pages = calc_pages(total_count, page_size)
 
         all_docs = []
 
@@ -351,8 +353,7 @@ class SergipeLegsonScraper(StateScraper):
             title = "Constituição Estadual de Sergipe"
 
             if self._is_already_scraped(file_url, title):
-                if self.verbose:
-                    logger.info("State constitution already scraped, skipping")
+                logger.debug("State constitution already scraped, skipping")
                 return
 
             text_markdown, raw_content, content_ext = await self._download_and_convert(
@@ -360,7 +361,7 @@ class SergipeLegsonScraper(StateScraper):
             )
             text_markdown = self._clean_legison_markdown(text_markdown)
 
-            valid, reason = self._valid_markdown(text_markdown)
+            valid, reason = valid_markdown(text_markdown)
             if not valid:
                 logger.warning(
                     f"Constitution markdown invalid: {reason} | URL: {file_url}"
@@ -390,10 +391,9 @@ class SergipeLegsonScraper(StateScraper):
                 doc_info = saved
             self._track_results([doc_info])
             self.count += 1
-            if self.verbose:
-                logger.info(
-                    f"Fetched constitution: {doc_info['title']} | ID: {doc_id} | URL: {file_url}"
-                )
+            logger.debug(
+                f"Fetched constitution: {doc_info['title']} | ID: {doc_id} | URL: {file_url}"
+            )
         else:
             logger.warning("No constitution file found in the response.")
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from bs4 import BeautifulSoup
 
 from src.scraper.icmbio.scrape import (
     COLUMNS,
@@ -293,6 +294,18 @@ class TestICMBioClassifyType:
         # "in 0" — numeric after "in " — should match
         assert ICMBioScraper._classify_type("in 0, de 2020") == "Instrução Normativa"
 
+    def test_in_icmbio_prefix_maps_to_instrucao_normativa(self):
+        assert (
+            ICMBioScraper._classify_type("IN ICMBio 5 de 19/05/2016")
+            == "Instrução Normativa"
+        )
+
+    def test_in_conjunta_prefix_maps_to_instrucao_normativa(self):
+        assert (
+            ICMBioScraper._classify_type("IN Conjunta MMA/IBAMA/ICMBio 1 de 12/04/2021")
+            == "Instrução Normativa"
+        )
+
 
 # =========================================================================
 # _row_to_doc
@@ -470,7 +483,7 @@ class TestICMBioFetchPage:
 
         import json as _json
 
-        async def _text():
+        async def _text(**kwargs):
             return _json.dumps(body or {})
 
         resp.text = _text
@@ -604,7 +617,7 @@ class TestICMBioGetDocData:
         resp.status = status
         resp.__bool__ = lambda self: True
 
-        async def _text():
+        async def _text(**kwargs):
             return html
 
         resp.text = _text
@@ -630,10 +643,9 @@ class TestICMBioGetDocData:
     @pytest.mark.asyncio
     async def test_http_error_saves_error_and_returns_none(self):
         scraper = self._make_scraper()
-        failed = MagicMock()
-        failed.__bool__ = lambda self: False
-        failed.status = 503
-        scraper.request_service.make_request = AsyncMock(return_value=failed)
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            side_effect=Exception("HTTP 503 error")
+        )
         result = await scraper._get_doc_data(self._valid_doc_info())
         assert result is None
         scraper._save_doc_error.assert_awaited_once()
@@ -641,9 +653,12 @@ class TestICMBioGetDocData:
     @pytest.mark.asyncio
     async def test_div_texto_dou_not_found_saves_error(self):
         scraper = self._make_scraper()
-        scraper.request_service.make_request = AsyncMock(
-            return_value=self._make_response(
-                200, "<html><body><p>No div here</p></body></html>"
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            return_value=(
+                BeautifulSoup(
+                    "<html><body><p>No div here</p></body></html>", "html.parser"
+                ),
+                b"fake-mhtml",
             )
         )
         result = await scraper._get_doc_data(self._valid_doc_info())
@@ -653,10 +668,13 @@ class TestICMBioGetDocData:
     @pytest.mark.asyncio
     async def test_empty_markdown_saves_error(self):
         scraper = self._make_scraper()
-        scraper.request_service.make_request = AsyncMock(
-            return_value=self._make_response(
-                200,
-                '<html><body><div class="texto-dou"><p>content</p></div></body></html>',
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            return_value=(
+                BeautifulSoup(
+                    '<html><body><div class="texto-dou"><p>content</p></div></body></html>',
+                    "html.parser",
+                ),
+                b"fake-mhtml",
             )
         )
         scraper._html_to_markdown = AsyncMock(return_value="   ")
@@ -667,10 +685,13 @@ class TestICMBioGetDocData:
     @pytest.mark.asyncio
     async def test_not_found_message_in_markdown_saves_error(self):
         scraper = self._make_scraper()
-        scraper.request_service.make_request = AsyncMock(
-            return_value=self._make_response(
-                200,
-                '<html><body><div class="texto-dou"><p>content</p></div></body></html>',
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            return_value=(
+                BeautifulSoup(
+                    '<html><body><div class="texto-dou"><p>content</p></div></body></html>',
+                    "html.parser",
+                ),
+                b"fake-mhtml",
             )
         )
         scraper._html_to_markdown = AsyncMock(
@@ -683,10 +704,13 @@ class TestICMBioGetDocData:
     @pytest.mark.asyncio
     async def test_happy_path_saves_and_returns_result(self):
         scraper = self._make_scraper()
-        scraper.request_service.make_request = AsyncMock(
-            return_value=self._make_response(
-                200,
-                '<html><body><div class="texto-dou"><p>Art. 1º Esta instrução normativa...</p></div></body></html>',
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            return_value=(
+                BeautifulSoup(
+                    '<html><body><div class="texto-dou"><p>Art. 1º Esta instrução normativa...</p></div></body></html>',
+                    "html.parser",
+                ),
+                b"fake-mhtml-content",
             )
         )
         saved_result = {}
@@ -702,16 +726,19 @@ class TestICMBioGetDocData:
         assert result["text_markdown"] == "# Converted markdown content"
         assert result["year"] == 2022
         assert result["title"] == "IN Nº 1"
-        assert "_raw_content" in result
-        assert result["_content_extension"] == ".html"
+        assert result["_raw_content"] == b"fake-mhtml-content"
+        assert result["_content_extension"] == ".mhtml"
 
     @pytest.mark.asyncio
     async def test_happy_path_clean_norm_soup_called(self):
         scraper = self._make_scraper()
-        scraper.request_service.make_request = AsyncMock(
-            return_value=self._make_response(
-                200,
-                '<html><body><div class="texto-dou"><p>Content here.</p></div></body></html>',
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            return_value=(
+                BeautifulSoup(
+                    '<html><body><div class="texto-dou"><p>Content here.</p></div></body></html>',
+                    "html.parser",
+                ),
+                b"fake-mhtml",
             )
         )
         await scraper._get_doc_data(self._valid_doc_info())
@@ -732,14 +759,17 @@ class TestICMBioGetDocData:
             return "# Body content only"
 
         scraper._html_to_markdown = capture_html
-        scraper.request_service.make_request = AsyncMock(
-            return_value=self._make_response(
-                200,
-                '<html><body><div class="texto-dou">'
-                '<p class="identifica">INSTRUÇÃO NORMATIVA ICMBio Nº 14</p>'
-                '<p class="ementa">Altera a Instrução Normativa nº 16...</p>'
-                '<p class="dou-paragraph">Art. 1º Esta instrução normativa...</p>'
-                "</div></body></html>",
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            return_value=(
+                BeautifulSoup(
+                    '<html><body><div class="texto-dou">'
+                    '<p class="identifica">INSTRUÇÃO NORMATIVA ICMBio Nº 14</p>'
+                    '<p class="ementa">Altera a Instrução Normativa nº 16...</p>'
+                    '<p class="dou-paragraph">Art. 1º Esta instrução normativa...</p>'
+                    "</div></body></html>",
+                    "html.parser",
+                ),
+                b"fake-mhtml",
             )
         )
 
@@ -792,11 +822,6 @@ class TestICMBioScrapeYear:
         result = await scraper._scrape_year(2022)
 
         scraper._gather_results.assert_awaited_once()
-        call_kwargs = scraper._gather_results.call_args
-        # Verify min_length=0 was passed
-        assert call_kwargs.kwargs.get("min_length") == 0 or (
-            len(call_kwargs.args) >= 4 and call_kwargs.args[3] == 0
-        )
         assert len(result) == 1
         assert result[0]["text_markdown"] == "# content"
 

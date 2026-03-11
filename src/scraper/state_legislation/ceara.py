@@ -4,10 +4,12 @@ from collections import defaultdict
 from datetime import datetime
 from urllib.parse import urlencode, urljoin
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from loguru import logger
 
+from src.scraper.base.converter import valid_markdown
 from src.scraper.base.scraper import StateScraper
+from src.services.browser.playwright import BrowserService
 
 TYPES = {
     "Ato Deliberativo": "ato-deliberativo",
@@ -107,33 +109,62 @@ class CearaAleceScraper(StateScraper):
 
         return docs
 
-    async def _get_doc_data(self, doc_info: dict) -> dict:
+    def _remove_summary_element(
+        self, container: BeautifulSoup | Tag, summary: str
+    ) -> None:
+        """Remove the smallest HTML element that contains the summary text."""
+        if not summary:
+            return
+        normalized_summary = re.sub(r"\s+", " ", summary).strip().casefold()
+        if not normalized_summary:
+            return
+
+        candidates: list[tuple[int, Tag]] = []
+        for tag in container.find_all(["p", "td", "div", "span", "font", "table"]):
+            tag_text = re.sub(r"\s+", " ", tag.get_text(" ", strip=True))
+            normalized_tag = tag_text.casefold()
+            if normalized_summary not in normalized_tag:
+                continue
+            if "art." in tag_text.lower():
+                continue
+            candidates.append((len(normalized_tag), tag))
+
+        if candidates:
+            _, best = min(candidates, key=lambda x: x[0])
+            best.decompose()
+
+    async def _get_doc_data(self, doc_info: dict) -> dict | None:
         """Get document data from given document dict"""
+        # Use the /visualizar HTML page as the canonical document_url so that
+        # (1) resume keys match and (2) MHTML capture navigates to an HTML page
+        # instead of triggering a PDF download.
+        visualizar_url = doc_info["document_url"].rstrip("/") + "/visualizar"
+        doc_info["document_url"] = visualizar_url
+
         if self._is_already_scraped(
             doc_info["document_url"], doc_info.get("title", "")
         ):
             return None
-
-        # Use the /visualizar HTML page to avoid needing OCR on the PDF download.
-        visualizar_url = doc_info["document_url"].rstrip("/") + "/visualizar"
-        soup = await self.request_service.get_soup(visualizar_url)
-        if not soup:
+        try:
+            soup, mhtml = await self._fetch_soup_and_mhtml(visualizar_url)
+        except Exception as exc:
             await self._save_doc_error(
                 title=doc_info.get("title", "Unknown"),
                 year=doc_info.get("year", ""),
                 norm_type=doc_info.get("norm_type", ""),
                 html_link=visualizar_url,
-                error_message="Failed to fetch document page",
+                error_message=f"Failed to fetch document page: {exc}",
             )
             return None
 
         content = soup.find("div", class_="card-body") or soup.find("main") or soup
         self._clean_norm_soup(content, unwrap_links=False)
+        self._remove_summary_element(content, doc_info.get("summary", ""))
 
         html_string = str(content)
         text_markdown = await self._get_markdown(html_content=html_string)
 
-        valid, reason = self._valid_markdown(text_markdown)
+        valid, reason = valid_markdown(text_markdown)
         if not valid:
             logger.error(f"Invalid markdown for {visualizar_url}: {reason}")
             await self._save_doc_error(
@@ -146,8 +177,8 @@ class CearaAleceScraper(StateScraper):
             return None
 
         doc_info["text_markdown"] = text_markdown
-        doc_info["_raw_content"] = html_string.encode("utf-8")
-        doc_info["_content_extension"] = ".html"
+        doc_info["_raw_content"] = mhtml
+        doc_info["_content_extension"] = ".mhtml"
 
         return doc_info
 
@@ -244,7 +275,7 @@ class CearaAleceScraper(StateScraper):
         if not docs:
             return []
 
-        situation = next(iter(self.situations), "Não consta")
+        situation = self.default_situation
         return await self._process_documents(
             docs,
             year=year,
@@ -260,7 +291,7 @@ class CearaAleceScraper(StateScraper):
         if norm_type in self.PAGINATED_TYPES:
             return await self._scrape_paginated_type(norm_type, year)
 
-        situation = next(iter(self.situations), "Não consta")
+        situation = self.default_situation
 
         if norm_type == "Lei Ordinária":
             if year not in self._lei_ordinaria_years:
@@ -358,9 +389,8 @@ class CearaAleceScraper(StateScraper):
 
     def construct_url(self, norm_type: str, html_link: str, year: int | None) -> str:
         """Construct the full url for the document page"""
-        if "https://" in html_link:
-            # don't need to do anything, it's already a full url
-            return html_link
+        if "http://" in html_link or "https://" in html_link:
+            return html_link.replace("http://", "https://", 1)
 
         # file:///\\10.85.100.8\10.85.100.8\legislativo\legislacao5\leis2014\15517.htm.
         if "file://" in html_link:
@@ -399,6 +429,28 @@ class CearaAleceScraper(StateScraper):
 
         return urljoin(base_url, html_link)
 
+    async def _browser_pdf_to_markdown(self, url: str) -> str:
+        """Render a URL to PDF via the browser and convert to markdown."""
+        if self._mhtml_browser is None:
+            self._mhtml_browser = BrowserService(
+                headless=True,
+                multiple_pages=True,
+                max_workers=self.max_workers,
+                owner_class_name=f"{self.__class__.__name__}_mhtml",
+            )
+            await self._mhtml_browser.initialize()
+
+        page = await self._mhtml_browser.get_available_page()
+        try:
+            await page.goto(url, wait_until="load", timeout=60_000)
+            pdf_bytes = await page.pdf()
+            return await self._converter.bytes_to_markdown(pdf_bytes)
+        except Exception as e:
+            logger.warning(f"Browser PDF fallback failed for {url}: {e}")
+            return ""
+        finally:
+            self._mhtml_browser.release_page(page)
+
     async def _get_laws_constitution_amendments_doc_data(
         self, doc_info: dict, norm_type: str, year: int | None = None
     ) -> dict | None:
@@ -410,9 +462,9 @@ class CearaAleceScraper(StateScraper):
         if self._is_already_scraped(url, doc_info.get("title", "")):
             return None
 
-        response = await self.request_service.make_request(url)
-
-        if not response or response.status == 404:
+        try:
+            soup, mhtml = await self._fetch_soup_and_mhtml(url)
+        except Exception as exc:
             logger.error(
                 f"Error fetching document page: {url}. Year: {year}. HTML link: {html_link}"
             )
@@ -421,11 +473,9 @@ class CearaAleceScraper(StateScraper):
                 year=year or "",
                 norm_type=norm_type,
                 html_link=url,
-                error_message="Failed to fetch document page",
+                error_message=f"Failed to fetch document page: {exc}",
             )
             return None
-
-        soup = BeautifulSoup(await response.read(), "html.parser")
 
         # Remove VOLTAR nav link (structure varies: <a><b>VOLTAR</b></a>, <a><span>VOLTAR</span></a>, etc.)
         for a in soup.find_all("a"):
@@ -439,10 +489,18 @@ class CearaAleceScraper(StateScraper):
         ):
             node.parent.decompose()
 
-        # Word-generated HTML docs wrap all content in <div class="Section1">.
-        # Extracting just that div avoids markitdown getting confused by MSO namespace bloat.
-        section1 = soup.find("div", class_="Section1")
-        content = section1 if section1 else soup
+        # Word-generated HTML docs wrap content in <div class="Section1/2/3/...">.
+        # Merge all Section divs to capture full text (old docs split across multiple).
+        sections = soup.find_all("div", class_=re.compile(r"^Section\d+$"))
+        if sections:
+            container = BeautifulSoup("<div></div>", "html.parser").div
+            for sec in sections:
+                for child in list(sec.children):
+                    container.append(child.extract())
+            content = container
+        else:
+            content = soup
+        self._remove_summary_element(content, doc_info.get("summary", ""))
         html_string = str(content).strip()
 
         # check if invalid document
@@ -459,7 +517,14 @@ class CearaAleceScraper(StateScraper):
         # Use direct HTML content conversion
         text_markdown = await self._get_markdown(html_content=html_string)
 
-        valid, reason = self._valid_markdown(text_markdown)
+        valid, reason = valid_markdown(text_markdown)
+        if not valid:
+            # Fallback: render page to PDF via browser, then use PDF→markdown pipeline
+            pdf_md = await self._browser_pdf_to_markdown(url)
+            if pdf_md:
+                text_markdown = pdf_md
+                valid, reason = valid_markdown(text_markdown)
+
         if not valid:
             logger.error(f"Invalid markdown for {url} (year={year}): {reason}")
             await self._save_doc_error(
@@ -473,8 +538,8 @@ class CearaAleceScraper(StateScraper):
 
         doc_info["text_markdown"] = text_markdown
         doc_info["document_url"] = url
-        doc_info["_raw_content"] = html_string.encode("utf-8")
-        doc_info["_content_extension"] = ".html"
+        doc_info["_raw_content"] = mhtml
+        doc_info["_content_extension"] = ".mhtml"
 
         return doc_info
 

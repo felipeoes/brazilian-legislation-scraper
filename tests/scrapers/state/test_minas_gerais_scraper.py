@@ -233,6 +233,22 @@ class TestNormalizeType:
             == "Instrução Normativa"
         )
 
+    def test_url_code_takes_precedence_over_title_prefix(self):
+        scraper = _make_scraper()
+        assert (
+            scraper._normalize_type(
+                "Norma desconhecida",
+                "/legislacao-mineira/LCP/1/2016/",
+            )
+            == "Lei Complementar"
+        )
+
+    def test_unknown_prefix_falls_back_to_title_prefix(self):
+        scraper = _make_scraper()
+        assert (
+            scraper._normalize_type("Norma Especial nº 1, de 2024") == "Norma Especial"
+        )
+
 
 class TestExtractTotalPages:
     def test_plural_count_uses_page_size_10(self):
@@ -366,9 +382,8 @@ class TestGetDocData:
         text_soup = BeautifulSoup(
             "<html><body><div>no span here</div></body></html>", "html.parser"
         )
-        scraper.request_service.get_soup = AsyncMock(
-            side_effect=[detail_soup, text_soup, text_soup]
-        )
+        scraper.request_service.get_soup = AsyncMock(return_value=detail_soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(text_soup, b""))
         scraper._is_already_scraped = MagicMock(return_value=False)
         scraper._save_doc_error = AsyncMock()
 
@@ -397,8 +412,9 @@ class TestGetDocData:
             "<html><body><div>sem texto</div></body></html>", "html.parser"
         )
         original_text = _make_text_soup()
-        scraper.request_service.get_soup = AsyncMock(
-            side_effect=[detail_soup, bad_updated, original_text]
+        scraper.request_service.get_soup = AsyncMock(return_value=detail_soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            side_effect=[(bad_updated, b""), (original_text, b"fake-mhtml")]
         )
         scraper._is_already_scraped = MagicMock(return_value=False)
         scraper._get_markdown = AsyncMock(return_value="# Lei\n\n" + "texto " * 30)
@@ -426,8 +442,9 @@ class TestGetDocData:
             "html.parser",
         )
         text_soup = _make_text_soup()
-        scraper.request_service.get_soup = AsyncMock(
-            side_effect=[detail_soup, denied_soup, text_soup]
+        scraper.request_service.get_soup = AsyncMock(return_value=detail_soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            side_effect=[(denied_soup, b""), (text_soup, b"fake-mhtml")]
         )
         scraper._is_already_scraped = MagicMock(return_value=False)
         scraper._get_markdown = AsyncMock(return_value="# Lei\n\n" + "texto " * 30)
@@ -455,8 +472,9 @@ class TestGetDocData:
             subject="Utilidade Pública.",
         )
         text_soup = _make_text_soup()
-        scraper.request_service.get_soup = AsyncMock(
-            side_effect=[detail_soup, text_soup]
+        scraper.request_service.get_soup = AsyncMock(return_value=detail_soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            return_value=(text_soup, b"fake-mhtml")
         )
         scraper._is_already_scraped = MagicMock(return_value=False)
         valid_md = "# Lei\n\n" + "Texto da lei. " * 20
@@ -482,16 +500,17 @@ class TestGetDocData:
         assert result["subject"] == "Utilidade Pública."
         assert result["text_markdown"] == valid_md
         assert result["document_url"].endswith("/legislacao-mineira/texto/DEC/1/2022/")
-        assert result["_content_extension"] == ".html"
-        assert isinstance(result["_raw_content"], bytes)
+        assert result["_content_extension"] == ".mhtml"
+        assert result["_raw_content"] == b"fake-mhtml"
 
     @pytest.mark.asyncio
     async def test_uppercase_situation_is_normalized(self):
         scraper = _make_scraper()
         detail_soup = _make_detail_soup(situation="DECLARADA INCONSTITUCIONAL")
         text_soup = _make_text_soup()
-        scraper.request_service.get_soup = AsyncMock(
-            side_effect=[detail_soup, text_soup]
+        scraper.request_service.get_soup = AsyncMock(return_value=detail_soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            return_value=(text_soup, b"fake-mhtml")
         )
         scraper._is_already_scraped = MagicMock(return_value=False)
         scraper._get_markdown = AsyncMock(return_value="# Norma\n\n" + "texto " * 30)
@@ -513,8 +532,9 @@ class TestGetDocData:
         scraper = _make_scraper()
         detail_soup = _make_detail_soup(situation=None)
         text_soup = _make_text_soup()
-        scraper.request_service.get_soup = AsyncMock(
-            side_effect=[detail_soup, text_soup]
+        scraper.request_service.get_soup = AsyncMock(return_value=detail_soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            return_value=(text_soup, b"fake-mhtml")
         )
         scraper._is_already_scraped = MagicMock(return_value=False)
         scraper._get_markdown = AsyncMock(return_value="# Norma\n\n" + "texto " * 30)
@@ -557,8 +577,9 @@ class TestGetDocData:
             """,
             "html.parser",
         )
-        scraper.request_service.get_soup = AsyncMock(
-            side_effect=[detail_soup, text_soup]
+        scraper.request_service.get_soup = AsyncMock(return_value=detail_soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            return_value=(text_soup, b"fake-mhtml")
         )
         scraper._is_already_scraped = MagicMock(return_value=False)
         scraper._download_and_convert = AsyncMock()
@@ -577,7 +598,7 @@ class TestGetDocData:
 
         assert result is not None
         assert result["document_url"].endswith("/legislacao-mineira/texto/PRT/67/2025/")
-        assert result["_content_extension"] == ".html"
+        assert result["_content_extension"] == ".mhtml"
         scraper._download_and_convert.assert_not_called()
         html_content = scraper._get_markdown.call_args.kwargs["html_content"]
         assert "Observacao" not in html_content
@@ -590,8 +611,9 @@ class TestGetDocData:
         pdf_url = "https://mediaserver.almg.gov.br/acervo/123.pdf"
         detail_soup = _make_detail_soup()
         text_soup = _make_text_soup(mediaserver_url=pdf_url)
-        scraper.request_service.get_soup = AsyncMock(
-            side_effect=[detail_soup, text_soup]
+        scraper.request_service.get_soup = AsyncMock(return_value=detail_soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            return_value=(text_soup, b"fake-mhtml")
         )
         scraper._is_already_scraped = MagicMock(return_value=False)
         scraper._download_and_convert = AsyncMock(
@@ -633,8 +655,9 @@ class TestGetDocData:
             """,
             "html.parser",
         )
-        scraper.request_service.get_soup = AsyncMock(
-            side_effect=[detail_soup, text_soup]
+        scraper.request_service.get_soup = AsyncMock(return_value=detail_soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            return_value=(text_soup, b"fake-mhtml")
         )
         scraper._is_already_scraped = MagicMock(return_value=False)
         scraper._get_markdown = AsyncMock(return_value="# Decisao\n\n" + "texto " * 30)

@@ -493,9 +493,8 @@ class TestGetDocData:
         assert result["situation"] == DEFAULT_VALID_SITUATION
 
     @pytest.mark.asyncio
-    async def test_html_content_type_path_raw_content_is_original_bytes(self):
-        """On the HTML path, raw_content must be the original downloaded bytes
-        (not a re-encoded prettified string)."""
+    async def test_html_content_type_path_raw_content_is_mhtml(self):
+        """On the HTML path, raw_content must be the MHTML bytes from browser capture."""
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
         scraper._save_doc_error = AsyncMock()
@@ -506,14 +505,17 @@ class TestGetDocData:
         scraper.request_service.make_request = AsyncMock(
             return_value=_make_http_response(original_body, content_type="text/html")
         )
+        soup = BeautifulSoup(original_body, "html.parser")
+        mhtml = b"MHTML content"
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, mhtml))
         long_md = "Art. 1 Conteúdo legal extenso e válido. " * 10
         scraper._get_markdown = AsyncMock(return_value=long_md)
 
         result = await scraper._get_doc_data(_sample_row())
 
         assert result is not None
-        assert result["_raw_content"] == original_body
-        assert result["_content_extension"] == ".html"
+        assert result["_raw_content"] == mhtml
+        assert result["_content_extension"] == ".mhtml"
 
     @pytest.mark.asyncio
     async def test_pdf_content_type_path_sets_pdf_extension(self):

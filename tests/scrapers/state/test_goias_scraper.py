@@ -396,7 +396,26 @@ class TestGetDocInfo:
         scraper._save_doc_error = AsyncMock()
         result = await scraper._get_doc_info(_make_search_result())
         assert result is not None
+        assert result["type"] == "Lei Ordinária"
         assert result["text_markdown"] is not None
+
+    @pytest.mark.asyncio
+    async def test_type_falls_back_to_search_row_when_detail_type_missing(self):
+        scraper = _make_scraper()
+        scraper._is_already_scraped = MagicMock(return_value=False)
+        detail = _make_doc_detail(conteudo="<p>" + "Lei text " * 100 + "</p>")
+        detail["tipo_legislacao"] = {}
+        response = _make_response(detail)
+        scraper.request_service.make_request = AsyncMock(return_value=response)
+        scraper._get_markdown = AsyncMock(return_value=_make_valid_md())
+        scraper._save_doc_error = AsyncMock()
+
+        result = await scraper._get_doc_info(
+            _make_search_result(tipo_nome="Resolução", tipo_id=7)
+        )
+
+        assert result is not None
+        assert result["type"] == "Resolução"
 
     @pytest.mark.asyncio
     async def test_javascript_error_msg_guard(self):
@@ -523,38 +542,28 @@ class TestGetDocInfo:
 
 
 # ---------------------------------------------------------------------------
-# _get_doc_data
+# _fetch_search_page
 # ---------------------------------------------------------------------------
 
 
-class TestGetDocData:
+class TestFetchSearchPage:
     @pytest.mark.asyncio
     async def test_http_error_returns_empty_list(self):
         scraper = _make_scraper()
         failed = MagicMock()
         failed.__bool__ = MagicMock(return_value=False)
         scraper.request_service.make_request = AsyncMock(return_value=failed)
-        result = await scraper._get_doc_data("https://example.com")
+        result = await scraper._fetch_search_page(2025, 2)
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_zero_results_returns_empty_list(self):
+    async def test_returns_page_results(self):
         scraper = _make_scraper()
-        response = _make_response({"total_resultados": 0, "resultados": []})
+        payload = {"total_resultados": 1, "resultados": [_make_search_result()]}
+        response = _make_response(payload)
         scraper.request_service.make_request = AsyncMock(return_value=response)
-        result = await scraper._get_doc_data("https://example.com")
-        assert result == []
-
-    @pytest.mark.asyncio
-    async def test_uses_preloaded_response_data(self):
-        scraper = _make_scraper()
-        scraper._get_doc_info = AsyncMock(return_value={"title": "Lei 001"})
-        scraper._gather_results = AsyncMock(return_value=[{"title": "Lei 001"}])
-        data = {"total_resultados": 1, "resultados": [_make_search_result()]}
-        result = await scraper._get_doc_data("https://example.com", response_data=data)
-        # request_service.make_request should NOT be called since response_data is preloaded
-        scraper.request_service.make_request.assert_not_called()
-        assert len(result) == 1
+        result = await scraper._fetch_search_page(2025, 2)
+        assert result == payload["resultados"]
 
 
 # ---------------------------------------------------------------------------

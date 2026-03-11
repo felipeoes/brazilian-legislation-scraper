@@ -12,6 +12,7 @@ import re
 from typing import Any
 from urllib.parse import urljoin
 
+from src.scraper.base.converter import strip_html_chrome
 from src.scraper.base.scraper import StateScraper
 
 _RE_TYPE_FROM_TITLE = re.compile(
@@ -122,28 +123,38 @@ class SantaCatarinaScraper(StateScraper):
         if self._is_already_scraped(document_url, title):
             return None
 
-        soup = await self.request_service.get_soup(document_url)
-        if not soup:
+        try:
+            soup, mhtml = await self._fetch_soup_and_mhtml(document_url)
+        except Exception as exc:
             await self._save_doc_error(
                 title=title,
                 year=doc_info.get("year", ""),
                 html_link=document_url,
-                error_message="Failed to fetch document page",
+                error_message=f"Failed to fetch document page: {exc}",
             )
             return None
 
-        self._strip_html_chrome(soup)
+        strip_html_chrome(soup)
         html_content = str(soup)
 
-        norm_type = "Legislação"
+        normalized_title = " ".join(title.split())
+        norm_type = normalized_title
         m = _RE_TYPE_FROM_TITLE.match(title)
         if m:
             matched = m.group(1)
             norm_type = _ABBREV_TO_TYPE.get(matched.upper(), matched.title())
+        else:
+            prefix_match = re.match(
+                r"(.+?)(?:\s+(?:n[º°o]|n\.|número)\s*\d|\s+\d)",
+                normalized_title,
+                re.IGNORECASE,
+            )
+            if prefix_match:
+                norm_type = prefix_match.group(1).strip()
 
         doc_info["type"] = norm_type
         doc_info["situation"] = "Não consta"
-        return await self._process_html_doc(doc_info, html_content, document_url)
+        return await self._process_html_doc(doc_info, html_content, document_url, mhtml)
 
     async def _scrape_type(
         self, norm_type: str, norm_type_id: str, year: int

@@ -3,7 +3,8 @@ from collections import defaultdict
 
 from loguru import logger
 
-from src.scraper.base.scraper import StateScraper
+from src.scraper.base.converter import wrap_html
+from src.scraper.base.scraper import StateScraper, flatten_results
 
 TYPES = {
     "Constituição Estadual": "/Web%5CConstituição%20Estadual",
@@ -194,13 +195,14 @@ class MSAlemsScraper(StateScraper):
         if self._is_already_scraped(url, doc_info.get("title", "")):
             return None
 
-        soup = await self.request_service.get_soup(url)
-        if not soup:
+        try:
+            soup, mhtml = await self._fetch_soup_and_mhtml(url)
+        except Exception as exc:
             await self._save_doc_error(
                 title=doc_info.get("title", ""),
                 year=doc_info.get("year", ""),
                 html_link=url,
-                error_message="Failed to retrieve document page",
+                error_message=f"Failed to retrieve document page: {exc}",
             )
             return None
 
@@ -222,8 +224,8 @@ class MSAlemsScraper(StateScraper):
             )
             return None
 
-        html_string = self._wrap_html(body.decode_contents())
-        return await self._process_html_doc(doc_info, html_string, url)
+        html_string = wrap_html(body.decode_contents())
+        return await self._process_html_doc(doc_info, html_string, url, mhtml)
 
     # ------------------------------------------------------------------
     # Year-level scrape (overrides base class)
@@ -231,7 +233,7 @@ class MSAlemsScraper(StateScraper):
 
     async def _scrape_year(self, year: int) -> list[dict]:
         """List all types for *year* via ReadViewEntries, then process docs."""
-        situation = next(iter(self.situations), "Não consta")
+        situation = self.default_situation
 
         # Fetch document listings for all types concurrently
         listing_tasks = [
@@ -273,4 +275,4 @@ class MSAlemsScraper(StateScraper):
             context={"year": year, "type": "NA", "situation": situation},
             desc=f"MATO GROSSO DO SUL | Year {year}",
         )
-        return self._flatten_results(valid)
+        return flatten_results(valid)

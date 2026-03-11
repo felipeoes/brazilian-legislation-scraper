@@ -48,6 +48,9 @@ TYPES = {
     "Outros Atos": "OUTROS ATOS",
 }
 
+_IN_TITLE_RE = re.compile(r"^in(?:\s+[a-zà-ÿ/.-]+)*\s+\d+", re.IGNORECASE)
+_PORTARIA_TITLE_RE = re.compile(r"^portari[ae]\w*", re.IGNORECASE)
+
 VALID_SITUATIONS = [
     "em vigência",
     "em vigência com alteração",
@@ -300,11 +303,15 @@ class ICMBioScraper(BaseScraper):
             return None, None, True
 
         # Response content-type is text/plain, so read as text then parse
-        text = await cast(aiohttp.ClientResponse, response).text()
+        text = await cast(aiohttp.ClientResponse, response).text(errors="replace")
         data = json.loads(text)
 
-        dsr = data["results"][0]["result"]["data"]["dsr"]
-        ds = dsr["DS"][0]
+        try:
+            dsr = data["results"][0]["result"]["data"]["dsr"]
+            ds = dsr["DS"][0]
+        except (KeyError, IndexError) as e:
+            logger.error(f"Unexpected PowerBI response structure: {e}")
+            return None, None, True
 
         is_complete = ds.get("IC", True)
         next_tokens = ds.get("RT") if not is_complete else None
@@ -335,11 +342,10 @@ class ICMBioScraper(BaseScraper):
             rows = self._parse_dsr_rows(ds, accumulated_dicts)
             all_rows.extend(rows)
 
-            if self.verbose:
-                logger.info(
-                    f"ICMBIO | Fetched page {page}: {len(rows)} rows "
-                    f"(total: {len(all_rows)}, complete: {is_complete})"
-                )
+            logger.debug(
+                f"ICMBIO | Fetched page {page}: {len(rows)} rows "
+                f"(total: {len(all_rows)}, complete: {is_complete})"
+            )
 
             if is_complete or not next_tokens:
                 break
@@ -360,10 +366,10 @@ class ICMBioScraper(BaseScraper):
         because it would match portarias whose titles start with that
         sequence for unrelated reasons.
         """
-        lower = title.lower()
-        if "instrução normativa" in lower or re.match(r"^in\s+\d+", lower):
+        lower = " ".join(title.lower().split())
+        if "instrução normativa" in lower or _IN_TITLE_RE.match(lower):
             return "Instrução Normativa"
-        if "portaria" in lower:
+        if _PORTARIA_TITLE_RE.match(lower):
             return "Portaria"
         return "Outros Atos"
 
@@ -373,7 +379,7 @@ class ICMBioScraper(BaseScraper):
         Returns None if the row has no usable DOU link.
         """
         parts = (row.get("link_dou") or "").split()
-        link_dou = parts[0].strip() if parts else ""
+        link_dou = parts[0].strip().rstrip(";") if parts else ""
         if not link_dou or "in.gov.br" not in link_dou:
             title = row.get("ato", "<sem título>")
             raw_link = row.get("link_dou", "")
@@ -462,23 +468,21 @@ class ICMBioScraper(BaseScraper):
             )
             return None
 
-        # Fetch the DOU page via RequestService (no browser needed)
-        response = await self.request_service.make_request(document_url)
-        if not response or response.status != 200:
-            status = response.status if response else "No response"
-            logger.warning(f"Failed to fetch {document_url}: {status}")
+        try:
+            soup, mhtml = await self._fetch_soup_and_mhtml(
+                document_url, wait_for_selector="div.texto-dou"
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to fetch {document_url}: {exc}")
             await self._save_doc_error(
                 title=doc_title,
                 year=year,
                 situation=situation,
                 norm_type=doc_type,
                 html_link=document_url,
-                error_message=f"HTTP {status}",
+                error_message=f"Failed to fetch page: {exc}",
             )
             return None
-
-        html = await cast(aiohttp.ClientResponse, response).text()
-        soup = BeautifulSoup(html, "html.parser")
         text_div = soup.find("div", class_="texto-dou")
 
         if not text_div:
@@ -538,13 +542,11 @@ class ICMBioScraper(BaseScraper):
             )
             return None
 
-        # Preserve the cleaned HTML fragment as the raw source file.
-        html_string = self._wrap_html(text_div.prettify())
         result = {
             **doc_info,
             "text_markdown": text_markdown,
-            "_raw_content": html_string.encode("utf-8"),
-            "_content_extension": ".html",
+            "_raw_content": mhtml,
+            "_content_extension": ".mhtml",
         }
         await self._save_doc_result(result)
         return result
@@ -561,21 +563,15 @@ class ICMBioScraper(BaseScraper):
 
         logger.info(f"ICMBIO | Year {year}: {len(docs)} documents to process")
 
-        # _get_doc_data calls _save_doc_result internally, so documents are
-        # already persisted before _gather_results validates them.  Pass
-        # min_length=0 to skip the redundant re-validation that would cause
-        # already-saved documents to be double-counted as errors.
         tasks = [self._get_doc_data(doc) for doc in docs]
         valid_results = await self._gather_results(
             tasks,
             context={"year": year, "type": "mixed", "situation": "mixed"},
             desc=f"ICMBIO | Processing docs for {year}",
-            min_length=0,
         )
 
         results = [r for r in valid_results if r is not None]
 
-        if self.verbose:
-            logger.info(f"Finished scraping for Year: {year} | Results: {len(results)}")
+        logger.debug(f"Finished scraping for Year: {year} | Results: {len(results)}")
 
         return results

@@ -3,6 +3,7 @@ from io import BytesIO
 from bs4 import BeautifulSoup
 from urllib.parse import urlencode
 from loguru import logger
+from src.scraper.base.converter import calc_pages, valid_markdown, wrap_html
 from src.scraper.base.scraper import StateScraper
 
 TYPES = {
@@ -43,6 +44,21 @@ class LegislaGoias(StateScraper):
         self._special_regex = re.compile(r"[^a-zA-ZÀ-ÿ\s]")
         self._space_regex = re.compile(r"\s+")
 
+    @staticmethod
+    def _resolve_norm_type(doc: dict, doc_detail: dict) -> str:
+        """Resolve the most reliable norm type from detail or search payloads."""
+        detail_type = (
+            (doc_detail.get("tipo_legislacao") or {}).get("nome") or ""
+        ).strip()
+        if detail_type:
+            return detail_type
+
+        search_type = ((doc.get("tipo_legislacao") or {}).get("nome") or "").strip()
+        if search_type:
+            return search_type
+
+        return ""
+
     def _build_search_url(
         self, year: int, page: int = 1, norm_type_id: int | None = None
     ) -> str:
@@ -72,7 +88,7 @@ class LegislaGoias(StateScraper):
 
         raw_content = await response.read()
         text_markdown = await self._get_markdown(stream=BytesIO(raw_content))
-        valid, reason = self._valid_markdown(text_markdown)
+        valid, reason = valid_markdown(text_markdown)
         if not valid:
             logger.error(
                 f"Failed to extract text from PDF for doc ID: {doc_id}: {reason}"
@@ -131,13 +147,19 @@ class LegislaGoias(StateScraper):
         situation = (doc_detail.get("estado_legislacao") or {}).get("nome", "") or (
             doc.get("estado_legislacao") or {}
         ).get("nome", "")
+        norm_type = self._resolve_norm_type(doc, doc_detail)
+
+        title_type = norm_type or (doc_detail.get("tipo_legislacao") or {}).get(
+            "nome", "Norma"
+        )
 
         doc_info = {
             "id": doc_detail["id"],
             "norm_number": doc_detail["numero"],
+            "type": norm_type,
             "situation": situation,
             "date": doc_detail["data_legislacao"],
-            "title": f"{doc_detail['tipo_legislacao']['nome']} {doc_detail['numero']} de {doc_detail['ano']}",
+            "title": f"{title_type} {doc_detail['numero']} de {doc_detail['ano']}",
             "summary": doc_detail["ementa"].strip(),
         }
 
@@ -192,16 +214,22 @@ class LegislaGoias(StateScraper):
             html_string = soup.prettify().strip()
 
             if not html_string.startswith("<html"):
-                html_string = self._wrap_html(html_string)
+                html_string = wrap_html(html_string)
 
             # Convert HTML to markdown using direct HTML content
             text_markdown = await self._get_markdown(html_content=html_string)
-            valid, reason = self._valid_markdown(text_markdown)
+            valid, reason = valid_markdown(text_markdown)
             if valid:
                 text_markdown = text_markdown.strip()
                 doc_info["text_markdown"] = text_markdown
-                doc_info["_raw_content"] = html_string.encode("utf-8")
-                doc_info["_content_extension"] = ".html"
+                try:
+                    doc_info["_raw_content"] = await self._capture_mhtml(html_link)
+                    doc_info["_content_extension"] = ".mhtml"
+                except Exception as exc:
+                    logger.warning(
+                        f"MHTML capture failed for {html_link}: {exc} — falling back to PDF"
+                    )
+                    doc_info["text_markdown"] = None  # force PDF fallback below
 
                 new_text = self._special_regex.sub("", text_markdown.lower())
                 new_text = self._space_regex.sub("", new_text).strip()
@@ -252,39 +280,16 @@ class LegislaGoias(StateScraper):
 
         return doc_info
 
-    async def _get_doc_data(
-        self,
-        url: str,
-        response_data: dict | None = None,
-    ) -> list[dict] | None:
-        """Get document data from a search page URL or preloaded response data."""
-        if response_data is None:
-            response = await self.request_service.make_request(url)
-
-            if not response:
-                logger.error(f"Error getting data from URL: {url}")
-                return []
-
-            response_data = await response.json()
-
-        total_results = response_data["total_resultados"]
-        if total_results == 0:
+    async def _fetch_search_page(self, year: int, page: int) -> list[dict]:
+        """Fetch a specific page from the search API."""
+        url = self._build_search_url(year, page=page)
+        response = await self.request_service.make_request(url)
+        if not response:
+            logger.error(f"Error fetching search page {page} for year {year}")
             return []
 
-        data = response_data["resultados"]
-        docs = []
-
-        tasks = [self._get_doc_info(doc) for doc in data]
-        valid_results = await self._gather_results(
-            tasks,
-            context={"year": "NA", "type": "NA", "situation": "NA"},
-            desc="GOIAS | get_doc_info",
-        )
-        for result in valid_results:
-            if result:
-                docs.append(result)
-
-        return docs
+        data = await response.json()
+        return data.get("resultados", [])
 
     async def _scrape_year(self, year: int) -> list[dict]:
         """Scrape norms for a specific year (all types in one API call)."""
@@ -301,29 +306,33 @@ class LegislaGoias(StateScraper):
         if total_results == 0:
             return []
 
-        pages = self._calc_pages(total_results, 100)
+        docs = data.get("resultados", [])
+        pages = calc_pages(total_results, 100)
 
-        ctx = {"year": year, "type": "all", "situation": "NA"}
-        tasks = [
-            self._with_save(
-                self._get_doc_data(url, response_data=data),
-                ctx,
-            )
-        ]
-        tasks.extend(
-            [
-                self._with_save(
-                    self._get_doc_data(self._build_search_url(year, page=page)),
-                    ctx,
-                )
-                for page in range(2, pages + 1)
+        if pages > 1:
+            tasks = [
+                self._fetch_search_page(year, page) for page in range(2, pages + 1)
             ]
-        )
-        results = await self._gather_results(
-            tasks,
-            context=ctx,
-            desc=f"GOIAS | year {year}",
-        )
-        results = self._flatten_results(results)
+            page_results = await self._gather_results(
+                tasks,
+                desc=f"GOIAS | year {year} page metadata",
+            )
+            for pr in page_results:
+                if isinstance(pr, list):
+                    docs.extend(pr)
+                elif isinstance(pr, Exception):
+                    logger.error(
+                        f"Failed to fetch a search page for year {year} | Error: {pr}"
+                    )
 
-        return results
+        if not docs:
+            return []
+
+        return await self._process_documents(
+            documents=docs,
+            year=year,
+            norm_type="NA",
+            situation="NA",
+            desc=f"GOIAS | year {year}",
+            doc_data_fn=self._get_doc_info,
+        )

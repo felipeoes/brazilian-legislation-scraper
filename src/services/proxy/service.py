@@ -55,8 +55,7 @@ class ProxyService:
             if self._loaded and (current_time - self._last_loaded) < ttl:
                 return
 
-            if self.verbose:
-                logger.info("Reloading proxies...")
+            logger.debug("Reloading proxies...")
 
             file_path = self.config.get("file_path")
             endpoint = self.config.get("endpoint")

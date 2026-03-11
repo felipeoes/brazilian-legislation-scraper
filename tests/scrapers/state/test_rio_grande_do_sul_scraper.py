@@ -348,6 +348,7 @@ class TestGetDocData:
         scraper.request_service.get_soup = AsyncMock(
             side_effect=[first_soup, second_soup]
         )
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(second_soup, b"MHTML"))
         scraper._is_already_scraped = MagicMock(return_value=False)
         scraper._get_markdown = AsyncMock(return_value="short")
         scraper._save_doc_error = AsyncMock()
@@ -362,9 +363,11 @@ class TestGetDocData:
         second_html = f"<html><body><table><tbody>{rows}</tbody></table></body></html>"
         first_soup = self._make_first_soup(link="/link.html")
         second_soup = BeautifulSoup(second_html, "html.parser")
+        mhtml = b"MHTML content"
         scraper.request_service.get_soup = AsyncMock(
             side_effect=[first_soup, second_soup]
         )
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(second_soup, mhtml))
         scraper._is_already_scraped = MagicMock(return_value=False)
         valid_md = "# Decreto\n\n" + "Texto do decreto. " * 30
         scraper._get_markdown = AsyncMock(return_value=valid_md)
@@ -372,7 +375,8 @@ class TestGetDocData:
         result = await scraper._get_doc_data(self._make_doc())
         assert result is not None
         assert result["text_markdown"] == valid_md.strip()
-        assert result["_content_extension"] == ".html"
+        assert result["_content_extension"] == ".mhtml"
+        assert result["_raw_content"] == mhtml
 
     @pytest.mark.asyncio
     async def test_invalid_markdown_pdf_path_returns_none(self):

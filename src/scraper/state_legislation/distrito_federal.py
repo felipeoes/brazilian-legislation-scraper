@@ -1,13 +1,22 @@
+from __future__ import annotations
+
 import json
 import re
 from io import BytesIO
 from typing import cast
+from urllib.parse import urljoin
 
 import aiohttp
 import fitz
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString, Tag
 from loguru import logger
 
+from src.scraper.base.converter import (
+    detect_extension,
+    is_pdf,
+    valid_markdown,
+    wrap_html,
+)
 from src.scraper.base.scraper import StateScraper
 
 TYPES = {
@@ -75,6 +84,26 @@ INVALID_SITUATIONS = {
 SITUATIONS = VALID_SITUATIONS | INVALID_SITUATIONS
 
 
+def _build_stop_next_heading_re(
+    types: dict, type_aliases: dict[str, tuple[str, ...]]
+) -> re.Pattern[str]:
+    """Precompute the stop-marker regex for multi-norm PDF pages."""
+    all_type_names = sorted(
+        {
+            *types.keys(),
+            *type_aliases.keys(),
+            *(alias for aliases in type_aliases.values() for alias in aliases),
+        },
+        key=len,
+        reverse=True,
+    )
+    alternation = "|".join(re.escape(t) for t in all_type_names)
+    return re.compile(
+        rf"\n(?:{alternation})\b\s*(?:N(?:[º°o]|o)?\.?\s*)?\d",
+        re.IGNORECASE,
+    )
+
+
 class DFSinjScraper(StateScraper):
     """Webscraper for Distrito Federal state legislation website (https://www.sinj.df.gov.br/sinj/)
 
@@ -86,7 +115,7 @@ class DFSinjScraper(StateScraper):
     taxonomy documentation.
     """
 
-    _iterate_situations = True
+    _iterate_situations = False
     _TEXT_ENDPOINT = "TextoArquivoNorma.aspx?id_file={id_file}"
     _RAW_ENDPOINT = "Norma/{ch_norma}/arquivo"
     _DETAILS_ENDPOINT = "DetalhesDeNorma.aspx?id_norma={ch_norma}"
@@ -113,9 +142,16 @@ class DFSinjScraper(StateScraper):
         r"INFORMA(?:Ç|C)(?:Õ|O)ES\s+IMPRECISAS",
         re.IGNORECASE,
     )
-    _TYPE_ALIASES = {
+    _TYPE_ALIASES: dict[str, tuple[str, ...]] = {
         "ADI": ("Ação Direta de Inconstitucionalidade",),
     }
+
+    # Precomputed stop-marker patterns for _clean_pdf_fallback_text
+    _STOP_NEXT_HEADING_RE: re.Pattern[str]  # set after class body
+    _STOP_ATOS_RE = re.compile(r"\nATOS?\s+DA\s+[A-ZÁÉÍÓÚÂÊÔÃÕÇ\s-]{3,}", re.IGNORECASE)
+    _STOP_DIGITAL_SIGN_RE = re.compile(
+        r"\nDocumento\s+assinado\s+digitalmente", re.IGNORECASE
+    )
 
     def __init__(
         self,
@@ -133,7 +169,15 @@ class DFSinjScraper(StateScraper):
             f"{self.base_url}/ashx/Datatable/ResultadoDePesquisaNormaDatatable.ashx"
         )
         self._display_length = 5000
-        self._document_batch_size = max(self.max_workers * 10, 200)
+
+    @staticmethod
+    def _infer_norm_type(title: str) -> str:
+        """Infer a norm type from the rendered title when the API omits it."""
+        normalized_title = " ".join(title.split())
+        for type_name in sorted(TYPES, key=len, reverse=True):
+            if normalized_title.casefold().startswith(type_name.casefold()):
+                return type_name
+        return ""
 
     def _build_payload(
         self,
@@ -143,7 +187,7 @@ class DFSinjScraper(StateScraper):
         limit: int | None = None,
     ) -> list[tuple[str, object]]:
         """Build the minimal datatable payload needed for a year-wide search."""
-        display_length = limit or self._display_length
+        display_length = self._display_length if limit is None else limit
         return [
             ("bbusca", "sinj_norma"),
             ("tipo_pesquisa", "avancada"),
@@ -220,9 +264,22 @@ class DFSinjScraper(StateScraper):
 
         return text
 
+    @staticmethod
+    def _normalize_whitespace(text: str) -> str:
+        """Collapse runs of spaces/tabs and excess blank lines."""
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n[ \t]+", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+    @staticmethod
+    def _normalize_linebreaks(text: str) -> str:
+        """Normalize line endings and remove soft hyphens."""
+        text = text.replace("\r", "\n").replace("\x0c", "\n")
+        return text.replace("\u00ad", "")
+
     def _clean_extracted_text(self, text: str, doc_info: dict) -> str:
-        cleaned = text.replace("\r", "\n").replace("\x0c", "\n")
-        cleaned = cleaned.replace("\u00ad", "")
+        cleaned = self._normalize_linebreaks(text)
         cleaned = self._trim_to_title(cleaned, doc_info)
         cleaned = self._TEXT_HEADER_RE.sub("", cleaned, count=1).strip()
 
@@ -230,22 +287,127 @@ class DFSinjScraper(StateScraper):
         if disclaimer_match:
             cleaned = cleaned[: disclaimer_match.start()].rstrip()
 
-        cleaned = re.sub(r"[ \t]+", " ", cleaned)
-        cleaned = re.sub(r"\n[ \t]+", "\n", cleaned)
-        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-        return cleaned.strip()
+        return self._normalize_whitespace(cleaned)
 
-    async def _extract_html_markdown(self, body: bytes, doc_info: dict) -> str:
-        soup = BeautifulSoup(body, "html.parser")
+    _SUMMARY_NORMALIZE_RE = re.compile(r"[^\w]", re.UNICODE)
+
+    @classmethod
+    def _normalize_for_compare(cls, text: str) -> str:
+        return cls._SUMMARY_NORMALIZE_RE.sub("", text).lower()
+
+    @classmethod
+    def _remove_summary_element(cls, content_root: Tag, summary: str) -> None:
+        """Remove the summary/ementa from *content_root*.
+
+        First tries to decompose a child *tag* (``<p>``, ``<span>``, etc.)
+        whose text matches the summary.  If no suitable tag is found (common on
+        SINJ pages where ``div_texto`` contains only raw text nodes), falls back
+        to replacing the matching ``NavigableString`` text node directly.
+        """
+        if not summary:
+            return
+
+        normalized_summary = cls._normalize_for_compare(summary)
+        if not normalized_summary:
+            return
+
+        # --- Strategy 1: decompose a child tag containing the summary ---
+        candidates: list[tuple[int, Tag]] = []
+        for tag in content_root.find_all(["p", "span", "font", "div", "td", "table"]):
+            tag_text = tag.get_text(" ", strip=True)
+            normalized_tag = cls._normalize_for_compare(tag_text)
+            if not normalized_tag:
+                continue
+            if normalized_summary not in normalized_tag:
+                continue
+            lower_text = tag_text.lower()
+            if "art." in lower_text or "o governador" in lower_text:
+                continue
+            candidates.append((len(normalized_tag), tag))
+
+        if candidates:
+            _, best_tag = min(candidates, key=lambda item: item[0])
+            best_tag.decompose()
+            return
+
+        # --- Strategy 2: strip summary from raw NavigableString text nodes ---
+        # SINJ pages often have div_texto with a single text node containing
+        # the entire document.  Find and excise just the summary line.
+        for node in list(content_root.children):
+            if not isinstance(node, NavigableString):
+                continue
+            text = str(node)
+            normalized_text = cls._normalize_for_compare(text)
+            if normalized_summary not in normalized_text:
+                continue
+            # Walk lines to find the one matching the summary
+            lines = text.split("\n")
+            filtered = []
+            removed = False
+            for line in lines:
+                if (
+                    not removed
+                    and cls._normalize_for_compare(line) == normalized_summary
+                ):
+                    removed = True
+                    continue
+                filtered.append(line)
+            if removed:
+                node.replace_with(NavigableString("\n".join(filtered)))
+                return
+
+    @classmethod
+    def _strip_summary_text(cls, text: str, summary: str) -> str:
+        """Remove the summary/ementa from the beginning of plain text (PDF path)."""
+        if not summary:
+            return text
+        normalized_summary = cls._normalize_for_compare(summary)
+        if not normalized_summary:
+            return text
+        # Find the first line break after the title line
+        first_nl = text.find("\n")
+        if first_nl < 0:
+            return text
+        # Search for the summary within a reasonable window after the title
+        search_region = text[first_nl : first_nl + len(summary) * 3]
+        normalized_region = cls._normalize_for_compare(search_region)
+        pos = normalized_region.find(normalized_summary)
+        if pos < 0:
+            return text
+        # Map normalized position back to original text position
+        consumed_norm = 0
+        orig_start = 0
+        for i, ch in enumerate(search_region):
+            if consumed_norm >= pos:
+                orig_start = i
+                break
+            if cls._SUMMARY_NORMALIZE_RE.match(ch) is None:
+                consumed_norm += 1
+        consumed_norm = 0
+        orig_end = len(search_region)
+        for i, ch in enumerate(search_region[orig_start:], start=orig_start):
+            if consumed_norm >= len(normalized_summary):
+                orig_end = i
+                break
+            if cls._SUMMARY_NORMALIZE_RE.match(ch) is None:
+                consumed_norm += 1
+        abs_start = first_nl + orig_start
+        abs_end = first_nl + orig_end
+        return (text[:abs_start].rstrip() + "\n" + text[abs_end:].lstrip()).strip()
+
+    async def _extract_html_markdown(self, soup: BeautifulSoup, doc_info: dict) -> str:
+        """Extract markdown from a pre-parsed BeautifulSoup object."""
         norm_text_tag = soup.find("div", id="div_texto")
         if not norm_text_tag:
             return ""
+
+        self._remove_summary_element(norm_text_tag, doc_info.get("summary", ""))
 
         text_markdown = self._clean_extracted_text(
             norm_text_tag.get_text("\n", strip=False),
             doc_info,
         )
-        if self._valid_markdown(text_markdown)[0]:
+        if valid_markdown(text_markdown)[0]:
             return text_markdown
 
         cleaned_tag = self._clean_norm_soup(
@@ -258,44 +420,21 @@ class DFSinjScraper(StateScraper):
             remove_style_tags=True,
             remove_script_tags=True,
         )
-        html_string = self._wrap_html(str(cleaned_tag))
+        html_string = wrap_html(str(cleaned_tag))
         text_markdown = await self._get_markdown(html_content=html_string)
         return self._clean_extracted_text(text_markdown, doc_info)
 
     def _clean_pdf_fallback_text(self, text: str, doc_info: dict) -> str:
-        cleaned = text.replace("\r", "\n").replace("\x0c", "\n")
-        cleaned = cleaned.replace("\u00ad", "")
+        cleaned = self._normalize_linebreaks(text)
         cleaned = self._trim_to_title(cleaned, doc_info, max_start=None)
-
-        stop_markers = []
-        next_heading_types = sorted(
-            {
-                *TYPES.keys(),
-                *self._TYPE_ALIASES.keys(),
-                *(
-                    alias
-                    for aliases in self._TYPE_ALIASES.values()
-                    for alias in aliases
-                ),
-            },
-            key=len,
-            reverse=True,
-        )
-        stop_markers.append(
-            re.compile(
-                rf"\n(?:{'|'.join(re.escape(item) for item in next_heading_types)})\b\s*(?:N(?:[º°o]|o)?\.?\s*)?\d",
-                re.IGNORECASE,
-            )
-        )
-        stop_markers.append(
-            re.compile(r"\nATOS?\s+DA\s+[A-ZÁÉÍÓÚÂÊÔÃÕÇ\s-]{3,}", re.IGNORECASE)
-        )
-        stop_markers.append(
-            re.compile(r"\nDocumento\s+assinado\s+digitalmente", re.IGNORECASE)
-        )
+        cleaned = self._strip_summary_text(cleaned, doc_info.get("summary", ""))
 
         cut_positions = []
-        for pattern in stop_markers:
+        for pattern in (
+            self._STOP_NEXT_HEADING_RE,
+            self._STOP_ATOS_RE,
+            self._STOP_DIGITAL_SIGN_RE,
+        ):
             match = pattern.search(cleaned[1:])
             if match:
                 cut_positions.append(match.start() + 1)
@@ -306,14 +445,11 @@ class DFSinjScraper(StateScraper):
         if disclaimer_match:
             cleaned = cleaned[: disclaimer_match.start()].rstrip()
 
-        cleaned = re.sub(r"[ \t]+", " ", cleaned)
-        cleaned = re.sub(r"\n[ \t]+", "\n", cleaned)
-        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-        return cleaned.strip()
+        return self._normalize_whitespace(cleaned)
 
     @classmethod
-    def _has_maintenance_placeholder(cls, body: bytes) -> bool:
-        soup = BeautifulSoup(body, "html.parser")
+    def _is_maintenance_soup(cls, soup: BeautifulSoup) -> bool:
+        """Return True if *soup* contains a SINJ maintenance placeholder."""
         text = soup.get_text(" ", strip=True)
         if not text:
             return False
@@ -391,7 +527,7 @@ class DFSinjScraper(StateScraper):
 
     async def _fetch_diary_pdf_fallback(
         self, doc: dict
-    ) -> tuple[str, bytes, str] | None:
+    ) -> tuple[str, bytes, str, str] | None:
         ch_norma = str(doc.get("ch_norma") or "")
         if not ch_norma:
             return None
@@ -419,9 +555,9 @@ class DFSinjScraper(StateScraper):
                 filename=diary_file.get("filename") or "diario.pdf",
             )
             text_markdown = self._clean_pdf_fallback_text(text_markdown, doc)
-            valid, _ = self._valid_markdown(text_markdown)
+            valid, _ = valid_markdown(text_markdown)
             if valid:
-                return text_markdown, pdf_slice, ".pdf"
+                return text_markdown, pdf_slice, ".pdf", diary_url
 
         return None
 
@@ -452,6 +588,9 @@ class DFSinjScraper(StateScraper):
                 f"{item_info.get('nm_tipo_norma', 'Norma')} "
                 f"{item_info.get('nr_norma', '')} de {item_info.get('dt_assinatura', '')}"
             ).strip()
+            norm_type = (
+                item_info.get("nm_tipo_norma") or ""
+            ).strip() or self._infer_norm_type(title)
 
             docs.append(
                 {
@@ -459,7 +598,7 @@ class DFSinjScraper(StateScraper):
                     "summary": item_info.get("ds_ementa", ""),
                     "date": item_info.get("dt_assinatura", ""),
                     "number": item_info.get("nr_norma", ""),
-                    "type": item_info.get("nm_tipo_norma") or "NA",
+                    "type": norm_type,
                     "situation": item_info.get("nm_situacao") or "NA",
                     "document_url": fallback_url,
                     "file_id": file_info.get("id_file") or "",
@@ -475,18 +614,30 @@ class DFSinjScraper(StateScraper):
     async def _get_docs_links(
         self, url: str, payload: list[tuple[str, object]]
     ) -> list[dict]:
-        """Return document metadata rows from the SINJ datatable endpoint."""
-        if url != self.search_url:
-            logger.warning(
-                f"Ignoring custom DF search URL {url}; using {self.search_url}"
-            )
+        """Template-method implementation — wraps ``_fetch_search_page`` and discards the total.
+
+        The internal scraping flow (``_scrape_year``) calls ``_fetch_search_page``
+        directly to retain the total count for pagination.  This method exists for
+        interface compliance with ``BaseScraper`` and for external/test callers that
+        only need the document list.
+        """
         docs, _ = await self._fetch_search_page(payload)
         return docs
 
-    @staticmethod
-    def _iter_batches(items: list[dict], batch_size: int):
-        for start in range(0, len(items), batch_size):
-            yield items[start : start + batch_size]
+    async def _handle_maintenance(self, soup: BeautifulSoup, doc: dict) -> bool:
+        """Log a maintenance error and return True if *soup* is a maintenance page."""
+        if not self._is_maintenance_soup(soup):
+            return False
+        fallback_url = doc.get("document_url", "")
+        await self._save_doc_error(
+            title=doc.get("title", ""),
+            year=doc.get("year", ""),
+            situation=doc.get("situation", ""),
+            norm_type=doc.get("type", ""),
+            html_link=fallback_url,
+            error_message="Norm text is in maintenance on SINJ",
+        )
+        return True
 
     async def _get_doc_data(self, doc_info: dict) -> dict | None:
         """Fetch a single norm, preferring the HTML text endpoint over raw PDFs."""
@@ -494,84 +645,151 @@ class DFSinjScraper(StateScraper):
         document_url = doc.get("document_url", "")
         title = doc.get("title", "Unknown")
         file_id = str(doc.get("file_id") or "").strip()
-        fallback_url = document_url or self._build_raw_url(
-            self.base_url, str(doc.get("ch_norma") or "")
+        file_name = doc.get("file_name") or ""
+        ch_norma = str(doc.get("ch_norma") or "")
+        fallback_url = document_url or self._build_raw_url(self.base_url, ch_norma)
+        text_url = self._build_text_url(self.base_url, file_id) if file_id else ""
+        download_url = (
+            f"{self.base_url}/Norma/{ch_norma}/{file_name}"
+            if file_name and ch_norma
+            else ""
         )
+        pdf_file = file_name.lower().endswith(".pdf")
+        if download_url and not pdf_file:
+            primary_url = download_url
+        else:
+            primary_url = text_url or fallback_url
 
-        if self._is_already_scraped(fallback_url, title):
+        if self._is_already_scraped(primary_url, title):
             return None
 
         try:
+            # --- Attempt 1: compiled HTML text endpoint ---
             if file_id:
-                text_url = self._build_text_url(self.base_url, file_id)
                 response = await self.request_service.make_request(text_url)
                 if response:
                     client_response = cast(aiohttp.ClientResponse, response)
                     body = await client_response.read()
-                    if self._has_maintenance_placeholder(body):
-                        await self._save_doc_error(
-                            title=title,
-                            year=doc.get("year", ""),
-                            situation=doc.get("situation", ""),
-                            norm_type=doc.get("type", ""),
-                            html_link=fallback_url,
-                            error_message="Norm text is in maintenance on SINJ",
-                        )
+                    soup = BeautifulSoup(body, "html.parser")
+                    if await self._handle_maintenance(soup, doc):
                         return None
-                    text_markdown = await self._extract_html_markdown(body, doc)
-                    valid, _ = self._valid_markdown(text_markdown)
+                    text_markdown = await self._extract_html_markdown(soup, doc)
+                    valid, _ = valid_markdown(text_markdown)
                     if valid and not self._looks_like_site_chrome(text_markdown):
+                        dl_link = soup.find("a", class_="baixarArquivo")
+                        if dl_link and dl_link.get("href"):
+                            doc_url = urljoin(text_url, str(dl_link["href"]))
+                        else:
+                            doc_url = download_url or text_url
+                        # PDF download URLs trigger Playwright downloads instead of
+                        # loading a page — use the HTML text endpoint for MHTML capture.
+                        if doc_url.lower().endswith(".pdf"):
+                            doc_url = text_url
                         doc["text_markdown"] = text_markdown
-                        doc["document_url"] = fallback_url
-                        doc["_mhtml_url"] = text_url
-                        doc["_raw_content"] = body
-                        doc["_content_extension"] = ".html"
+                        doc["document_url"] = doc_url
+                        try:
+                            doc["_raw_content"] = await self._capture_mhtml(doc_url)
+                            doc["_content_extension"] = ".mhtml"
+                        except Exception as exc:
+                            logger.warning(f"MHTML capture failed for {doc_url}: {exc}")
+                            await self._save_doc_error(
+                                title=title,
+                                year=doc.get("year", ""),
+                                situation=doc.get("situation", ""),
+                                norm_type=doc.get("type", ""),
+                                html_link=doc_url,
+                                error_message=f"MHTML capture failed: {exc}",
+                            )
+                            return None
                         return doc
 
+            # --- Attempt 2: raw /arquivo endpoint ---
             response = await self.request_service.make_request(fallback_url)
             if not response:
                 raise RuntimeError(f"No response for {fallback_url}")
 
             client_response = cast(aiohttp.ClientResponse, response)
             body = await client_response.read()
-            if self._has_maintenance_placeholder(body):
+            filename, content_type = self.request_service.detect_content_info(
+                client_response
+            )
+
+            if is_pdf(body, content_type):
+                # --- Attempt 2b: direct PDF conversion (bytes already in memory) ---
+                text_markdown = await self._get_markdown(
+                    stream=BytesIO(body),
+                    filename=filename or doc.get("file_name") or "document.pdf",
+                )
+                valid, reason = valid_markdown(text_markdown)
+                if valid and not self._looks_like_site_chrome(text_markdown):
+                    doc["text_markdown"] = text_markdown
+                    doc["document_url"] = fallback_url
+                    doc["_raw_content"] = body
+                    doc["_content_extension"] = detect_extension(content_type, filename)
+                    return doc
+
+                # --- Attempt 3 (PDF): diary PDF slice — only for image/scanned PDFs ---
+                diary_fallback = await self._fetch_diary_pdf_fallback(doc)
+                if diary_fallback is not None:
+                    text_markdown, raw_content, content_ext, diary_url = diary_fallback
+                    doc["text_markdown"] = text_markdown
+                    doc["document_url"] = diary_url
+                    doc["_raw_content"] = raw_content
+                    doc["_content_extension"] = content_ext
+                    return doc
+
                 await self._save_doc_error(
                     title=title,
                     year=doc.get("year", ""),
                     situation=doc.get("situation", ""),
                     norm_type=doc.get("type", ""),
                     html_link=fallback_url,
-                    error_message="Norm text is in maintenance on SINJ",
+                    error_message=f"Could not extract valid markdown from PDF: {reason}",
                 )
                 return None
-            filename, content_type = self.request_service.detect_content_info(
-                client_response
-            )
 
-            text_markdown = await self._extract_html_markdown(body, doc)
-            valid, reason = self._valid_markdown(text_markdown)
+            # HTML path
+            soup = BeautifulSoup(body, "html.parser")
+            if await self._handle_maintenance(soup, doc):
+                return None
+
+            text_markdown = await self._extract_html_markdown(soup, doc)
+            valid, reason = valid_markdown(text_markdown)
             if valid and not self._looks_like_site_chrome(text_markdown):
                 doc["text_markdown"] = text_markdown
                 doc["document_url"] = fallback_url
-                doc["_mhtml_url"] = fallback_url
-                doc["_raw_content"] = body
-                doc["_content_extension"] = ".html"
+                try:
+                    doc["_raw_content"] = await self._capture_mhtml(fallback_url)
+                    doc["_content_extension"] = ".mhtml"
+                except Exception as exc:
+                    logger.warning(f"MHTML capture failed for {fallback_url}: {exc}")
+                    await self._save_doc_error(
+                        title=title,
+                        year=doc.get("year", ""),
+                        situation=doc.get("situation", ""),
+                        norm_type=doc.get("type", ""),
+                        html_link=fallback_url,
+                        error_message=f"MHTML capture failed: {exc}",
+                    )
+                    return None
                 return doc
 
+            # --- Attempt 3 (HTML): diary PDF slice ---
             diary_fallback = await self._fetch_diary_pdf_fallback(doc)
             if diary_fallback is not None:
-                text_markdown, raw_content, content_ext = diary_fallback
+                text_markdown, raw_content, content_ext, diary_url = diary_fallback
                 doc["text_markdown"] = text_markdown
-                doc["document_url"] = fallback_url
+                doc["document_url"] = diary_url
                 doc["_raw_content"] = raw_content
                 doc["_content_extension"] = content_ext
                 return doc
 
+            # --- Attempt 4: generic markdown from full HTML page ---
             text_markdown = await self._get_markdown(
                 stream=BytesIO(body),
-                filename=filename or doc.get("file_name") or "document.pdf",
+                filename=filename or doc.get("file_name") or "document.html",
             )
-            valid, reason = self._valid_markdown(text_markdown)
+            valid, reason = valid_markdown(text_markdown)
             if not valid or self._looks_like_site_chrome(text_markdown):
                 await self._save_doc_error(
                     title=title,
@@ -586,10 +804,10 @@ class DFSinjScraper(StateScraper):
             doc["text_markdown"] = text_markdown
             doc["document_url"] = fallback_url
             doc["_raw_content"] = body
-            doc["_content_extension"] = self._detect_extension(content_type, filename)
+            doc["_content_extension"] = detect_extension(content_type, filename)
             return doc
         except Exception as exc:
-            logger.error(f"Error getting document data for {fallback_url}: {exc}")
+            logger.exception(f"Error getting document data for {fallback_url}: {exc}")
             await self._save_doc_error(
                 title=title,
                 year=doc.get("year", ""),
@@ -601,7 +819,7 @@ class DFSinjScraper(StateScraper):
             return None
 
     async def _scrape_year(self, year: int) -> list[dict]:
-        """Scrape a whole SINJ year in broad listing batches."""
+        """Scrape a whole SINJ year via a broad datatable query."""
         first_page_docs, total = await self._fetch_search_page(
             self._build_payload(year)
         )
@@ -613,37 +831,33 @@ class DFSinjScraper(StateScraper):
             offsets = range(len(first_page_docs), total, self._display_length)
             page_results = await self._gather_results(
                 [
-                    self._get_docs_links(
-                        self.search_url, self._build_payload(year, offset=o)
-                    )
+                    self._fetch_search_page(self._build_payload(year, offset=o))
                     for o in offsets
                 ],
                 context={"year": year, "type": "NA", "situation": "NA"},
                 desc=f"DISTRITO FEDERAL | {year} | get_docs_links",
             )
-            for page_docs in page_results:
+            for page_docs, _ in page_results:
                 if page_docs:
                     documents.extend(page_docs)
-
-        for doc in documents:
-            doc["year"] = year
 
         if not documents:
             return []
 
-        results: list[dict] = []
-        total_batches = self._calc_pages(len(documents), self._document_batch_size)
-        for index, batch in enumerate(
-            self._iter_batches(documents, self._document_batch_size),
-            start=1,
-        ):
-            batch_results = await self._process_documents(
-                batch,
-                year=year,
-                norm_type="NA",
-                situation="NA",
-                desc=f"DISTRITO FEDERAL | {year} | docs {index}/{total_batches}",
-            )
-            results.extend(batch_results)
+        for doc in documents:
+            doc["year"] = year
 
-        return results
+        return await self._process_documents(
+            documents,
+            year=year,
+            norm_type="NA",
+            situation="NA",
+            desc=f"DISTRITO FEDERAL | {year} | docs",
+        )
+
+
+# Precompute the stop-next-heading regex at class definition time.
+# Done outside the class body so it can reference both TYPES and _TYPE_ALIASES.
+DFSinjScraper._STOP_NEXT_HEADING_RE = _build_stop_next_heading_re(
+    TYPES, DFSinjScraper._TYPE_ALIASES
+)

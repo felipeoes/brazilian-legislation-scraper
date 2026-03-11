@@ -1,8 +1,9 @@
+import re
 from urllib.parse import urlencode
 
 from bs4 import BeautifulSoup
 from loguru import logger
-from src.scraper.base.scraper import StateScraper
+from src.scraper.base.scraper import StateScraper, flatten_results
 
 TYPES = {
     "Lei Ordinária": "lei ord",
@@ -18,6 +19,14 @@ VALID_SITUATIONS = [
 
 INVALID_SITUATIONS = []
 SITUATIONS = {s: s for s in VALID_SITUATIONS + INVALID_SITUATIONS}
+
+_TYPE_PATTERNS = [
+    (r"^lei\s*ord(?:in[aá]ria)?\b", "Lei Ordinária"),
+    (r"^lei\s*comp(?:lementar)?\b", "Lei Complementar"),
+    (r"^emenda\b", "Emenda Constitucional"),
+    (r"^constitui(?:c|ç)(?:a|ã)o\b", "Constituição Estadual"),
+    (r"^resolu(?:c|ç)(?:a|ã)o\b", "Resolução"),
+]
 
 
 class RNAlrnScraper(StateScraper):
@@ -59,17 +68,18 @@ class RNAlrnScraper(StateScraper):
     @staticmethod
     def _infer_norm_type(title: str) -> str:
         """Infer norm type from document title prefix."""
-        lower = title.lower()
-        if "lei ord" in lower:
-            return "Lei Ordinária"
-        if "lei comp" in lower:
-            return "Lei Complementar"
-        if "emenda" in lower:
-            return "Emenda Constitucional"
-        if "constitu" in lower:
-            return "Constituição Estadual"
-        if "resolu" in lower:
-            return "Resolução"
+        normalized = re.sub(r"(?<=[A-Za-zÀ-ÿ])(?=\d)", " ", title)
+        normalized = re.sub(r"[^\wÀ-ÿ]+", " ", normalized, flags=re.UNICODE)
+        normalized = re.sub(r"\s+", " ", normalized).strip().casefold()
+
+        for pattern, canonical in _TYPE_PATTERNS:
+            if re.match(pattern, normalized, re.IGNORECASE):
+                return canonical
+
+        match = re.match(r"([A-Za-zÀ-ÿ\s]+?)\s+\d", normalized, re.IGNORECASE)
+        if match:
+            return match.group(1).strip().title()
+
         return "Outro"
 
     async def _get_docs_links(
@@ -166,7 +176,7 @@ class RNAlrnScraper(StateScraper):
             norm_type = self._infer_norm_type(doc["title"])
             docs_by_type.setdefault(norm_type, []).append(doc)
 
-        situation = next(iter(self.situations), "Não consta")
+        situation = self.default_situation
         tasks = [
             self._process_documents(
                 type_docs,
@@ -182,4 +192,4 @@ class RNAlrnScraper(StateScraper):
             context={"year": year, "type": "NA", "situation": situation},
             desc=f"RIO GRANDE DO NORTE | Year {year}",
         )
-        return self._flatten_results(results)
+        return flatten_results(results)

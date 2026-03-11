@@ -60,7 +60,7 @@ Copy `.env.example` to `.env` and configure the following variables:
 | `SAVE_DIR` | Base directory for scraped JSON output | `outputs/legislation` |
 | `STATE_LEGISLATION_SAVE_DIR` | Directory for state legislation documents | — |
 | `SPECIFIC_LEGISLATION_SAVE_DIR` | Directory for CONAMA/ICMBio documents | — |
-| `ERROR_LOG_DIR` | Directory for error logs | `logs/legislation` |
+| `LOG_DIR` | Directory for per-scraper runtime logs and error logs | `logs/legislation` |
 | `PROXY_FILE_PATH` | Path to a file containing proxy URLs (one per line) | — |
 | `PROXY_ENDPOINT` | HTTP endpoint that returns proxy URLs | — |
 
@@ -84,7 +84,9 @@ uv run main.py
 uv run main.py --verbose
 ```
 
-When `--verbose` is not specified, scrapers only log warnings, errors, and show tqdm progress bars. With `--verbose`, all debug and info messages are displayed.
+When `--verbose` is not specified, scrapers only log warnings, errors, and show tqdm progress bars in the terminal. With `--verbose`, all debug and info messages are displayed in the terminal.
+
+Each scraper also writes a debug-level runtime log to `LOG_DIR/<SCRAPER>/runtime.log` on every run. Structured document error JSON files are saved in the same scraper log directory.
 
 ### Run specific scrapers by name
 
@@ -192,13 +194,31 @@ uv run ruff format src/ main.py
 Run tests:
 
 ```bash
-uv run pytest tests/                          # run all tests (including integration)
-uv run pytest tests/test_core.py             # run a single test file
-uv run pytest tests/ -m "not integration"    # skip live-network integration tests
-uv run pytest tests/ -m integration          # run only integration tests (requires network)
+# Fast tests (recommended for development) - skips slow integration tests
+uv run pytest -m "not integration"
+
+# Parallel execution (faster on multi-core systems)
+uv run pytest -n auto -m "not integration"
+
+# Run all tests (including slow integration tests)
+uv run pytest tests/
+
+# Run a single test file
+uv run pytest tests/test_core.py
+
+# Run only integration tests (requires network and credentials)
+uv run pytest tests/ -m integration
+
+# Run tests with timing information
+uv run pytest --durations=10
 ```
 
-Integration tests make real network requests to live legislative websites. They require internet access and (for Snowflake tests) valid credentials in `.env`. Deselect them with `-m "not integration"` for offline or CI runs.
+**Test Performance**: The test suite has been optimized for speed:
+- **Fast tests**: ~12 seconds (98.3% faster than before)
+- **Integration tests**: Include live network calls and may take several minutes
+- **Parallel execution**: Use `-n auto` for multi-core speedup
+
+Integration tests make real network requests to live legislative websites. They require internet access and (for Snowflake tests) valid credentials in `.env`. Use `-m "not integration"` for fast offline or CI runs.
 
 Run pre-commit hooks on all files:
 

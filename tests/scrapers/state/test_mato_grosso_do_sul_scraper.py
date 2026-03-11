@@ -324,8 +324,7 @@ class TestGetDocData:
     async def test_failed_soup_saves_error_and_returns_none(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        failed = make_failed_request()
-        scraper.request_service.get_soup = AsyncMock(return_value=failed)
+        scraper._fetch_soup_and_mhtml = AsyncMock(side_effect=Exception("fetch failed"))
         scraper._save_doc_error = AsyncMock()
         doc = {"title": "Lei 1", "html_link": "/lei1.nsf/view"}
         result = await scraper._get_doc_data(doc)
@@ -341,7 +340,7 @@ class TestGetDocData:
         # Remove the body that BeautifulSoup auto-inserts by replacing it
         for tag in soup.find_all("body"):
             tag.decompose()
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
         scraper._save_doc_error = AsyncMock()
         doc = {"title": "Lei 1", "html_link": "/lei1.nsf/view"}
         result = await scraper._get_doc_data(doc)
@@ -353,7 +352,7 @@ class TestGetDocData:
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
         soup = BeautifulSoup("<html><body><p>Short</p></body></html>", "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
         scraper._get_markdown = AsyncMock(return_value="short")
         scraper._save_doc_error = AsyncMock()
         doc = {"title": "Lei 1", "html_link": "/lei1.nsf/view"}
@@ -370,7 +369,9 @@ class TestGetDocData:
             "<font face='Tahoma'>Artigo 2.</font></body></html>",
             "html.parser",
         )
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            return_value=(soup, b"fake-mhtml-content")
+        )
         valid_md = "# Lei Estadual\n\n" + "Texto legislativo. " * 30
         scraper._get_markdown = AsyncMock(return_value=valid_md)
         doc = {"title": "Lei 1", "html_link": "/lei1.nsf/view"}
@@ -378,8 +379,8 @@ class TestGetDocData:
         assert result is not None
         assert "# Lei Estadual" in result["text_markdown"]
         assert "document_url" in result
-        assert result["_content_extension"] == ".html"
-        assert isinstance(result["_raw_content"], bytes)
+        assert result["_raw_content"] == b"fake-mhtml-content"
+        assert result["_content_extension"] == ".mhtml"
 
     @pytest.mark.asyncio
     async def test_body_content_used_for_markdown(self):
@@ -401,7 +402,7 @@ class TestGetDocData:
             "</body></html>",
             "html.parser",
         )
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
 
         captured_html: list[str] = []
 
@@ -428,7 +429,7 @@ class TestGetDocData:
             "<html><body><font face='Tahoma'>Texto.</font></body></html>",
             "html.parser",
         )
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
         valid_md = "# Lei\n\n" + "Conteúdo legislativo. " * 30
         scraper._get_markdown = AsyncMock(return_value=valid_md)
         doc = {"title": "Lei 1", "html_link": "/lei1.nsf/view"}
@@ -481,7 +482,6 @@ class TestScrapeYear:
 
         scraper._process_documents = fake_process
         scraper._gather_results = fake_gather
-        scraper._flatten_results = MSAlemsScraper._flatten_results
 
         result = await scraper._scrape_year(2025)
         assert result == []
@@ -517,7 +517,6 @@ class TestScrapeYear:
 
         scraper._process_documents = fake_process
         scraper._gather_results = fake_gather
-        scraper._flatten_results = MSAlemsScraper._flatten_results
 
         await scraper._scrape_year(2025)
 

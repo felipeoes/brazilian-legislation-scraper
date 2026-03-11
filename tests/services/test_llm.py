@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.scraper.base.concurrency import RateLimiter
+from src.utils.concurrency import RateLimiter
 from src.services.ocr.config import LLMConfig
 
 
@@ -187,38 +187,78 @@ class TestLLMUsageFormatting:
 
 
 class TestSaveSummaryLLMUsage:
-    @pytest.mark.asyncio
-    async def test_save_summary_includes_llm_usage(self):
+    @staticmethod
+    def _make_scraper(tmp: str):
         from src.database.saver import FileSaver
         from src.scraper.base.scraper import BaseScraper
 
+        scraper = BaseScraper.__new__(BaseScraper)
+        scraper.saver = FileSaver(save_dir=Path(tmp), flush_interval=100)
+        scraper.year_start = 2024
+        scraper.year_end = 2025
+        scraper.count = 0
+        scraper.error_count = 0
+        scraper._scrape_start = None
+        scraper._types_summary = {}
+        scraper.ocr_service = None
+        return scraper
+
+    @pytest.mark.asyncio
+    async def test_save_summary_includes_llm_usage_and_aggregate_totals(self):
+        expected_llm_usage = {
+            "gpt-4o": {
+                "requests": 2,
+                "successful_requests": 2,
+                "failed_requests": 0,
+                "input_tokens": 120,
+                "cached_tokens": 30,
+                "output_tokens": 60,
+                "reasoning_tokens": 4,
+            }
+        }
+
         with tempfile.TemporaryDirectory() as tmp:
-            scraper = BaseScraper.__new__(BaseScraper)
-            scraper.saver = FileSaver(save_dir=Path(tmp), flush_interval=100)
-            scraper.year_start = 2024
-            scraper.year_end = 2025
+            scraper = self._make_scraper(tmp)
             scraper.count = 7
             scraper.error_count = 1
-            scraper._scrape_start = None
             scraper._types_summary = {"Lei": {"total": 7, "situations": {"Vigente": 7}}}
             scraper.ocr_service = MagicMock()
-            scraper.ocr_service.usage_stats = {
-                "gpt-4o": {
-                    "requests": 2,
-                    "successful_requests": 2,
-                    "failed_requests": 0,
-                    "input_tokens": 120,
-                    "cached_tokens": 30,
-                    "output_tokens": 60,
-                    "reasoning_tokens": 4,
+            scraper.ocr_service.usage_stats = expected_llm_usage
+            assert scraper.saver is not None
+
+            await scraper.saver.save_document(
+                {
+                    "year": 2024,
+                    "document_url": "http://example.com/lei-1",
+                    "title": "Lei 1",
+                    "text_markdown": "content",
+                    "type": "Lei",
+                    "situation": "Vigente",
                 }
-            }
+            )
+            await scraper.saver.save_document(
+                {
+                    "year": 2025,
+                    "document_url": "http://example.com/decreto-1",
+                    "title": "Decreto 1",
+                    "text_markdown": "content",
+                    "type": "Decreto",
+                    "situation": "Revogada",
+                }
+            )
 
             await scraper._save_summary()
 
             summary = json.loads(Path(tmp, "summary.json").read_text())
+            assert summary["year_start"] == 2024
+            assert summary["year_end"] == 2025
+            assert summary["total_documents"] == 2
+            assert summary["types_summary"] == {
+                "Lei": {"total": 1, "situations": {"Vigente": 1}},
+                "Decreto": {"total": 1, "situations": {"Revogada": 1}},
+            }
             assert summary["llm_usage"] == {
-                "models": scraper.ocr_service.usage_stats,
+                "models": expected_llm_usage,
                 "totals": {
                     "requests": 2,
                     "successful_requests": 2,
@@ -233,26 +273,26 @@ class TestSaveSummaryLLMUsage:
                     "gpt-4o: 2 reqs (2 ok, 0 failed), 120 input, 30 cached, 60 output, 4 reasoning"
                 ),
             }
+            assert len(summary["runs"]) == 1
+            assert summary["runs"][0]["total_documents"] == 7
+            assert summary["runs"][0]["types_summary"] == scraper._types_summary
+            assert summary["runs"][0]["llm_usage"] == summary["llm_usage"]
 
     @pytest.mark.asyncio
     async def test_save_summary_includes_empty_llm_usage(self):
-        from src.database.saver import FileSaver
-        from src.scraper.base.scraper import BaseScraper
-
         with tempfile.TemporaryDirectory() as tmp:
-            scraper = BaseScraper.__new__(BaseScraper)
-            scraper.saver = FileSaver(save_dir=Path(tmp), flush_interval=100)
-            scraper.year_start = 2024
-            scraper.year_end = 2025
+            scraper = self._make_scraper(tmp)
             scraper.count = 7
             scraper.error_count = 1
-            scraper._scrape_start = None
             scraper._types_summary = {"Lei": {"total": 7, "situations": {"Vigente": 7}}}
-            scraper.ocr_service = None
 
             await scraper._save_summary()
 
             summary = json.loads(Path(tmp, "summary.json").read_text())
+            assert summary["year_start"] is None
+            assert summary["year_end"] is None
+            assert summary["total_documents"] == 0
+            assert summary["types_summary"] == {}
             assert summary["llm_usage"] == {
                 "models": {},
                 "totals": {
@@ -266,6 +306,120 @@ class TestSaveSummaryLLMUsage:
                 },
                 "human": "LLM total 0 reqs (0 ok, 0 failed), 0 input, 0 cached, 0 output, 0 reasoning",
             }
+            assert len(summary["runs"]) == 1
+            assert summary["runs"][0]["total_documents"] == 7
+
+    @pytest.mark.asyncio
+    async def test_save_summary_appends_runs_while_top_level_tracks_saved_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scraper = self._make_scraper(tmp)
+
+            assert scraper.saver is not None
+            await scraper.saver.save_document(
+                {
+                    "year": 2024,
+                    "document_url": "http://example.com/lei-1",
+                    "title": "Lei 1",
+                    "text_markdown": "content",
+                    "type": "Lei",
+                    "situation": "Vigente",
+                }
+            )
+            scraper.count = 1
+            scraper.error_count = 0
+            scraper._types_summary = {"Lei": {"total": 1, "situations": {"Vigente": 1}}}
+            await scraper._save_summary()
+
+            await scraper.saver.save_document(
+                {
+                    "year": 2025,
+                    "document_url": "http://example.com/lei-2",
+                    "title": "Lei 2",
+                    "text_markdown": "content",
+                    "type": "Lei",
+                    "situation": "Vigente",
+                }
+            )
+            scraper.count = 1
+            scraper.error_count = 2
+            scraper._types_summary = {"Lei": {"total": 1, "situations": {"Vigente": 1}}}
+            await scraper._save_summary()
+
+            summary = json.loads(Path(tmp, "summary.json").read_text())
+
+            assert summary["year_start"] == 2024
+            assert summary["year_end"] == 2025
+            assert summary["total_documents"] == 2
+            assert summary["types_summary"] == {
+                "Lei": {"total": 2, "situations": {"Vigente": 2}}
+            }
+            assert summary["total_errors"] == 2
+            assert len(summary["runs"]) == 2
+            assert summary["runs"][0]["total_documents"] == 1
+            assert summary["runs"][1]["total_documents"] == 1
+
+    @pytest.mark.asyncio
+    async def test_save_summary_migrates_legacy_flat_summary_into_runs(self):
+        legacy_summary = {
+            "scraper": "BaseScraper",
+            "year_start": 2022,
+            "year_end": 2022,
+            "total_documents": 3,
+            "total_errors": 1,
+            "elapsed_seconds": 12.5,
+            "elapsed_human": "12s",
+            "completed_at": "2026-03-10T00:00:00",
+            "types_summary": {"Lei": {"total": 3, "situations": {"Vigente": 3}}},
+            "llm_usage": {
+                "models": {},
+                "totals": {
+                    "requests": 0,
+                    "successful_requests": 0,
+                    "failed_requests": 0,
+                    "input_tokens": 0,
+                    "cached_tokens": 0,
+                    "output_tokens": 0,
+                    "reasoning_tokens": 0,
+                },
+                "human": "LLM total 0 reqs (0 ok, 0 failed), 0 input, 0 cached, 0 output, 0 reasoning",
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "summary.json").write_text(
+                json.dumps(legacy_summary), encoding="utf-8"
+            )
+
+            scraper = self._make_scraper(tmp)
+            assert scraper.saver is not None
+            await scraper.saver.save_document(
+                {
+                    "year": 2024,
+                    "document_url": "http://example.com/lei-1",
+                    "title": "Lei 1",
+                    "text_markdown": "content",
+                    "type": "Lei",
+                    "situation": "Vigente",
+                }
+            )
+            scraper.count = 1
+            scraper.error_count = 0
+            scraper._types_summary = {"Lei": {"total": 1, "situations": {"Vigente": 1}}}
+
+            await scraper._save_summary()
+
+            summary = json.loads(Path(tmp, "summary.json").read_text())
+
+            assert len(summary["runs"]) == 2
+            assert summary["runs"][0]["completed_at"] == legacy_summary["completed_at"]
+            assert (
+                summary["runs"][0]["total_documents"]
+                == legacy_summary["total_documents"]
+            )
+            assert summary["runs"][1]["total_documents"] == 1
+            assert summary["year_start"] == 2024
+            assert summary["year_end"] == 2024
+            assert summary["total_documents"] == 1
 
 
 # =========================================================================
@@ -393,6 +547,77 @@ class TestLLMUsageTracking:
         assert usage.output_tokens == 0
 
     @pytest.mark.asyncio
+    async def test_call_with_retry_acquires_rate_limiter(self):
+        from src.services.ocr.protocol import LLMUsage
+        from src.services.ocr.llm import LLMOCRService
+        from src.services.ocr.config import LLMConfig
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_client = MagicMock()
+        mock_client.generate = AsyncMock(
+            return_value=("ok", LLMUsage(input_tokens=10, output_tokens=5))
+        )
+        config = LLMConfig(client=mock_client, model="test-model", rps=1000)
+        svc = LLMOCRService(prompt="test", llm_config=config)
+        svc._rate_limiter = MagicMock()
+        svc._rate_limiter.acquire = AsyncMock()
+
+        await svc._call_with_retry([{"role": "user", "content": "hi"}])
+
+        svc._rate_limiter.acquire.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_call_with_retry_acquires_rate_limiter_per_retry_attempt(self):
+        from src.services.ocr.protocol import LLMUsage
+        from src.services.ocr.llm import LLMOCRService
+        from src.services.ocr.config import LLMConfig
+        from tenacity import (
+            AsyncRetrying,
+            retry_if_exception_type,
+            stop_after_attempt,
+            wait_fixed,
+        )
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_client = MagicMock()
+        mock_client.generate = AsyncMock(
+            side_effect=[
+                RuntimeError("transient"),
+                ("ok", LLMUsage(input_tokens=10, output_tokens=5)),
+            ]
+        )
+        config = LLMConfig(client=mock_client, model="test-model", rps=1000)
+        svc = LLMOCRService(prompt="test", llm_config=config)
+        svc._rate_limiter = MagicMock()
+        svc._rate_limiter.acquire = AsyncMock()
+        svc._new_retry = lambda: AsyncRetrying(
+            stop=stop_after_attempt(2),
+            wait=wait_fixed(0),
+            retry=retry_if_exception_type((RuntimeError,)),
+        )
+
+        await svc._call_with_retry([{"role": "user", "content": "hi"}])
+
+        # acquire() should be called once per attempt (2 total: 1 fail + 1 success)
+        assert svc._rate_limiter.acquire.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_call_with_retry_uses_shared_rate_limiter_from_config(self):
+        from src.services.ocr.llm import LLMOCRService
+        from src.services.ocr.config import LLMConfig
+        from unittest.mock import MagicMock
+
+        shared_limiter = RateLimiter(42)
+        mock_client = MagicMock()
+        config = LLMConfig(
+            client=mock_client, model="test-model", rate_limiter=shared_limiter
+        )
+        svc = LLMOCRService(prompt="test", llm_config=config)
+
+        # The service should use the exact same limiter instance from config
+        assert svc._rate_limiter is shared_limiter
+
+    @pytest.mark.asyncio
     async def test_call_with_retry_accumulates_usage(self):
         from src.services.ocr.protocol import LLMUsage
         from src.services.ocr.llm import LLMOCRService
@@ -439,7 +664,7 @@ class TestLLMUsageTracking:
         )
         config = LLMConfig(client=mock_client, model="model-a,model-b", rps=1000)
         svc = LLMOCRService(prompt="test", llm_config=config)
-        svc._retry_strategy = AsyncRetrying(
+        svc._new_retry = lambda: AsyncRetrying(
             stop=stop_after_attempt(2),
             wait=wait_fixed(0),
             retry=retry_if_exception_type((RuntimeError,)),
@@ -484,7 +709,7 @@ class TestLLMUsageTracking:
         mock_client.generate = AsyncMock(side_effect=RuntimeError("still failing"))
         config = LLMConfig(client=mock_client, model="test-model", rps=1000)
         svc = LLMOCRService(prompt="test", llm_config=config)
-        svc._retry_strategy = AsyncRetrying(
+        svc._new_retry = lambda: AsyncRetrying(
             stop=stop_after_attempt(2),
             wait=wait_fixed(0),
             retry=retry_if_exception_type((RuntimeError,)),

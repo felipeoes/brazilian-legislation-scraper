@@ -9,7 +9,7 @@ import aiohttp
 import fitz
 from src.services.ocr.config import LLMConfig
 from src.services.ocr.protocol import LLMClient, LLMUsage
-from src.scraper.base.concurrency import RateLimiter
+from src.utils.concurrency import RateLimiter
 from src.utils import clean_md_tag
 from loguru import logger
 from openai import (
@@ -63,8 +63,8 @@ class LLMOCRService:
         self.batch_size = llm_config.batch_size if llm_config else 5
         self.raw = llm_config.raw if llm_config else False
         self._usage: dict[str, dict] = {}
-        self._pdf_semaphore = asyncio.Semaphore(4)
-        self._retry_strategy = self._create_retry_strategy()
+        self._pdf_semaphore = asyncio.Semaphore(max(1, int(effective_rps)))
+        self._max_retry_attempts = 10
         if verbose:
             logger.info(
                 f"Initialized LLMOCRService with models: {self.models} | RPS: {effective_rps} | batch_size: {self.batch_size} | Timeout: {timeout}s | Raw: {self.raw}"
@@ -111,10 +111,15 @@ class LLMOCRService:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _create_retry_strategy(self, max_attempts: int = 10) -> AsyncRetrying:
-        """Create a configured AsyncRetrying instance for LLM requests."""
+    def _new_retry(self) -> AsyncRetrying:
+        """Create a fresh ``AsyncRetrying`` for each call.
+
+        A single shared ``AsyncRetrying`` is NOT safe for concurrent use:
+        ``__aiter__`` stores ``_retry_state`` on the instance, so concurrent
+        ``async for`` loops corrupt each other's state.
+        """
         return AsyncRetrying(
-            stop=stop_after_attempt(max_attempts),
+            stop=stop_after_attempt(self._max_retry_attempts),
             wait=wait_fixed(5) + wait_random_exponential(min=1, max=60, multiplier=2),
             retry=retry_if_exception_type(
                 (
@@ -152,7 +157,7 @@ class LLMOCRService:
         timeout = timeout or self.timeout
         response_text = ""
         try:
-            async for attempt in self._retry_strategy:
+            async for attempt in self._new_retry():
                 await self._rate_limiter.acquire()
                 attempt_num = attempt.retry_state.attempt_number
                 model = self.models[(attempt_num - 1) % len(self.models)]
@@ -190,7 +195,11 @@ class LLMOCRService:
             return ""
 
         content_blocks: list[dict] = [{"type": "text", "text": self.prompt}]
+        valid_count = 0
         for img_bytes in images:
+            if not img_bytes:
+                logger.debug("Skipping empty image bytes (blank/corrupt PDF page)")
+                continue
             image_b64 = base64.standard_b64encode(img_bytes).decode()
             content_blocks.append(
                 {
@@ -198,10 +207,14 @@ class LLMOCRService:
                     "image_url": {"url": f"data:image/png;base64,{image_b64}"},
                 }
             )
+            valid_count += 1
+
+        if valid_count == 0:
+            return ""
 
         messages = [{"role": "user", "content": content_blocks}]
         return await self._call_with_retry(
-            messages, desc=f"{len(images)} images", timeout=timeout
+            messages, desc=f"{valid_count} images", timeout=timeout
         )
 
     async def documents_to_markdown(

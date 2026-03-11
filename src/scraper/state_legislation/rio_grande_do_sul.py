@@ -2,6 +2,7 @@ import re
 from urllib.parse import urlencode
 
 from bs4 import BeautifulSoup
+from src.scraper.base.converter import valid_markdown, wrap_html
 from src.scraper.base.scraper import StateScraper
 from loguru import logger
 
@@ -145,7 +146,7 @@ class RSAlrsScraper(StateScraper):
             tr = items[-1]
             norm_text = tr.text.strip()
 
-            html_string = self._wrap_html(norm_text)
+            html_string = wrap_html(norm_text)
 
         return html_string
 
@@ -247,15 +248,26 @@ class RSAlrsScraper(StateScraper):
         if html_string:
             # Use direct HTML content conversion
             text_markdown = await self._get_markdown(html_content=html_string)
-            raw_content = html_string.encode("utf-8")
-            content_ext = ".html"
+            try:
+                _, mhtml_bytes = await self._fetch_soup_and_mhtml(html_link)
+                raw_content = mhtml_bytes
+                content_ext = ".mhtml"
+            except Exception as exc:
+                logger.warning(f"MHTML capture failed for {html_link}: {exc}")
+                await self._save_doc_error(
+                    title=doc_info.get("title", "Unknown"),
+                    norm_type=doc_info.get("type", ""),
+                    html_link=html_link,
+                    error_message=f"MHTML capture failed: {exc}",
+                )
+                return None
         else:
             text_markdown, raw_content, content_ext = await self._download_and_convert(
                 pdf_link
             )
 
         text_markdown = self._clean_rs_markdown(text_markdown)
-        valid, reason = self._valid_markdown(text_markdown)
+        valid, reason = valid_markdown(text_markdown)
         if not valid:
             logger.error(f"Error getting markdown from pdf: {pdf_link}")
             await self._save_doc_error(

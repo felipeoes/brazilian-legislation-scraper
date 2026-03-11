@@ -267,8 +267,7 @@ class TestGetDocData:
     @pytest.mark.asyncio
     async def test_failed_soup_returns_none(self):
         scraper = _make_scraper()
-        failed = make_failed_request()
-        scraper.request_service.get_soup = AsyncMock(return_value=failed)
+        scraper._fetch_soup_and_mhtml = AsyncMock(side_effect=Exception("fetch failed"))
         scraper._save_doc_error = AsyncMock()
         result = await scraper._get_doc_data(self._make_doc_info())
         assert result is None
@@ -278,7 +277,8 @@ class TestGetDocData:
     async def test_no_content_root_returns_none(self):
         scraper = _make_scraper()
         soup = BeautifulSoup("<html><body></body></html>", "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        mhtml = b"MHTML content"
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, mhtml))
         scraper._extract_norm_content_root = MagicMock(return_value=None)
         scraper._save_doc_error = AsyncMock()
         result = await scraper._get_doc_data(self._make_doc_info())
@@ -292,7 +292,8 @@ class TestGetDocData:
             "<html><body><div>content</div></body></html>", "html.parser"
         )
         content_root = BeautifulSoup("<div>content</div>", "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        mhtml = b"MHTML content"
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, mhtml))
         scraper._extract_norm_content_root = MagicMock(return_value=content_root)
         scraper._clean_norm_content_root = MagicMock()
         scraper._trim_to_norm_start = MagicMock()
@@ -310,8 +311,9 @@ class TestGetDocData:
         scraper = _make_scraper()
         html = "<html><body><div>content</div></body></html>"
         soup = BeautifulSoup(html, "html.parser")
+        mhtml = b"MHTML content"
         content_root = BeautifulSoup("<div>Conteúdo da lei</div>", "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, mhtml))
         scraper._extract_norm_content_root = MagicMock(return_value=content_root)
         scraper._clean_norm_content_root = MagicMock()
         scraper._trim_to_norm_start = MagicMock()
@@ -326,7 +328,8 @@ class TestGetDocData:
         assert result is not None
         assert result["text_markdown"] == valid_md
         assert result["year"] == 2023
-        assert result["_content_extension"] == ".html"
+        assert result["_content_extension"] == ".mhtml"
+        assert result["_raw_content"] == mhtml
         assert "_html_link" not in result
 
     @pytest.mark.asyncio
@@ -334,8 +337,9 @@ class TestGetDocData:
         scraper = _make_scraper()
         html = "<html><body><div>[ Revogada ]</div></body></html>"
         soup = BeautifulSoup(html, "html.parser")
+        mhtml = b"MHTML content"
         content_root = BeautifulSoup("<div>[ Revogada ] conteúdo</div>", "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, mhtml))
         scraper._extract_norm_content_root = MagicMock(return_value=content_root)
         scraper._clean_norm_content_root = MagicMock()
         scraper._trim_to_norm_start = MagicMock()
@@ -355,8 +359,9 @@ class TestGetDocData:
         scraper = _make_scraper()
         html = "<html><body><div>content sem revogacao</div></body></html>"
         soup = BeautifulSoup(html, "html.parser")
+        mhtml = b"MHTML content"
         content_root = BeautifulSoup("<div>Conteúdo normal</div>", "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, mhtml))
         scraper._extract_norm_content_root = MagicMock(return_value=content_root)
         scraper._clean_norm_content_root = MagicMock()
         scraper._trim_to_norm_start = MagicMock()
@@ -420,6 +425,7 @@ class TestScrapeConstitution:
         valid_md = "# Constituição Estadual\n\n" + "Art. 1º conteúdo. " * 50
         scraper._get_markdown = AsyncMock(return_value=valid_md)
         scraper._wrap_html = MagicMock(return_value="<html></html>")
+        scraper._capture_mhtml = AsyncMock(return_value=b"MHTML content")
         scraper._save_doc_result = AsyncMock(return_value={"saved": True})
         scraper._track_results = MagicMock()
 

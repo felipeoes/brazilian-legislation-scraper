@@ -1,7 +1,12 @@
 import asyncio
 import ssl
 import aiohttp
-from aiohttp_socks import ProxyConnector
+from aiohttp_socks import (
+    ProxyConnector,
+    ProxyConnectionError,
+    ProxyError,
+    ProxyTimeoutError,
+)
 from bs4 import BeautifulSoup
 from loguru import logger
 from tenacity import (
@@ -11,7 +16,7 @@ from tenacity import (
     retry_if_exception_type,
 )
 
-from src.scraper.base.concurrency import RateLimiter
+from src.utils.concurrency import RateLimiter
 
 
 def _make_ssl_context(verify: bool = True) -> ssl.SSLContext:
@@ -72,6 +77,7 @@ class RequestService:
         max_retries: int = 5,
         verify_ssl: bool = False,
         disable_cookies: bool = False,
+        proxy_timeout: int = 15,
     ):
         self.rps = rps
         self.verbose = verbose
@@ -85,14 +91,24 @@ class RequestService:
         self._proxy_sessions: dict[str, aiohttp.ClientSession] = {}
         self._rate_limiter = RateLimiter(rps)
         self.proxy_service = proxy_service
-        self._retry_strategy = AsyncRetrying(
-            stop=stop_after_attempt(max_retries),
+        self._max_retries = max_retries
+        self._proxy_timeout = proxy_timeout
+
+    _MAX_PROXY_SESSIONS = 50
+
+    def _new_retry(self) -> AsyncRetrying:
+        """Create a fresh ``AsyncRetrying`` instance for each call.
+
+        A single shared ``AsyncRetrying`` is NOT safe for concurrent use:
+        ``__aiter__`` stores ``_retry_state`` on the instance, so concurrent
+        ``async for`` loops corrupt each other's state.
+        """
+        return AsyncRetrying(
+            stop=stop_after_attempt(self._max_retries),
             wait=wait_exponential(multiplier=2, min=2, max=60),
             retry=retry_if_exception_type(RetryableHTTPError),
             reraise=True,
         )
-
-    _MAX_PROXY_SESSIONS = 50
 
     async def _ensure_session(self, proxy: str | None = None) -> aiohttp.ClientSession:
         """Get or create the aiohttp session."""
@@ -105,7 +121,7 @@ class RequestService:
                     if not old_session.closed:
                         await old_session.close()
                 connector = ProxyConnector.from_url(proxy, ssl=self._ssl_ctx)
-                timeout = aiohttp.ClientTimeout(total=120)
+                timeout = aiohttp.ClientTimeout(total=180)
                 self._proxy_sessions[proxy] = aiohttp.ClientSession(
                     headers=self.headers,
                     connector=connector,
@@ -115,7 +131,9 @@ class RequestService:
 
         if self._default_session is None or self._default_session.closed:
             connector = aiohttp.TCPConnector(ssl=self._ssl_ctx)
-            timeout = aiohttp.ClientTimeout(total=120)
+            timeout = aiohttp.ClientTimeout(
+                total=180
+            )  # Increased from 120 to 180 seconds
             kwargs: dict = {
                 "headers": self.headers,
                 "connector": connector,
@@ -140,11 +158,13 @@ class RequestService:
         proxy = None
         if self.proxy_service:
             proxy = await self.proxy_service.get_proxy()
-            if self.verbose and proxy:
-                logger.info(f"Using proxy: {proxy}")
 
         session = await self._ensure_session(proxy=proxy)
-        req_timeout = aiohttp.ClientTimeout(total=timeout)
+        req_timeout = (
+            aiohttp.ClientTimeout(total=timeout, connect=self._proxy_timeout)
+            if proxy
+            else aiohttp.ClientTimeout(total=timeout)
+        )
 
         try:
             if method == "POST":
@@ -177,7 +197,13 @@ class RequestService:
         except (
             aiohttp.ClientError,
             aiohttp.ServerDisconnectedError,
+            aiohttp.ClientOSError,
+            aiohttp.ClientPayloadError,
             asyncio.TimeoutError,
+            ConnectionError,
+            ProxyTimeoutError,
+            ProxyConnectionError,
+            ProxyError,
         ) as e:
             if proxy:
                 if (
@@ -203,7 +229,7 @@ class RequestService:
         last_error: Exception | None = None
         attempt_count = 0
         try:
-            async for attempt in self._retry_strategy:
+            async for attempt in self._new_retry():
                 with attempt:
                     attempt_count += 1
                     try:
@@ -215,7 +241,8 @@ class RequestService:
                         last_error = e
                         raise
         except RetryableHTTPError:
-            reason = f"{last_error} (failed after {attempt_count} attempt{'s' if attempt_count != 1 else ''})"
+            error_msg = str(last_error) if last_error is not None else "unknown error"
+            reason = f"{error_msg} (failed after {attempt_count} attempt{'s' if attempt_count != 1 else ''})"
             return FailedRequest(url=url, reason=reason)
         except Exception as e:
             return FailedRequest(url=url, reason=str(e))
@@ -311,8 +338,8 @@ class RequestService:
         if "filename=" in cd:
             try:
                 filename = cd.split("filename=")[1].strip("\"'").split(";")[0].strip()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Failed to parse Content-Disposition header {cd!r}: {e}")
         if filename == "document":
             if "html" in content_type:
                 filename = "document.html"

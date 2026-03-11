@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from src.database.saver import FileSaver
+from src.database.saver import FileSaver, aggregate_types_summary
 
 
 class TestFileSaver:
@@ -17,7 +17,7 @@ class TestFileSaver:
         with tempfile.TemporaryDirectory() as tmp:
             saver = FileSaver(
                 save_dir=Path(tmp),
-                error_log_dir=str(Path(tmp) / "errors"),
+                log_dir=str(Path(tmp) / "logs"),
                 flush_interval=100,
             )
             doc = {
@@ -94,32 +94,27 @@ class TestFileSaver:
             assert "file_path" in result
 
     @pytest.mark.asyncio
-    async def test_save_document_prefers_mhtml_capture_url(self):
-        captured_urls = []
-
-        async def fake_capture(url: str) -> bytes:
-            captured_urls.append(url)
-            return (
-                b"From: saved\n"
-                b"Snapshot-Content-Location: https://example.com/wrapped\n"
-                b"Content-Type: multipart/related; boundary=foo\n\n"
-                b"--foo\n"
-                b"Content-Type: text/html\n"
-                b"Content-Location: https://example.com/wrapped\n\n"
-                b"<html><body>wrapped</body></html>"
-            )
+    async def test_save_document_mhtml_content(self):
+        """Saver stores .mhtml content directly (MHTML capture is done at scraper level)."""
+        mhtml_bytes = (
+            b"From: saved\n"
+            b"Snapshot-Content-Location: http://example.com/canonical\n"
+            b"Content-Type: multipart/related; boundary=foo\n\n"
+            b"--foo\n"
+            b"Content-Type: text/html\n"
+            b"Content-Location: http://example.com/canonical\n\n"
+            b"<html><body>captured</body></html>"
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
             saver = FileSaver(
                 save_dir=Path(tmp),
                 flush_interval=100,
-                mhtml_capture_fn=fake_capture,
             )
             doc = {
                 "year": 2025,
                 "document_url": "http://example.com/canonical",
-                "_mhtml_url": "https://example.com/wrapped",
-                "title": "Test HTML",
+                "title": "Test MHTML",
                 "text_markdown": "content",
                 "type": "Lei",
                 "situation": "Vigente",
@@ -127,20 +122,12 @@ class TestFileSaver:
 
             result = await saver.save_document(
                 doc,
-                raw_content=b"<html><body>fallback</body></html>",
-                content_extension=".html",
+                raw_content=mhtml_bytes,
+                content_extension=".mhtml",
             )
 
             assert result is not None
-            assert captured_urls == ["https://example.com/wrapped"]
             assert result["file_path"].endswith(".mhtml")
-
-            saved_file = Path(tmp) / result["file_path"]
-            saved_text = saved_file.read_text()
-            assert (
-                "Snapshot-Content-Location: http://example.com/canonical" in saved_text
-            )
-            assert "Content-Location: http://example.com/canonical" in saved_text
 
     @pytest.mark.asyncio
     async def test_sanitize_filename(self):
@@ -153,7 +140,7 @@ class TestFileSaver:
         with tempfile.TemporaryDirectory() as tmp:
             saver = FileSaver(
                 save_dir=Path(tmp),
-                error_log_dir=str(Path(tmp) / "errors"),
+                log_dir=str(Path(tmp) / "logs"),
             )
             error_data = {
                 "title": "Bad Doc",
@@ -165,5 +152,19 @@ class TestFileSaver:
             await saver.save_error(error_data, error_message="Parse failed")
 
             # Verify error file was created
-            error_files = list(Path(tmp, "errors").rglob("*.json"))
+            error_files = list(Path(tmp, "logs").rglob("*.json"))
             assert len(error_files) == 1
+
+
+def test_aggregate_types_summary_normalizes_placeholder_values():
+    summary = aggregate_types_summary(
+        [
+            {"type": "", "situation": ""},
+            {"type": "all", "situation": "NA"},
+            {"type": "Lei", "situation": "Vigente"},
+        ]
+    )
+
+    assert summary["Unknown"]["total"] == 2
+    assert summary["Unknown"]["situations"]["Unknown"] == 2
+    assert summary["Lei"]["situations"]["Vigente"] == 1

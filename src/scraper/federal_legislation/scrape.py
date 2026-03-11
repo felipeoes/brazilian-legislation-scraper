@@ -1,9 +1,15 @@
-from urllib.parse import unquote, urljoin
+import re
+from urllib.parse import unquote, urljoin, urlparse
 from typing import cast
 
 from bs4 import BeautifulSoup, Tag
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper
+from src.scraper.base.converter import (
+    calc_pages,
+    infer_type_from_title,
+    strip_html_chrome,
+)
+from src.scraper.base.scraper import BaseScraper, flatten_results
 
 # ---------------------------------------------------------------------------
 # Situation constants — kept for documentation and downstream filtering.
@@ -26,8 +32,6 @@ INVALID_SITUATIONS = [
     "Sem Eficácia",
 ]
 
-# Kept for reference / downstream consumers.
-SITUATIONS = {s: s for s in VALID_SITUATIONS + INVALID_SITUATIONS}
 
 # Empty string → search returns all coverage (Toda legislação).
 # OPTIONS: 'Legislação Interna' or 'Legislação Federal'
@@ -74,22 +78,238 @@ TYPES = {
     "Resolução do Senado Federal": "Resolu%C3%A7%C3%A3o+do+Senado+Federal",
 }
 
+_FEDERAL_TYPE_SLUG_MAP = {
+    "alvara": "Alvará",
+    "ata_sn": "Ata",
+    "ato": "Ato",
+    "ato_sn": "Ato Sem Número",
+    "atocom": "Ato Complementar",
+    "atocon": "Ato Conjunto",
+    "atocon_sn": "Ato Conjunto",
+    "atocsr": "Ato do Comando Supremo da Revolução",
+    "atodec": "Ato Declaratório",
+    "atodec_sn": "Ato Declaratório",
+    "atodecpm": "Ato Declaratório do Presidente da Mesa",
+    "atoins": "Ato Institucional",
+    "atomes": "Ato da Mesa",
+    "atomes_sn": "Ato da Mesa",
+    "atonor": "Ato Normativo",
+    "atopre_sn": "Ato da Presidência Sem Número",
+    "atoprt": "Ato do Presidente",
+    "atoprt_sn": "Ato do Presidente Sem Número",
+    "atoprtm": "Ato do Presidente da Mesa",
+    "atoprtm_sn": "Ato do Presidente da Mesa",
+    "atopvp": "Ato do Primeiro-Vice-Presidente",
+    "carimp": "Carta Imperial",
+    "carlei": "Carta de Lei",
+    "carlei_sn": "Carta de Lei",
+    "carpat_sn": "Carta Patente",
+    "carreg_sn": "Carta Régia",
+    "carta_sn": "Carta",
+    "circul": "Circular",
+    "comuni_sn": "Comunicado",
+    "conadc": "Ato das Disposições Constitucionais Transitórias",
+    "consti": "Constituição",
+    "decisa": "Decisão",
+    "decisa_sn": "Decisão",
+    "declcn": "Decreto Legislativo",
+    "decleg": "Decreto Legislativo",
+    "declei": "Decreto-Lei",
+    "decmin": "Decreto do Conselho de Ministros",
+    "decpre_sn": "Decisão do Presidente",
+    "decres": "Decreto Reservado",
+    "decret": "Decreto",
+    "decret_sn": "Decreto Sem Número",
+    "dmsn": "Decisão da Mesa Sem Número",
+    "dpsn": "Decisão da Presidência",
+    "emecon": "Emenda Constitucional",
+    "emecon_sn": "Emenda Constitucional",
+    "emecrv": "Emenda Constitucional de Revisão",
+    "instno": "Instrução Normativa",
+    "instru": "Instrução",
+    "instse": "Instrução de Serviço",
+    "lei": "Lei Ordinária",
+    "lei_sn": "Lei Ordinária",
+    "leicom": "Lei Complementar",
+    "leicon": "Lei Constitucional",
+    "leidel": "Lei Delegada",
+    "leimp": "Lei Ordinária",
+    "manife_sn": "Manifesto",
+    "medpro": "Medida Provisória",
+    "mensag": "Mensagem",
+    "mensag_sn": "Mensagem",
+    "ordsec": "Ordem de Serviço Conjunta",
+    "ordser": "Ordem de Serviço",
+    "ordser-sn": "Ordem de Serviço",
+    "pacto_sn": "Pacto",
+    "pactorep": "Pacto Republicano",
+    "portar": "Portaria",
+    "portar_con": "Portaria Conjunta",
+    "portar_sn": "Portaria",
+    "procla_sn": "Proclamação",
+    "protoc_sn": "Protocolo",
+    "regim_sn": "Regimento",
+    "regula": "Regulamento",
+    "regula_sn": "Regulamento",
+    "resaco": "Resolução da Assembleia Nacional Constituinte",
+    "rescad": "Resolução da Câmara dos Deputados",
+    "rescon": "Resolução do Congresso Nacional",
+    "resmes": "Resolução da Mesa",
+    "resmes_sn": "Resolução da Mesa",
+    "resolu": "Resolução",
+    "resolu_sn": "Resolução",
+    "ressen": "Resolução do Senado Federal",
+}
+
+_FEDERAL_TITLE_PREFIX_ALIASES = {
+    "Ato Declaratório do Presidente da Mesa": "Ato Declaratório do Presidente da Mesa",
+    "Ato da Presidência": "Ato da Presidência Sem Número",
+    "Ato do Presidente da Mesa": "Ato do Presidente da Mesa",
+    "Ato do Presidente": "Ato do Presidente",
+    "Ato da Mesa": "Ato da Mesa",
+    "Ato Conjunto": "Ato Conjunto",
+    "Ato Complementar": "Ato Complementar",
+    "Ato Institucional": "Ato Institucional",
+    "Ato Normativo": "Ato Normativo",
+    "Ato": "Ato",
+    "Carta de Lei": "Carta de Lei",
+    "Carta Régia": "Carta Régia",
+    "Carta Imperial": "Carta Imperial",
+    "Carta Patente": "Carta Patente",
+    "Carta": "Carta",
+    "Comunicado": "Comunicado",
+    "Circular": "Circular",
+    "Constituição. ADCT": "Ato das Disposições Constitucionais Transitórias",
+    "Constituição": "Constituição",
+    "Decisão da Mesa": "Decisão da Mesa Sem Número",
+    "Decisão da Presidência": "Decisão da Presidência",
+    "Decisão do Presidente": "Decisão do Presidente",
+    "Decisão": "Decisão",
+    "Decreto do Conselho de Ministros": "Decreto do Conselho de Ministros",
+    "Decreto Legislativo": "Decreto Legislativo",
+    "Decreto-Lei": "Decreto-Lei",
+    "Decreto Reservado": "Decreto Reservado",
+    "Decreto": "Decreto",
+    "Emenda Constitucional de Revisão": "Emenda Constitucional de Revisão",
+    "Emenda Constitucional": "Emenda Constitucional",
+    "Instrução Normativa": "Instrução Normativa",
+    "Instrução de Serviço": "Instrução de Serviço",
+    "Instrução": "Instrução",
+    "Lei Complementar": "Lei Complementar",
+    "Lei Constitucional": "Lei Constitucional",
+    "Lei Delegada": "Lei Delegada",
+    "Lei": "Lei Ordinária",
+    "Manifesto": "Manifesto",
+    "Mensagem": "Mensagem",
+    "Medida Provisória": "Medida Provisória",
+    "Ordem de Serviço Conjunta": "Ordem de Serviço Conjunta",
+    "Ordem de Serviço": "Ordem de Serviço",
+    "Pacto Republicano": "Pacto Republicano",
+    "Pacto": "Pacto",
+    "Portaria Conjunta": "Portaria Conjunta",
+    "Portaria": "Portaria",
+    "Proclamação": "Proclamação",
+    "Protocolo": "Protocolo",
+    "Regimento": "Regimento",
+    "Regulamento": "Regulamento",
+    "Resolução da Assembleia Nacional Constituinte": "Resolução da Assembleia Nacional Constituinte",
+    "Resolução da Câmara dos Deputados": "Resolução da Câmara dos Deputados",
+    "Resolução da Mesa": "Resolução da Mesa",
+    "Resolução do Congresso Nacional": "Resolução do Congresso Nacional",
+    "Resolução do Senado Federal": "Resolução do Senado Federal",
+    "Resolução": "Resolução",
+}
+
+_FEDERAL_TYPE_PREFIX_RE = re.compile(
+    r"(.+?)(?:\s+(?:n[º°o]|n\.|número)\s*[\dA-Za-z]|\s+\d|\s+de\s)",
+    re.IGNORECASE,
+)
+
 ORDERING = "data%3AASC"
 YEAR_START = 1808
 EXPORT_MAX_DOCS = 300
 
 
 class CamaraDepScraper(BaseScraper):
-    """Webscraper for Camara dos Deputados website (https://www.camara.leg.br/legislacao/)
+    """Scraper for the Câmara dos Deputados legislation portal.
 
-    Year start (earliest on source): 1808
+    Source: https://www.camara.leg.br/legislacao/
+    Earliest year available: 1808
+    35+ norm types (see module-level ``TYPES`` dict).
 
-    Situation is NOT used as a search filter — it is read directly from each
-    listing-page result item (p.busca-resultados__situacao).
+    ## How it works
 
-    Example search request url:
-      https://www.camara.leg.br/legislacao/busca?abrangencia=&geral=&ano=2020
-        &situacao=&origem=&numero=&ordenacao=data%3AASC&tipo=Decreto
+    ### Entry point
+    ``scrape()`` (inherited from ``BaseScraper``) iterates years sequentially,
+    calling ``_scrape_year(year)`` for each one.
+
+    ### Year scraping  — ``_scrape_year``
+    Delegates immediately to ``_scrape_type("", "", year)``, passing an empty
+    ``tipo`` parameter.  This makes the search API return **all types at once**,
+    eliminating 35 separate per-type requests.  Each document's norm type is
+    then inferred from its title via ``_infer_norm_type``.
+
+    ### Three-phase pipeline  — ``_scrape_type``
+
+    **Phase 1 — listing (collect metadata)**
+
+    Fetches the first search-results page and reads the total result count from
+    ``div.busca-info__resultado``.
+
+    - If total ≤ ``export_max_docs`` (default 300): requests the export URL
+      (``busca/exportar?…``), which returns **all results in a single page**.
+      Falls back to pagination if the export count doesn't match.
+    - Otherwise: paginates concurrently across all pages (20 results/page).
+
+    Each result yields: ``{title, summary, metadata_url, situation}``.
+    ``situation`` is read from ``p.busca-resultados__situacao`` on the listing
+    page and is **never** used as a search filter.
+
+    **Phase 2 — resolve text URLs**
+
+    For each document, visits its metadata page (``metadata_url``) to find the
+    actual text URL.  Priority order among ``div.sessao`` anchor links:
+
+    1. ``"texto - republicação"`` (last match)
+    2. ``"texto - publicação original"`` (last match)
+    3. Any link containing ``"texto"``
+
+    Resolved mappings are cached in ``_metadata_to_text_url`` and persisted
+    across restarts by ``_load_scraped_keys``, so already-visited metadata
+    pages are skipped on subsequent runs.
+
+    **Phase 3 — fetch, convert, save**
+
+    For each resolved document not yet saved (``_is_already_scraped``):
+
+    1. Fetches the text HTML page (``document_url``).
+    2. Extracts the main content area: ``div#content`` >
+       ``div.textoNorma`` > whole page.
+    3. Strips portal chrome (``strip_html_chrome`` + ``_clean_norm_soup``),
+       ``<h1>`` tags (title already captured), and ``<p class="ementa">``
+       (summary already captured).
+    4. Converts to Markdown via ``_get_markdown``.
+    5. If the result is empty but ementa nodes were present, retries with
+       ementa included as a fallback.
+    6. Saves via ``_process_documents`` (raw HTML + ``data.json`` entry).
+
+    Output schema per document::
+
+        {
+            "title": str,
+            "summary": str,        # ementa text, stripped of "Ementa:" prefix
+            "situation": str,      # e.g. "Não consta revogação expressa"
+            "text_markdown": str,
+            "document_url": str,   # URL of the full text page
+            "metadata_url": str,   # URL of the document detail/metadata page
+            "_raw_content": bytes, # MHTML snapshot bytes
+            "_content_extension": ".mhtml",
+        }
+
+    Example search URL::
+
+        https://www.camara.leg.br/legislacao/busca?abrangencia=&geral=&ano=2020
+            &situacao=&origem=&numero=&ordenacao=data%3AASC&tipo=Decreto
     """
 
     def __init__(
@@ -115,18 +335,18 @@ class CamaraDepScraper(BaseScraper):
     async def _load_scraped_keys(self, year: int) -> None:
         await super()._load_scraped_keys(year)
         self._metadata_to_text_url = {}
-        if not self.saver:
+        if not self.saver or self.overwrite:
             return
 
         year_docs = await self.saver.get_year_documents(year)
         for doc in year_docs:
-            metadata_url = str(doc.get("metadata_url", "") or "")
-            document_url = str(doc.get("document_url", "") or "")
+            metadata_url = str(doc.get("metadata_url", ""))
+            document_url = str(doc.get("document_url", ""))
             if metadata_url and document_url:
                 self._metadata_to_text_url[metadata_url] = document_url
 
-        if self.verbose and self._metadata_to_text_url:
-            logger.info(
+        if self._metadata_to_text_url:
+            logger.debug(
                 f"{self.__class__.__name__} | Year {year}: loaded "
                 f"{len(self._metadata_to_text_url)} metadata->text URL mappings"
             )
@@ -287,8 +507,8 @@ class CamaraDepScraper(BaseScraper):
         soup = cast(BeautifulSoup, soup)
         documents_html_links_info = self._parse_listing_page_documents(soup)
 
-        if not documents_html_links_info and self.verbose:
-            logger.info(f"No documents found for url: {url}")
+        if not documents_html_links_info:
+            logger.debug(f"No documents found for url: {url}")
 
         return documents_html_links_info
 
@@ -302,8 +522,8 @@ class CamaraDepScraper(BaseScraper):
 
         soup = cast(BeautifulSoup, soup)
         documents_metadata = self._parse_export_documents(soup)
-        if not documents_metadata and self.verbose:
-            logger.info(f"No documents found in export page: {url}")
+        if not documents_metadata:
+            logger.debug(f"No documents found in export page: {url}")
 
         return documents_metadata
 
@@ -326,6 +546,7 @@ class CamaraDepScraper(BaseScraper):
         if cached_text_url:
             return {
                 "title": title,
+                "_norm_type": norm_type,
                 "summary": summary,
                 "situation": situation,
                 "metadata_url": metadata_url,
@@ -334,8 +555,8 @@ class CamaraDepScraper(BaseScraper):
 
         soup = await self.request_service.get_soup(metadata_url)
         if not soup:
-            reason = getattr(soup, "reason", "unknown")
-            status = getattr(soup, "status", None)
+            reason = soup.reason
+            status = soup.status
             detail = f"HTTP {status} — {reason}" if status else reason
             logger.error(
                 f"Could not fetch metadata page: {title} | {detail} | {metadata_url}"
@@ -419,6 +640,7 @@ class CamaraDepScraper(BaseScraper):
         self._metadata_to_text_url[metadata_url] = text_url
         return {
             "title": title,
+            "_norm_type": norm_type,
             "summary": summary,
             "situation": situation,
             "metadata_url": metadata_url,
@@ -439,22 +661,14 @@ class CamaraDepScraper(BaseScraper):
         metadata_url = doc.get("metadata_url", "")
         document_text_link = doc.get("document_url", "")
         situation = doc.get("situation", "")
+        doc_type = norm_type or self._resolve_norm_type(
+            title,
+            metadata_url=metadata_url,
+            document_url=document_text_link,
+        )
 
         try:
-            soup = await self.request_service.get_soup(document_text_link)
-            if not soup:
-                logger.warning(f"Could not fetch document page: {title}")
-                await self._save_doc_error(
-                    title=title,
-                    year=year,
-                    situation=situation,
-                    norm_type=norm_type,
-                    html_link=document_text_link,
-                    metadata_url=metadata_url,
-                    error_message="Could not fetch document page",
-                )
-                return None
-
+            soup, mhtml = await self._fetch_soup_and_mhtml(document_text_link)
             soup = cast(BeautifulSoup, soup)
             # Extract main content area; fall back progressively
             content_div = cast(
@@ -465,7 +679,7 @@ class CamaraDepScraper(BaseScraper):
             )
 
             # Remove portal chrome and boilerplate
-            self._strip_html_chrome(
+            strip_html_chrome(
                 content_div,
                 extra_selectors=[
                     {"class_": "vejaTambem"},
@@ -507,7 +721,7 @@ class CamaraDepScraper(BaseScraper):
                         title=title,
                         year=year,
                         situation=situation,
-                        norm_type=norm_type,
+                        norm_type=doc_type,
                         html_link=document_text_link,
                         metadata_url=metadata_url,
                         error_message="Document text is empty after conversion",
@@ -516,13 +730,14 @@ class CamaraDepScraper(BaseScraper):
 
             return {
                 "title": title,
+                "type": doc_type,
                 "summary": summary,
                 "situation": situation,
                 "metadata_url": metadata_url,
                 "text_markdown": text_markdown.strip(),
                 "document_url": document_text_link,
-                "_raw_content": html_string.encode("utf-8"),
-                "_content_extension": ".html",
+                "_raw_content": mhtml,
+                "_content_extension": ".mhtml",
             }
         except Exception as e:
             logger.error(f"Error converting document to markdown: {title} - {e}")
@@ -530,34 +745,80 @@ class CamaraDepScraper(BaseScraper):
                 title=title,
                 year=year,
                 situation=situation,
-                norm_type=norm_type,
+                norm_type=doc_type,
                 html_link=document_text_link,
                 metadata_url=metadata_url,
                 error_message=str(e),
             )
             return None
 
+    def _infer_norm_type(self, title: str) -> str:
+        """Infer norm type from metadata/document URL slug or title prefix."""
+        normalized_title = " ".join(title.split())
+
+        for prefix, canonical in sorted(
+            _FEDERAL_TITLE_PREFIX_ALIASES.items(),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        ):
+            if normalized_title.casefold().startswith(prefix.casefold()):
+                return canonical
+
+        inferred = infer_type_from_title(normalized_title, TYPES)
+        if inferred:
+            return inferred
+
+        prefix_match = _FEDERAL_TYPE_PREFIX_RE.match(normalized_title)
+        if prefix_match:
+            return prefix_match.group(1).strip()
+
+        return "Desconhecido"
+
+    @staticmethod
+    def _extract_type_slug(*urls: str) -> str:
+        """Extract the federal norm-type slug from a metadata/document URL."""
+        for url in urls:
+            if not url:
+                continue
+            parts = [part for part in urlparse(url).path.split("/") if part]
+            if len(parts) >= 3 and parts[0] == "legin":
+                return parts[2]
+        return ""
+
+    def _resolve_norm_type(
+        self,
+        title: str,
+        *,
+        metadata_url: str = "",
+        document_url: str = "",
+    ) -> str:
+        """Resolve the most reliable norm type from URL slug first, title second."""
+        slug = self._extract_type_slug(metadata_url, document_url)
+        if slug:
+            mapped = _FEDERAL_TYPE_SLUG_MAP.get(slug)
+            if mapped:
+                return mapped
+        return self._infer_norm_type(title)
+
     async def _scrape_type(
         self,
         norm_type: str,
-        norm_type_id,
+        norm_type_id: str,
         year: int,
-        seen_urls: set[str] | None = None,
     ) -> list:
-        """Scrape all documents of a single norm type for the given year.
+        """Scrape all documents for the given year.
+
+        When ``norm_type`` is empty, all types are fetched in a single query
+        and the type is inferred from each document's title.
 
         Phase 1: fetch all listing pages (concurrent) → list of
                  {title, summary, metadata_url, situation}
         Phase 2: resolve text URLs (concurrent) → list of
                  {title, summary, situation, metadata_url, document_url}
         Phase 3: fetch + convert content, save (via _process_documents)
-
-        ``seen_urls`` is a shared set of already-processed text URLs (by
-        reference) used to deduplicate across norm types within the same year.
-        Documents whose resolved text URL is already in ``seen_urls`` are
-        silently skipped before Phase 3, preventing duplicate content when
-        the same document appears under multiple ``tipo`` query values.
         """
+        all_types = not norm_type
+        label = f"Year {year}" if all_types else norm_type
         results = []
 
         url = self._format_search_url(str(year), norm_type_id)
@@ -577,7 +838,7 @@ class CamaraDepScraper(BaseScraper):
         if total == 0:
             return results
 
-        pages = self._calc_pages(total, per_page)
+        pages = calc_pages(total, per_page)
 
         # --- Phase 1: collect all listing-page metadata ---
         documents_html_links_info = []
@@ -591,7 +852,7 @@ class CamaraDepScraper(BaseScraper):
                 used_export = True
             else:
                 logger.warning(
-                    f"Export count mismatch for {norm_type} {year}: "
+                    f"Export count mismatch for {label}: "
                     f"expected {total}, got {len(export_docs)}; falling back to pagination"
                 )
 
@@ -603,92 +864,90 @@ class CamaraDepScraper(BaseScraper):
             ]
             page_results = await self._gather_results(
                 page_tasks,
-                context={"year": year, "type": norm_type, "situation": ""},
-                desc=f"{self.name} | {norm_type} | get_html_links",
+                context={"year": year, "type": label, "situation": ""},
+                desc=f"{self.name} | {label} | get_html_links",
             )
-            documents_html_links_info.extend(self._flatten_results(page_results))
+            documents_html_links_info.extend(flatten_results(page_results))
 
         # --- Phase 2: resolve text URLs ---
+        # Infer norm_type per document when scraping all types at once.
+        if all_types:
+            for doc in documents_html_links_info:
+                if doc is not None:
+                    doc["_norm_type"] = self._resolve_norm_type(
+                        doc.get("title", ""),
+                        metadata_url=doc.get("metadata_url", ""),
+                    )
+
         resolved_docs = []
-        text_link_tasks = [
-            self._get_document_text_link(doc, year, norm_type)
-            for doc in documents_html_links_info
-            if doc is not None
-            and doc.get("metadata_url", "") not in self._metadata_to_text_url
-        ]
-        resolved_docs.extend(
-            {
-                **doc,
-                "document_url": self._metadata_to_text_url[doc.get("metadata_url", "")],
-            }
-            for doc in documents_html_links_info
-            if doc is not None
-            and doc.get("metadata_url", "") in self._metadata_to_text_url
-        )
+        text_link_tasks = []
+        for doc in documents_html_links_info:
+            if doc is None:
+                continue
+            doc_type = doc.get("_norm_type", norm_type) if all_types else norm_type
+            meta_url = doc.get("metadata_url", "")
+            if meta_url in self._metadata_to_text_url:
+                resolved_docs.append(
+                    {**doc, "document_url": self._metadata_to_text_url[meta_url]}
+                )
+            else:
+                text_link_tasks.append(
+                    self._get_document_text_link(doc, year, doc_type)
+                )
+
         text_link_results = await self._gather_results(
             text_link_tasks,
-            context={"year": year, "type": norm_type, "situation": ""},
-            desc=f"{self.name} | {norm_type} | get_text_links",
+            context={"year": year, "type": label, "situation": ""},
+            desc=f"{self.name} | {label} | get_text_links",
         )
         resolved_docs.extend(text_link_results)
 
-        # Filter already-scraped documents and cross-type duplicates before Phase 3.
-        # seen_urls is mutated in-place so subsequent _scrape_type calls for the
-        # same year skip URLs that were already processed by an earlier type.
-        documents_to_fetch = []
-        for doc in resolved_docs:
-            if doc is None:
-                continue
-            text_url = doc.get("document_url", "")
-            if self._is_already_scraped(text_url, doc.get("title", "")):
-                continue
-            if seen_urls is not None:
-                if text_url in seen_urls:
-                    if self.verbose:
-                        logger.debug(f"Skipping duplicate URL across types: {text_url}")
-                    continue
-                seen_urls.add(text_url)
-            documents_to_fetch.append(doc)
+        # Filter already-scraped documents before Phase 3.
+        documents_to_fetch = [
+            doc
+            for doc in resolved_docs
+            if doc is not None
+            and not self._is_already_scraped(
+                doc.get("document_url", ""), doc.get("title", "")
+            )
+        ]
 
         # --- Phase 3: fetch content, convert to markdown, save ---
-        results = await self._process_documents(
-            documents_to_fetch,
-            year=year,
-            norm_type=norm_type,
-            situation="",  # each doc carries its own situation field
-            desc=f"{self.name} | {norm_type} | get_doc_data",
-            doc_data_fn=lambda doc: self._get_doc_data(
-                doc, year=year, norm_type=norm_type
-            ),
-        )
-
-        if self.verbose:
-            logger.info(
-                f"Finished scraping | Year: {year} | Type: {norm_type} "
-                f"| Results: {len(results)}"
+        if all_types:
+            results = await self._process_documents(
+                documents_to_fetch,
+                year=year,
+                norm_type="",
+                situation="",  # each doc carries its own situation field
+                desc=f"{self.name} | {label} | get_doc_data",
+                doc_data_fn=lambda doc: self._get_doc_data(
+                    doc, year=year, norm_type=doc.get("_norm_type", "")
+                ),
             )
+        else:
+            results = await self._process_documents(
+                documents_to_fetch,
+                year=year,
+                norm_type=norm_type,
+                situation="",  # each doc carries its own situation field
+                desc=f"{self.name} | {label} | get_doc_data",
+                doc_data_fn=lambda doc: self._get_doc_data(
+                    doc, year=year, norm_type=norm_type
+                ),
+            )
+
+        logger.debug(
+            f"Finished scraping | Year: {year} | Type: {label} "
+            f"| Results: {len(results)}"
+        )
 
         return results
 
     async def _scrape_year(self, year: int) -> list[dict]:
-        """Scrape all norm types for a year with cross-type URL deduplication.
+        """Scrape all documents for a year in a single query (tipo= empty).
 
-        Overrides the base implementation to pass a shared ``seen_urls`` set
-        into every ``_scrape_type`` call.  Because types are scraped
-        concurrently, the set is populated as each Phase-2 result is resolved;
-        any text URL that was already claimed by a concurrent or earlier type
-        is silently skipped before Phase 3, so no document is fetched or saved
-        twice even when the same norm appears under multiple ``tipo`` queries.
+        The type is inferred from each document's title via
+        ``_infer_norm_type``, eliminating the overhead of 35 per-type queries
+        and the need for cross-type URL deduplication.
         """
-        seen_urls: set[str] = set()
-        type_items = cast(dict[str, str], self.types)
-        tasks = [
-            self._scrape_type(nt, nt_id, year, seen_urls=seen_urls)
-            for nt, nt_id in type_items.items()
-        ]
-        valid = await self._gather_results(
-            tasks,
-            context={"year": year, "type": "NA", "situation": "NA"},
-            desc=f"{self.name} | Year {year}",
-        )
-        return self._flatten_results(valid)
+        return await self._scrape_type("", "", year)

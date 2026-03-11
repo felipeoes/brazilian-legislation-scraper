@@ -32,7 +32,6 @@ class ParaibaAlpbScraper(SAPLBaseScraper):
         base_url: str = "https://sapl3.al.pb.leg.br",
         max_workers: int = 2,
         rps: float = 1,
-        max_retries: int = 3,
         **kwargs: Any,
     ):
         super().__init__(
@@ -41,6 +40,5 @@ class ParaibaAlpbScraper(SAPLBaseScraper):
             types=TYPES,
             max_workers=max_workers,
             rps=rps,
-            max_retries=max_retries,
             **kwargs,
         )

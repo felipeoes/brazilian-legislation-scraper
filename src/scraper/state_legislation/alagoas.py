@@ -1,8 +1,12 @@
 import base64
+import re
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote
 
+from loguru import logger
+
+from src.scraper.base.converter import calc_pages, valid_markdown
 from src.scraper.base.scraper import StateScraper
 
 # Documentation-only reference — the API does not require filtering by type.
@@ -18,6 +22,20 @@ TYPES = {
     "Lei Delegada": "TIP044",
     "Lei Ordinária": "TIP043",
 }
+
+# Structural ementa removal: matches the norm title line followed by the ementa
+# block (any content, including blank lines) up to the body opener.
+_EMENTA_STRUCTURAL_RE = re.compile(
+    r"((?:LEI|DECRETO|EMENDA|RESOLU[ÇC][ÃA]O|CONSTITUIÇÃO|EMENTÁRIO|PORTARIA|ATO)[^\n]*)"
+    r"\n+[\s\S]+?(?=\nO GOVERNADOR\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Footer disclaimer common to Alagoas PDFs: "Este texto não substitui..."
+_DISCLAIMER_LINE_RE = re.compile(
+    r"\n?Est[ea]\s+texto\s+n[aã]o\s+substitui[^\n]*",
+    re.IGNORECASE,
+)
 
 
 class AlagoasSefazScraper(StateScraper):
@@ -50,6 +68,40 @@ class AlagoasSefazScraper(StateScraper):
 
     The site has no *situation* (revogação) concept, so ``situations`` is
     empty and no situation iteration is performed.
+
+    **Rate limit:** The API enforces a server-side limit of 5 req/s.  Exceeding
+    that ceiling triggers throttling which, combined with retry back-off, makes
+    the overall scrape significantly slower.  ``rps`` is capped at 5 in
+    ``__init__`` regardless of the caller-supplied value.
+
+    **Markdown extraction strategy (year boundary):**
+
+    * ``year < 2000`` — documents are scanned PDF images.  Markitdown can
+      open them but yields many OCR errors.  When ``llm_config`` is supplied,
+      the LLM OCR service is invoked directly (``ocr_service.pdf_to_markdown``)
+      for these years, bypassing markitdown entirely.  Without ``llm_config``
+      the scraper falls back to ``_get_markdown`` and logs a warning.
+    * ``year >= 2000`` — documents carry a proper text layer; ``_get_markdown``
+      handles them correctly without LLM assistance.
+
+    **Summary vs. text_markdown:** The ``summary`` field (``textoEmenta``) is
+    intentionally **not** stripped from ``text_markdown``.  Alagoas documents
+    fall into two structural categories:
+
+    * *Laws and long decrees* — the ementa appears as a standalone ALL-CAPS
+      block between the title line and the body opener.  A reliable structural
+      regex would need to handle PDF column-layout artifacts that scramble word
+      order, making any text-based match fragile.
+    * *Short administrative decrees* (exonerations, appointments, etc.) — the
+      ementa is derived directly from the body sentence (e.g. "RESOLVE exonerar
+      …").  Removing it would corrupt the body text, leaving orphaned
+      punctuation and broken sentences.
+
+    Given these two mutually exclusive cases there is no single safe strategy
+    to strip the ementa from ``text_markdown`` for all document types.  The
+    ``summary`` field is kept for search and indexing purposes; consumers
+    should treat it as a standalone excerpt rather than expecting it to be
+    absent from ``text_markdown``.
     """
 
     def __init__(
@@ -57,8 +109,30 @@ class AlagoasSefazScraper(StateScraper):
         base_url: str = "https://gcs2.sefaz.al.gov.br/sfz-gcs-api/api/administrativo/documento/consultar",
         **kwargs,
     ):
+        kwargs["rps"] = min(kwargs.get("rps", 5), 5)
         super().__init__(base_url, name="ALAGOAS", types=TYPES, situations={}, **kwargs)
         self.view_doc_url = "https://gcs2.sefaz.al.gov.br/sfz-gcs-api/api/documentos/visualizarDocumento?"
+
+    @staticmethod
+    def _infer_type_from_title(title: str) -> str:
+        """Infer a canonical type from a title when the API omits it."""
+        normalized_title = " ".join(title.split())
+        aliases = {
+            "Lei Complementar": "Lei Complementar",
+            "Lei Delegada": "Lei Delegada",
+            "Lei ": "Lei Ordinária",
+            "Decreto Autônomo": "Decreto Autônomo",
+            "Decreto ": "Decreto",
+            "Emenda Constitucional": "Emenda Constitucional",
+            "Constituição Estadual": "Constituição Estadual",
+            "Ementário": "Ementário",
+        }
+        for prefix, canonical in sorted(
+            aliases.items(), key=lambda item: len(item[0]), reverse=True
+        ):
+            if normalized_title.casefold().startswith(prefix.casefold()):
+                return canonical
+        return ""
 
     def _build_params(self, year: int) -> dict:
         """Build a fresh POST body for an unfiltered year query."""
@@ -90,7 +164,8 @@ class AlagoasSefazScraper(StateScraper):
                 return []
             data = await response.json()
             return data.get("documentos") or []
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Failed to fetch Alagoas norm page: {e}")
             return []
 
     async def _get_doc_data(self, doc_info: dict) -> dict | None:
@@ -101,15 +176,35 @@ class AlagoasSefazScraper(StateScraper):
 
         The document key must be double-URL-encoded, otherwise the API
         returns 404.  The response contains a base64-encoded file payload.
+
+        **Markdown extraction strategy:**
+
+        * ``year < 2000`` — documents are scanned PDF images.  Markitdown can
+          open them but produces many OCR errors.  When an ``ocr_service`` is
+          configured (i.e. ``llm_config`` was supplied to the scraper), LLM OCR
+          is used directly via ``ocr_service.pdf_to_markdown()``, bypassing
+          markitdown entirely.  If no ``ocr_service`` is available the scraper
+          falls back to ``_get_markdown`` with a warning.
+        * ``year >= 2000`` — documents have a proper text layer and
+          ``_get_markdown`` works correctly without LLM assistance.
         """
         key = quote(quote(doc_info["link"]["key"]))
         doc_link = f"{self.view_doc_url}acess={doc_info['link']['acess']}&key={key}"
 
-        if self._is_already_scraped(doc_link):
+        norm_type = (
+            (doc_info.get("tipoDocumento") or {}).get("descricao") or ""
+        ).strip()
+        number = doc_info["numeroDocumento"]
+        year = int(doc_info.get("_year") or 0)
+        title = f"{norm_type} {number} de {year}".strip()
+        if not norm_type:
+            norm_type = self._infer_type_from_title(title)
+            if norm_type:
+                title = f"{norm_type} {number} de {year}".strip()
+
+        if self._is_already_scraped(doc_link, title):
             return None
 
-        year = doc_info.get("_year", "")
-        title = ""
         ext = ".pdf"
         pdf_bytes = b""
 
@@ -127,12 +222,29 @@ class AlagoasSefazScraper(StateScraper):
             data = await response.json()
             full_filename = data["arquivo"]["nomeArquivo"]
             ext = Path(full_filename).suffix.lower() or ".pdf"
-            title = Path(full_filename).stem
+
+            if not norm_type:
+                norm_type = self._infer_type_from_title(full_filename.replace("_", " "))
+                if norm_type:
+                    title = f"{norm_type} {number} de {year}".strip()
 
             pdf_bytes = base64.b64decode(data["arquivo"]["base64"])
-            text_markdown = await self._get_markdown(
-                stream=BytesIO(pdf_bytes), filename=full_filename
-            )
+
+            if year < 2000:
+                if self.ocr_service:
+                    text_markdown = await self.ocr_service.pdf_to_markdown(pdf_bytes)
+                else:
+                    logger.warning(
+                        f"ALAGOAS | {year} | No OCR service configured for pre-2000 "
+                        "scanned PDF — falling back to _get_markdown (expect errors)."
+                    )
+                    text_markdown = await self._get_markdown(
+                        stream=BytesIO(pdf_bytes), filename=full_filename
+                    )
+            else:
+                text_markdown = await self._get_markdown(
+                    stream=BytesIO(pdf_bytes), filename=full_filename
+                )
 
         except Exception as e:
             await self._save_doc_error(
@@ -152,7 +264,7 @@ class AlagoasSefazScraper(StateScraper):
             )
             return None
 
-        valid, reason = self._valid_markdown(text_markdown)
+        valid, reason = valid_markdown(text_markdown)
         if not valid:
             await self._save_doc_error(
                 title=title,
@@ -162,11 +274,14 @@ class AlagoasSefazScraper(StateScraper):
             )
             return None
 
+        # Remove "Este texto não substitui..." footer disclaimer
+        text_markdown = _DISCLAIMER_LINE_RE.sub("", text_markdown).strip()
+
         return {
             "id": doc_info["numeroDocumento"],
             "number": doc_info["numeroDocumento"],
             "title": title,
-            "type": (doc_info.get("tipoDocumento") or {}).get("descricao", ""),
+            "type": norm_type,
             "summary": doc_info.get("textoEmenta", ""),
             "category": (doc_info.get("categoria") or {}).get("descricao", ""),
             "publication_date": doc_info.get("dataPublicacao", ""),
@@ -188,7 +303,8 @@ class AlagoasSefazScraper(StateScraper):
 
         try:
             data = await response.json()
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Failed to parse Alagoas year response JSON: {e}")
             return []
 
         total_norms = data.get("registrosTotais")
@@ -196,7 +312,7 @@ class AlagoasSefazScraper(StateScraper):
             return []
 
         per_page = data.get("registrosPorPagina") or 10
-        pages = self._calc_pages(total_norms, per_page)
+        pages = calc_pages(total_norms, per_page)
 
         norms: list[dict] = list(data.get("documentos") or [])
 
@@ -218,6 +334,6 @@ class AlagoasSefazScraper(StateScraper):
         return await self._process_documents(
             norms,
             year=year,
-            norm_type="NA",
-            situation="NA",
+            norm_type="ALL",
+            situation="",
         )

@@ -283,9 +283,9 @@ class TestGetDocData:
     async def test_failed_request_logs_error_and_returns_none(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        failed = make_failed_request()
-        failed.reason = "Connection refused"
-        scraper.request_service.get_soup = AsyncMock(return_value=failed)
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            side_effect=Exception("Connection refused")
+        )
         scraper._save_doc_error = AsyncMock()
         doc_info = {
             "title": "Lei 001",
@@ -313,7 +313,7 @@ class TestGetDocData:
         scraper._is_already_scraped = MagicMock(return_value=False)
         # Soup with no "materia rounded" div
         soup = BeautifulSoup("<html><body><p>nothing</p></body></html>", "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
         scraper._save_doc_error = AsyncMock()
         doc_info = {
             "title": "Lei 001",
@@ -330,7 +330,7 @@ class TestGetDocData:
         scraper._is_already_scraped = MagicMock(return_value=False)
         long_text = "X" * 200
         soup = _make_doc_soup(long_text)
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
         scraper._save_doc_error = AsyncMock()
         # Return very short (invalid) markdown
         scraper._get_markdown = AsyncMock(return_value="short")
@@ -352,7 +352,9 @@ class TestGetDocData:
         scraper._is_already_scraped = MagicMock(return_value=False)
         long_text = "C" * 200
         soup = _make_doc_soup(long_text)
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            return_value=(soup, b"fake-mhtml-content")
+        )
         valid_md = "# Lei Ordinária\n\n" + "Texto da lei. " * 20
         scraper._get_markdown = AsyncMock(return_value=valid_md)
         doc_info = {
@@ -366,9 +368,8 @@ class TestGetDocData:
         assert result is not None
         assert result["text_markdown"] == valid_md
         assert "document_url" in result
-        assert "_raw_content" in result
-        assert result["_content_extension"] == ".html"
-        assert isinstance(result["_raw_content"], bytes)
+        assert result["_raw_content"] == b"fake-mhtml-content"
+        assert result["_content_extension"] == ".mhtml"
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +386,7 @@ class TestScrapeType:
         scraper._get_markdown = AsyncMock(return_value=valid_md)
         long_text = "D" * 200
         soup = _make_doc_soup(long_text)
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
         scraper._save_doc_result = AsyncMock()
 
         results = await scraper._scrape_type(
@@ -403,7 +404,7 @@ class TestScrapeType:
         valid_md = "# Constituição Estadual\n\n" + "Texto. " * 30
         scraper._get_markdown = AsyncMock(return_value=valid_md)
         soup = _make_doc_soup("E" * 200)
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
         scraper._save_doc_result = AsyncMock()
 
         # Called during year 1956 — year/date must still be 1989

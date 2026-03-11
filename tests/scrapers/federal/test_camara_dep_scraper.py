@@ -201,6 +201,36 @@ def test_types_dict_completeness():
         assert t in TYPES, f"TYPES missing required key: {t!r}"
 
 
+class TestTypeResolution:
+    def test_resolve_norm_type_prefers_metadata_slug(self):
+        scraper = build_unit_scraper()
+
+        assert (
+            scraper._resolve_norm_type(
+                "Lei nº 15.323, de 6 de Janeiro de 2026",
+                metadata_url=(
+                    "https://www2.camara.leg.br/legin/fed/lei/2026/"
+                    "lei-15323-6-janeiro-2026-798626-norma-pl.html"
+                ),
+            )
+            == "Lei Ordinária"
+        )
+
+    def test_resolve_norm_type_maps_slug_only_titles(self):
+        scraper = build_unit_scraper()
+
+        assert (
+            scraper._resolve_norm_type(
+                "Carta de Lei  de 29 de Novembro de 1808",
+                metadata_url=(
+                    "https://www2.camara.leg.br/legin/fed/carlei_sn/anterioresa1824/"
+                    "cartadelei-40273-29-novembro-1808-572462-norma-pe.html"
+                ),
+            )
+            == "Carta de Lei"
+        )
+
+
 class TestListingParsing:
     def test_parse_export_documents_extracts_metadata(self):
         scraper = build_unit_scraper()
@@ -339,20 +369,21 @@ class TestGetDocData:
     @pytest.mark.asyncio
     async def test_get_doc_data_strips_ementa_when_body_exists(self):
         scraper = build_unit_scraper()
-        scraper.request_service.get_soup = AsyncMock(
-            return_value=BeautifulSoup(
-                """
-                <html><body><div id="content">
-                    <h1>DECRETO Nº 365, DE 10 DE SETEMBRO DE 1845</h1>
-                    <div class="textoNorma">
-                        <p class="ementa">Approva a Pensão annual de hum conto e duzentos mil réis.</p>
-                        <p>Art. 1º Fica mantida a concessão da pensão.</p>
-                        <p>Art. 2º Revogam-se as disposições em contrário.</p>
-                    </div>
-                </div></body></html>
-                """,
-                "html.parser",
-            )
+        fake_soup = BeautifulSoup(
+            """
+            <html><body><div id="content">
+                <h1>DECRETO Nº 365, DE 10 DE SETEMBRO DE 1845</h1>
+                <div class="textoNorma">
+                    <p class="ementa">Approva a Pensão annual de hum conto e duzentos mil réis.</p>
+                    <p>Art. 1º Fica mantida a concessão da pensão.</p>
+                    <p>Art. 2º Revogam-se as disposições em contrário.</p>
+                </div>
+            </div></body></html>
+            """,
+            "html.parser",
+        )
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            return_value=(fake_soup, b"fake-mhtml-content")
         )
 
         markdown_calls = []
@@ -372,6 +403,7 @@ class TestGetDocData:
         )
 
         assert result is not None
+        assert result["type"] == "Decreto"
         assert result["text_markdown"] == expected_markdown
         assert len(markdown_calls) == 1
 
@@ -384,18 +416,19 @@ class TestGetDocData:
     @pytest.mark.asyncio
     async def test_get_doc_data_falls_back_to_ementa_when_it_is_the_only_text(self):
         scraper = build_unit_scraper()
-        scraper.request_service.get_soup = AsyncMock(
-            return_value=BeautifulSoup(
-                """
-                <html><body><div id="content">
-                    <h1>DECRETO Nº 365, DE 10 DE SETEMBRO DE 1845</h1>
-                    <div class="textoNorma">
-                        <p class="ementa">Approva a Pensão annual de hum conto e duzentos mil réis.</p>
-                    </div>
-                </div></body></html>
-                """,
-                "html.parser",
-            )
+        fake_soup = BeautifulSoup(
+            """
+            <html><body><div id="content">
+                <h1>DECRETO Nº 365, DE 10 DE SETEMBRO DE 1845</h1>
+                <div class="textoNorma">
+                    <p class="ementa">Approva a Pensão annual de hum conto e duzentos mil réis.</p>
+                </div>
+            </div></body></html>
+            """,
+            "html.parser",
+        )
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            return_value=(fake_soup, b"fake-mhtml-content")
         )
 
         markdown_calls = []
@@ -412,19 +445,17 @@ class TestGetDocData:
         )
 
         assert result is not None
+        assert result["type"] == "Decreto"
         assert result["text_markdown"] == fallback_markdown
         assert len(markdown_calls) == 2
 
         stripped_soup = BeautifulSoup(markdown_calls[0], "html.parser")
         fallback_soup = BeautifulSoup(markdown_calls[1], "html.parser")
-        saved_html = BeautifulSoup(
-            result["_raw_content"].decode("utf-8"), "html.parser"
-        )
 
         assert stripped_soup.find("h1") is None
         assert stripped_soup.find("p", class_="ementa") is None
         assert fallback_soup.find("h1") is None
         assert fallback_soup.find("p", class_="ementa") is not None
-        assert saved_html.find("h1") is None
-        assert saved_html.find("p", class_="ementa") is not None
+        assert result["_raw_content"] == b"fake-mhtml-content"
+        assert result["_content_extension"] == ".mhtml"
         assert scraper._save_doc_error.await_count == 0

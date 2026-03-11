@@ -25,11 +25,18 @@ class AcreLegisScraper(StateScraper):
     Example search request: https://legis.ac.gov.br/principal/1
     """
 
+    # legis.ac.gov.br has slow-loading resources; use domcontentloaded
+    # to avoid waiting for scripts/fonts that may never finish.
+    _mhtml_wait_until = "domcontentloaded"
+
     def __init__(
         self,
         base_url: str = "https://legis.ac.gov.br/principal",
         **kwargs,
     ):
+        # legis.ac.gov.br can't handle many concurrent browser connections;
+        # keeping max_workers low prevents MHTML capture timeouts (30s).
+        # kwargs.setdefault("max_workers", 5)
         super().__init__(
             base_url, name="ACRE", types=TYPES, situations=SITUATIONS, **kwargs
         )
@@ -86,13 +93,25 @@ class AcreLegisScraper(StateScraper):
         doe_span = html_tag.find("span", id="texto_publicado_doe")
         if doe_span:
             doe_span.decompose()
+        # Remove header with brasão (constitution page)
+        topo = html_tag.find("div", class_="topo-lei")
+        if topo:
+            topo.decompose()
+        # Remove the ementa metadata table (first table with an empty leading cell)
+        first_table = html_tag.find("table")
+        if first_table:
+            first_td = first_table.find("td")
+            if first_td and not first_td.get_text(strip=True):
+                first_table.decompose()
 
         # Reuse base helpers: unwrap links and remove disclaimer notices
         self._clean_norm_soup(html_tag, unwrap_links=True, remove_disclaimers=True)
 
-        return html_tag.prettify()
+        # Use str() instead of prettify() to preserve inline flow
+        # (prettify adds newlines between siblings, breaking inline text)
+        return str(html_tag)
 
-    async def _get_doc_data(self, doc_info: dict) -> dict:
+    async def _get_doc_data(self, doc_info: dict) -> dict | None:
         """Get document data from given html link"""
         doc_html_link = doc_info["html_link"]
         doc_title = doc_info["title"]
@@ -101,21 +120,21 @@ class AcreLegisScraper(StateScraper):
         if self._is_already_scraped(doc_html_link, doc_title):
             return None
 
-        response = await self.request_service.make_request(doc_html_link)
-        if not response:
+        try:
+            soup, mhtml = await self._fetch_soup_and_mhtml(doc_html_link)
+        except Exception as exc:
             await self._save_doc_error(
                 title=doc_title,
                 year=doc_year,
                 html_link=doc_html_link,
-                error_message="Failed to fetch document page",
+                error_message=f"Failed to fetch document page: {exc}",
             )
             return None
 
-        soup = BeautifulSoup(await response.text(), "html.parser")
         html_string = self._clean_acre_html(soup)
 
         doc_data = {k: v for k, v in doc_info.items() if k != "html_link"}
-        return await self._process_html_doc(doc_data, html_string, doc_html_link)
+        return await self._process_html_doc(doc_data, html_string, doc_html_link, mhtml)
 
     async def _prefetch_all_links(self) -> None:
         """Fetch all document links from the single page and group by year.
@@ -139,14 +158,13 @@ class AcreLegisScraper(StateScraper):
                 year = int(doc["year"])
                 self._prefetched_docs[year][norm_type].append(doc)
 
-            if self.verbose:
-                logger.info(f"Prefetched {len(html_links)} links for {norm_type}")
+            logger.debug(f"Prefetched {len(html_links)} links for {norm_type}")
 
     async def _scrape_type(
         self, norm_type: str, norm_type_id: str, year: int
     ) -> list[dict]:
         """Scrape all documents of a single type for a year."""
-        situation = next(iter(self.situations), "Não consta")
+        situation = self.default_situation
 
         if norm_type == "Constituição Estadual":
             # Scrape once on the first year that reaches here
@@ -154,12 +172,38 @@ class AcreLegisScraper(StateScraper):
                 return []
             self._scraped_constitution = True
             document_url = f"{self.base_url.replace('/principal', '')}/{norm_type_id}"
-            doc = await self._fetch_and_save_constitution(
-                url=document_url,
-                title="Constituição Estadual",
-                year=datetime.now().year,
-                summary="Constituição Estadual do Estado do Acre",
+
+            try:
+                soup, mhtml = await self._fetch_soup_and_mhtml(document_url)
+            except Exception as exc:
+                await self._save_doc_error(
+                    title="Constituição Estadual",
+                    year=year,
+                    html_link=document_url,
+                    error_message=f"Failed to fetch constitution: {exc}",
+                )
+                return []
+
+            html_string = self._clean_acre_html(soup)
+            if not html_string:
+                return []
+
+            doc_data = {
+                "year": datetime.now().year,
+                "type": "Constituição Estadual",
+                "situation": self.default_situation,
+                "summary": "Constituição Estadual do Estado do Acre",
+            }
+            doc = await self._process_html_doc(
+                doc_data, html_string, document_url, mhtml
             )
+            if doc:
+                doc["title"] = "Constituição Estadual"
+                saved = await self._save_doc_result(doc)
+                if saved is not None:
+                    doc = saved
+                self._track_results([doc])
+                self.count += 1
             return [doc] if doc else []
 
         docs = self._prefetched_docs.get(year, {}).get(norm_type, [])
@@ -174,7 +218,7 @@ class AcreLegisScraper(StateScraper):
             desc=f"ACRE | {norm_type} | Year {year}",
         )
 
-    async def scrape(self) -> list:
+    async def scrape(self) -> int:
         """Scrape data from all years.
 
         Prefetches all document links from the single page, groups them

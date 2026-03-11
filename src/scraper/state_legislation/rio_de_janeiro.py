@@ -7,6 +7,11 @@ from typing import Any
 from bs4 import BeautifulSoup
 from unidecode import unidecode
 
+from src.scraper.base.converter import (
+    strip_html_chrome,
+    valid_markdown,
+    wrap_html,
+)
 from src.scraper.base.scraper import StateScraper
 
 # obs: LeiComp = Lei Complementar; LeiOrd = Lei Ordinária;
@@ -115,7 +120,6 @@ class RJAlerjScraper(StateScraper):
                     "summary": summary,
                     "_html_link": wrapped_url,
                     "document_url": document_url.replace("?OpenDocument", ""),
-                    "_mhtml_url": wrapped_url,
                 }
             )
         return html_links, page_years
@@ -145,7 +149,7 @@ class RJAlerjScraper(StateScraper):
             div_to_remove.decompose()
         for div_to_remove in content_root.find_all("div", id="barraBotoes"):
             div_to_remove.decompose()
-        self._strip_html_chrome(content_root)
+        strip_html_chrome(content_root)
         self._clean_norm_soup(content_root)
         for text_node in list(content_root.strings):
             if not text_node.strip():
@@ -328,7 +332,7 @@ class RJAlerjScraper(StateScraper):
             break
         return "\n".join(lines).strip()
 
-    async def _get_doc_data(self, doc_info: dict, year: str = "") -> dict:
+    async def _get_doc_data(self, doc_info: dict, year: str = "") -> dict | None:
         """Get document data from given html link"""
         doc_html_link = doc_info["_html_link"]
         document_url = doc_info.get("document_url") or doc_html_link.strip().replace(
@@ -338,12 +342,13 @@ class RJAlerjScraper(StateScraper):
         if self._is_already_scraped(document_url, doc_info.get("title", "")):
             return None
 
-        soup = await self.request_service.get_soup(doc_html_link)
-        if not soup:
+        try:
+            soup, mhtml = await self._fetch_soup_and_mhtml(doc_html_link)
+        except Exception as exc:
             await self._save_doc_error(
                 title=doc_info.get("title", "Unknown"),
                 html_link=doc_html_link,
-                error_message=f"Request failed: {getattr(soup, 'reason', 'unknown')}",
+                error_message=f"Request failed: {exc}",
             )
             return None
 
@@ -376,11 +381,11 @@ class RJAlerjScraper(StateScraper):
         )
 
         html_string = content_root.prettify().replace("\n", "")
-        full_html = self._wrap_html(html_string)
+        full_html = wrap_html(html_string)
         text_markdown = (await self._get_markdown(html_content=full_html)).strip()
         text_markdown = self._clean_extracted_markdown(text_markdown)
 
-        valid, reason = self._valid_markdown(text_markdown)
+        valid, reason = valid_markdown(text_markdown)
         if not valid:
             await self._save_doc_error(
                 title=doc_info.get("title", "Unknown"),
@@ -394,9 +399,8 @@ class RJAlerjScraper(StateScraper):
             "situation": situation,
             "text_markdown": text_markdown,
             "document_url": document_url,
-            "_mhtml_url": doc_html_link,
-            "_raw_content": full_html.encode("utf-8"),
-            "_content_extension": ".html",
+            "_raw_content": mhtml,
+            "_content_extension": ".mhtml",
         }
         result.pop("_html_link", None)
 
@@ -463,10 +467,10 @@ class RJAlerjScraper(StateScraper):
         )
 
         html_string = "<hr/>".join(html_parts)
-        full_html = self._wrap_html(html_string)
+        full_html = wrap_html(html_string)
         text_markdown = (await self._get_markdown(html_content=full_html)).strip()
 
-        valid, reason = self._valid_markdown(text_markdown)
+        valid, reason = valid_markdown(text_markdown)
         if not valid:
             self._scraped_constitution = True
             return
@@ -480,9 +484,8 @@ class RJAlerjScraper(StateScraper):
             "text_markdown": text_markdown,
             "situation": "Sem revogação expressa",
             "document_url": constitution_url,
-            "_mhtml_url": constitution_url,
-            "_raw_content": full_html.encode("utf-8"),
-            "_content_extension": ".html",
+            "_raw_content": await self._capture_mhtml(constitution_url),
+            "_content_extension": ".mhtml",
         }
 
         saved = await self._save_doc_result(queue_item)

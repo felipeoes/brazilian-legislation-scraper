@@ -1,11 +1,33 @@
 import re
-from typing import Any, cast
 from urllib.parse import urlencode, urljoin
 
 from bs4 import BeautifulSoup, Tag
 from loguru import logger
 
+from src.scraper.base.converter import wrap_html
 from src.scraper.base.scraper import StateScraper
+
+
+def _remove_summary_from_markdown(md: str, summary: str) -> str:
+    """Remove the summary paragraph from text_markdown to avoid duplication.
+
+    The Bahia document body (``field--name-body``) includes the ementa/summary
+    as its second paragraph. Since the summary is already stored separately, it
+    is stripped here to avoid repeating it verbatim inside ``text_markdown``.
+    """
+    if not summary:
+        return md
+    summary_norm = re.sub(r"\s+", " ", summary).strip()
+    paragraphs = md.split("\n\n")
+    filtered = [
+        p
+        for p in paragraphs
+        if re.sub(r"\s+", " ", re.sub(r"[*_`]+", "", p)).strip() != summary_norm
+    ]
+    if len(filtered) == len(paragraphs):
+        return md  # summary not found as a standalone paragraph
+    return "\n\n".join(filtered)
+
 
 TYPES = {
     "Constituição Estadual Atual 1989": 11,
@@ -26,7 +48,8 @@ TYPES = {
     "Instrução Normativa Casa Civil": 92,
 }
 
-SITUATIONS = {"Não consta": "Não consta"}
+
+SITUATIONS: dict[str, str] = {}
 
 _TYPE_LABELS = {name.casefold(): name for name in TYPES}
 _TYPE_LABELS.update(
@@ -169,7 +192,7 @@ class BahiaLegislaScraper(StateScraper):
             return None
 
         try:
-            response = await self.request_service.make_request(url, timeout=120)
+            soup, mhtml = await self._fetch_soup_and_mhtml(url)
         except Exception as exc:
             logger.error(f"Failed to get document data from URL: {url} | Error: {exc}")
             await self._save_doc_error(
@@ -180,24 +203,6 @@ class BahiaLegislaScraper(StateScraper):
                 error_message=f"Failed to fetch document page: {exc}",
             )
             return None
-
-        if not response or not hasattr(response, "read"):
-            reason = getattr(response, "reason", "Failed to fetch document page")
-            logger.error(
-                f"Failed to get document data from URL: {url} | Error: {reason}"
-            )
-            await self._save_doc_error(
-                title=doc_info.get("title", "Unknown"),
-                year=doc_info.get("year", ""),
-                norm_type=doc_info.get("type", ""),
-                html_link=url,
-                error_message=reason,
-            )
-            return None
-
-        response_obj = cast(Any, response)
-        content = await response_obj.read()
-        soup = BeautifulSoup(content, "html.parser")
 
         category = self._get_field_item_text(soup, "field--name-field-categoria-doc")
         if category:
@@ -230,7 +235,7 @@ class BahiaLegislaScraper(StateScraper):
             remove_script_tags=True,
         )
 
-        html_string = self._wrap_html(norm_text_tag.prettify())
+        html_string = wrap_html(norm_text_tag.prettify())
 
         is_revogado = bool(norm_text_tag.find("span", class_=self._REVOGADO_RE)) or any(
             self._REVOGADO_RE.match(div.get_text(strip=True))
@@ -243,7 +248,12 @@ class BahiaLegislaScraper(StateScraper):
         doc_info["date"] = date
         doc_info["publication_date"] = publication_date
         doc_info["summary"] = summary
-        return await self._process_html_doc(doc_info, html_string, url)
+        result = await self._process_html_doc(doc_info, html_string, url, mhtml)
+        if result is not None and summary:
+            md = result.get("text_markdown", "")
+            if md:
+                result["text_markdown"] = _remove_summary_from_markdown(md, summary)
+        return result
 
     async def _scrape_year(self, year: int) -> list[dict]:
         """Scrape all norms for a specific year in a single unfiltered listing."""

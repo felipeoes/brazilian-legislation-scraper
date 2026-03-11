@@ -1,57 +1,27 @@
-from .acre import AcreLegisScraper
-from .alagoas import AlagoasSefazScraper
-from .amapa import AmapaAlapScraper
-from .amazonas import LegislaAMScraper
-from .bahia import BahiaLegislaScraper
-from .ceara import CearaAleceScraper
-from .distrito_federal import DFSinjScraper
-from .espirito_santo import ESAlesScraper
-from .goias import LegislaGoias
-from .maranhao import MaranhaoAlemaScraper
-from .mato_grosso_do_sul import MSAlemsScraper
-from .mato_grosso import MTAlmtScraper
-from .minas_gerais import MGAlmgScraper
-from .para import ParaAlepaScraper
-from .paraiba import ParaibaAlpbScraper
-from .parana import ParanaCVScraper
-from .pernambuco import PernambucoAlepeScraper
-from .piaui import PiauiAlepiScraper
-from .sao_paulo import SaoPauloAlespScraper
-from .rio_de_janeiro import RJAlerjScraper
-from .rio_grande_do_norte import RNAlrnScraper
-from .rio_grande_do_sul import RSAlrsScraper
-from .rondonia import RondoniaCotelScraper
-from .roraima import RoraimaAlerScraper
-from .santa_catarina import SantaCatarinaScraper
-from .sergipe import SergipeLegsonScraper
-from .tocantins import TocantinsScraper
-
-__all__ = [
-    "AcreLegisScraper",
-    "AlagoasSefazScraper",
-    "AmapaAlapScraper",
-    "LegislaAMScraper",
-    "BahiaLegislaScraper",
-    "CearaAleceScraper",
-    "DFSinjScraper",
-    "ESAlesScraper",
-    "LegislaGoias",
-    "MaranhaoAlemaScraper",
-    "MSAlemsScraper",
-    "MTAlmtScraper",
-    "MGAlmgScraper",
-    "ParaAlepaScraper",
-    "ParaibaAlpbScraper",
-    "ParanaCVScraper",
-    "PernambucoAlepeScraper",
-    "PiauiAlepiScraper",
-    "SaoPauloAlespScraper",
-    "RJAlerjScraper",
-    "RNAlrnScraper",
-    "RSAlrsScraper",
-    "RondoniaCotelScraper",
-    "RoraimaAlerScraper",
-    "SantaCatarinaScraper",
-    "SergipeLegsonScraper",
-    "TocantinsScraper",
-]
+from .acre import AcreLegisScraper as AcreLegisScraper
+from .alagoas import AlagoasSefazScraper as AlagoasSefazScraper
+from .amapa import AmapaAlapScraper as AmapaAlapScraper
+from .amazonas import LegislaAMScraper as LegislaAMScraper
+from .bahia import BahiaLegislaScraper as BahiaLegislaScraper
+from .ceara import CearaAleceScraper as CearaAleceScraper
+from .distrito_federal import DFSinjScraper as DFSinjScraper
+from .espirito_santo import ESAlesScraper as ESAlesScraper
+from .goias import LegislaGoias as LegislaGoias
+from .maranhao import MaranhaoAlemaScraper as MaranhaoAlemaScraper
+from .mato_grosso_do_sul import MSAlemsScraper as MSAlemsScraper
+from .mato_grosso import MTAlmtScraper as MTAlmtScraper
+from .minas_gerais import MGAlmgScraper as MGAlmgScraper
+from .para import ParaAlepaScraper as ParaAlepaScraper
+from .paraiba import ParaibaAlpbScraper as ParaibaAlpbScraper
+from .parana import ParanaCVScraper as ParanaCVScraper
+from .pernambuco import PernambucoAlepeScraper as PernambucoAlepeScraper
+from .piaui import PiauiAlepiScraper as PiauiAlepiScraper
+from .sao_paulo import SaoPauloAlespScraper as SaoPauloAlespScraper
+from .rio_de_janeiro import RJAlerjScraper as RJAlerjScraper
+from .rio_grande_do_norte import RNAlrnScraper as RNAlrnScraper
+from .rio_grande_do_sul import RSAlrsScraper as RSAlrsScraper
+from .rondonia import RondoniaCotelScraper as RondoniaCotelScraper
+from .roraima import RoraimaAlerScraper as RoraimaAlerScraper
+from .santa_catarina import SantaCatarinaScraper as SantaCatarinaScraper
+from .sergipe import SergipeLegsonScraper as SergipeLegsonScraper
+from .tocantins import TocantinsScraper as TocantinsScraper

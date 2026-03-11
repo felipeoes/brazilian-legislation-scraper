@@ -20,7 +20,6 @@ def _make_scraper(**kwargs) -> DFSinjScraper:
     defaults = {
         "search_url": "https://www.sinj.df.gov.br/sinj/ashx/Datatable/ResultadoDePesquisaNormaDatatable.ashx",
         "_display_length": 5000,
-        "_document_batch_size": 200,
         "max_workers": 20,
     }
     return make_base_scraper(
@@ -70,10 +69,22 @@ def _make_search_response(*sources: dict, total: int | None = None) -> dict:
     }
 
 
-def _make_html_text_body(title_line: str) -> bytes:
-    return f"""<html><body><div id="div_texto">
+def _make_html_text_body(
+    title_line: str,
+    summary: str = "",
+    *,
+    download_href: str = "./Norma/67028/document.html",
+) -> bytes:
+    summary_tag = f"\n<p>{summary}</p>" if summary else ""
+    download_tag = (
+        f'\n<a title="baixar arquivo" class="baixarArquivo" target="_blank"'
+        f' href="{download_href}">baixar arquivo</a>'
+        if download_href
+        else ""
+    )
+    return f"""<html><body>{download_tag}<div id="div_texto">
 Sistema Integrado de Normas Jurídicas do Distrito Federal - SINJ-DF
-{title_line}
+{title_line}{summary_tag}
 Art. 1º Texto principal da norma com conteúdo suficiente para validação.
 Art. 2º Disposições complementares da norma do Distrito Federal.
 Este texto não substitui o publicado no DODF.
@@ -126,7 +137,7 @@ class TestSituationsConstant(SituationsConstantTests):
 class TestClassAttributes(ScraperClassTests):
     SCRAPER_CLS = DFSinjScraper
     STATE_NAME = "Distrito Federal"
-    EXPECT_ITERATE_SITUATIONS = True
+    EXPECT_ITERATE_SITUATIONS = False
 
 
 class TestBuildPayload:
@@ -195,6 +206,27 @@ Este texto não substitui o publicado no DODF.
         assert "Este texto não substitui" not in cleaned
         assert "## img-0000 ##" not in cleaned
 
+    def test_remove_summary_element_handles_raw_text_nodes(self):
+        from bs4 import BeautifulSoup
+
+        scraper = _make_scraper()
+        summary = "Dispõe sobre a alteração da estrutura administrativa."
+        html = (
+            '<div id="div_texto">'
+            "DECRETO Nº 48.124, DE 31 DE DEZEMBRO DE 2025\n"
+            f" {summary}\n"
+            " O GOVERNADOR DO DISTRITO FEDERAL, DECRETA:\n"
+            " Art. 1º Texto principal."
+            "</div>"
+        )
+        soup = BeautifulSoup(html, "html.parser")
+        root = soup.find("div", id="div_texto")
+        scraper._remove_summary_element(root, summary)
+        text = root.get_text(" ", strip=True)
+        assert summary not in text
+        assert "Art. 1º" in text
+        assert "DECRETO Nº 48.124" in text
+
     def test_clean_extracted_text_does_not_jump_to_late_adi_reference(self):
         scraper = _make_scraper()
         raw = """EMENTA: Ação direta de inconstitucionalidade relevante.
@@ -234,12 +266,63 @@ Texto seguinte."""
         assert "ATOS DA SUBSECRETARIA" not in cleaned
         assert "ORDEM DE SERVIÇO Nº 18" not in cleaned
 
-    def test_detects_maintenance_placeholder(self):
+    def test_remove_summary_element_decomposes_matching_tag(self):
+        from bs4 import BeautifulSoup
+
         scraper = _make_scraper()
-        assert scraper._has_maintenance_placeholder(_make_maintenance_body()) is True
+        html = """<div id="div_texto">
+        <p>DECRETO Nº 100, DE 01 DE JANEIRO DE 2025</p>
+        <p>Dispõe sobre a criação da faculdade.</p>
+        <p>Art. 1º Texto principal.</p>
+        </div>"""
+        soup = BeautifulSoup(html, "html.parser")
+        root = soup.find("div", id="div_texto")
+        scraper._remove_summary_element(root, "Dispõe sobre a criação da faculdade.")
+        text = root.get_text(" ", strip=True)
+        assert "Dispõe sobre a criação da faculdade" not in text
+        assert "Art. 1º" in text
+
+    def test_remove_summary_element_skips_tag_with_art(self):
+        from bs4 import BeautifulSoup
+
+        scraper = _make_scraper()
+        html = """<div id="div_texto">
+        <p>Dispõe sobre a criação. Art. 1º Texto.</p>
+        </div>"""
+        soup = BeautifulSoup(html, "html.parser")
+        root = soup.find("div", id="div_texto")
+        scraper._remove_summary_element(root, "Dispõe sobre a criação.")
+        text = root.get_text(" ", strip=True)
+        assert "Dispõe sobre a criação" in text
+
+    def test_strip_summary_text_removes_from_pdf(self):
+        scraper = _make_scraper()
+        text = (
+            "DECRETO Nº 100, DE 01 DE JANEIRO DE 2025\n"
+            "Dispõe sobre a criação da faculdade.\n"
+            "Art. 1º Texto principal da norma."
+        )
+        result = scraper._strip_summary_text(
+            text, "Dispõe sobre a criação da faculdade."
+        )
+        assert "Dispõe sobre a criação" not in result
+        assert result.startswith("DECRETO Nº 100")
+        assert "Art. 1º" in result
+
+    def test_detects_maintenance_placeholder(self):
+        from bs4 import BeautifulSoup
+
+        scraper = _make_scraper()
+        soup = BeautifulSoup(_make_maintenance_body(), "html.parser")
+        assert scraper._is_maintenance_soup(soup) is True
 
 
 class TestGetDocsLinks:
+    def test_infer_norm_type_uses_title_prefix(self):
+        scraper = _make_scraper()
+
+        assert scraper._infer_norm_type("Portaria 708 de 14/01/2025") == "Portaria"
+
     @pytest.mark.asyncio
     async def test_returns_docs_with_any_type_and_situation(self):
         scraper = _make_scraper()
@@ -302,6 +385,7 @@ class TestGetDocData:
                 "title": "Decreto 32712 de 30/12/2010",
                 "document_url": f"{scraper.base_url}/Norma/67024/arquivo",
                 "ch_norma": "67024",
+                "file_name": "document.html",
             },
         )
 
@@ -317,6 +401,7 @@ class TestGetDocData:
             )
         )
         scraper.request_service.make_request = AsyncMock(return_value=html_response)
+        scraper._capture_mhtml = AsyncMock(return_value=b"fake-mhtml")
 
         result = await scraper._get_doc_data(
             {
@@ -327,17 +412,89 @@ class TestGetDocData:
                 "year": 2010,
                 "document_url": f"{scraper.base_url}/Norma/67028/arquivo",
                 "file_id": "text-id",
+                "file_name": "document.html",
                 "ch_norma": "67028",
             }
         )
 
         assert result is not None
-        assert result["document_url"].endswith("/Norma/67028/arquivo")
-        assert result["_mhtml_url"].endswith("TextoArquivoNorma.aspx?id_file=text-id")
-        assert result["_content_extension"] == ".html"
+        assert result["document_url"].endswith("/Norma/67028/document.html")
+        assert result["_content_extension"] == ".mhtml"
         assert result["text_markdown"].startswith("PORTARIA Nº 300")
         assert "Sistema Integrado" not in result["text_markdown"]
         assert "Este texto não substitui" not in result["text_markdown"]
+        assert scraper.request_service.make_request.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_html_endpoint_strips_summary_from_markdown(self):
+        scraper = _make_scraper()
+        scraper._is_already_scraped = MagicMock(return_value=False)
+        summary = "Dispõe sobre a alteração da estrutura administrativa."
+        html_response = MagicMock()
+        html_response.__bool__ = lambda s: True
+        html_response.read = AsyncMock(
+            return_value=_make_html_text_body(
+                "PORTARIA Nº 300, DE 30 DE DEZEMBRO DE 2010.",
+                summary=summary,
+            )
+        )
+        scraper.request_service.make_request = AsyncMock(return_value=html_response)
+        scraper._capture_mhtml = AsyncMock(return_value=b"fake-mhtml")
+
+        result = await scraper._get_doc_data(
+            {
+                "title": "Portaria 300 de 30/12/2010",
+                "type": "Portaria",
+                "number": "300",
+                "situation": "Sem Revogação Expressa",
+                "year": 2010,
+                "summary": summary,
+                "document_url": f"{scraper.base_url}/Norma/67028/arquivo",
+                "file_id": "text-id",
+                "file_name": "document.html",
+                "ch_norma": "67028",
+            }
+        )
+
+        assert result is not None
+        assert summary not in result["text_markdown"]
+        assert result["text_markdown"].startswith("PORTARIA Nº 300")
+
+    @pytest.mark.asyncio
+    async def test_prefers_text_url_when_file_is_pdf(self):
+        """When file_name is a PDF, document_url should be text_url, not the PDF download."""
+        scraper = _make_scraper()
+        scraper._is_already_scraped = MagicMock(return_value=False)
+        html_response = MagicMock()
+        html_response.__bool__ = lambda s: True
+        html_response.read = AsyncMock(
+            return_value=_make_html_text_body(
+                "PORTARIA Nº 300, DE 30 DE DEZEMBRO DE 2010.",
+                download_href="./Norma/67028/document.pdf",
+            )
+        )
+        scraper.request_service.make_request = AsyncMock(return_value=html_response)
+        scraper._capture_mhtml = AsyncMock(return_value=b"fake-mhtml")
+
+        result = await scraper._get_doc_data(
+            {
+                "title": "Portaria 300 de 30/12/2010",
+                "type": "Portaria",
+                "number": "300",
+                "situation": "Sem Revogação Expressa",
+                "year": 2010,
+                "document_url": f"{scraper.base_url}/Norma/67028/arquivo",
+                "file_id": "text-id",
+                "file_name": "document.pdf",
+                "ch_norma": "67028",
+            }
+        )
+
+        assert result is not None
+        # Should use text_url (TextoArquivoNorma.aspx), NOT the PDF download link
+        assert "TextoArquivoNorma.aspx" in result["document_url"]
+        assert not result["document_url"].endswith(".pdf")
+        assert result["_content_extension"] == ".mhtml"
         assert scraper.request_service.make_request.await_count == 1
 
     @pytest.mark.asyncio
@@ -378,13 +535,13 @@ class TestGetDocData:
                 "year": 2010,
                 "document_url": f"{scraper.base_url}/Norma/67028/arquivo",
                 "file_id": "text-id",
+                "file_name": "document.pdf",
                 "ch_norma": "67028",
             }
         )
 
         assert result is not None
         assert result["_content_extension"] == ".pdf"
-        assert "_mhtml_url" not in result
         assert result["document_url"].endswith("/Norma/67028/arquivo")
 
     @pytest.mark.asyncio
@@ -406,6 +563,7 @@ class TestGetDocData:
                 "year": 2025,
                 "document_url": f"{scraper.base_url}/Norma/abc123/arquivo",
                 "file_id": "text-id",
+                "file_name": "document.html",
                 "ch_norma": "abc123",
             }
         )
@@ -418,7 +576,7 @@ class TestGetDocData:
 class TestScrapeYear:
     @pytest.mark.asyncio
     async def test_scrape_year_fetches_extra_pages_and_processes_in_batches(self):
-        scraper = _make_scraper(_display_length=2, _document_batch_size=2)
+        scraper = _make_scraper(_display_length=2)
         page1 = [
             {"title": "Doc 1", "type": "Lei", "situation": "A", "document_url": "u1"},
             {"title": "Doc 2", "type": "Lei", "situation": "A", "document_url": "u2"},
@@ -432,8 +590,8 @@ class TestScrapeYear:
             }
         ]
 
-        scraper._fetch_search_page = AsyncMock(return_value=(page1, 3))
-        scraper._get_docs_links = AsyncMock(return_value=page2)
+        # First call returns page1 with total=3; second call (offset=2) returns page2.
+        scraper._fetch_search_page = AsyncMock(side_effect=[(page1, 3), (page2, 3)])
 
         async def fake_process(documents, **kwargs):
             for doc in documents:
@@ -445,7 +603,7 @@ class TestScrapeYear:
         results = await scraper._scrape_year(2025)
 
         assert len(results) == 3
-        scraper._get_docs_links.assert_awaited_once()
+        assert scraper._fetch_search_page.await_count == 2
 
 
 @pytest.mark.integration

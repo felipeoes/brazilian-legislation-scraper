@@ -261,6 +261,7 @@ class TestGetDocData:
             return _doc_response(original_html)
 
         scraper.request_service.make_request = AsyncMock(side_effect=make_request)
+        scraper._capture_mhtml = AsyncMock(return_value=b"fake-mhtml")
 
         result = await scraper._get_doc_data(
             {
@@ -276,10 +277,6 @@ class TestGetDocData:
         assert result is not None
         assert (
             result["document_url"]
-            == "https://al.ap.leg.br/ver_texto_lei.php?iddocumento=104262"
-        )
-        assert (
-            result["_mhtml_url"]
             == "https://al.ap.leg.br/ver_texto_lei.php?iddocumento=104262"
         )
         assert "Texto da lei." in result["text_markdown"]

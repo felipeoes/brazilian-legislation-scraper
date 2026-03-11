@@ -5,6 +5,7 @@ from typing import Any, cast
 import aiohttp
 from bs4 import BeautifulSoup, Tag
 from loguru import logger
+from src.scraper.base.converter import calc_pages, valid_markdown
 from src.scraper.base.scraper import StateScraper
 
 
@@ -222,7 +223,7 @@ class TocantinsScraper(StateScraper):
         first_page_size = len(first_page_docs)
 
         if total_count and first_page_size:
-            return max(1, self._calc_pages(total_count, first_page_size))
+            return max(1, calc_pages(total_count, first_page_size))
 
         # Look for pagination navigation with "Grupo paginação"
         nav = soup.find("nav", {"aria-label": "Grupo paginação"})
@@ -306,7 +307,7 @@ class TocantinsScraper(StateScraper):
             if text_markdown and self._has_table_artifacts(text_markdown):
                 text_markdown = self._normalize_table_markdown(text_markdown)
 
-            valid, reason = self._valid_markdown(text_markdown)
+            valid, reason = valid_markdown(text_markdown)
             if not valid:
                 await self._save_doc_error(
                     title=title,

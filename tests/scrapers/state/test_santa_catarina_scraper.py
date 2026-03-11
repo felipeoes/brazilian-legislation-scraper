@@ -22,7 +22,7 @@ Covers:
   - "LEI" prefix → "Lei"
   - "DECRETO" prefix → "Decreto"
   - "DEC-123" abbreviation → "Decreto"
-  - unknown prefix → "Legislação" fallback
+- unknown prefix → title-prefix fallback
 
 Run with:
     .venv/bin/pytest tests/test_santa_catarina_scraper.py -v
@@ -253,8 +253,7 @@ class TestGetDocData:
     @pytest.mark.asyncio
     async def test_failed_soup_returns_none_and_saves_error(self):
         scraper = _make_scraper()
-        failed = make_failed_request()
-        scraper.request_service.get_soup = AsyncMock(return_value=failed)
+        scraper._fetch_soup_and_mhtml = AsyncMock(side_effect=Exception("fetch failed"))
         scraper._save_doc_error = AsyncMock()
         result = await scraper._get_doc_data(self._make_doc())
         assert result is None
@@ -264,7 +263,7 @@ class TestGetDocData:
     async def test_invalid_markdown_returns_none_and_saves_error(self):
         scraper = _make_scraper()
         soup = BeautifulSoup("<html><body><p>Texto</p></body></html>", "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
         scraper._get_markdown = AsyncMock(return_value="short")
         scraper._save_doc_error = AsyncMock()
         result = await scraper._get_doc_data(self._make_doc())
@@ -275,7 +274,7 @@ class TestGetDocData:
     async def test_whitespace_markdown_returns_none(self):
         scraper = _make_scraper()
         soup = BeautifulSoup("<html><body><p>Texto</p></body></html>", "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
         scraper._get_markdown = AsyncMock(return_value="   \n\n   ")
         scraper._save_doc_error = AsyncMock()
         result = await scraper._get_doc_data(self._make_doc())
@@ -285,7 +284,7 @@ class TestGetDocData:
     async def test_valid_markdown_returns_doc_with_fields(self):
         scraper = _make_scraper()
         soup = BeautifulSoup("<html><body><p>Texto</p></body></html>", "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
         valid_md = "# Lei 42/2023\n\n" + "Texto da lei. " * 30
         scraper._get_markdown = AsyncMock(return_value=valid_md)
 
@@ -294,14 +293,14 @@ class TestGetDocData:
         assert result is not None
         assert result["text_markdown"] == valid_md
         assert result["situation"] == "Não consta"
-        assert result["_content_extension"] == ".html"
-        assert isinstance(result["_raw_content"], bytes)
+        assert result["_content_extension"] == ".mhtml"
+        assert result["_raw_content"] == b"fake-mhtml"
 
     @pytest.mark.asyncio
     async def test_norm_type_inferred_from_lei_prefix(self):
         scraper = _make_scraper()
         soup = BeautifulSoup("<html><body><p>Texto</p></body></html>", "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
         valid_md = "# Lei\n\n" + "Texto. " * 30
         scraper._get_markdown = AsyncMock(return_value=valid_md)
         doc = self._make_doc(title="LEI 42/2023")
@@ -313,7 +312,7 @@ class TestGetDocData:
     async def test_norm_type_inferred_from_decreto_prefix(self):
         scraper = _make_scraper()
         soup = BeautifulSoup("<html><body><p>Texto</p></body></html>", "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
         valid_md = "# Decreto\n\n" + "Texto. " * 30
         scraper._get_markdown = AsyncMock(return_value=valid_md)
         doc = self._make_doc(title="DECRETO 10/2023")
@@ -326,7 +325,7 @@ class TestGetDocData:
         """DEC- abbreviation should map to 'Decreto'."""
         scraper = _make_scraper()
         soup = BeautifulSoup("<html><body><p>Texto</p></body></html>", "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
         valid_md = "# Decreto\n\n" + "Texto. " * 30
         scraper._get_markdown = AsyncMock(return_value=valid_md)
         doc = self._make_doc(title="DEC-123 de 2023")
@@ -335,14 +334,14 @@ class TestGetDocData:
         assert result["type"] == "Decreto"
 
     @pytest.mark.asyncio
-    async def test_norm_type_fallback_to_legislacao(self):
-        """Titles with no recognizable prefix fall back to 'Legislação'."""
+    async def test_norm_type_fallback_to_title_prefix(self):
+        """Titles with no known prefix fall back to the source title prefix."""
         scraper = _make_scraper()
         soup = BeautifulSoup("<html><body><p>Texto</p></body></html>", "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
         valid_md = "# Norma\n\n" + "Texto. " * 30
         scraper._get_markdown = AsyncMock(return_value=valid_md)
         doc = self._make_doc(title="Norma Especial 5/2023")
         result = await scraper._get_doc_data(doc)
         assert result is not None
-        assert result["type"] == "Legislação"
+        assert result["type"] == "Norma Especial"

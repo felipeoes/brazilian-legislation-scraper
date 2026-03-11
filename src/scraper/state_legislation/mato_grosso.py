@@ -2,6 +2,7 @@ import re
 from urllib.parse import urljoin, urlencode
 from bs4 import BeautifulSoup
 from loguru import logger
+from src.scraper.base.converter import calc_pages, strip_html_chrome, valid_markdown
 from src.scraper.base.scraper import StateScraper
 
 
@@ -24,7 +25,7 @@ HISTORIC_TYPES = {
     "Resolução": "resolucao",
     "Resolução Provincial": "resolucao-provincial",
     "Regulamento": "regulamento",
-}  # types to be used when scraping historic data (https://www.al.mt.gov.br/norma-juridica/pesquisa-historica)
+}  # types for historic data (https://www.al.mt.gov.br/norma-juridica/pesquisa-historica)
 
 # situations are gotten from doc data while scraping
 SITUATIONS = {}
@@ -86,6 +87,15 @@ class MTAlmtScraper(StateScraper):
         self.min_year = 1979
         self.token = None
         self.regex_total_items = re.compile(r"Total de registros:\s+([\d.]+)")
+
+    def _infer_norm_type(self, title: str, *, is_historic: bool = False) -> str:
+        """Infer the norm type from a listing title when the dash separator is absent."""
+        normalized_title = " ".join(title.split())
+        type_names = HISTORIC_TYPES if is_historic else TYPES
+        for type_name in sorted(type_names, key=len, reverse=True):
+            if normalized_title.casefold().startswith(type_name.casefold()):
+                return type_name
+        return ""
 
     async def _set_token(self):
         """Get token for search request (optional — field was removed from the form)."""
@@ -173,7 +183,11 @@ class MTAlmtScraper(StateScraper):
         docs = []
         for item in items:
             title_raw = item.find("h5").text.strip()
-            norm_type = title_raw.split(" - ")[0].strip() if " - " in title_raw else ""
+            norm_type = (
+                title_raw.split(" - ")[0].strip()
+                if " - " in title_raw
+                else self._infer_norm_type(title_raw, is_historic=is_historic)
+            )
             summary = item.find("div", class_="text-muted").text.strip()
             links = item.find_all("a", href=True)
             if len(links) < 2:
@@ -287,13 +301,26 @@ class MTAlmtScraper(StateScraper):
             )
             return None
 
-        self._strip_html_chrome(frame)
+        strip_html_chrome(frame)
         html_str = str(frame)
         text_markdown = await self._get_markdown(html_content=html_str)
-        raw_content = html_str.encode("utf-8")
-        content_ext = ".html"
 
-        valid, reason = self._valid_markdown(text_markdown)
+        # MHTML captures the canonical norm page (document_url), not the compilado
+        capture_url = doc_info.get("document_url", compilado_url)
+        try:
+            raw_content = await self._capture_mhtml(capture_url)
+            content_ext = ".mhtml"
+        except Exception as exc:
+            logger.warning(f"MHTML capture failed for {capture_url}: {exc}")
+            await self._save_doc_error(
+                title=doc_info.get("title", ""),
+                year=doc_info.get("year", ""),
+                html_link=capture_url,
+                error_message=f"MHTML capture failed: {exc}",
+            )
+            return None
+
+        valid, reason = valid_markdown(text_markdown)
         if not valid:
             await self._save_doc_error(
                 title=doc_info.get("title", ""),
@@ -332,7 +359,7 @@ class MTAlmtScraper(StateScraper):
         if total_items == 0:
             return []
 
-        pages = self._calc_pages(total_items, 10)
+        pages = calc_pages(total_items, 10)
         documents = self._extract_docs_from_soup(soup_p1, is_historic)
 
         # Pages 2..N: fetch concurrently

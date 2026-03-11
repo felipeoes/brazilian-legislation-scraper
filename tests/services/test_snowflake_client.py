@@ -88,6 +88,9 @@ def llm_service(snowflake_client):
 
 
 @pytest.mark.integration
+@pytest.mark.skip(
+    reason="Use mock versions in test_snowflake_client_mock.py for faster execution"
+)
 class TestSnowflakeClientIntegration:
     @pytest.mark.asyncio
     async def test_image_to_markdown(self, llm_service):

@@ -1,23 +1,40 @@
 """Tests for main CLI scraper selection helpers."""
 
-from main import _get_scraper_names, _sc, build_scraper_configs
+import importlib
+from pathlib import Path
+
+from main import _get_scraper_names, build_scraper_configs
+import src.config as config_module
 from src.services.ocr.config import LLMConfig
 from src.scraper.conama.scrape import ConamaScraper
-from src.scraper.state_legislation import LegislaGoias
+from src.scraper.state_legislation import AlagoasSefazScraper, LegislaGoias
 
 
 class TestScraperCliNames:
+    def test_log_dir_reads_env_value(self, monkeypatch):
+        with monkeypatch.context() as context:
+            context.setenv("LOG_DIR", "logs/legislation")
+            context.delenv("ERROR_LOG_DIR", raising=False)
+
+            importlib.reload(config_module)
+
+            assert config_module.LOG_DIR == Path("logs/legislation")
+
+        importlib.reload(config_module)
+
     def test_short_name_defaults_from_scraper_class(self):
-        cfg = _sc(ConamaScraper)
+        configs = build_scraper_configs(None)
+        cfg = next(c for c in configs if c.scraper is ConamaScraper)
 
         assert cfg.name == "Conama"
         assert _get_scraper_names(cfg) == {"conama", "conamascraper"}
 
     def test_scrapers_without_suffix_keep_class_name(self):
-        cfg = _sc(LegislaGoias)
+        configs = build_scraper_configs(None)
+        cfg = next(c for c in configs if c.scraper is LegislaGoias)
 
         assert cfg.name == "LegislaGoias"
-        assert _get_scraper_names(cfg) == {"legislagoias"}
+        assert _get_scraper_names(cfg) == {"legislagoias", "goias", "go"}
 
     def test_build_configs_assigns_names_to_all_scrapers(self):
         configs = build_scraper_configs(None)
@@ -26,70 +43,52 @@ class TestScraperCliNames:
         assert all(cfg.name for cfg in configs)
 
     def test_short_name_selection_matches_conama(self):
-        configs = build_scraper_configs(None)
-        selected = {"conama"}
-
-        for cfg in configs:
-            cfg.run = bool(_get_scraper_names(cfg) & selected)
+        configs = build_scraper_configs(None, run_names={"conama"})
 
         enabled = [cfg.scraper.__name__ for cfg in configs if cfg.run]
         assert enabled == ["ConamaScraper"]
 
     def test_class_name_selection_still_matches_conama(self):
-        configs = build_scraper_configs(None)
-        selected = {"conamascraper"}
-
-        for cfg in configs:
-            cfg.run = bool(_get_scraper_names(cfg) & selected)
+        configs = build_scraper_configs(None, run_names={"conamascraper"})
 
         enabled = [cfg.scraper.__name__ for cfg in configs if cfg.run]
         assert enabled == ["ConamaScraper"]
 
     def test_case_insensitive_selection_matches_goias(self):
-        configs = build_scraper_configs(None)
-        selected = {"legislagoias"}
-
-        for cfg in configs:
-            cfg.run = bool(_get_scraper_names(cfg) & selected)
+        configs = build_scraper_configs(None, run_names={"legislagoias"})
 
         enabled = [cfg.scraper.__name__ for cfg in configs if cfg.run]
         assert enabled == ["LegislaGoias"]
 
-    def test_build_llm_config_disables_openai_sdk_retries(self, monkeypatch):
-        captured_async_openai_kwargs = {}
-        captured_openai_client_kwargs = {}
+    def test_state_alias_goias_matches_goias_scraper(self):
+        configs = build_scraper_configs(None, run_names={"goias"})
 
-        class DummyAsyncOpenAI:
-            def __init__(self, **kwargs):
-                captured_async_openai_kwargs.update(kwargs)
-                self.base_url = kwargs.get("base_url")
+        enabled = [cfg.scraper.__name__ for cfg in configs if cfg.run]
+        assert enabled == ["LegislaGoias"]
 
-        class DummyOpenAIClient:
-            def __init__(self, raw_client, **kwargs):
-                captured_openai_client_kwargs.update(kwargs)
-                self.raw_client = raw_client
+    def test_state_alias_alagoas_matches_alagoas_scraper(self):
+        configs = build_scraper_configs(None, run_names={"alagoas"})
 
-        monkeypatch.setenv("LLM_PROVIDER", "openai")
-        monkeypatch.setenv("LLM_API_KEY", "test-key")
-        monkeypatch.setenv(
-            "PROVIDER_BASE_URL", "https://example.invalid/v1beta/openai/"
+        enabled = [cfg.scraper.__name__ for cfg in configs if cfg.run]
+        assert enabled == ["AlagoasSefazScraper"]
+
+    def test_state_alias_case_insensitive(self):
+        configs = build_scraper_configs(None, run_names={"alagoas"})
+        cfg = next(c for c in configs if c.scraper is AlagoasSefazScraper)
+
+        assert cfg.run is True
+
+    def test_all_state_scrapers_have_aliases(self):
+        configs = build_scraper_configs(None)
+        federal_scrapers = {"CamaraDepScraper", "ConamaScraper", "ICMBioScraper"}
+
+        state_configs = [
+            cfg for cfg in configs if cfg.scraper.__name__ not in federal_scrapers
+        ]
+        assert all(cfg.aliases for cfg in state_configs), (
+            "All state scrapers must declare at least one alias. "
+            f"Missing: {[cfg.scraper.__name__ for cfg in state_configs if not cfg.aliases]}"
         )
-        monkeypatch.setenv("LLM_MODEL", "google.gemini-2.5-flash")
-        monkeypatch.setattr("openai.AsyncOpenAI", DummyAsyncOpenAI)
-        monkeypatch.setattr("src.services.ocr.clients.OpenAIClient", DummyOpenAIClient)
-
-        config = LLMConfig.from_env()
-
-        assert config is not None
-        assert captured_async_openai_kwargs == {
-            "api_key": "test-key",
-            "base_url": "https://example.invalid/v1beta/openai/",
-            "max_retries": 0,
-        }
-        assert captured_openai_client_kwargs == {
-            "max_completion_tokens": 32768,
-            "extra_body": {"media_resolution": "MEDIA_RESOLUTION_HIGH"},
-        }
 
     def test_build_llm_config_infers_snowflake_when_provider_unset(self, monkeypatch):
         captured_snowflake_kwargs = {}

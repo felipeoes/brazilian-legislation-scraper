@@ -3,7 +3,7 @@ import re
 from bs4 import BeautifulSoup
 from loguru import logger
 
-from src.scraper.base.scraper import StateScraper
+from src.scraper.base.scraper import StateScraper, flatten_results
 
 TYPES = {
     "Decreto Estadual": 2,
@@ -193,4 +193,4 @@ class ParaAlepaScraper(StateScraper):
             context={"year": year, "type": "NA", "situation": "Não consta"},
             desc=f"PARA | Year {year}",
         )
-        return self._flatten_results(results)
+        return flatten_results(results)

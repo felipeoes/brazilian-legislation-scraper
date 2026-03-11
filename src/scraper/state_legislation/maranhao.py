@@ -7,6 +7,7 @@ from aiohttp import ClientResponse
 from bs4 import BeautifulSoup, Tag
 from loguru import logger
 
+from src.scraper.base.converter import calc_pages, valid_markdown
 from src.scraper.base.scraper import DEFAULT_VALID_SITUATION, StateScraper
 
 TYPES = {
@@ -578,7 +579,7 @@ class MaranhaoAlemaScraper(StateScraper):
 
         effective_type = subtype or norm_type
         documents = await self._get_docs_links(soup, effective_type) or []
-        total_pages = self._calc_pages(total_docs, self._rows_per_page)
+        total_pages = calc_pages(total_docs, self._rows_per_page)
 
         if total_pages > 1:
             page_results = await self._gather_results(
@@ -635,7 +636,7 @@ class MaranhaoAlemaScraper(StateScraper):
         text_markdown, raw_content, content_ext = await self._download_and_convert(
             pdf_link
         )
-        valid, reason = self._valid_markdown(text_markdown)
+        valid, reason = valid_markdown(text_markdown)
         if not valid:
             logger.error(
                 f"Failed to get markdown for Constitution | {pdf_link}: {reason}"

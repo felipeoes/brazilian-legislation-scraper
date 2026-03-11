@@ -82,11 +82,12 @@ All scrapers inherit from `BaseScraper`. State scrapers go through `StateScraper
 - Use `_get_markdown()` for flexible content-to-markdown conversion (accepts url, response, stream, or html_content).
 - Use `_download_and_convert()` when you also need the raw bytes (e.g., for saving source PDFs).
 - LLM configuration uses the `LLMConfig` dataclass (`src/services/ocr/config.py`), passed directly to `BaseScraper` and `LLMOCRService`.
-- Environment variables are centralized in `src/config.py` — import `SAVE_DIR`, `STATE_LEGISLATION_SAVE_DIR`, `ERROR_LOG_DIR`, etc. from there.
+- Environment variables are centralized in `src/config.py` — import `SAVE_DIR`, `STATE_LEGISLATION_SAVE_DIR`, `LOG_DIR`, etc. from there.
 - The LLM OCR prompt is in Portuguese and defined as the module-level constant `DEFAULT_LLM_PROMPT` in `src/scraper/base/scraper.py`. Override `llm_prompt` only if a scraper needs different extraction instructions.
+- `RateLimiter` (`src/utils/concurrency.py`) wraps PyrateLimiter with `Rate(1, interval)` (not `Rate(rps, Duration.SECOND)`) to enforce strict even spacing with no burst. This prevents bursty traffic that triggers rate limiting on target servers.
 
 ## Environment
 
-Python >= 3.12, managed with `uv`. Config via `.env` (copy `.env.example`). Key variables: `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_MODEL`, `PROVIDER_BASE_URL`, `SAVE_DIR`, `STATE_LEGISLATION_SAVE_DIR`.
+Python >= 3.12, managed with `uv`. Config via `.env` (copy `.env.example`). Key variables: `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_MODEL`, `PROVIDER_BASE_URL`, `SAVE_DIR`, `STATE_LEGISLATION_SAVE_DIR`, `LOG_DIR`.
 
 LLM providers: `openai` (OpenAI-compatible API, default), `bedrock` (AWS Bedrock Converse), `snowflake` (Snowflake Cortex).

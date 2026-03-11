@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from src.scraper.base.concurrency import RateLimiter
+    from src.utils.concurrency import RateLimiter
     from src.services.ocr.protocol import LLMClient
 
 
@@ -35,13 +35,14 @@ class LLMConfig:
 
     def __post_init__(self) -> None:
         if self.rate_limiter is None:
-            from src.scraper.base.concurrency import RateLimiter
+            from src.utils.concurrency import RateLimiter
 
             self.rate_limiter = RateLimiter(self.rps)
 
     async def cleanup(self) -> None:
         """Close the underlying LLM client."""
-        await self.client.close()
+        if self.client is not None:
+            await self.client.close()
 
     @classmethod
     def _create_bedrock_client(
@@ -63,23 +64,33 @@ class LLMConfig:
         return cls(client=client, model=model, rps=1, raw=True)
 
     @classmethod
-    def _create_snowflake_client(cls, api_key: str, model: str) -> "LLMConfig":
+    def _create_snowflake_client(
+        cls,
+        api_key: str,
+        model: str,
+        *,
+        account: str = "",
+        user: str = "",
+        database: str = "",
+        schema: str = "PUBLIC",
+        stage: str = "",
+    ) -> "LLMConfig":
         from loguru import logger
 
         from src.services.ocr.clients import SnowflakeClient
 
         client = SnowflakeClient(
-            account=os.environ.get("SNOWFLAKE_ACCOUNT", ""),
-            user=os.environ.get("SNOWFLAKE_USER", ""),
+            account=account,
+            user=user,
             token=api_key,
-            database=os.environ.get("SNOWFLAKE_DATABASE", ""),
-            schema=os.environ.get("SNOWFLAKE_SCHEMA", "PUBLIC"),
-            stage=os.environ.get("SNOWFLAKE_STAGE", ""),
+            database=database,
+            schema=schema,
+            stage=stage,
         )
         logger.info(
             f"Using Snowflake provider | Model: {model} | Account: {client.account}"
         )
-        return cls(client=client, model=model, rps=2)
+        return cls(client=client, model=model, rps=100)
 
     @classmethod
     def _create_openai_client(
@@ -90,7 +101,7 @@ class LLMConfig:
 
         from src.services.ocr.clients import OpenAIClient
 
-        raw_client = AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0)
+        raw_client = AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=1)
         logger.info(
             f"Using OpenAI provider | Model: {model} | Base URL: {raw_client.base_url}"
         )
@@ -117,16 +128,20 @@ class LLMConfig:
         model = os.environ.get("LLM_MODEL", "")
         provider_env = os.environ.get("LLM_PROVIDER", "").strip().lower()
 
+        # Read Snowflake vars once so they're available for both auto-detection
+        # and client construction without a second os.environ.get() pass.
+        snowflake_account = os.environ.get("SNOWFLAKE_ACCOUNT", "")
+        snowflake_user = os.environ.get("SNOWFLAKE_USER", "")
+        snowflake_database = os.environ.get("SNOWFLAKE_DATABASE", "")
+        snowflake_schema = os.environ.get("SNOWFLAKE_SCHEMA", "PUBLIC")
+        snowflake_stage = os.environ.get("SNOWFLAKE_STAGE", "")
+
         if not api_key and not base_url:
             logger.warning("No LLM_API_KEY or PROVIDER_BASE_URL set; LLM OCR disabled.")
             return None
 
         provider = provider_env
         if not provider:
-            snowflake_account = os.environ.get("SNOWFLAKE_ACCOUNT", "")
-            snowflake_user = os.environ.get("SNOWFLAKE_USER", "")
-            snowflake_database = os.environ.get("SNOWFLAKE_DATABASE", "")
-            snowflake_stage = os.environ.get("SNOWFLAKE_STAGE", "")
             looks_like_snowflake = "snowflakecomputing.com" in base_url.lower()
             has_snowflake_config = all(
                 [snowflake_account, snowflake_user, snowflake_database, snowflake_stage]
@@ -142,5 +157,13 @@ class LLMConfig:
         if provider == "bedrock":
             return cls._create_bedrock_client(base_url, api_key, model)
         if provider == "snowflake":
-            return cls._create_snowflake_client(api_key, model)
+            return cls._create_snowflake_client(
+                api_key,
+                model,
+                account=snowflake_account,
+                user=snowflake_user,
+                database=snowflake_database,
+                schema=snowflake_schema,
+                stage=snowflake_stage,
+            )
         return cls._create_openai_client(api_key, base_url, model)

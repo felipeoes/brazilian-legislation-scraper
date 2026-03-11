@@ -3,6 +3,7 @@ import re
 from bs4 import BeautifulSoup
 from bs4.element import NavigableString, Tag
 from loguru import logger
+from src.scraper.base.converter import valid_markdown, wrap_html
 from src.scraper.base.scraper import DEFAULT_VALID_SITUATION, StateScraper
 from typing import cast
 from urllib.parse import urlencode, urljoin
@@ -155,15 +156,23 @@ class MGAlmgScraper(StateScraper):
 
     def _normalize_type(self, title: str, html_link: str = "") -> str:
         clean_title = self._clean_text(title)
-        for pattern, canonical_type in _TYPE_PATTERNS:
-            if pattern.match(clean_title):
-                return canonical_type
-
         code_match = re.search(r"/legislacao-mineira/([A-Z]{3})/", html_link)
         if code_match:
             canonical_type = _TYPE_CODE_MAP.get(code_match.group(1))
             if canonical_type:
                 return canonical_type
+
+        for pattern, canonical_type in _TYPE_PATTERNS:
+            if pattern.match(clean_title):
+                return canonical_type
+
+        prefix_match = re.match(
+            r"(.+?)(?:\s+(?:n[º°o]|n\.|número)\s*\d|\s+\d)",
+            clean_title,
+            re.IGNORECASE,
+        )
+        if prefix_match:
+            return prefix_match.group(1).strip()
 
         logger.warning(
             f"Could not normalize Minas Gerais norm type from title='{title}' link='{html_link}'"
@@ -454,9 +463,10 @@ class MGAlmgScraper(StateScraper):
             ),
         }
 
-        last_text_error = "Failed to fetch document text page (soup is None)"
+        last_text_error = "Failed to fetch document text page"
         document_page_url = ""
         text_norm_span = None
+        page_mhtml: bytes | None = None
         for text_link in text_links:
             candidate_url = urljoin(self.base_url, text_link)
             if candidate_url.rstrip("/") == self.base_url.rstrip("/"):
@@ -469,11 +479,10 @@ class MGAlmgScraper(StateScraper):
                 return None
 
             for attempt in range(_TEXT_PAGE_ATTEMPTS):
-                soup = await self.request_service.get_soup(candidate_url)
-                if not soup:
-                    last_text_error = (
-                        "Failed to fetch document text page (soup is None)"
-                    )
+                try:
+                    soup, mhtml_bytes = await self._fetch_soup_and_mhtml(candidate_url)
+                except Exception as exc:
+                    last_text_error = f"Failed to fetch document text page: {exc}"
                     if attempt + 1 < _TEXT_PAGE_ATTEMPTS:
                         await asyncio.sleep(
                             _TEXT_PAGE_RETRY_SLEEP_SECONDS * (attempt + 1)
@@ -485,6 +494,7 @@ class MGAlmgScraper(StateScraper):
                 if candidate_span is not None:
                     document_page_url = candidate_url
                     text_norm_span = candidate_span
+                    page_mhtml = mhtml_bytes
                     break
 
                 page_title = (
@@ -502,7 +512,7 @@ class MGAlmgScraper(StateScraper):
                     last_text_error = "Could not find span.textNorma in document page"
                     break
 
-                if attempt + 1 < _TEXT_PAGE_ATTEMPTS and self.verbose:
+                if attempt + 1 < _TEXT_PAGE_ATTEMPTS:
                     logger.debug(
                         f"Retrying Minas Gerais text page for '{title}' | url={candidate_url} | attempt={attempt + 2}"
                     )
@@ -535,7 +545,7 @@ class MGAlmgScraper(StateScraper):
                 pdf_link
             )
 
-            valid, reason = self._valid_markdown(text_markdown)
+            valid, reason = valid_markdown(text_markdown)
             if not valid:
                 await self._save_doc_error(
                     title=title,
@@ -552,10 +562,10 @@ class MGAlmgScraper(StateScraper):
                 "_content_extension": content_ext or ".pdf",
             }
 
-        html_string = self._wrap_html(html_string)
+        html_string = wrap_html(html_string)
         text_markdown = await self._get_markdown(html_content=html_string)
 
-        valid, reason = self._valid_markdown(text_markdown)
+        valid, reason = valid_markdown(text_markdown)
         if not valid:
             await self._save_doc_error(
                 title=title,
@@ -568,8 +578,8 @@ class MGAlmgScraper(StateScraper):
             **data,
             "text_markdown": text_markdown,
             "document_url": document_page_url,
-            "_raw_content": html_string.encode("utf-8"),
-            "_content_extension": ".html",
+            "_raw_content": page_mhtml,
+            "_content_extension": ".mhtml",
         }
 
     async def _scrape_year(self, year: int) -> list[dict]:

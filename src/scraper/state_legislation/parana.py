@@ -13,6 +13,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from loguru import logger
 
+from src.scraper.base.converter import valid_markdown, wrap_html
 from src.scraper.base.scraper import (
     StateScraper,
     DEFAULT_VALID_SITUATION,
@@ -192,11 +193,10 @@ class ParanaCVScraper(StateScraper):
         # Parse page 1 results
         all_docs = self._parse_results_table(soup)
 
-        if self.verbose:
-            logger.info(
-                f"PARANA | Type {norm_type_id} | Year {year}: "
-                f"{total_records or '?'} records, {total_pages} pages"
-            )
+        logger.debug(
+            f"PARANA | Type {norm_type_id} | Year {year}: "
+            f"{total_records or '?'} records, {total_pages} pages"
+        )
 
         # Fetch remaining pages concurrently
         if total_pages > 1:
@@ -237,20 +237,18 @@ class ParanaCVScraper(StateScraper):
         if self._is_already_scraped(html_link, doc_title):
             return None
 
-        response = await self.request_service.make_request(html_link, timeout=30)
-        if not response or response.status != 200:
-            status = response.status if response else "No response"
-            logger.warning(f"Failed to fetch doc {cod_ato}: {status}")
+        try:
+            soup, mhtml = await self._fetch_soup_and_mhtml(html_link)
+        except Exception as exc:
+            logger.warning(f"Failed to fetch doc {cod_ato}: {exc}")
             await self._save_doc_error(
                 title=doc_title,
                 year=doc_info.get("date", "")[-4:],
                 html_link=html_link,
-                error_message=f"HTTP {status}",
+                error_message=str(exc),
             )
             return None
 
-        html = await response.text()
-        soup = BeautifulSoup(html, "html.parser")
         form = soup.find("form", attrs={"name": "pesquisarAtoForm"})
 
         if not form:
@@ -270,12 +268,12 @@ class ParanaCVScraper(StateScraper):
 
         html_string = form.prettify().replace("\n ANEXOS:", "").strip()
         html_string = html_string.replace("javascript:listarAssinaturas();", "")
-        html_string = self._wrap_html(html_string)
+        html_string = wrap_html(html_string)
 
         situation = self._infer_situation(soup)
 
         text_markdown = (await self._get_markdown(html_content=html_string)).strip()
-        valid, reason = self._valid_markdown(text_markdown)
+        valid, reason = valid_markdown(text_markdown)
         if not valid:
             logger.warning(f"Invalid markdown for doc {cod_ato}: {reason}")
             return None
@@ -285,8 +283,8 @@ class ParanaCVScraper(StateScraper):
             "text_markdown": text_markdown,
             "document_url": html_link,
             "situation": situation,
-            "_raw_content": html_string.encode("utf-8"),
-            "_content_extension": ".html",
+            "_raw_content": mhtml,
+            "_content_extension": ".mhtml",
         }
 
         return result

@@ -1,5 +1,7 @@
 """Centralized configuration from environment variables."""
 
+from __future__ import annotations
+
 import os
 from pathlib import Path
 
@@ -19,7 +21,9 @@ SPECIFIC_LEGISLATION_SAVE_DIR: Path | None = (
     Path(_raw_specific_dir) if _raw_specific_dir else None
 )
 
-ERROR_LOG_DIR = Path(os.environ.get("ERROR_LOG_DIR", "logs/legislation"))
+LOG_DIR = Path(
+    os.environ.get("LOG_DIR", os.environ.get("ERROR_LOG_DIR", "logs/legislation"))
+)
 
 PROXY_FILE_PATH = os.environ.get("PROXY_FILE_PATH")
 PROXY_ENDPOINT = os.environ.get("PROXY_ENDPOINT")

@@ -133,7 +133,7 @@ class LegislaAMScraper(StateScraper):
         empty_soup.body.append(norm_element)
         return empty_soup
 
-    async def _get_doc_data(self, doc_info: dict) -> dict:
+    async def _get_doc_data(self, doc_info: dict) -> dict | None:
         """Get document data from given document dict"""
         doc_info = dict(doc_info)
         html_link = doc_info.pop("html_link")
@@ -142,17 +142,18 @@ class LegislaAMScraper(StateScraper):
         if self._is_already_scraped(url, doc_info.get("title", "")):
             return None
 
-        resp = await self.request_service.get_soup(url)
-        if not resp:
+        try:
+            soup, mhtml = await self._fetch_soup_and_mhtml(url)
+        except Exception as exc:
             await self._save_doc_error(
                 title=doc_info.get("title", ""),
                 year=doc_info.get("year", ""),
                 html_link=url,
-                error_message=f"Failed to fetch page: {resp.reason}",
+                error_message=f"Failed to fetch page: {exc}",
             )
             return None
 
-        html_content = self._get_norm_text(resp)
+        html_content = self._get_norm_text(soup)
         if html_content is None:
             await self._save_doc_error(
                 title=doc_info.get("title", ""),
@@ -162,9 +163,9 @@ class LegislaAMScraper(StateScraper):
             )
             return None
 
-        return await self._process_html_doc(doc_info, str(html_content), url)
+        return await self._process_html_doc(doc_info, str(html_content), url, mhtml)
 
-    async def _scrape_type(self, norm_type: str, norm_type_id, year: int) -> list:
+    async def _scrape_type(self, norm_type: str, norm_type_id, year: int) -> list[dict]:
         """Scrape norms for a specific type and year"""
         situation = "Não consta"
         if not self._scraped_constitution and norm_type == "Constituição Estadual":

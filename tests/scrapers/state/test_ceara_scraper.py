@@ -196,6 +196,17 @@ class TestConstructUrl:
         )
         assert url == "https://example.com/lei.htm"
 
+    def test_http_normalized_to_https(self):
+        scraper = _make_scraper()
+        url = scraper.construct_url(
+            "Lei Ordinária",
+            "http://www2.al.ce.gov.br/legislativo/legislacao5/leis85/11120.htm",
+            1985,
+        )
+        assert (
+            url == "https://www2.al.ce.gov.br/legislativo/legislacao5/leis85/11120.htm"
+        )
+
     def test_file_protocol_rewrite(self):
         scraper = _make_scraper()
         link = r"file:///\\10.85.100.8\10.85.100.8\legislativo\legislacao5\leis2014\15517.htm"
@@ -360,7 +371,8 @@ class TestGetDocData:
         scraper._is_already_scraped = MagicMock(return_value=False)
         html = "<html><body><div class='card-body'>content</div></body></html>"
         soup = BeautifulSoup(html, "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        mhtml = b"MHTML content"
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, mhtml))
         scraper._clean_norm_soup = MagicMock()
         valid_md = _make_valid_md()
         scraper._get_markdown = AsyncMock(return_value=valid_md)
@@ -372,8 +384,8 @@ class TestGetDocData:
         result = await scraper._get_doc_data(doc_info)
         assert result is not None
         assert result["text_markdown"] == valid_md
-        assert result["_content_extension"] == ".html"
-        assert "_raw_content" in result
+        assert result["_content_extension"] == ".mhtml"
+        assert result["_raw_content"] == mhtml
 
     @pytest.mark.asyncio
     async def test_visualizar_url_constructed(self):
@@ -381,7 +393,8 @@ class TestGetDocData:
         scraper._is_already_scraped = MagicMock(return_value=False)
         html = "<html><body><main>content</main></body></html>"
         soup = BeautifulSoup(html, "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        mhtml = b"MHTML content"
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, mhtml))
         scraper._clean_norm_soup = MagicMock()
         valid_md = _make_valid_md()
         scraper._get_markdown = AsyncMock(return_value=valid_md)
@@ -391,7 +404,7 @@ class TestGetDocData:
             "year": "2020",
         }
         await scraper._get_doc_data(doc_info)
-        called_url = scraper.request_service.get_soup.call_args[0][0]
+        called_url = scraper._fetch_soup_and_mhtml.call_args[0][0]
         assert called_url.endswith("/visualizar")
         assert "//" not in called_url.replace("https://", "")
 
@@ -416,10 +429,7 @@ class TestGetLawsConstitutionAmendmentsDocData:
     async def test_http_error_saves_error_and_returns_none(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        failed = MagicMock()
-        failed.__bool__ = MagicMock(return_value=False)
-        failed.status = 404
-        scraper.request_service.make_request = AsyncMock(return_value=failed)
+        scraper._fetch_soup_and_mhtml = AsyncMock(side_effect=Exception("fetch failed"))
         scraper._save_doc_error = AsyncMock()
         doc_info = {"title": "Emenda 1", "html_link": "emenda1.htm", "year": 2020}
         result = await scraper._get_laws_constitution_amendments_doc_data(
@@ -432,13 +442,10 @@ class TestGetLawsConstitutionAmendmentsDocData:
     async def test_invalid_doc_guard_saves_error(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        response = MagicMock()
-        response.__bool__ = MagicMock(return_value=True)
-        response.status = 200
-        response.read = AsyncMock(
-            return_value=b"<html><body>NAO EXISTE LEI COM ESTE NUMERO</body></html>"
-        )
-        scraper.request_service.make_request = AsyncMock(return_value=response)
+        html = "<html><body>NÄO EXISTE LEI COM ESTE NÚMERO</body></html>"
+        soup = BeautifulSoup(html, "html.parser")
+        mhtml = b"MHTML content"
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, mhtml))
         scraper._save_doc_error = AsyncMock()
         doc_info = {"title": "Lei 9999", "html_link": "lei9999.htm", "year": 2020}
         result = await scraper._get_laws_constitution_amendments_doc_data(
@@ -451,14 +458,12 @@ class TestGetLawsConstitutionAmendmentsDocData:
     async def test_invalid_markdown_saves_error_and_returns_none(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        response = MagicMock()
-        response.__bool__ = MagicMock(return_value=True)
-        response.status = 200
-        response.read = AsyncMock(
-            return_value=b"<html><body><p>Content here</p></body></html>"
-        )
-        scraper.request_service.make_request = AsyncMock(return_value=response)
+        html = "<html><body><p>Content here</p></body></html>"
+        soup = BeautifulSoup(html, "html.parser")
+        mhtml = b"MHTML content"
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, mhtml))
         scraper._get_markdown = AsyncMock(return_value="short")
+        scraper._browser_pdf_to_markdown = AsyncMock(return_value="")
         scraper._save_doc_error = AsyncMock()
         doc_info = {"title": "Lei 001", "html_link": "lei001.htm", "year": 2020}
         result = await scraper._get_laws_constitution_amendments_doc_data(
@@ -471,13 +476,10 @@ class TestGetLawsConstitutionAmendmentsDocData:
     async def test_valid_doc_returns_correct_shape(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        response = MagicMock()
-        response.__bool__ = MagicMock(return_value=True)
-        response.status = 200
-        response.read = AsyncMock(
-            return_value=b"<html><body><p>Valid content</p></body></html>"
-        )
-        scraper.request_service.make_request = AsyncMock(return_value=response)
+        html = "<html><body><p>Valid content</p></body></html>"
+        soup = BeautifulSoup(html, "html.parser")
+        mhtml = b"MHTML content"
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, mhtml))
         valid_md = _make_valid_md()
         scraper._get_markdown = AsyncMock(return_value=valid_md)
         doc_info = {
@@ -491,35 +493,43 @@ class TestGetLawsConstitutionAmendmentsDocData:
         )
         assert result is not None
         assert result["text_markdown"] == valid_md
-        assert result["_content_extension"] == ".html"
-        assert "_raw_content" in result
+        assert result["_content_extension"] == ".mhtml"
+        assert result["_raw_content"] == mhtml
         assert "document_url" in result
         # html_link must be popped
         assert "html_link" not in result
 
     @pytest.mark.asyncio
-    async def test_section1_div_extracted_when_present(self):
+    async def test_section_divs_merged_when_present(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        response = MagicMock()
-        response.__bool__ = MagicMock(return_value=True)
-        response.status = 200
-        html = b'<html><body><div class="Section1"><p>Lei text</p></div></body></html>'
-        response.read = AsyncMock(return_value=html)
-        scraper.request_service.make_request = AsyncMock(return_value=response)
+        html = (
+            "<html><body>"
+            '<div class="Section1"><p>Header</p></div>'
+            '<div class="Section2"><p>Body text</p></div>'
+            "</body></html>"
+        )
+        soup = BeautifulSoup(html, "html.parser")
+        mhtml = b"MHTML content"
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, mhtml))
         valid_md = _make_valid_md()
         scraper._get_markdown = AsyncMock(return_value=valid_md)
         doc_info = {
             "title": "Lei 001",
             "html_link": "lei001.htm",
             "year": 2020,
-            "summary": "x",
+            "summary": "",
         }
         await scraper._get_laws_constitution_amendments_doc_data(
             doc_info, "Lei Ordinária", year=2020
         )
         called_html = scraper._get_markdown.call_args[1]["html_content"]
-        assert "Section1" in called_html
+        # Both sections' content should be merged into the container
+        assert "Header" in called_html
+        assert "Body text" in called_html
+        # Section class names should not be in the merged container
+        assert "Section1" not in called_html
+        assert "Section2" not in called_html
 
 
 # ---------------------------------------------------------------------------

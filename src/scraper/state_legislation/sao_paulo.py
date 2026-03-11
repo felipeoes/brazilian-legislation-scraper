@@ -3,12 +3,12 @@ from io import BytesIO
 from urllib.parse import urlencode, urljoin
 
 from loguru import logger
-from tenacity import retry, stop_after_attempt, wait_exponential
 
+from src.scraper.base.converter import valid_markdown, wrap_html
 from src.scraper.base.scraper import StateScraper
 
 
-# We don't have situations for São Paulo, since the websitew only publishes valid documents (no invalid, no expired, no archived, no revoked, etc.)
+# We don't have situations for São Paulo, since the website only publishes valid documents (no invalid, no expired, no archived, no revoked, etc.)
 
 
 VALID_SITUATIONS = {
@@ -40,6 +40,11 @@ TYPES = {  # dict with norm type and its id (kept as reference metadata)
     "Ato do Presidente": 22,
     "Decisão do Presidente": 23,
     "Constituição Estadual": 59,
+}
+
+_TYPE_ALIASES = {
+    "Constituição do Estado": "Constituição Estadual",
+    "Constituição Estadual": "Constituição Estadual",
 }
 
 
@@ -139,11 +144,6 @@ class SaoPauloAlespScraper(StateScraper):
             return []
         return self._parse_docs_from_soup(soup)
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=2, min=2, max=15),
-        reraise=True,
-    )
     async def _get_norm_data(self, norm_link: str) -> dict:
         """Get norm data from given norm link"""
 
@@ -155,31 +155,32 @@ class SaoPauloAlespScraper(StateScraper):
         # get "promulgacao", "projeto", "temas", "palavras-chave", "situacao" if they exist
         promulgacao = soup.find("label", string="Promulgação")
         if promulgacao:
-            promulgacao = promulgacao.find_next("label").text
-            if not promulgacao:
-                promulgacao = ""
+            next_label = promulgacao.find_next("label")
+            promulgacao = next_label.text if next_label else ""
 
         projeto = soup.find("label", string="Projeto")
         if projeto:
-            projeto = projeto.find_next("label").text
-            if not projeto:
-                projeto = ""
+            next_label = projeto.find_next("label")
+            projeto = next_label.text if next_label else ""
 
         temas = soup.find("label", string="Temas")
         if temas:
-            temas = [
-                button.text for button in temas.find_next("div").find_all("button")
-            ]
+            temas_div = temas.find_next("div")
+            temas = (
+                [button.text for button in temas_div.find_all("button")]
+                if temas_div
+                else []
+            )
 
         palavras_chave = soup.find("label", string="Palavras-chave")
         if palavras_chave:
-            palavras_chave = [
-                a.text for a in palavras_chave.find_next("div").find_all("a")
-            ]
+            kw_div = palavras_chave.find_next("div")
+            palavras_chave = [a.text for a in kw_div.find_all("a")] if kw_div else []
 
         situacao = soup.find("label", string="Situação")
         if situacao:
-            situacao = situacao.find_next("label").text or ""
+            next_label = situacao.find_next("label")
+            situacao = next_label.text if next_label else ""
 
         return {
             "promulgation": promulgacao,
@@ -191,11 +192,28 @@ class SaoPauloAlespScraper(StateScraper):
 
     @staticmethod
     def _infer_type(title: str) -> str:
-        """Infer norm type from title (longest match first to avoid prefix collisions)."""
+        """Infer norm type from the title prefix exposed by the source site."""
+        normalized_title = " ".join(title.split())
+
+        for alias, canonical in sorted(
+            _TYPE_ALIASES.items(), key=lambda item: len(item[0]), reverse=True
+        ):
+            if normalized_title.casefold().startswith(alias.casefold()):
+                return canonical
+
         for type_name in sorted(TYPES, key=len, reverse=True):
-            if title.lower().startswith(type_name.lower()):
+            if normalized_title.casefold().startswith(type_name.casefold()):
                 return type_name
-        return "Legislação"
+
+        match = re.match(
+            r"(.+?)(?:\s+(?:n[º°o]|n\.|número)\s*\d|\s+\d)",
+            normalized_title,
+            re.IGNORECASE,
+        )
+        if match:
+            return match.group(1).strip()
+
+        return normalized_title
 
     async def _get_doc_data(
         self, doc_info: dict, norm_type: str = "NA", year: str = ""
@@ -214,7 +232,7 @@ class SaoPauloAlespScraper(StateScraper):
         try:
             norm_data = await self._get_norm_data(norm_link)
         except Exception as e:
-            logger.error(f"Failed to fetch norm data after retries: {e}")
+            logger.warning(f"Failed to fetch norm data for {norm_link}: {e}")
             norm_data = {}
 
         situation = norm_data.pop("situation", "Não consta") or "Não consta"
@@ -240,15 +258,24 @@ class SaoPauloAlespScraper(StateScraper):
             if text_markdown and (
                 "<html>" in text_markdown or "<!DOCTYPE html>" in text_markdown
             ):
-                if self.verbose:
-                    logger.info(f"Got HTML content for PDF: {doc_html_link}")
+                logger.debug(f"Got HTML content for PDF: {doc_html_link}")
 
-                # Use direct HTML content conversion
-                raw_content = text_markdown.encode("utf-8")
-                content_ext = ".html"
-                text_markdown = await self._get_markdown(html_content=text_markdown)
+                # Use direct HTML content conversion; capture MHTML for archival
+                html_str = text_markdown
+                text_markdown = await self._get_markdown(html_content=html_str)
+                try:
+                    raw_content = await self._capture_mhtml(doc_html_link)
+                    content_ext = ".mhtml"
+                except Exception as exc:
+                    await self._save_doc_error(
+                        title=title,
+                        norm_type=norm_type,
+                        html_link=doc_html_link,
+                        error_message=f"MHTML capture failed: {exc}",
+                    )
+                    return None
 
-            valid, reason = self._valid_markdown(text_markdown)
+            valid, reason = valid_markdown(text_markdown)
             if not valid:
                 logger.error(f"Failed to get markdown for PDF: {doc_html_link}")
                 await self._save_doc_error(
@@ -265,8 +292,17 @@ class SaoPauloAlespScraper(StateScraper):
 
             return data
 
-        soup = await self.request_service.get_soup(doc_html_link)
-        if not soup or not soup.body:
+        try:
+            soup, mhtml = await self._fetch_soup_and_mhtml(doc_html_link)
+        except Exception as exc:
+            await self._save_doc_error(
+                title=title,
+                norm_type=norm_type,
+                html_link=doc_html_link,
+                error_message=f"Failed to fetch page: {exc}",
+            )
+            return None
+        if not soup.body:
             await self._save_doc_error(
                 title=title,
                 norm_type=norm_type,
@@ -282,8 +318,7 @@ class SaoPauloAlespScraper(StateScraper):
             if iframe:
                 pdf_link = iframe["src"]
                 pdf_link = urljoin(doc_html_link, pdf_link)
-                if self.verbose:
-                    logger.info(f"Found PDF link in iframe: {pdf_link}")
+                logger.debug(f"Found PDF link in iframe: {pdf_link}")
                 pdf_response = await self.request_service.make_request(pdf_link)
                 if not pdf_response:
                     await self._save_doc_error(
@@ -295,7 +330,7 @@ class SaoPauloAlespScraper(StateScraper):
                     return None
                 pdf_content = await pdf_response.read()
                 text_markdown = await self._get_markdown(stream=BytesIO(pdf_content))
-                valid, reason = self._valid_markdown(text_markdown)
+                valid, reason = valid_markdown(text_markdown)
                 if not valid:
                     logger.error(f"Failed to get markdown for PDF: {pdf_link}")
                     await self._save_doc_error(
@@ -334,12 +369,12 @@ class SaoPauloAlespScraper(StateScraper):
         else:
             html_string = soup.prettify(formatter="html")
             if "<html>" not in html_string:
-                html_string = self._wrap_html(html_string)
+                html_string = wrap_html(html_string)
 
         # get text markdown
         text_markdown = await self._get_markdown(html_content=html_string)
-        raw_content = html_string.encode("utf-8")
-        content_ext = ".html"
+        raw_content = mhtml
+        content_ext = ".mhtml"
 
         # <p><img src="decisao.da.mesa-1311-img1-02.05.2005.jpg"></p>
         # For some Decisão da Mesa norms, it will have the content as image, so we need to get that and append to the markdown
@@ -347,10 +382,9 @@ class SaoPauloAlespScraper(StateScraper):
             img = soup.find("img")
             if img:
                 img_url = img.get("src")
-                if self.verbose:
-                    logger.info(
-                        f"Getting image for Decisão da Mesa: {doc_html_link} | img source: {img_url}"
-                    )
+                logger.debug(
+                    f"Getting image for Decisão da Mesa: {doc_html_link} | img source: {img_url}"
+                )
                 img_url = urljoin(doc_html_link, img_url)
                 img_response = await self.request_service.make_request(img_url)
                 if not img_response:
@@ -366,7 +400,7 @@ class SaoPauloAlespScraper(StateScraper):
                     else:
                         logger.error(f"Failed to get markdown for image: {img_url}")
 
-        valid, reason = self._valid_markdown(text_markdown)
+        valid, reason = valid_markdown(text_markdown)
         if not valid:
             await self._save_doc_error(
                 title=title,

@@ -4,10 +4,8 @@ import asyncio
 import hashlib
 import json
 import re
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+from dataclasses import dataclass, field
 from datetime import datetime
-from collections.abc import Callable, Awaitable
 from unidecode import unidecode
 from pathlib import Path
 from urllib.parse import unquote
@@ -15,9 +13,58 @@ from typing import Any
 from loguru import logger
 import aiofiles
 
-from src.config import SAVE_DIR, ERROR_LOG_DIR
+from src.config import LOG_DIR, SAVE_DIR
 
-MHTMLCaptureFn = Callable[[str], Awaitable[bytes]]
+
+@dataclass
+class _YearState:
+    """Per-year mutable state for FileSaver (lock + pending buffer + shard sequence)."""
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    pending_docs: dict[tuple[str, str], dict] = field(default_factory=dict)
+    shard_seq: int | None = None  # None = not yet scanned from disk
+
+
+def aggregate_types_summary(
+    items: list[dict[str, Any]],
+    summary: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Aggregate documents into a ``{type: {total, situations}}`` summary dict.
+
+    If *summary* is provided, counts are added to it in-place (and returned).
+    Otherwise a new dict is created.
+    """
+    result = summary if summary is not None else {}
+    for doc in items:
+        doc_type = _normalize_summary_value(doc.get("type"))
+        doc_situation = _normalize_summary_value(doc.get("situation"))
+        if doc_type not in result:
+            result[doc_type] = {"total": 0, "situations": {}}
+        result[doc_type]["total"] += 1
+        result[doc_type]["situations"][doc_situation] = (
+            result[doc_type]["situations"].get(doc_situation, 0) + 1
+        )
+    return result
+
+
+def _normalize_year(value: Any) -> int | None:
+    """Normalize a year-like value to ``int`` when possible."""
+    if value is None:
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_summary_value(value: Any, *, fallback: str = "Unknown") -> str:
+    """Normalize summary bucket labels and collapse placeholder values."""
+    normalized = str(value or "").strip()
+    if not normalized:
+        return fallback
+    if normalized.casefold() in {"na", "n/a", "all"}:
+        return fallback
+    return normalized
 
 
 class FileSaver:
@@ -26,108 +73,28 @@ class FileSaver:
     def __init__(
         self,
         save_dir: Path = SAVE_DIR,
-        error_log_dir: Path | str = ERROR_LOG_DIR,
+        log_dir: Path | str = LOG_DIR,
         max_path_length: int = 225,
         verbose: bool = False,
-        flush_interval: int = 50,
-        max_workers: int = 16,
-        mhtml_capture_fn: MHTMLCaptureFn | None = None,
+        flush_interval: int = 100,
+        max_workers: int = 50,
     ):
         self.save_dir = save_dir
-        self.error_log_dir = error_log_dir
+        self.log_dir = Path(log_dir)
         self.max_path_length = max_path_length
         self.verbose = verbose
         self.flush_interval = flush_interval
         self.max_workers = max_workers
-        self._mhtml_capture_fn = mhtml_capture_fn
-        self._mhtml_capture_disabled = False
 
         self._format_regex_ws = re.compile(r"[\s]+")
         self._format_regex_special = re.compile(r"[^\w\s-]")
 
-        self._year_locks: dict[int, asyncio.Lock] = {}
-        self._pending_docs: dict[int, dict[tuple[str, str], dict]] = {}
-        self._year_shard_seq: dict[int, int] = {}
         self._shard_name_regex = re.compile(r"^chunk_(\d{6})\.json$")
+        self._year_states: dict[int, _YearState] = {}
 
         if self.verbose:
             logger.info(f"Saving to {save_dir}")
-            logger.info(f"Saving errors to {error_log_dir}")
-
-    _ERROR_PAGE_MARKERS = (
-        b"Azion - Default error page",
-        b"<title>403 Forbidden</title>",
-        b"<title>Access Denied</title>",
-        b"<title>Error</title>",
-        b"Acesso Proibido",
-        b"Erro 403",
-        b"error/error.css",
-    )
-
-    def _is_error_page(self, content: bytes) -> bool:
-        """Return True if *content* looks like a CDN / WAF error page."""
-        head = content[:2048]
-        return any(marker in head for marker in self._ERROR_PAGE_MARKERS)
-
-    @staticmethod
-    def _should_disable_mhtml_capture(exc: Exception) -> bool:
-        message = str(exc)
-        return (
-            "Executable doesn't exist" in message
-            or "playwright install" in message.lower()
-            or "chrome-headless-shell" in message
-        )
-
-    def _rewrite_mhtml_primary_location(
-        self,
-        content: bytes,
-        capture_url: str,
-        document_url: str,
-    ) -> bytes:
-        if not capture_url or not document_url or capture_url == document_url:
-            return content
-        try:
-            text = content.decode("utf-8")
-        except UnicodeDecodeError:
-            return content
-
-        text = re.sub(
-            r"^(Snapshot-Content-Location:\s*).*$",
-            rf"\1{document_url}",
-            text,
-            count=1,
-            flags=re.MULTILINE,
-        )
-        text = re.sub(
-            rf"^(Content-Location:\s*){re.escape(capture_url)}$",
-            rf"\1{document_url}",
-            text,
-            count=1,
-            flags=re.MULTILINE,
-        )
-        return text.encode("utf-8")
-
-    def _html_to_mhtml(
-        self,
-        html_content: bytes,
-        capture_url: str,
-        document_url: str,
-    ) -> bytes:
-        """Wrap standalone HTML bytes into a minimal MHTML archive."""
-        location = document_url or capture_url or "about:blank"
-        try:
-            html_text = html_content.decode("utf-8")
-        except UnicodeDecodeError:
-            html_text = html_content.decode("utf-8", errors="replace")
-
-        message = MIMEMultipart("related", type="text/html")
-        message["Subject"] = location
-        message["Snapshot-Content-Location"] = location
-
-        html_part = MIMEText(html_text, "html", "utf-8")
-        html_part["Content-Location"] = location
-        message.attach(html_part)
-        return message.as_bytes()
+            logger.info(f"Saving logs to {self.log_dir}")
 
     def _validate_data(self, data: dict[str, Any]) -> bool:
         """Validate that data contains required fields."""
@@ -153,11 +120,15 @@ class FileSaver:
 
         return path
 
+    def _get_year_state(self, year: int) -> _YearState:
+        """Get or create the per-year state object."""
+        if year not in self._year_states:
+            self._year_states[year] = _YearState()
+        return self._year_states[year]
+
     def _get_year_lock(self, year: int) -> asyncio.Lock:
-        """Get or create a lock for a specific year."""
-        if year not in self._year_locks:
-            self._year_locks[year] = asyncio.Lock()
-        return self._year_locks[year]
+        """Get the asyncio lock for a specific year."""
+        return self._get_year_state(year).lock
 
     def _year_dir(self, year: int) -> Path:
         """Return the directory used for a given year."""
@@ -218,18 +189,19 @@ class FileSaver:
 
     def _next_shard_path(self, year: int) -> Path:
         """Return the next shard file path for a given year."""
-        if year not in self._year_shard_seq:
+        state = self._get_year_state(year)
+        if state.shard_seq is None:
             max_seq = 0
             for shard_path in self._list_shard_files(year):
                 match = self._shard_name_regex.match(shard_path.name)
                 if match:
                     max_seq = max(max_seq, int(match.group(1)))
-            self._year_shard_seq[year] = max_seq
+            state.shard_seq = max_seq
 
-        self._year_shard_seq[year] += 1
+        state.shard_seq += 1
         shards_dir = self._shards_dir(year)
         shards_dir.mkdir(parents=True, exist_ok=True)
-        return shards_dir / f"chunk_{self._year_shard_seq[year]:06d}.json"
+        return shards_dir / f"chunk_{state.shard_seq:06d}.json"
 
     def _years_with_shards(self) -> set[int]:
         """Return years that currently have shard files on disk."""
@@ -250,6 +222,20 @@ class FileSaver:
                 years.add(year)
 
         return years
+
+    def _saved_years(self) -> list[int]:
+        """Return all numeric year directories tracked by this saver."""
+        years = set(self._year_states)
+        root = Path(self.save_dir)
+        if root.exists():
+            for entry in root.iterdir():
+                if not entry.is_dir():
+                    continue
+                try:
+                    years.add(int(entry.name))
+                except ValueError:
+                    continue
+        return sorted(years)
 
     async def _load_main_year_data(self, year: int) -> dict[tuple[str, str], dict]:
         """Load canonical ``data.json`` rows for a year keyed by document key."""
@@ -273,39 +259,39 @@ class FileSaver:
         """Flush remaining documents."""
         await self.flush_all()
 
-    async def _load_year_data(self, year: int) -> dict[tuple[str, str], dict]:
-        """Load full year data from canonical file + pending shards."""
-        data = await self._load_main_year_data(year)
-
-        for shard_path in self._list_shard_files(year):
-            items = await self._read_items_file(shard_path)
+    async def _load_shard_data(
+        self, shard_files: list[Path]
+    ) -> dict[tuple[str, str], dict]:
+        """Load and merge shard files into a keyed dict."""
+        if not shard_files:
+            return {}
+        data: dict[tuple[str, str], dict] = {}
+        shard_results = await asyncio.gather(
+            *[self._read_items_file(p) for p in shard_files]
+        )
+        for items in shard_results:
             for item in items:
                 key = self._doc_key(item)
                 if key is not None:
                     data[key] = item
+        return data
 
-        pending = self._pending_docs.get(year, {})
+    async def _load_year_data(self, year: int) -> dict[tuple[str, str], dict]:
+        """Load full year data from canonical file + pending shards."""
+        data = await self._load_main_year_data(year)
+        shard_data = await self._load_shard_data(self._list_shard_files(year))
+        data.update(shard_data)
+        pending = self._get_year_state(year).pending_docs
         if pending:
             data.update(pending)
-
         return data
 
     @staticmethod
     def _build_summary(items: list[dict[str, Any]]) -> dict[str, Any]:
         """Compute summary statistics for a list of document dicts."""
-        types_summary: dict[str, dict[str, Any]] = {}
-        for doc in items:
-            doc_type = doc.get("type", "Unknown")
-            doc_situation = doc.get("situation", "Unknown")
-            if doc_type not in types_summary:
-                types_summary[doc_type] = {"total": 0, "situations": {}}
-            types_summary[doc_type]["total"] += 1
-            types_summary[doc_type]["situations"][doc_situation] = (
-                types_summary[doc_type]["situations"].get(doc_situation, 0) + 1
-            )
         return {
             "count": len(items),
-            "types_summary": types_summary,
+            "types_summary": aggregate_types_summary(items),
             "last_updated": datetime.now().isoformat(),
         }
 
@@ -342,6 +328,30 @@ class FileSaver:
             data = await self._load_year_data(year)
             return list(data.values())
 
+    async def get_all_documents(self) -> list[dict[str, Any]]:
+        """Return all saved document rows across all years."""
+        years = self._saved_years()
+        if not years:
+            return []
+
+        year_batches = await asyncio.gather(
+            *(self.get_year_documents(year) for year in years)
+        )
+        return [doc for batch in year_batches for doc in batch]
+
+    async def get_dataset_summary(self) -> dict[str, Any]:
+        """Build aggregate summary stats from all saved documents on disk."""
+        documents = await self.get_all_documents()
+        years = [
+            year for doc in documents if (year := _normalize_year(doc.get("year")))
+        ]
+        return {
+            "year_start": min(years) if years else None,
+            "year_end": max(years) if years else None,
+            "total_documents": len(documents),
+            "types_summary": aggregate_types_summary(documents),
+        }
+
     async def save_document(
         self,
         doc_data: dict[str, Any],
@@ -352,50 +362,6 @@ class FileSaver:
         if not self._validate_data(doc_data):
             logger.warning(f"Invalid document data, skipping save: {doc_data}")
             return None
-
-        # Capture MHTML before acquiring the year lock (slow I/O).
-        # Falls back to the original HTML when capture fails or returns
-        # an error page (e.g. Azion CDN blocking headless browsers).
-        if (
-            raw_content
-            and content_extension
-            and content_extension.lstrip(".") == "html"
-        ):
-            capture_url = doc_data.get("_mhtml_url") or doc_data.get("document_url", "")
-            document_url = doc_data.get("document_url", "")
-            if capture_url:
-                used_browser_capture = False
-                if self._mhtml_capture_fn and not self._mhtml_capture_disabled:
-                    try:
-                        mhtml_bytes = await self._mhtml_capture_fn(capture_url)
-                        if self._is_error_page(mhtml_bytes):
-                            logger.debug(
-                                f"MHTML captured an error page for {capture_url}, "
-                                "falling back to synthesized MHTML from raw HTML"
-                            )
-                        else:
-                            raw_content = self._rewrite_mhtml_primary_location(
-                                mhtml_bytes,
-                                capture_url,
-                                document_url,
-                            )
-                            content_extension = ".mhtml"
-                            used_browser_capture = True
-                    except Exception as e:
-                        logger.debug(
-                            f"MHTML capture failed for {capture_url}, "
-                            f"falling back to synthesized MHTML from raw HTML: {e}"
-                        )
-                        if self._should_disable_mhtml_capture(e):
-                            self._mhtml_capture_disabled = True
-
-                if not used_browser_capture:
-                    raw_content = self._html_to_mhtml(
-                        raw_content,
-                        capture_url,
-                        document_url,
-                    )
-                    content_extension = ".mhtml"
 
         year = int(doc_data["year"])
         lock = self._get_year_lock(year)
@@ -437,11 +403,9 @@ class FileSaver:
                     clean_data["file_path"] = str(file_path.relative_to(save_dir))
 
                 key = (clean_data.get("document_url", ""), clean_data.get("title", ""))
-                if year not in self._pending_docs:
-                    self._pending_docs[year] = {}
-                self._pending_docs[year][key] = clean_data
-
-                pending_count = len(self._pending_docs[year])
+                state = self._get_year_state(year)
+                state.pending_docs[key] = clean_data
+                pending_count = len(state.pending_docs)
 
                 if pending_count >= self.flush_interval:
                     await self._flush_year(year)
@@ -460,7 +424,8 @@ class FileSaver:
 
         Must be called while holding the year lock.
         """
-        pending = self._pending_docs.get(year)
+        state = self._get_year_state(year)
+        pending = state.pending_docs
         if not pending:
             return
 
@@ -471,13 +436,7 @@ class FileSaver:
                 json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
             )
 
-        count = len(payload)
-        self._pending_docs[year] = {}
-
-        if self.verbose:
-            logger.info(
-                f"Flushed {count} documents for year {year} to shard {shard_path.name}"
-            )
+        state.pending_docs = {}
 
     async def _compact_year(self, year: int) -> None:
         """Compact ``data.json`` + shard files into a single canonical file."""
@@ -486,16 +445,9 @@ class FileSaver:
             return
 
         merged_data = await self._load_main_year_data(year)
-        merged_from_shards = 0
-
-        for shard_path in shard_files:
-            items = await self._read_items_file(shard_path)
-            for item in items:
-                key = self._doc_key(item)
-                if key is None:
-                    continue
-                merged_data[key] = item
-                merged_from_shards += 1
+        shard_data = await self._load_shard_data(shard_files)
+        merged_data.update(shard_data)
+        merged_from_shards = len(shard_data)
 
         await self._write_year_data(year, merged_data)
 
@@ -509,14 +461,13 @@ class FileSaver:
         try:
             if shards_dir.exists() and not any(shards_dir.iterdir()):
                 shards_dir.rmdir()
-        except OSError:
-            pass
+        except OSError as e:
+            logger.debug(f"Could not remove shards directory {shards_dir}: {e}")
 
-        if self.verbose:
-            logger.info(
-                f"Compacted year {year}: merged {merged_from_shards} docs from "
-                f"{len(shard_files)} shards (total on disk: {len(merged_data)})"
-            )
+        logger.debug(
+            f"Compacted year {year}: merged {merged_from_shards} docs from "
+            f"{len(shard_files)} shards (total on disk: {len(merged_data)})"
+        )
 
     async def flush(self, year: int) -> None:
         """Flush buffered documents and compact shard files for a year."""
@@ -527,7 +478,9 @@ class FileSaver:
 
     async def flush_all(self) -> None:
         """Flush all buffered documents across all years to disk."""
-        years = set(self._pending_docs.keys()) | self._years_with_shards()
+        years = {
+            y for y, s in self._year_states.items() if s.pending_docs
+        } | self._years_with_shards()
         if years:
             await asyncio.gather(*(self.flush(year) for year in sorted(years)))
 
@@ -543,8 +496,7 @@ class FileSaver:
             if error_message:
                 data = {**data, "error_message": error_message}
 
-            save_dir = Path(self.error_log_dir)
-            year_dir = save_dir / str(data["year"])
+            year_dir = self.log_dir / str(data["year"])
             type_dir = year_dir / data["type"]
             situation_dir = type_dir / data["situation"]
 
@@ -559,9 +511,6 @@ class FileSaver:
 
             async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
                 await f.write(json.dumps(data, ensure_ascii=False, indent=4))
-
-            if self.verbose:
-                logger.info(f"Saved error data to {file_path}")
 
         except Exception as e:
             error_msg = f"Error saving error data for '{data.get('title', 'Unknown')}'"

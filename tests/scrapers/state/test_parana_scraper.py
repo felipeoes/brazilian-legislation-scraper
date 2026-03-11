@@ -25,7 +25,7 @@ from bs4 import BeautifulSoup
 from src.scraper.base.scraper import DEFAULT_INVALID_SITUATION, DEFAULT_VALID_SITUATION
 from src.scraper.state_legislation.parana import SITUATIONS, TYPES, ParanaCVScraper
 from base_tests import TypesConstantTests, SituationsConstantTests, ScraperClassTests
-from conftest import make_base_scraper, make_failed_request, assert_resume_skips
+from conftest import make_base_scraper, assert_resume_skips
 
 
 # ---------------------------------------------------------------------------
@@ -282,9 +282,7 @@ class TestGetDocData:
     async def test_failed_response_saves_error_and_returns_none(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        failed = make_failed_request()
-        failed.status = None
-        scraper.request_service.make_request = AsyncMock(return_value=failed)
+        scraper._fetch_soup_and_mhtml = AsyncMock(side_effect=Exception("fetch failed"))
         scraper._save_doc_error = AsyncMock()
         doc = {"id": "101", "title": "Lei 1/2020", "date": "01/01/2020"}
         result = await scraper._get_doc_data(doc)
@@ -295,11 +293,14 @@ class TestGetDocData:
     async def test_missing_form_saves_error_and_returns_none(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        resp = MagicMock()
-        resp.__bool__ = lambda s: True
-        resp.status = 200
-        resp.text = AsyncMock(return_value="<html><body><p>No form</p></body></html>")
-        scraper.request_service.make_request = AsyncMock(return_value=resp)
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            return_value=(
+                BeautifulSoup(
+                    "<html><body><p>No form</p></body></html>", "html.parser"
+                ),
+                b"",
+            )
+        )
         scraper._save_doc_error = AsyncMock()
         doc = {"id": "101", "title": "Lei 1/2020", "date": "01/01/2020"}
         result = await scraper._get_doc_data(doc)
@@ -310,11 +311,9 @@ class TestGetDocData:
     async def test_invalid_markdown_returns_none(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        resp = MagicMock()
-        resp.__bool__ = lambda s: True
-        resp.status = 200
-        resp.text = AsyncMock(return_value=_make_doc_html())
-        scraper.request_service.make_request = AsyncMock(return_value=resp)
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            return_value=(BeautifulSoup(_make_doc_html(), "html.parser"), b"")
+        )
         scraper._get_markdown = AsyncMock(return_value="   ")
         doc = {"id": "101", "title": "Lei 1/2020", "date": "01/01/2020"}
         result = await scraper._get_doc_data(doc)
@@ -324,11 +323,9 @@ class TestGetDocData:
     async def test_valid_doc_returns_correct_shape(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        resp = MagicMock()
-        resp.__bool__ = lambda s: True
-        resp.status = 200
-        resp.text = AsyncMock(return_value=_make_doc_html())
-        scraper.request_service.make_request = AsyncMock(return_value=resp)
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            return_value=(BeautifulSoup(_make_doc_html(), "html.parser"), b"fake-mhtml")
+        )
         valid_md = "# Lei Estadual 1/2020\n\n" + "Texto da lei. " * 30
         scraper._get_markdown = AsyncMock(return_value=valid_md)
         doc = {"id": "101", "title": "Lei 1/2020", "date": "01/01/2020"}
@@ -336,18 +333,19 @@ class TestGetDocData:
         assert result is not None
         assert "text_markdown" in result
         assert "document_url" in result
-        assert result["_content_extension"] == ".html"
-        assert isinstance(result["_raw_content"], bytes)
+        assert result["_content_extension"] == ".mhtml"
+        assert result["_raw_content"] == b"fake-mhtml"
 
     @pytest.mark.asyncio
     async def test_valid_revogado_doc_infers_invalid_situation(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        resp = MagicMock()
-        resp.__bool__ = lambda s: True
-        resp.status = 200
-        resp.text = AsyncMock(return_value=_make_doc_html(revogado=True))
-        scraper.request_service.make_request = AsyncMock(return_value=resp)
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            return_value=(
+                BeautifulSoup(_make_doc_html(revogado=True), "html.parser"),
+                b"fake-mhtml",
+            )
+        )
         valid_md = "# Lei\n\n" + "Revogado pelo Decreto 999. " * 20
         scraper._get_markdown = AsyncMock(return_value=valid_md)
         doc = {"id": "101", "title": "Lei 1/2020", "date": "01/01/2020"}
@@ -359,11 +357,12 @@ class TestGetDocData:
     async def test_valid_active_doc_infers_valid_situation(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        resp = MagicMock()
-        resp.__bool__ = lambda s: True
-        resp.status = 200
-        resp.text = AsyncMock(return_value=_make_doc_html(revogado=False))
-        scraper.request_service.make_request = AsyncMock(return_value=resp)
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            return_value=(
+                BeautifulSoup(_make_doc_html(revogado=False), "html.parser"),
+                b"fake-mhtml",
+            )
+        )
         valid_md = "# Lei\n\n" + "Dispõe sobre normas. " * 30
         scraper._get_markdown = AsyncMock(return_value=valid_md)
         doc = {"id": "101", "title": "Lei 1/2020", "date": "01/01/2020"}

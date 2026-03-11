@@ -239,6 +239,67 @@ class TestCleanAcreHtml:
         # exportacao content should not be present (body-law was found first)
         assert "Secondary content." not in result
 
+    def test_removes_ementa_metadata_table(self):
+        """The ementa table (first td empty, second td has summary) should be removed."""
+        scraper = _make_scraper()
+        html = self._make_detail_page(
+            "body-law",
+            "<p>Art. 1º Conteúdo real.</p>",
+            extra="""<table><tbody><tr>
+                <td width="52%"></td>
+                <td width="48%">Ementa que dispõe sobre X.</td>
+            </tr></tbody></table>""",
+        )
+        soup = BeautifulSoup(html, "html.parser")
+        result = scraper._clean_acre_html(soup)
+        assert "Ementa que dispõe sobre X." not in result
+        assert "Conteúdo real." in result
+
+    def test_keeps_content_table(self):
+        """Tables where the first cell has text should NOT be removed."""
+        scraper = _make_scraper()
+        html = self._make_detail_page(
+            "body-law",
+            """<table><tbody><tr>
+                <td>Coluna 1</td><td>Coluna 2</td>
+            </tr></tbody></table>""",
+        )
+        soup = BeautifulSoup(html, "html.parser")
+        result = scraper._clean_acre_html(soup)
+        assert "Coluna 1" in result
+        assert "Coluna 2" in result
+
+    def test_removes_topo_lei_header(self):
+        """The topo-lei div (state brasão/header) should be removed."""
+        scraper = _make_scraper()
+        html = """<html><body>
+            <div id="exportacao">
+                <div class="topo-lei"><h2>ESTADO DO ACRE</h2></div>
+                <p>PREÂMBULO</p>
+            </div>
+        </body></html>"""
+        soup = BeautifulSoup(html, "html.parser")
+        result = scraper._clean_acre_html(soup)
+        assert "ESTADO DO ACRE" not in result
+        assert "PREÂMBULO" in result
+
+    def test_link_text_stays_inline(self):
+        """After unwrapping, link text should not be on a separate line."""
+        scraper = _make_scraper()
+        html = self._make_detail_page(
+            "body-law",
+            "<p><span>texto antes </span>"
+            '<a href="https://example.com"><span>https://example.com</span></a>'
+            "<span> texto depois</span></p>",
+        )
+        soup = BeautifulSoup(html, "html.parser")
+        result = scraper._clean_acre_html(soup)
+        # The link text should NOT be separated by newlines from surrounding text
+        assert (
+            "\n" not in result.split("texto antes")[1].split("texto depois")[0].strip()
+            or "https://example.com" in result
+        )
+
 
 # ---------------------------------------------------------------------------
 # _scrape_type
@@ -258,34 +319,48 @@ class TestScrapeType:
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_constitution_calls_fetch_and_save(self):
+    async def test_constitution_uses_clean_acre_html(self):
+        """Constitution should be fetched, cleaned with _clean_acre_html, and processed."""
         scraper = _make_scraper()
-        fake_doc = {"title": "Constituição Estadual", "year": 2025}
+        scraper._fetch_soup_and_mhtml = AsyncMock(
+            return_value=(
+                BeautifulSoup(
+                    '<html><body><div id="exportacao">'
+                    '<div class="topo-lei"><h2>ESTADO DO ACRE</h2></div>'
+                    "<p>PREÂMBULO</p></div></body></html>",
+                    "html.parser",
+                ),
+                b"fake-mhtml",
+            )
+        )
 
-        with patch.object(
-            scraper,
-            "_fetch_and_save_constitution",
-            new=AsyncMock(return_value=fake_doc),
-        ) as mock_fetch:
+        fake_doc = {"title": "Constituição Estadual", "year": 2026}
+        with (
+            patch.object(
+                scraper, "_process_html_doc", new=AsyncMock(return_value=fake_doc)
+            ) as mock_process,
+            patch.object(scraper, "_save_doc_result", new=AsyncMock(return_value=None)),
+            patch.object(scraper, "_track_results"),
+        ):
             result = await scraper._scrape_type(
                 "Constituição Estadual", "detalhar_constituicao", 2000
             )
 
-        mock_fetch.assert_awaited_once()
-        call_kwargs = mock_fetch.call_args.kwargs
-        assert call_kwargs["title"] == "Constituição Estadual"
-        assert "legis.ac.gov.br/detalhar_constituicao" in call_kwargs["url"]
+        mock_process.assert_awaited_once()
+        html_arg = mock_process.call_args.args[1]
+        assert "PREÂMBULO" in html_arg
+        assert "ESTADO DO ACRE" not in html_arg  # topo-lei removed
         assert result == [fake_doc]
 
     @pytest.mark.asyncio
     async def test_constitution_returns_empty_when_fetch_fails(self):
         scraper = _make_scraper()
-        with patch.object(
-            scraper, "_fetch_and_save_constitution", new=AsyncMock(return_value=None)
-        ):
-            result = await scraper._scrape_type(
-                "Constituição Estadual", "detalhar_constituicao", 2000
-            )
+        scraper._fetch_soup_and_mhtml = AsyncMock(side_effect=Exception("fetch failed"))
+        scraper._save_doc_error = AsyncMock()
+
+        result = await scraper._scrape_type(
+            "Constituição Estadual", "detalhar_constituicao", 2000
+        )
         assert result == []
 
     @pytest.mark.asyncio

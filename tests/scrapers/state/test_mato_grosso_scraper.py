@@ -270,6 +270,24 @@ class TestExtractDocsFromSoup:
         assert len(docs) == 1
         assert docs[0]["type"] == ""
 
+    def test_known_prefix_without_dash_is_inferred(self):
+        scraper = _make_scraper()
+        html = """<html><body>
+            <div class="col-12"><h5>dummy form</h5><div class="text-muted">x</div></div>
+            <div class="col-12"><h5>dummy filter</h5><div class="text-muted">x</div></div>
+            <div class="col-12">
+                <h5>Lei Ordinária 123/2020</h5>
+                <div class="text-muted">Ementa</div>
+                <a href="/download/1">PDF</a>
+                <a href="/norma/1">Ver</a>
+            </div>
+            <div class="col-12"><nav>pag</nav></div>
+        </body></html>"""
+        soup = BeautifulSoup(html, "html.parser")
+        docs = scraper._extract_docs_from_soup(soup, is_historic=False)
+        assert len(docs) == 1
+        assert docs[0]["type"] == "Lei Ordinária"
+
     def test_skips_items_with_fewer_than_2_links(self):
         scraper = _make_scraper()
         html = """<html><body>
@@ -471,7 +489,7 @@ class TestGetDocData:
         scraper._save_doc_error = AsyncMock()
         scraper._strip_html_chrome = MagicMock()
         scraper._get_markdown = AsyncMock(return_value="short")
-        scraper._valid_markdown = MagicMock(return_value=(False, "too short"))
+        scraper._capture_mhtml = AsyncMock(return_value=b"fake-mhtml")
         scraper.request_service.get_soup = AsyncMock(
             side_effect=[_make_ficha_soup(), _make_compilado_soup()]
         )
@@ -486,13 +504,14 @@ class TestGetDocData:
         scraper._save_doc_error = AsyncMock()
         scraper._strip_html_chrome = MagicMock()
         scraper._get_markdown = AsyncMock(return_value=_make_valid_md())
+        scraper._capture_mhtml = AsyncMock(return_value=b"fake-mhtml")
         scraper.request_service.get_soup = AsyncMock(
             side_effect=[_make_ficha_soup(), _make_compilado_soup()]
         )
         result = await scraper._get_doc_data(_make_doc_info())
         assert result is not None
         assert "# Lei Estadual" in result["text_markdown"]
-        assert result["_content_extension"] == ".html"
-        assert isinstance(result["_raw_content"], bytes)
+        assert result["_content_extension"] == ".mhtml"
+        assert result["_raw_content"] == b"fake-mhtml"
         assert "norm_link" not in result  # popped
         assert result.get("situation") == "Vigente"

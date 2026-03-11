@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 import re
 import shutil
@@ -91,7 +92,8 @@ class SnowflakeClient:
         try:
             if conn.is_closed():
                 conn = await asyncio.to_thread(self._create_connection)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Reconnecting stale Snowflake connection: {e}")
             conn = await asyncio.to_thread(self._create_connection)
         return conn
 
@@ -104,8 +106,8 @@ class SnowflakeClient:
         except asyncio.QueueFull:
             try:
                 conn.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Error closing excess Snowflake connection: {e}")
 
     # ------------------------------------------------------------------
     # Public API (matches LLMClient protocol)
@@ -176,7 +178,8 @@ class SnowflakeClient:
                     elif block_type == "image_url":
                         data_url = block["image_url"]["url"]
                         _, img_b64 = parse_base64_data_uri(data_url)
-                        images.append(base64.standard_b64decode(img_b64))
+                        if img_b64:
+                            images.append(base64.standard_b64decode(img_b64))
 
         return prompt, images
 
@@ -192,7 +195,14 @@ class SnowflakeClient:
         prompt: str,
         model_id: str,
     ) -> str:
-        """Upload images to stage and run AI_COMPLETE in one connection (blocking)."""
+        """Upload images to stage and run AI_COMPLETE in one connection (blocking).
+
+        Snowflake's ``AI_COMPLETE`` returns a VARIANT column; the Python
+        connector delivers it as a **JSON-encoded string** (e.g.
+        ``'"text\\\\nwith newline"'``).  We JSON-decode the raw value so that
+        callers receive a plain Python string with real newline characters and
+        no surrounding quotes.
+        """
         cursor = conn.cursor()
         try:
             for local_path in local_paths:
@@ -208,7 +218,16 @@ class SnowflakeClient:
             row = cursor.fetchone()
             if row is None:
                 raise RuntimeError("AI_COMPLETE returned no rows.")
-            return row[0]
+
+            result = row[0]
+            if isinstance(result, str):
+                try:
+                    decoded = json.loads(result)
+                    if isinstance(decoded, str):
+                        return decoded
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            return result
         finally:
             cursor.close()
 
@@ -272,6 +291,6 @@ class SnowflakeClient:
             try:
                 conn = self._pool.get_nowait()
                 await asyncio.to_thread(conn.close)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Error closing Snowflake connection during cleanup: {e}")
         self._pool_initialized = False
