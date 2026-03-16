@@ -7,21 +7,18 @@ Covers:
 - Class docstring accessible (__doc__ is not None)
 - _build_search_url: correct URL + query params, optional norm_type_id, page=1 default
 - _clean_markdown: strips javascript:print(), strips whitespace
-- _process_pdf_link: HTTP error → None, invalid markdown → None, valid → correct shape,
-  sets document_url when missing vs pdf_link when already set
-- _get_doc_info: HTTP error → None, early resume skip (before detail API call) → None,
+- _get_doc_data: HTTP error → None, early resume skip (before detail API call) → None,
   redirect guard → None, HTML with baixar_div as secondary pdf source,
-  HTML to markdown happy path, short content falls back to PDF,
+  HTML to markdown happy path, short content falls back to PDF via _process_pdf_doc,
   invalid markdown falls back to PDF, javascript error message guard → None,
   clean markdown applied at end, derives norm_url_suffix from search result
-- _get_doc_data: HTTP error → empty list, zero results → empty list, valid → list of docs
+- _fetch_search_page: HTTP error → empty list, returns page results
 - _scrape_year: single paginated fetch per year, handles empty results
 
 Run with:
-    .venv/bin/pytest tests/test_goias_scraper.py -v
+    uv run pytest tests/scrapers/state/test_goias_scraper.py -v
 """
 
-import re
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -49,8 +46,6 @@ def _make_scraper(**kwargs) -> LegislaGoias:
         "GOIAS",
         {k: dict(v) for k, v in TYPES.items()},
         dict(SITUATIONS),
-        _special_regex=re.compile(r"[^a-zA-ZÀ-ÿ\s]"),
-        _space_regex=re.compile(r"\s+"),
         **kwargs,
     )
 
@@ -240,93 +235,11 @@ class TestCleanMarkdown:
 
 
 # ---------------------------------------------------------------------------
-# _process_pdf_link
+# _get_doc_data
 # ---------------------------------------------------------------------------
 
 
-class TestProcessPdfLink:
-    @pytest.mark.asyncio
-    async def test_http_error_returns_none(self):
-        scraper = _make_scraper()
-        failed = MagicMock()
-        failed.__bool__ = MagicMock(return_value=False)
-        scraper.request_service.make_request = AsyncMock(return_value=failed)
-        result = await scraper._process_pdf_link("http://example.com/doc.pdf", "42", {})
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_invalid_markdown_returns_none(self):
-        scraper = _make_scraper()
-        response = MagicMock()
-        response.__bool__ = MagicMock(return_value=True)
-        response.read = AsyncMock(return_value=b"%PDF short")
-        scraper.request_service.make_request = AsyncMock(return_value=response)
-        scraper._get_markdown = AsyncMock(return_value="short")
-        result = await scraper._process_pdf_link("http://example.com/doc.pdf", "42", {})
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_valid_pdf_returns_correct_shape(self):
-        scraper = _make_scraper()
-        response = MagicMock()
-        response.__bool__ = MagicMock(return_value=True)
-        response.read = AsyncMock(return_value=b"%PDF content")
-        scraper.request_service.make_request = AsyncMock(return_value=response)
-        valid_md = _make_valid_md()
-        scraper._get_markdown = AsyncMock(return_value=valid_md)
-        doc_info = {"title": "Lei 001", "summary": "ementa"}
-        result = await scraper._process_pdf_link(
-            "http://example.com/doc.pdf", "42", doc_info
-        )
-        assert result is not None
-        assert result["_content_extension"] == ".pdf"
-        assert result["document_url"] == "http://example.com/doc.pdf"
-        assert result["_raw_content"] == b"%PDF content"
-
-    @pytest.mark.asyncio
-    async def test_sets_pdf_link_when_document_url_already_set(self):
-        scraper = _make_scraper()
-        response = MagicMock()
-        response.__bool__ = MagicMock(return_value=True)
-        response.read = AsyncMock(return_value=b"%PDF content")
-        scraper.request_service.make_request = AsyncMock(return_value=response)
-        valid_md = _make_valid_md()
-        scraper._get_markdown = AsyncMock(return_value=valid_md)
-        doc_info = {
-            "title": "Lei 001",
-            "summary": "ementa",
-            "document_url": "https://existing.url",
-        }
-        result = await scraper._process_pdf_link(
-            "http://example.com/doc.pdf", "42", doc_info
-        )
-        assert result is not None
-        assert result["document_url"] == "https://existing.url"
-        assert result["pdf_link"] == "http://example.com/doc.pdf"
-
-    @pytest.mark.asyncio
-    async def test_clean_markdown_applied(self):
-        scraper = _make_scraper()
-        response = MagicMock()
-        response.__bool__ = MagicMock(return_value=True)
-        response.read = AsyncMock(return_value=b"%PDF content")
-        scraper.request_service.make_request = AsyncMock(return_value=response)
-        valid_md = _make_valid_md() + " javascript:print()"
-        scraper._get_markdown = AsyncMock(return_value=valid_md)
-        doc_info = {"title": "Lei 001", "summary": "ementa"}
-        result = await scraper._process_pdf_link(
-            "http://example.com/doc.pdf", "42", doc_info
-        )
-        assert result is not None
-        assert "javascript:print()" not in result["text_markdown"]
-
-
-# ---------------------------------------------------------------------------
-# _get_doc_info
-# ---------------------------------------------------------------------------
-
-
-class TestGetDocInfo:
+class TestGetDocData:
     @pytest.mark.asyncio
     async def test_http_error_returns_none(self):
         scraper = _make_scraper()
@@ -335,7 +248,7 @@ class TestGetDocInfo:
         failed.__bool__ = MagicMock(return_value=False)
         scraper.request_service.make_request = AsyncMock(return_value=failed)
         scraper._save_doc_error = AsyncMock()
-        result = await scraper._get_doc_info(_make_search_result())
+        result = await scraper._get_doc_data(_make_search_result())
         assert result is None
         scraper._save_doc_error.assert_called_once()
 
@@ -344,7 +257,7 @@ class TestGetDocInfo:
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=True)
         scraper.request_service.make_request = AsyncMock()
-        result = await scraper._get_doc_info(_make_search_result())
+        result = await scraper._get_doc_data(_make_search_result())
         assert result is None
         # Detail API should NOT be called when resume-skipping
         scraper.request_service.make_request.assert_not_called()
@@ -358,7 +271,7 @@ class TestGetDocInfo:
         detail = _make_doc_detail(conteudo=conteudo)
         response = _make_response(detail)
         scraper.request_service.make_request = AsyncMock(return_value=response)
-        result = await scraper._get_doc_info(_make_search_result())
+        result = await scraper._get_doc_data(_make_search_result())
         assert result is None
         scraper._save_doc_error.assert_called_once()
 
@@ -369,17 +282,11 @@ class TestGetDocInfo:
         detail = _make_doc_detail(conteudo="")
         response = _make_response(detail)
         scraper.request_service.make_request = AsyncMock(return_value=response)
-        valid_md = _make_valid_md()
-        scraper._process_pdf_link = AsyncMock(
-            return_value={
-                "title": "Lei 001",
-                "text_markdown": valid_md,
-                "document_url": "http://x.com",
-            }
-        )
+        mock_doc = MagicMock()
+        scraper._process_pdf_doc = AsyncMock(return_value=mock_doc)
         scraper._save_doc_error = AsyncMock()
-        result = await scraper._get_doc_info(_make_search_result())
-        scraper._process_pdf_link.assert_called_once()
+        result = await scraper._get_doc_data(_make_search_result())
+        scraper._process_pdf_doc.assert_called_once()
         assert result is not None
 
     @pytest.mark.asyncio
@@ -394,10 +301,26 @@ class TestGetDocInfo:
         valid_md = _make_valid_md()
         scraper._get_markdown = AsyncMock(return_value=valid_md)
         scraper._save_doc_error = AsyncMock()
-        result = await scraper._get_doc_info(_make_search_result())
+        result = await scraper._get_doc_data(_make_search_result())
         assert result is not None
         assert result["type"] == "Lei Ordinária"
         assert result["text_markdown"] is not None
+
+    @pytest.mark.asyncio
+    async def test_valid_html_saves_html_file_not_mhtml(self):
+        """HTML path must store raw bytes as .html, not trigger browser MHTML capture."""
+        scraper = _make_scraper()
+        scraper._is_already_scraped = MagicMock(return_value=False)
+        long_content = "<p>" + "Lei text " * 100 + "</p>"
+        detail = _make_doc_detail(conteudo=long_content, ementa="ementa")
+        response = _make_response(detail)
+        scraper.request_service.make_request = AsyncMock(return_value=response)
+        scraper._get_markdown = AsyncMock(return_value=_make_valid_md())
+        scraper._save_doc_error = AsyncMock()
+        result = await scraper._get_doc_data(_make_search_result())
+        assert result is not None
+        assert result["_content_extension"] == ".html"
+        assert isinstance(result["_raw_content"], bytes)
 
     @pytest.mark.asyncio
     async def test_type_falls_back_to_search_row_when_detail_type_missing(self):
@@ -410,7 +333,7 @@ class TestGetDocInfo:
         scraper._get_markdown = AsyncMock(return_value=_make_valid_md())
         scraper._save_doc_error = AsyncMock()
 
-        result = await scraper._get_doc_info(
+        result = await scraper._get_doc_data(
             _make_search_result(tipo_nome="Resolução", tipo_id=7)
         )
 
@@ -419,6 +342,7 @@ class TestGetDocInfo:
 
     @pytest.mark.asyncio
     async def test_javascript_error_msg_guard(self):
+        """valid_markdown already rejects the JS-disabled message, so falls back to PDF."""
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
         content = "<p>Some content</p>"
@@ -427,10 +351,12 @@ class TestGetDocInfo:
         scraper.request_service.make_request = AsyncMock(return_value=response)
         bad_md = "doesn't work properly without JavaScript enabled " * 10
         scraper._get_markdown = AsyncMock(return_value=bad_md)
+        scraper._process_pdf_doc = AsyncMock(return_value=None)
         scraper._save_doc_error = AsyncMock()
-        result = await scraper._get_doc_info(_make_search_result())
+        result = await scraper._get_doc_data(_make_search_result())
+        # valid_markdown catches the JS error pattern → falls through to PDF path
+        scraper._process_pdf_doc.assert_called_once()
         assert result is None
-        scraper._save_doc_error.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_constituicao_url_has_no_number_suffix(self):
@@ -445,18 +371,11 @@ class TestGetDocInfo:
         )
         response = _make_response(detail)
         scraper.request_service.make_request = AsyncMock(return_value=response)
-        valid_md = _make_valid_md()
-        scraper._process_pdf_link = AsyncMock(
-            return_value={
-                "title": "CE",
-                "text_markdown": valid_md,
-                "document_url": "http://x.com",
-            }
-        )
+        scraper._process_pdf_doc = AsyncMock(return_value=MagicMock())
         search_result = _make_search_result(
             doc_id=42, numero="001", tipo_nome="Constituição Estadual", tipo_id=12
         )
-        await scraper._get_doc_info(search_result)
+        await scraper._get_doc_data(search_result)
         # Check is_already_scraped was called with URL ending in /constituicao-estadual (no number)
         called_url = scraper._is_already_scraped.call_args[0][0]
         assert called_url.endswith("constituicao-estadual")
@@ -471,18 +390,11 @@ class TestGetDocInfo:
         )
         response = _make_response(detail)
         scraper.request_service.make_request = AsyncMock(return_value=response)
-        valid_md = _make_valid_md()
-        scraper._process_pdf_link = AsyncMock(
-            return_value={
-                "title": "Res",
-                "text_markdown": valid_md,
-                "document_url": "http://x.com",
-            }
-        )
+        scraper._process_pdf_doc = AsyncMock(return_value=MagicMock())
         search_result = _make_search_result(
             doc_id=99, numero="55", tipo_nome="Resolução", tipo_id=7
         )
-        await scraper._get_doc_info(search_result)
+        await scraper._get_doc_data(search_result)
         called_url = scraper._is_already_scraped.call_args[0][0]
         assert "resolucao-55" in called_url
 
@@ -498,19 +410,13 @@ class TestGetDocInfo:
         scraper.request_service.make_request = AsyncMock(return_value=response)
         # Make markdown invalid to force PDF fallback
         scraper._get_markdown = AsyncMock(return_value="x")
-        valid_md = _make_valid_md()
-        scraper._process_pdf_link = AsyncMock(
-            return_value={
-                "title": "Lei 001",
-                "text_markdown": valid_md,
-                "document_url": "http://x.com",
-            }
-        )
+        scraper._process_pdf_doc = AsyncMock(return_value=MagicMock())
         scraper._save_doc_error = AsyncMock()
-        await scraper._get_doc_info(_make_search_result())
-        # _process_pdf_link should be called with the baixar_div link
-        scraper._process_pdf_link.assert_called_once()
-        assert scraper._process_pdf_link.call_args[0][0] == "/api/v1/arquivos/123"
+        await scraper._get_doc_data(_make_search_result())
+        # _process_pdf_doc should be called with doc_info containing the baixar_div link
+        scraper._process_pdf_doc.assert_called_once()
+        call_doc_info = scraper._process_pdf_doc.call_args[0][0]
+        assert call_doc_info.get("pdf_link") == "/api/v1/arquivos/123"
 
     @pytest.mark.asyncio
     async def test_baixar_div_does_not_override_ver_lei_pdf_link(self):
@@ -526,19 +432,14 @@ class TestGetDocInfo:
         response = _make_response(detail)
         scraper.request_service.make_request = AsyncMock(return_value=response)
         scraper._get_markdown = AsyncMock(return_value="x")
-        valid_md = _make_valid_md()
-        scraper._process_pdf_link = AsyncMock(
-            return_value={
-                "title": "Lei 001",
-                "text_markdown": valid_md,
-                "document_url": "http://x.com",
-            }
-        )
+        scraper._process_pdf_doc = AsyncMock(return_value=MagicMock())
         scraper._save_doc_error = AsyncMock()
-        await scraper._get_doc_info(_make_search_result())
+        await scraper._get_doc_data(_make_search_result())
         # Should use the ver_lei.jpg link, NOT the baixar_div link
-        scraper._process_pdf_link.assert_called_once()
-        assert scraper._process_pdf_link.call_args[0][0] == "/api/v1/arquivos/primary"
+        scraper._process_pdf_doc.assert_called_once()
+        call_doc_info = scraper._process_pdf_doc.call_args[0][0]
+        assert call_doc_info.get("pdf_link") == "/api/v1/arquivos/primary"
+
 
 
 # ---------------------------------------------------------------------------

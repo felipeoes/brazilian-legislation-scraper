@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-from io import BytesIO
 from typing import TYPE_CHECKING
 
 from bs4 import BeautifulSoup
@@ -32,6 +31,9 @@ SITUATIONS = {}
 
 _TYPE_ID_TO_SUFFIX = {v["id"]: v["url_suffix"] for v in TYPES.values()}
 
+# Pre-compiled for the content-threshold check in _get_doc_data
+_NON_ALPHA_RE = re.compile(r"[^a-zA-ZÀ-ÿ]")
+
 
 class LegislaGoias(StateScraper):
     """Webscraper for Goias state legislation website (https://legisla.casacivil.go.gov.br)
@@ -49,8 +51,6 @@ class LegislaGoias(StateScraper):
         super().__init__(
             base_url, name="GOIAS", types=TYPES, situations=SITUATIONS, **kwargs
         )
-        self._special_regex = re.compile(r"[^a-zA-ZÀ-ÿ\s]")
-        self._space_regex = re.compile(r"\s+")
 
     @staticmethod
     def _resolve_norm_type(doc: dict, doc_detail: dict) -> str:
@@ -86,35 +86,7 @@ class LegislaGoias(StateScraper):
 
         return text_markdown.replace("javascript:print()", "").strip()
 
-    async def _process_pdf_link(
-        self, link: str, doc_id: str, doc_info: dict
-    ) -> dict | None:
-        response = await self.request_service.make_request(link)
-        if not response:
-            logger.error(f"Error fetching PDF for doc ID: {doc_id} | Link: {link}")
-            return None
-
-        raw_content = await response.read()
-        text_markdown = await self._get_markdown(stream=BytesIO(raw_content))
-        valid, reason = valid_markdown(text_markdown)
-        if not valid:
-            logger.error(
-                f"Failed to extract text from PDF for doc ID: {doc_id}: {reason}"
-            )
-            return None
-        doc_info["text_markdown"] = text_markdown
-        doc_info["_raw_content"] = raw_content
-        doc_info["_content_extension"] = ".pdf"
-        if not doc_info.get("document_url"):
-            doc_info["document_url"] = link
-        else:
-            doc_info["pdf_link"] = link
-
-        doc_info["text_markdown"] = self._clean_markdown(doc_info["text_markdown"])
-
-        return doc_info
-
-    async def _get_doc_info(self, doc: dict) -> ScrapedDocument | None:
+    async def _get_doc_data(self, doc: dict) -> ScrapedDocument | None:
         """Get document info from given doc data using API"""
         doc_id = doc["id"]
         numero = doc.get("numero", "")
@@ -183,7 +155,7 @@ class LegislaGoias(StateScraper):
             # check if "Clique no link abaixo para acessar a:" in soup and skip document
             if (
                 "Clique no link abaixo para acessar a:".lower()
-                in str(soup.prettify()).lower()
+                in soup.get_text().lower()
             ):
                 await self._save_doc_error(
                     title=doc_info.get("title", f"Doc ID {doc_id}"),
@@ -219,7 +191,11 @@ class LegislaGoias(StateScraper):
                         pdf_link = a_tag["href"]
                     baixar_div.decompose()
 
-            html_string = soup.prettify().strip()
+            self._clean_norm_soup(
+                soup, unwrap_links=True, remove_images=True, remove_disclaimers=True
+            )
+
+            html_string = str(soup)
 
             if not html_string.startswith("<html"):
                 html_string = wrap_html(html_string)
@@ -230,44 +206,24 @@ class LegislaGoias(StateScraper):
             if valid:
                 text_markdown = text_markdown.strip()
                 doc_info["text_markdown"] = text_markdown
-                try:
-                    doc_info["_raw_content"] = await self._capture_mhtml(html_link)
-                    doc_info["_content_extension"] = ".mhtml"
-                except Exception as exc:
-                    logger.warning(
-                        f"MHTML capture failed for {html_link}: {exc} — falling back to PDF"
-                    )
-                    doc_info["text_markdown"] = None  # force PDF fallback below
+                doc_info["_raw_content"] = html_string.encode("utf-8")
+                doc_info["_content_extension"] = ".html"
 
-                new_text = self._special_regex.sub("", text_markdown.lower())
-                new_text = self._space_regex.sub("", new_text).strip()
-                compare_summary = self._special_regex.sub(
-                    "", doc_info["summary"].lower()
-                )
-                compare_summary = self._space_regex.sub("", compare_summary).strip()
-
-                new_text = new_text.replace(compare_summary, "").strip()
+                # Fall back to PDF if the HTML contains little beyond the summary
+                text_stripped = _NON_ALPHA_RE.sub("", text_markdown.lower())
+                summary_stripped = _NON_ALPHA_RE.sub("", doc_info["summary"].lower())
                 if (
-                    len(new_text) < 150
-                ):  # threshold for substantial content (based on experimentation with goias norms)
-                    # set text_markdown to None so that we can fall back to PDF fetching below
+                    len(text_stripped.replace(summary_stripped, "", 1)) < 150
+                ):  # threshold based on experimentation with goias norms
                     doc_info["text_markdown"] = None
 
             doc_info["document_url"] = html_link
 
         # If we don't have HTML content or markdown conversion failed, try PDF
         if not doc_info.get("text_markdown"):
-            doc_info = await self._process_pdf_link(pdf_link, doc_id, doc_info)
-            if not doc_info:
-                logger.error(f"Failed to process PDF for doc ID: {doc_id}")
-                await self._save_doc_error(
-                    title=f"Doc ID {doc_id}",
-                    year=doc_detail.get("ano", ""),
-                    norm_type=doc_detail.get("tipo_legislacao", {}).get("nome", ""),
-                    html_link=pdf_link if pdf_link else api_url,
-                    error_message="PDF processing failed (fallback)",
-                )
-                return None
+            if pdf_link:
+                doc_info["pdf_link"] = pdf_link
+            return await self._process_pdf_doc(doc_info)
 
         # clean text_markdown (some docs may have the "javascript:print()" string at the end of the document)
         doc_info["text_markdown"] = self._clean_markdown(doc_info["text_markdown"])
@@ -344,5 +300,4 @@ class LegislaGoias(StateScraper):
             norm_type="NA",
             situation="NA",
             desc=f"GOIAS | year {year}",
-            doc_data_fn=self._get_doc_info,
         )
