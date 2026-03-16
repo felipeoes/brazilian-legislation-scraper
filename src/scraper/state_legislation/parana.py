@@ -1,3 +1,8 @@
+from __future__ import annotations
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 """Paraná state legislation scraper using direct HTTP requests.
 
 Scrapes the Casa Civil legislation system at ``legislacao.pr.gov.br``
@@ -5,7 +10,6 @@ by posting search forms and fetching document pages via HTTP — no
 browser or VPN required.
 """
 
-from __future__ import annotations
 
 import re
 from urllib.parse import urljoin
@@ -225,7 +229,7 @@ class ParanaCVScraper(StateScraper):
             return DEFAULT_INVALID_SITUATION
         return DEFAULT_VALID_SITUATION
 
-    async def _get_doc_data(self, doc_info: dict) -> dict | None:
+    async def _get_doc_data(self, doc_info: dict) -> ScrapedDocument | None:
         """Fetch a single document's HTML and convert to markdown."""
         cod_ato = doc_info.get("id", "")
         doc_title = doc_info.get("title", "")
@@ -283,11 +287,13 @@ class ParanaCVScraper(StateScraper):
             "text_markdown": text_markdown,
             "document_url": html_link,
             "situation": situation,
-            "_raw_content": mhtml,
-            "_content_extension": ".mhtml",
+            "raw_content": mhtml,
+            "content_extension": ".mhtml",
         }
 
-        return result
+        from src.scraper.base.schemas import ScrapedDocument
+
+        return ScrapedDocument(**result)
 
     # ── Year-level orchestration ───────────────────────────────────
 

@@ -1,3 +1,8 @@
+from __future__ import annotations
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 import asyncio
 import re
 from collections import defaultdict
@@ -133,7 +138,7 @@ class CearaAleceScraper(StateScraper):
             _, best = min(candidates, key=lambda x: x[0])
             best.decompose()
 
-    async def _get_doc_data(self, doc_info: dict) -> dict | None:
+    async def _get_doc_data(self, doc_info: dict) -> ScrapedDocument | None:
         """Get document data from given document dict"""
         # Use the /visualizar HTML page as the canonical document_url so that
         # (1) resume keys match and (2) MHTML capture navigates to an HTML page
@@ -177,8 +182,8 @@ class CearaAleceScraper(StateScraper):
             return None
 
         doc_info["text_markdown"] = text_markdown
-        doc_info["_raw_content"] = mhtml
-        doc_info["_content_extension"] = ".mhtml"
+        doc_info["raw_content"] = mhtml
+        doc_info["content_extension"] = ".mhtml"
 
         return doc_info
 
@@ -538,8 +543,8 @@ class CearaAleceScraper(StateScraper):
 
         doc_info["text_markdown"] = text_markdown
         doc_info["document_url"] = url
-        doc_info["_raw_content"] = mhtml
-        doc_info["_content_extension"] = ".mhtml"
+        doc_info["raw_content"] = mhtml
+        doc_info["content_extension"] = ".mhtml"
 
         return doc_info
 

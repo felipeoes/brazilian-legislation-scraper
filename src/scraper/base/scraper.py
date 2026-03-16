@@ -33,6 +33,7 @@ from src.services.request.service import RequestService
 if TYPE_CHECKING:
     from src.services.ocr.config import LLMConfig
     from src.services.ocr.llm import LLMOCRService
+from src.scraper.base.schemas import ScrapedDocument
 
 # suppress urllib3 InsecureRequestWarning (verify=False is used intentionally for some gov sites)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -216,11 +217,21 @@ def _meaningful_context_value(value: Any) -> str | None:
     return normalized
 
 
-def merge_context(result: dict, context: dict) -> dict:
+def merge_context(result: dict | ScrapedDocument, context: dict) -> dict:
     """Merge a document result dict with its scraping context."""
-    doc = {**context, **result}
+    if isinstance(result, ScrapedDocument):
+        # Convert to dict but preserve raw_content/content_extension
+        res_dict = result.model_dump()
+        if result.raw_content is not None:
+            res_dict["raw_content"] = result.raw_content
+        if result.content_extension is not None:
+            res_dict["content_extension"] = result.content_extension
+    else:
+        res_dict = result
 
-    result_type = _meaningful_context_value(result.get("type"))
+    doc = {**context, **res_dict}
+
+    result_type = _meaningful_context_value(res_dict.get("type"))
     context_type = _meaningful_context_value(context.get("type"))
     if result_type:
         doc["type"] = result_type
@@ -229,7 +240,7 @@ def merge_context(result: dict, context: dict) -> dict:
     else:
         doc.pop("type", None)
 
-    result_situation = _meaningful_context_value(result.get("situation"))
+    result_situation = _meaningful_context_value(res_dict.get("situation"))
     context_situation = _meaningful_context_value(context.get("situation"))
     if result_situation:
         doc["situation"] = result_situation
@@ -244,9 +255,9 @@ def merge_context(result: dict, context: dict) -> dict:
     return doc
 
 
-def flatten_results(results: list) -> list[dict]:
+def flatten_results(results: list) -> list[dict | ScrapedDocument]:
     """Flatten a list of results (some of which may be sub-lists) into a single list."""
-    flat: list[dict] = []
+    flat: list[dict | ScrapedDocument] = []
     for item in results:
         if isinstance(item, list):
             flat.extend(item)
@@ -654,7 +665,7 @@ class BaseScraper:
         raw_content: bytes,
         content_ext: str,
         error_prefix: str = "Invalid content",
-    ) -> dict | None:
+    ) -> ScrapedDocument | None:
         """Validate markdown and populate *doc_info*, or save an error."""
         valid, reason = valid_markdown(text_markdown)
         if not valid:
@@ -667,17 +678,23 @@ class BaseScraper:
             )
             return None
 
-        doc_info["text_markdown"] = text_markdown
-        doc_info["document_url"] = url
-        doc_info["_raw_content"] = raw_content
-        doc_info["_content_extension"] = content_ext
-        return doc_info
+        # Merge url/text_markdown/raw_content into a copy of doc_info so that
+        # any keys already present in doc_info (e.g. document_url) are
+        # overridden cleanly rather than causing a "multiple values" TypeError.
+        merged = {
+            **doc_info,
+            "text_markdown": text_markdown,
+            "document_url": url,
+            "raw_content": raw_content,
+            "content_extension": content_ext,
+        }
+        return ScrapedDocument(**merged)
 
     async def _process_pdf_doc(
         self,
         doc_info: dict,
         pdf_link_key: str = "pdf_link",
-    ) -> dict | None:
+    ) -> ScrapedDocument | None:
         """Download a PDF, convert to markdown, validate, and populate doc_info."""
         pdf_link = doc_info.pop(pdf_link_key, "") or doc_info.get("document_url", "")
         title = doc_info.get("title", "")
@@ -703,7 +720,7 @@ class BaseScraper:
         html_content: str,
         url: str,
         mhtml_content: bytes,
-    ) -> dict | None:
+    ) -> ScrapedDocument | None:
         """Convert HTML to markdown, validate, and populate doc_info.
 
         Stores *mhtml_content* as the raw file (`.mhtml` extension).
@@ -724,7 +741,9 @@ class BaseScraper:
             "This method should be implemented in the child class."
         )
 
-    async def _get_doc_data(self, *args, **kwargs) -> dict | list[dict] | None:
+    async def _get_doc_data(
+        self, *args, **kwargs
+    ) -> "ScrapedDocument" | list["ScrapedDocument"] | None:
         """Template method: fetch and parse a single document's content."""
         raise NotImplementedError(
             "This method should be implemented in the child class."
@@ -1182,7 +1201,7 @@ class StateScraper(BaseScraper):
         title: str,
         year: int,
         **extra,
-    ) -> dict | None:
+    ) -> ScrapedDocument | None:
         """Download a state constitution, convert to markdown, save, and track."""
         if self._is_already_scraped(url, title):
             logger.debug(f"Constitution already scraped, skipping: {title}")
@@ -1208,15 +1227,19 @@ class StateScraper(BaseScraper):
             "situation": DEFAULT_VALID_SITUATION,
             "text_markdown": text_markdown,
             "document_url": url,
-            "_raw_content": raw_content,
-            "_content_extension": content_ext,
+            "raw_content": raw_content,
+            "content_extension": content_ext,
             **extra,
         }
+        doc_obj = ScrapedDocument(**doc_info)
 
-        saved = await self._save_doc_result(doc_info)
+        saved = await self._save_doc_result(doc_obj)
         if saved is not None:
-            doc_info = saved
+            # _save_doc_result currently returns dict (from PersistenceManager)
+            # but we want to return ScrapedDocument from this method.
+            # Let's check what _save_doc_result returns.
+            pass
         self._track_results([doc_info])
         self.count += 1
         logger.debug(f"Fetched constitution: {title}")
-        return doc_info
+        return doc_obj

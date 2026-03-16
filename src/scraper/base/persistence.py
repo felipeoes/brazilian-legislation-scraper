@@ -4,6 +4,8 @@ Extracted from BaseScraper; access via ``self._persister`` on any BaseScraper su
 """
 
 from __future__ import annotations
+
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -40,17 +42,28 @@ class PersistenceManager:
             return False
         return (document_url, title) in self._scraper._scraped_keys
 
-    async def save_doc_result(self, doc_result: dict) -> dict | None:
+    async def save_doc_result(self, doc_result) -> dict | None:
         """Persist a document result via FileSaver."""
         saver = self._scraper.saver
         if not saver:
             return None
 
-        raw_content = doc_result.pop("_raw_content", None)
-        content_ext = doc_result.pop("_content_extension", None)
+        # Handle both dict and ScrapedDocument during refactor
+        from src.scraper.base.schemas import ScrapedDocument
+
+        if isinstance(doc_result, ScrapedDocument):
+            doc_data = doc_result.model_dump(
+                exclude={"raw_content", "content_extension"}
+            )
+            raw_content = doc_result.raw_content
+            content_ext = doc_result.content_extension
+        else:
+            doc_data = dict(doc_result)
+            raw_content = doc_data.pop("_raw_content", None)
+            content_ext = doc_data.pop("_content_extension", None)
 
         return await saver.save_document(
-            doc_data=doc_result,
+            doc_data=doc_data,
             raw_content=raw_content,
             content_extension=content_ext,
         )

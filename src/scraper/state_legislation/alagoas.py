@@ -1,3 +1,8 @@
+from __future__ import annotations
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 import base64
 import re
 from io import BytesIO
@@ -168,7 +173,7 @@ class AlagoasSefazScraper(StateScraper):
             logger.warning(f"Failed to fetch Alagoas norm page: {e}")
             return []
 
-    async def _get_doc_data(self, doc_info: dict) -> dict | None:
+    async def _get_doc_data(self, doc_info: dict) -> ScrapedDocument | None:
         """Fetch and convert a single Alagoas norm.
 
         Download URL pattern:
@@ -277,19 +282,23 @@ class AlagoasSefazScraper(StateScraper):
         # Remove "Este texto não substitui..." footer disclaimer
         text_markdown = _DISCLAIMER_LINE_RE.sub("", text_markdown).strip()
 
-        return {
-            "id": doc_info["numeroDocumento"],
-            "number": doc_info["numeroDocumento"],
-            "title": title,
-            "type": norm_type,
-            "summary": doc_info.get("textoEmenta", ""),
-            "category": (doc_info.get("categoria") or {}).get("descricao", ""),
-            "publication_date": doc_info.get("dataPublicacao", ""),
-            "text_markdown": text_markdown,
-            "document_url": doc_link,
-            "_raw_content": pdf_bytes,
-            "_content_extension": ext,
-        }
+        from src.scraper.base.schemas import ScrapedDocument
+
+        return ScrapedDocument(
+            year=year,
+            id=doc_info["numeroDocumento"],
+            number=doc_info["numeroDocumento"],
+            title=title,
+            type=norm_type or "Desconhecido",
+            summary=doc_info.get("textoEmenta", ""),
+            category=(doc_info.get("categoria") or {}).get("descricao", ""),
+            publication_date=doc_info.get("dataPublicacao", ""),
+            text_markdown=text_markdown,
+            document_url=doc_link,
+            raw_content=pdf_bytes,
+            content_extension=ext,
+            situation="Não consta",
+        )
 
     async def _scrape_year(self, year: int) -> list[dict]:
         """Scrape all norms for a given year in a single unfiltered request batch."""

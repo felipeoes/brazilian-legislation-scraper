@@ -108,8 +108,11 @@ class LLMConfig:
         return cls(
             client=OpenAIClient(
                 raw_client,
-                max_completion_tokens=32768,
-                extra_body={"media_resolution": "MEDIA_RESOLUTION_HIGH"},
+                max_completion_tokens=65536,
+                extra_body={
+                    "reasoning_effort": "high",  # since we will be using gemini 3.1 flash lite, we can set this to high to get better results on OCR tasks
+                    "media_resolution": "MEDIA_RESOLUTION_HIGH",
+                },
             ),
             model=model,
             rps=2,

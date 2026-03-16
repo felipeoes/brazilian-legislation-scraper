@@ -1,3 +1,8 @@
+from __future__ import annotations
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 import re
 from dataclasses import dataclass
 from urllib.parse import urljoin
@@ -502,7 +507,7 @@ class PernambucoAlepeScraper(StateScraper):
             )
         return None
 
-    async def _get_doc_data(self, doc_info: dict, year: int) -> dict | None:
+    async def _get_doc_data(self, doc_info: dict, year: int) -> ScrapedDocument | None:
         """Fetch one ALEPE norm page, prefer updated text, and save metadata."""
         title = doc_info.get("title", "")
         norm_type = doc_info.get("type", "")
@@ -601,8 +606,8 @@ class PernambucoAlepeScraper(StateScraper):
             "document_url": selected_url,
             "text_version": self._extract_text_version(selected_url) or "DEFAULT",
             "text_markdown": text_markdown,
-            "_raw_content": mhtml,
-            "_content_extension": ".mhtml",
+            "raw_content": mhtml,
+            "content_extension": ".mhtml",
         }
         result.pop("_candidate_document_urls", None)
 
@@ -616,7 +621,9 @@ class PernambucoAlepeScraper(StateScraper):
         if not result.get("situation"):
             result["situation"] = DEFAULT_VALID_SITUATION
 
-        return result
+        from src.scraper.base.schemas import ScrapedDocument
+
+        return ScrapedDocument(**result)
 
     async def _scrape_year(self, year: int) -> list[dict]:
         documents = await self._get_docs_links(year)

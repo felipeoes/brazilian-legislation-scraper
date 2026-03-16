@@ -613,3 +613,215 @@ class TestBaseScraperHelpers:
             error_data = json.loads(error_files[0].read_text(encoding="utf-8"))
             assert error_data["title"] == "Bad Doc"
             assert error_data["error_message"] == "Parse failed"
+
+
+# =========================================================================
+# ScrapedDocument pydantic validation
+# =========================================================================
+
+
+_VALID_DOC_KWARGS = dict(
+    year=2024,
+    title="Lei nº 1/2024",
+    type="Lei Ordinária",
+    situation="Não consta revogação expressa",
+    summary="",
+    text_markdown="# Art. 1º Fica criado o município.",
+    document_url="https://example.com/lei/1",
+)
+
+
+class TestScrapedDocumentValidation:
+    """Tests for ScrapedDocument field validators."""
+
+    def test_valid_document_passes(self):
+        from src.scraper.base.schemas import ScrapedDocument
+
+        doc = ScrapedDocument(**_VALID_DOC_KWARGS)
+        assert doc.year == 2024
+        assert doc.title == "Lei nº 1/2024"
+
+    def test_year_coerced_from_string(self):
+        from src.scraper.base.schemas import ScrapedDocument
+
+        doc = ScrapedDocument(**{**_VALID_DOC_KWARGS, "year": "2022"})
+        assert doc.year == 2022
+        assert isinstance(doc.year, int)
+
+    def test_summary_may_be_empty_string(self):
+        from src.scraper.base.schemas import ScrapedDocument
+
+        doc = ScrapedDocument(**{**_VALID_DOC_KWARGS, "summary": ""})
+        assert doc.summary == ""
+
+    def test_extra_fields_allowed(self):
+        from src.scraper.base.schemas import ScrapedDocument
+
+        doc = ScrapedDocument(**_VALID_DOC_KWARGS, norm_number="42", date="2024-01-01")
+        assert doc.model_extra["norm_number"] == "42"
+
+    @pytest.mark.parametrize(
+        "field",
+        ["title", "type", "situation", "text_markdown", "document_url"],
+    )
+    def test_empty_required_string_raises(self, field):
+        from pydantic import ValidationError
+
+        from src.scraper.base.schemas import ScrapedDocument
+
+        kwargs = {**_VALID_DOC_KWARGS, field: ""}
+        with pytest.raises(ValidationError, match=field):
+            ScrapedDocument(**kwargs)
+
+    @pytest.mark.parametrize(
+        "field",
+        ["title", "type", "situation", "text_markdown", "document_url"],
+    )
+    def test_whitespace_only_required_string_raises(self, field):
+        from pydantic import ValidationError
+
+        from src.scraper.base.schemas import ScrapedDocument
+
+        kwargs = {**_VALID_DOC_KWARGS, field: "   "}
+        with pytest.raises(ValidationError, match=field):
+            ScrapedDocument(**kwargs)
+
+    @pytest.mark.parametrize(
+        "field",
+        ["title", "type", "situation", "text_markdown", "document_url"],
+    )
+    def test_leading_trailing_whitespace_is_stripped(self, field):
+        from src.scraper.base.schemas import ScrapedDocument
+
+        kwargs = {**_VALID_DOC_KWARGS, field: "  value  "}
+        doc = ScrapedDocument(**kwargs)
+        assert getattr(doc, field) == "value"
+
+
+# =========================================================================
+# SavedDocument pydantic validation
+# =========================================================================
+
+
+class TestSavedDocumentValidation:
+    """Tests for SavedDocument (extends ScrapedDocument with file_path)."""
+
+    def test_valid_saved_document_with_file_path_passes(self):
+        from src.scraper.base.schemas import SavedDocument
+
+        doc = SavedDocument(
+            **_VALID_DOC_KWARGS, file_path="MYSTATE/2024/docs/lei_1.pdf"
+        )
+        assert doc.file_path == "MYSTATE/2024/docs/lei_1.pdf"
+
+    def test_saved_document_without_file_path_is_allowed(self):
+        """file_path is optional — not all saves produce a raw file on disk."""
+        from src.scraper.base.schemas import SavedDocument
+
+        doc = SavedDocument(**_VALID_DOC_KWARGS)
+        assert doc.file_path is None
+
+    def test_empty_file_path_raises(self):
+        from pydantic import ValidationError
+
+        from src.scraper.base.schemas import SavedDocument
+
+        with pytest.raises(ValidationError):
+            SavedDocument(**_VALID_DOC_KWARGS, file_path="")
+
+
+# =========================================================================
+# FileSaver document validation
+# =========================================================================
+
+
+class TestFileSaverValidation:
+    """Tests for FileSaver._validate_data and save_document validation."""
+
+    @pytest.mark.asyncio
+    async def test_save_document_returns_none_for_missing_required_fields(self):
+        from src.database.saver import FileSaver
+
+        with tempfile.TemporaryDirectory() as tmp:
+            saver = FileSaver(save_dir=Path(tmp))
+            # Missing 'type' and 'situation'
+            result = await saver.save_document(
+                {
+                    "year": 2024,
+                    "document_url": "https://example.com/doc",
+                    "title": "Test Doc",
+                    "text_markdown": "content",
+                }
+            )
+            assert result is None
+
+    @pytest.mark.asyncio
+    async def test_save_document_returns_none_for_empty_required_field(self):
+        from src.database.saver import FileSaver
+
+        with tempfile.TemporaryDirectory() as tmp:
+            saver = FileSaver(save_dir=Path(tmp))
+            result = await saver.save_document(
+                {
+                    "year": 2024,
+                    "document_url": "https://example.com/doc",
+                    "title": "Test Doc",
+                    "text_markdown": "content",
+                    "type": "",  # blank — must be rejected
+                    "situation": "Vigente",
+                }
+            )
+            assert result is None
+
+    @pytest.mark.asyncio
+    async def test_save_document_succeeds_with_all_valid_fields(self):
+        from src.database.saver import FileSaver
+
+        with tempfile.TemporaryDirectory() as tmp:
+            saver = FileSaver(save_dir=Path(tmp))
+            result = await saver.save_document(
+                {
+                    "year": 2024,
+                    "document_url": "https://example.com/doc/valid",
+                    "title": "Valid Doc",
+                    "text_markdown": "# Art. 1º Content here.",
+                    "type": "Lei Ordinária",
+                    "situation": "Não consta revogação expressa",
+                    "summary": "",
+                },
+                raw_content=b"fake-pdf-bytes",
+                content_extension=".pdf",
+            )
+            assert result is not None
+            assert result["title"] == "Valid Doc"
+            assert result["year"] == 2024
+            assert "file_path" in result
+
+    @pytest.mark.asyncio
+    async def test_validate_data_rejects_blank_type(self):
+        from src.database.saver import FileSaver
+
+        saver = FileSaver(save_dir=Path("/tmp/irrelevant"))
+        data = {
+            "year": 2024,
+            "document_url": "https://example.com/doc",
+            "title": "Doc",
+            "text_markdown": "content",
+            "type": "  ",  # whitespace only
+            "situation": "Vigente",
+        }
+        assert saver._validate_data(data) is False
+
+    def test_validate_data_passes_for_complete_data(self):
+        from src.database.saver import FileSaver
+
+        saver = FileSaver(save_dir=Path("/tmp/irrelevant"))
+        data = {
+            "year": 2024,
+            "document_url": "https://example.com/doc",
+            "title": "Doc",
+            "text_markdown": "content",
+            "type": "Lei",
+            "situation": "Vigente",
+        }
+        assert saver._validate_data(data) is True

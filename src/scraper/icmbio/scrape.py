@@ -1,25 +1,18 @@
-"""ICMBio scraper using the PowerBI querydata REST API.
-
-Fetches normative acts from the ICMBio (Instituto Chico Mendes de Conservação
-da Biodiversidade) PowerBI dashboard by calling the underlying querydata
-endpoint directly — no browser required.
-
-PowerBI dashboard:
-    https://app.powerbi.com/view?r=eyJrIjoiMGQ0ODRhY2QtYThmNy00NmYwLWFkOGYtOWJmZDU0ODZlZWUzIiwidCI6ImMxNGUyYjU2LWM1YmMtNDNiZC1hZDljLTQwOGNmNmNjMzU2MCJ9
-"""
-
 from __future__ import annotations
-
 import json
 import re
 from datetime import datetime, timezone
-from typing import cast
+from typing import cast, TYPE_CHECKING
 
 import aiohttp
 from bs4 import BeautifulSoup
 from loguru import logger
 
 from src.scraper.base.scraper import BaseScraper
+from src.scraper.base.schemas import ScrapedDocument
+
+if TYPE_CHECKING:
+    pass
 
 # ── PowerBI API constants ──────────────────────────────────────────
 QUERY_URL = "https://wabi-brazil-south-api.analysis.windows.net/public/reports/querydata?synchronous=true"
@@ -445,7 +438,7 @@ class ICMBioScraper(BaseScraper):
 
     # ── Document content fetching ─────────────────────────────────
 
-    async def _get_doc_data(self, doc_info: dict) -> dict | None:
+    async def _get_doc_data(self, doc_info: dict) -> ScrapedDocument | None:
         """Fetch the DOU page HTML and convert to markdown."""
         document_url = doc_info.get("document_url", "")
         doc_title = doc_info.get("title", "Sem título")
@@ -542,12 +535,12 @@ class ICMBioScraper(BaseScraper):
             )
             return None
 
-        result = {
+        result = ScrapedDocument(
             **doc_info,
-            "text_markdown": text_markdown,
-            "_raw_content": mhtml,
-            "_content_extension": ".mhtml",
-        }
+            text_markdown=text_markdown,
+            raw_content=mhtml,
+            content_extension=".mhtml",
+        )
         await self._save_doc_result(result)
         return result
 

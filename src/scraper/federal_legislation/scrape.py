@@ -1,3 +1,8 @@
+from __future__ import annotations
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 import re
 from urllib.parse import unquote, urljoin, urlparse
 from typing import cast
@@ -647,7 +652,9 @@ class CamaraDepScraper(BaseScraper):
             "document_url": text_url,
         }
 
-    async def _get_doc_data(self, doc: dict, year: int, norm_type: str) -> dict | None:
+    async def _get_doc_data(
+        self, doc: dict, year: int, norm_type: str
+    ) -> ScrapedDocument | None:
         """Fetch and convert document text to markdown.
 
         ``doc`` is a dict with keys: title, summary, metadata_url, document_url, situation.
@@ -728,17 +735,20 @@ class CamaraDepScraper(BaseScraper):
                     )
                     return None
 
-            return {
-                "title": title,
-                "type": doc_type,
-                "summary": summary,
-                "situation": situation,
-                "metadata_url": metadata_url,
-                "text_markdown": text_markdown.strip(),
-                "document_url": document_text_link,
-                "_raw_content": mhtml,
-                "_content_extension": ".mhtml",
-            }
+            from src.scraper.base.schemas import ScrapedDocument
+
+            return ScrapedDocument(
+                year=year,
+                title=title,
+                type=doc_type,
+                summary=summary,
+                situation=situation,
+                metadata_url=metadata_url,
+                text_markdown=text_markdown.strip(),
+                document_url=document_text_link,
+                raw_content=mhtml,
+                content_extension=".mhtml",
+            )
         except Exception as e:
             logger.error(f"Error converting document to markdown: {title} - {e}")
             await self._save_doc_error(

@@ -1,3 +1,8 @@
+from __future__ import annotations
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 import base64
 import copy
 import re
@@ -332,7 +337,9 @@ class RJAlerjScraper(StateScraper):
             break
         return "\n".join(lines).strip()
 
-    async def _get_doc_data(self, doc_info: dict, year: str = "") -> dict | None:
+    async def _get_doc_data(
+        self, doc_info: dict, year: str = ""
+    ) -> ScrapedDocument | None:
         """Get document data from given html link"""
         doc_html_link = doc_info["_html_link"]
         document_url = doc_info.get("document_url") or doc_html_link.strip().replace(

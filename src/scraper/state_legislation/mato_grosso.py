@@ -1,3 +1,8 @@
+from __future__ import annotations
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 import re
 from urllib.parse import urljoin, urlencode
 from bs4 import BeautifulSoup
@@ -214,7 +219,7 @@ class MTAlmtScraper(StateScraper):
 
     async def _get_doc_data(
         self, doc_info: dict, is_historic: bool = False
-    ) -> dict | None:
+    ) -> ScrapedDocument | None:
         """Get document data from given document dict"""
         doc_info = dict(doc_info)
         norm_link = doc_info.pop("norm_link")
@@ -339,11 +344,13 @@ class MTAlmtScraper(StateScraper):
             "tags": tags if tags else "",
             "situation": situation if situation else "",
             "text_markdown": text_markdown,
-            "_raw_content": raw_content,
-            "_content_extension": content_ext,
+            "raw_content": raw_content,
+            "content_extension": content_ext,
         }
 
-        return doc_data
+        from src.scraper.base.schemas import ScrapedDocument
+
+        return ScrapedDocument(**doc_data)
 
     async def _scrape_year(self, year: int) -> list[dict]:
         """Scrape all norms for a specific year using a single all-types search."""

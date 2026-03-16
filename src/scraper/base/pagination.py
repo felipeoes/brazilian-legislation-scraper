@@ -1,9 +1,13 @@
+from __future__ import annotations
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    pass
 """Pagination helpers for BaseScraper.
 
 Extracted from BaseScraper; access via ``self.paginator`` on any BaseScraper subclass.
 """
 
-from __future__ import annotations
 
 from typing import Any, Callable, Coroutine
 

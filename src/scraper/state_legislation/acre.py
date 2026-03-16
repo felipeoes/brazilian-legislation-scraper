@@ -1,3 +1,8 @@
+from __future__ import annotations
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 import re
 
 from collections import defaultdict
@@ -111,7 +116,7 @@ class AcreLegisScraper(StateScraper):
         # (prettify adds newlines between siblings, breaking inline text)
         return str(html_tag)
 
-    async def _get_doc_data(self, doc_info: dict) -> dict | None:
+    async def _get_doc_data(self, doc_info: dict) -> ScrapedDocument | None:
         """Get document data from given html link"""
         doc_html_link = doc_info["html_link"]
         doc_title = doc_info["title"]
@@ -198,11 +203,12 @@ class AcreLegisScraper(StateScraper):
                 doc_data, html_string, document_url, mhtml
             )
             if doc:
-                doc["title"] = "Constituição Estadual"
+                doc.title = "Constituição Estadual"
                 saved = await self._save_doc_result(doc)
                 if saved is not None:
-                    doc = saved
-                self._track_results([doc])
+                    # Update doc from saved dict if needed, but ScrapedDocument is preferred
+                    pass
+                self._track_results([doc.model_dump()])
                 self.count += 1
             return [doc] if doc else []
 

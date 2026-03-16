@@ -1,3 +1,8 @@
+from __future__ import annotations
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 import re
 from dataclasses import dataclass
 from urllib.parse import urljoin
@@ -454,7 +459,7 @@ class MaranhaoAlemaScraper(StateScraper):
 
         return docs
 
-    async def _get_doc_data(self, doc_info: dict) -> dict | None:
+    async def _get_doc_data(self, doc_info: dict) -> ScrapedDocument | None:
         return await self._process_pdf_doc(doc_info)
 
     async def _search_norms(

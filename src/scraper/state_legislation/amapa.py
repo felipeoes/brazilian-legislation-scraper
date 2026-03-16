@@ -1,4 +1,8 @@
 from __future__ import annotations
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 
 import asyncio
 import re
@@ -356,7 +360,7 @@ class AmapaAlapScraper(StateScraper):
         self._pending_flush_years.clear()
         await asyncio.gather(*(self.saver.flush(year) for year in years))
 
-    async def _get_doc_data(self, doc_info: dict) -> dict | None:
+    async def _get_doc_data(self, doc_info: dict) -> ScrapedDocument | None:
         doc_data = dict(doc_info)
         title = doc_data.get("title", "")
         html_link = doc_data.get("html_link")
@@ -425,8 +429,6 @@ class AmapaAlapScraper(StateScraper):
 
         try:
             mhtml = await self._capture_mhtml(capture_url)
-            doc_data["_raw_content"] = mhtml
-            doc_data["_content_extension"] = ".mhtml"
         except Exception as exc:
             await self._save_doc_error(
                 title=title,
@@ -438,7 +440,13 @@ class AmapaAlapScraper(StateScraper):
             )
             return None
 
-        return doc_data
+        from src.scraper.base.schemas import ScrapedDocument
+
+        return ScrapedDocument(
+            **doc_data,
+            raw_content=mhtml,
+            content_extension=".mhtml",
+        )
 
     async def _get_year_documents(self, year: int) -> list[dict]:
         first_url = self._format_search_url(year, page=1)

@@ -97,11 +97,36 @@ class FileSaver:
             logger.info(f"Saving logs to {self.log_dir}")
 
     def _validate_data(self, data: dict[str, Any]) -> bool:
-        """Validate that data contains required fields."""
-        required_fields = ["year", "document_url", "title"]
-        return all(
-            field in data and data[field] is not None for field in required_fields
-        )
+        """Quickly validate required fields are present and non-empty before locking.
+
+        Checks all fields that ``SavedDocument`` requires as non-empty so that
+        bad data is caught cheaply (before file I/O and the year lock) with a
+        clear log message pinpointing the missing/empty field.
+        """
+        # Fields that must be non-None and (for strings) non-blank.
+        required_nonempty = [
+            "year",
+            "document_url",
+            "title",
+            "type",
+            "situation",
+            "text_markdown",
+        ]
+        for field_name in required_nonempty:
+            value = data.get(field_name)
+            if value is None:
+                logger.warning(
+                    f"Document validation failed: field '{field_name}' is missing "
+                    f"(title={data.get('title', '?')!r})"
+                )
+                return False
+            if isinstance(value, str) and not value.strip():
+                logger.warning(
+                    f"Document validation failed: field '{field_name}' is empty "
+                    f"(title={data.get('title', '?')!r})"
+                )
+                return False
+        return True
 
     def _truncate_path(self, path: str) -> str:
         """Truncate path if it exceeds max_path_length."""
@@ -401,6 +426,17 @@ class FileSaver:
                         await f.write(raw_content)
 
                     clean_data["file_path"] = str(file_path.relative_to(save_dir))
+
+                from src.scraper.base.schemas import SavedDocument
+
+                try:
+                    validated_doc = SavedDocument(**clean_data)
+                    clean_data = validated_doc.model_dump()
+                except Exception as e:
+                    logger.error(
+                        f"Pydantic validation failed for document '{clean_data.get('title', 'Unknown')}': {e}"
+                    )
+                    return None
 
                 key = (clean_data.get("document_url", ""), clean_data.get("title", ""))
                 state = self._get_year_state(year)

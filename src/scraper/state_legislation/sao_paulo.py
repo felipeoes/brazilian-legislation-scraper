@@ -1,3 +1,8 @@
+from __future__ import annotations
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    pass
 import re
 from io import BytesIO
 from urllib.parse import urlencode, urljoin
@@ -287,10 +292,12 @@ class SaoPauloAlespScraper(StateScraper):
                 return None
 
             data["text_markdown"] = text_markdown
-            data["_raw_content"] = raw_content
-            data["_content_extension"] = content_ext
+            data["raw_content"] = raw_content
+            data["content_extension"] = content_ext
 
-            return data
+            from src.scraper.base.schemas import ScrapedDocument
+
+            return ScrapedDocument(**data)
 
         try:
             soup, mhtml = await self._fetch_soup_and_mhtml(doc_html_link)
@@ -342,10 +349,12 @@ class SaoPauloAlespScraper(StateScraper):
                     return None
 
                 data["text_markdown"] = text_markdown
-                data["_raw_content"] = pdf_content
-                data["_content_extension"] = ".pdf"
+                data["raw_content"] = pdf_content
+                data["content_extension"] = ".pdf"
 
-                return data
+                from src.scraper.base.schemas import ScrapedDocument
+
+                return ScrapedDocument(**data)
 
         # remove a tags with 'Assembleia Legislativa do Estado de São Paulo' and 'Ficha informativa'
         for a in soup.find_all("a"):
@@ -411,10 +420,12 @@ class SaoPauloAlespScraper(StateScraper):
             return None
 
         data["text_markdown"] = text_markdown
-        data["_raw_content"] = raw_content
-        data["_content_extension"] = content_ext
+        data["raw_content"] = raw_content
+        data["content_extension"] = content_ext
 
-        return data
+        from src.scraper.base.schemas import ScrapedDocument
+
+        return ScrapedDocument(**data)
 
     async def _scrape_year(self, year: int) -> list[dict]:
         """Fetch all norms for a year in a single paginated query (idTipoSituacao=0)."""

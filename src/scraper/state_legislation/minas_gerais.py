@@ -1,3 +1,8 @@
+from __future__ import annotations
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 import asyncio
 import re
 from bs4 import BeautifulSoup
@@ -421,7 +426,7 @@ class MGAlmgScraper(StateScraper):
             return True
         return len(clean_text) >= 350
 
-    async def _get_doc_data(self, doc_info: dict) -> dict | None:
+    async def _get_doc_data(self, doc_info: dict) -> ScrapedDocument | None:
         """Get document data from a listing entry."""
         doc_info = dict(doc_info)
         detail_link = doc_info.get("html_link", "")
@@ -554,13 +559,18 @@ class MGAlmgScraper(StateScraper):
                 )
                 return None
 
-            return {
+            from src.scraper.base.schemas import ScrapedDocument
+
+            res = {
                 **data,
                 "text_markdown": text_markdown,
                 "document_url": pdf_link,
-                "_raw_content": raw_content,
-                "_content_extension": content_ext or ".pdf",
+                "raw_content": raw_content,
+                "content_extension": content_ext or ".pdf",
             }
+            if "year" not in res:
+                res["year"] = doc_info.get("year", 0)
+            return ScrapedDocument(**res)
 
         html_string = wrap_html(html_string)
         text_markdown = await self._get_markdown(html_content=html_string)
@@ -574,13 +584,18 @@ class MGAlmgScraper(StateScraper):
             )
             return None
 
-        return {
+        result = {
             **data,
             "text_markdown": text_markdown,
             "document_url": document_page_url,
-            "_raw_content": page_mhtml,
-            "_content_extension": ".mhtml",
+            "raw_content": page_mhtml,
+            "content_extension": ".mhtml",
         }
+        from src.scraper.base.schemas import ScrapedDocument
+
+        if isinstance(result, dict) and "year" not in result:
+            result["year"] = doc_info.get("year", 0)
+        return ScrapedDocument(**result)
 
     async def _scrape_year(self, year: int) -> list[dict]:
         """Scrape all norms for a year using the mixed year-only search."""

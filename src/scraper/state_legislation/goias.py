@@ -1,10 +1,18 @@
+from __future__ import annotations
+
 import re
 from io import BytesIO
+from typing import TYPE_CHECKING
+
 from bs4 import BeautifulSoup
-from urllib.parse import urlencode
 from loguru import logger
+from urllib.parse import urlencode
+
 from src.scraper.base.converter import calc_pages, valid_markdown, wrap_html
 from src.scraper.base.scraper import StateScraper
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 
 TYPES = {
     "Constituição Estadual": {"id": 12, "url_suffix": "constituicao-estadual"},
@@ -106,7 +114,7 @@ class LegislaGoias(StateScraper):
 
         return doc_info
 
-    async def _get_doc_info(self, doc: dict) -> dict | None:
+    async def _get_doc_info(self, doc: dict) -> ScrapedDocument | None:
         """Get document info from given doc data using API"""
         doc_id = doc["id"]
         numero = doc.get("numero", "")
@@ -278,7 +286,9 @@ class LegislaGoias(StateScraper):
             )
             return None
 
-        return doc_info
+        from src.scraper.base.schemas import ScrapedDocument
+
+        return ScrapedDocument(year=doc_detail.get("ano"), **doc_info)
 
     async def _fetch_search_page(self, year: int, page: int) -> list[dict]:
         """Fetch a specific page from the search API."""

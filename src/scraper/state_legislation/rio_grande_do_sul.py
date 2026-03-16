@@ -1,3 +1,8 @@
+from __future__ import annotations
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 import re
 from urllib.parse import urlencode
 
@@ -150,7 +155,7 @@ class RSAlrsScraper(StateScraper):
 
         return html_string
 
-    async def _get_doc_data(self, doc_info: dict) -> dict | None:
+    async def _get_doc_data(self, doc_info: dict) -> ScrapedDocument | None:
         """Get document data from given document dict"""
         doc_info = dict(doc_info)
         html_link = doc_info.pop("html_link")

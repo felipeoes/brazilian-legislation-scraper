@@ -1,4 +1,8 @@
 from __future__ import annotations
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 
 from io import BytesIO
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -349,7 +353,7 @@ class ESAlesScraper(StateScraper):
             desc=f"ESPIRITO_SANTO | {year}",
         )
 
-    async def _get_doc_data(self, doc_info: dict) -> dict | None:
+    async def _get_doc_data(self, doc_info: dict) -> ScrapedDocument | None:
         """Get document data from document link"""
         doc_info = dict(doc_info)
         doc_link = doc_info.pop("doc_link")
@@ -405,9 +409,11 @@ class ESAlesScraper(StateScraper):
 
             doc_info["text_markdown"] = _clean_markdown(text_markdown, summary)
             doc_info["document_url"] = url
-            doc_info["_raw_content"] = raw_content
-            doc_info["_content_extension"] = content_ext
-            return doc_info
+            doc_info["raw_content"] = raw_content
+            doc_info["content_extension"] = content_ext
+            from src.scraper.base.schemas import ScrapedDocument
+
+            return ScrapedDocument(**doc_info)
 
         soup = await self.request_service.get_soup(url)
         if not soup:
@@ -434,5 +440,5 @@ class ESAlesScraper(StateScraper):
             error_prefix="Invalid markdown",
         )
         if result:
-            result["text_markdown"] = _clean_markdown(result["text_markdown"], summary)
+            result.text_markdown = _clean_markdown(result.text_markdown, summary)
         return result

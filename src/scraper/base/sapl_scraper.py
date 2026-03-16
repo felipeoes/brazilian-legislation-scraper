@@ -9,6 +9,7 @@ This base class provides the shared logic for:
 
 from __future__ import annotations
 
+
 import re
 
 from collections import defaultdict
@@ -16,6 +17,7 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from loguru import logger
+from src.scraper.base.schemas import ScrapedDocument
 from src.scraper.base.converter import valid_markdown
 from src.scraper.base.scraper import (
     DEFAULT_INVALID_SITUATION,
@@ -480,12 +482,14 @@ class SAPLBaseScraper(StateScraper):
             return {
                 "text_markdown": text_markdown.strip(),
                 "document_url": pdf_link,
-                "_raw_content": raw_bytes,
-                "_content_extension": ext,
+                "raw_content": raw_bytes,
+                "content_extension": ext,
             }
         return None
 
-    async def _get_doc_data(self, doc_info: dict, year: int = 0) -> dict | None:
+    async def _get_doc_data(
+        self, doc_info: dict, year: int = 0
+    ) -> ScrapedDocument | None:
         """Get full document data by processing the PDF attachment."""
         pdf_link = doc_info.pop("pdf_link")
         doc_info.pop("tipo_id", None)
@@ -508,7 +512,7 @@ class SAPLBaseScraper(StateScraper):
         doc_info["year"] = year
         doc_info.update(processed)
 
-        return doc_info
+        return ScrapedDocument(**doc_info)
 
     # ------------------------------------------------------------------
     # Subject fetching

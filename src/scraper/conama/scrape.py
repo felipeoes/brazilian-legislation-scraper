@@ -1,3 +1,5 @@
+from __future__ import annotations
+from typing import TYPE_CHECKING
 import re
 import urllib.parse
 from io import BytesIO
@@ -12,6 +14,10 @@ from src.scraper.base.scraper import (
     BaseScraper,
     flatten_results,
 )
+from src.scraper.base.schemas import ScrapedDocument
+
+if TYPE_CHECKING:
+    pass
 
 # Kept for documentation / downstream reference — not used to filter API requests.
 # The unfiltered API already returns id_tipo_ato + nomeato on every row.
@@ -173,7 +179,7 @@ class ConamaScraper(BaseScraper):
             text = pat.sub("", text)
         return text.strip()
 
-    async def _get_doc_data(self, doc_info: dict) -> dict | None:
+    async def _get_doc_data(self, doc_info: dict) -> ScrapedDocument | None:
         """Fetch and convert a single CONAMA norm.
 
         Download URL pattern:
@@ -291,21 +297,21 @@ class ConamaScraper(BaseScraper):
             )
             return None
 
-        return {
-            "year": doc_year,
-            "title": title,
-            "type": doc_type,  # from nomeato — each doc carries its own type
-            "id": doc_id,
-            "number": doc_number,
-            "summary": doc_description,
-            "situation": situation,
-            "keyword": doc_keyword,
-            "origin": doc_origin,
-            "text_markdown": text_markdown,
-            "document_url": doc_url,
-            "_raw_content": raw_content,
-            "_content_extension": content_ext,
-        }
+        return ScrapedDocument(
+            year=doc_year,
+            title=title,
+            type=doc_type,  # from nomeato — each doc carries its own type
+            id=doc_id,
+            number=doc_number,
+            summary=doc_description,
+            situation=situation,
+            keyword=doc_keyword,
+            origin=doc_origin,
+            text_markdown=text_markdown,
+            document_url=doc_url,
+            raw_content=raw_content,
+            content_extension=content_ext,
+        )
 
     async def _fetch_page_norms(self, offset: int, year_str: str) -> list[dict]:
         """Fetch norms from a single pagination page."""

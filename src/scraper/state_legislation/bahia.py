@@ -1,3 +1,8 @@
+from __future__ import annotations
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 import re
 from urllib.parse import urlencode, urljoin
 
@@ -182,7 +187,7 @@ class BahiaLegislaScraper(StateScraper):
 
         return docs
 
-    async def _get_doc_data(self, doc_info: dict) -> dict | None:
+    async def _get_doc_data(self, doc_info: dict) -> ScrapedDocument | None:
         """Get document data from a given document dict."""
         doc_info = dict(doc_info)
         html_link = doc_info.pop("html_link")
@@ -250,9 +255,9 @@ class BahiaLegislaScraper(StateScraper):
         doc_info["summary"] = summary
         result = await self._process_html_doc(doc_info, html_string, url, mhtml)
         if result is not None and summary:
-            md = result.get("text_markdown", "")
+            md = result.text_markdown
             if md:
-                result["text_markdown"] = _remove_summary_from_markdown(md, summary)
+                result.text_markdown = _remove_summary_from_markdown(md, summary)
         return result
 
     async def _scrape_year(self, year: int) -> list[dict]:

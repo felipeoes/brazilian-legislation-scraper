@@ -1,3 +1,8 @@
+from __future__ import annotations
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 import re
 from io import BytesIO
 from typing import Any, cast
@@ -187,7 +192,7 @@ class SergipeLegsonScraper(StateScraper):
         wait=wait_exponential(multiplier=2, min=2, max=15),
         reraise=True,
     )
-    async def _get_doc_data(self, doc_info: dict) -> dict | None:
+    async def _get_doc_data(self, doc_info: dict) -> ScrapedDocument | None:
         """Get document data by fetching PDF content and converting to markdown"""
         doc_info = dict(doc_info)
         doc_id = doc_info.pop("doc_id", None)
@@ -226,11 +231,13 @@ class SergipeLegsonScraper(StateScraper):
                 {
                     "text_markdown": content_markdown,
                     "document_url": content_url,
-                    "_raw_content": content_markdown.encode("utf-8"),
-                    "_content_extension": ".txt",
+                    "raw_content": content_markdown.encode("utf-8"),
+                    "content_extension": ".txt",
                 }
             )
-            return doc_info
+            from src.scraper.base.schemas import ScrapedDocument
+
+            return ScrapedDocument(**doc_info)
 
         # Get PDF path from files section
         if "files" in data and data["files"]:
@@ -261,12 +268,14 @@ class SergipeLegsonScraper(StateScraper):
                             {
                                 "text_markdown": text_markdown,
                                 "document_url": pdf_url,
-                                "_raw_content": pdf_content,
-                                "_content_extension": ".pdf",
+                                "raw_content": pdf_content,
+                                "content_extension": ".pdf",
                             }
                         )
 
-                        return doc_info
+                        from src.scraper.base.schemas import ScrapedDocument
+
+                        return ScrapedDocument(**doc_info)
 
         await self._save_doc_error(
             title=title,

@@ -1,3 +1,8 @@
+from __future__ import annotations
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 import re
 from urllib.parse import urlencode
 
@@ -134,7 +139,7 @@ class RNAlrnScraper(StateScraper):
 
         return docs
 
-    async def _get_doc_data(self, doc_info: dict) -> dict | None:
+    async def _get_doc_data(self, doc_info: dict) -> ScrapedDocument | None:
         """Get document data from given document dict."""
         return await self._process_pdf_doc(doc_info)
 

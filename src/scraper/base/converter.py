@@ -6,6 +6,7 @@ Access via ``self._converter`` on any BaseScraper subclass.
 
 from __future__ import annotations
 
+
 import os
 import re
 import string
