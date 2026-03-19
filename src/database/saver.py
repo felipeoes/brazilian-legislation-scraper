@@ -93,8 +93,8 @@ class FileSaver:
         self._shard_name_regex = re.compile(r"^chunk_(\d{6})\.json$")
         self._year_states: dict[int, _YearState] = {}
 
-        # Single consolidated error file: log_dir/error.json
-        self._error_docs: list[dict] = self._load_error_docs()
+        # Single consolidated error file: log_dir/error.json (reset each run)
+        self._error_docs: list[dict] = []
         self._error_lock: asyncio.Lock | None = (
             None  # created lazily (needs event loop)
         )
@@ -102,19 +102,6 @@ class FileSaver:
         if self.verbose:
             logger.info(f"Saving to {save_dir}")
             logger.info(f"Saving logs to {self.log_dir}")
-
-    def _load_error_docs(self) -> list[dict]:
-        """Load existing errors from error.json for resume support."""
-        error_file = self.log_dir / "error.json"
-        if error_file.exists():
-            try:
-                with error_file.open(encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, list):
-                    return data
-            except Exception as e:
-                logger.warning(f"Could not load existing error.json: {e}")
-        return []
 
     def _get_error_lock(self) -> asyncio.Lock:
         """Return the error-file lock, creating it lazily inside the event loop."""
@@ -561,10 +548,8 @@ class FileSaver:
     async def save_error(self, data: dict[str, Any], error_message: str = "") -> None:
         """Append an error document to the consolidated error.json file.
 
-        All errors for a scraper are stored in a single JSON list at
-        ``{log_dir}/error.json``, making it easy to review failures at a glance.
-        Existing content is loaded on startup so re-runs accumulate errors rather
-        than overwriting them.
+        All errors for a scraper run are stored in a single JSON list at
+        ``{log_dir}/error.json``. The file is overwritten fresh on each run.
         """
         try:
             required_error_fields = ["title", "year", "situation", "type", "html_link"]
