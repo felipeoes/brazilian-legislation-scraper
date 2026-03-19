@@ -478,13 +478,8 @@ class MarkdownConverter:
         def _convert() -> str:
             doc = fitz.open(stream=body, filetype="pdf")
             try:
-                # table_strategy=None disables find_tables(), which uses a
-                # module-level TEXTPAGE global in pymupdf/table.py that can be
-                # None for certain PDFs, causing 'NoneType' has no attr
-                # 'extractRAWDICT'. Table text is still extracted as plain text
-                # via force_text=True (the default).
                 return pymupdf4llm.helpers.pymupdf_rag.to_markdown(
-                    doc, embed_images=True, table_strategy=None
+                    doc, embed_images=True
                 )
             finally:
                 doc.close()
