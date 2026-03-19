@@ -9,7 +9,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote
 
 import aiofiles
 from loguru import logger
@@ -94,9 +93,34 @@ class FileSaver:
         self._shard_name_regex = re.compile(r"^chunk_(\d{6})\.json$")
         self._year_states: dict[int, _YearState] = {}
 
+        # Single consolidated error file: log_dir/error.json
+        self._error_docs: list[dict] = self._load_error_docs()
+        self._error_lock: asyncio.Lock | None = (
+            None  # created lazily (needs event loop)
+        )
+
         if self.verbose:
             logger.info(f"Saving to {save_dir}")
             logger.info(f"Saving logs to {self.log_dir}")
+
+    def _load_error_docs(self) -> list[dict]:
+        """Load existing errors from error.json for resume support."""
+        error_file = self.log_dir / "error.json"
+        if error_file.exists():
+            try:
+                with error_file.open(encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    return data
+            except Exception as e:
+                logger.warning(f"Could not load existing error.json: {e}")
+        return []
+
+    def _get_error_lock(self) -> asyncio.Lock:
+        """Return the error-file lock, creating it lazily inside the event loop."""
+        if self._error_lock is None:
+            self._error_lock = asyncio.Lock()
+        return self._error_lock
 
     def _validate_data(self, data: dict[str, Any]) -> bool:
         """Quickly validate required fields are present and non-empty before locking.
@@ -535,8 +559,13 @@ class FileSaver:
             await asyncio.gather(*(self.flush(year) for year in sorted(years)))
 
     async def save_error(self, data: dict[str, Any], error_message: str = "") -> None:
-        """Save error data to file (async)."""
-        file_path = None
+        """Append an error document to the consolidated error.json file.
+
+        All errors for a scraper are stored in a single JSON list at
+        ``{log_dir}/error.json``, making it easy to review failures at a glance.
+        Existing content is loaded on startup so re-runs accumulate errors rather
+        than overwriting them.
+        """
         try:
             required_error_fields = ["title", "year", "situation", "type", "html_link"]
             if not all(field in data for field in required_error_fields):
@@ -546,25 +575,16 @@ class FileSaver:
             if error_message:
                 data = {**data, "error_message": error_message}
 
-            year_dir = self.log_dir / str(data["year"])
-            type_dir = year_dir / data["type"]
-            situation_dir = type_dir / data["situation"]
-
-            situation_dir = Path(unquote(str(situation_dir)))
-            situation_dir.mkdir(parents=True, exist_ok=True)
-
-            title = self._sanitize_filename(data["title"])
-            html_link = self._sanitize_filename(Path(data["html_link"]).stem)
-
-            file_path = situation_dir / f"{title}_{html_link}.json"
-            file_path = Path(self._truncate_path(str(file_path)))
-
-            async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
-                await f.write(json.dumps(data, ensure_ascii=False, indent=4))
+            async with self._get_error_lock():
+                self._error_docs.append(data)
+                error_file = self.log_dir / "error.json"
+                error_file.parent.mkdir(parents=True, exist_ok=True)
+                async with aiofiles.open(error_file, "w", encoding="utf-8") as f:
+                    await f.write(
+                        json.dumps(self._error_docs, ensure_ascii=False, indent=4)
+                    )
 
         except Exception as e:
-            error_msg = f"Error saving error data for '{data.get('title', 'Unknown')}'"
-            if file_path:
-                error_msg += f" to {file_path}"
-            error_msg += f": {e}"
-            logger.error(error_msg)
+            logger.error(
+                f"Error saving error data for '{data.get('title', 'Unknown')}': {e}"
+            )

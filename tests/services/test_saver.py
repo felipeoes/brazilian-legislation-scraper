@@ -165,9 +165,10 @@ class TestFileSaver:
     @pytest.mark.asyncio
     async def test_save_error(self):
         with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp) / "logs"
             saver = FileSaver(
                 save_dir=Path(tmp),
-                log_dir=str(Path(tmp) / "logs"),
+                log_dir=str(log_dir),
             )
             error_data = {
                 "title": "Bad Doc",
@@ -178,9 +179,23 @@ class TestFileSaver:
             }
             await saver.save_error(error_data, error_message="Parse failed")
 
-            # Verify error file was created
-            error_files = list(Path(tmp, "logs").rglob("*.json"))
-            assert len(error_files) == 1
+            # Single consolidated file at log_dir/error.json
+            error_file = log_dir / "error.json"
+            assert error_file.exists(), "error.json was not created"
+
+            docs = json.loads(error_file.read_text(encoding="utf-8"))
+            assert isinstance(docs, list)
+            assert len(docs) == 1
+            assert docs[0]["title"] == "Bad Doc"
+            assert docs[0]["error_message"] == "Parse failed"
+
+            # Second error is appended, not overwritten
+            error_data2 = {**error_data, "title": "Another Bad Doc"}
+            await saver.save_error(error_data2, error_message="Timeout")
+
+            docs = json.loads(error_file.read_text(encoding="utf-8"))
+            assert len(docs) == 2
+            assert docs[1]["title"] == "Another Bad Doc"
 
 
 def test_aggregate_types_summary_normalizes_placeholder_values():

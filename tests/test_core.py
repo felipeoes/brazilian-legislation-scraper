@@ -783,12 +783,13 @@ class TestBaseScraperHelpers:
             finally:
                 await scraper.cleanup()
 
-            error_files = list((log_dir / "SCRAPER_ERRORS").rglob("*.json"))
-            assert len(error_files) == 1
+            error_file = log_dir / "SCRAPER_ERRORS" / "error.json"
+            assert error_file.exists(), "error.json was not created"
 
-            error_data = json.loads(error_files[0].read_text(encoding="utf-8"))
-            assert error_data["title"] == "Bad Doc"
-            assert error_data["error_message"] == "Parse failed"
+            docs = json.loads(error_file.read_text(encoding="utf-8"))
+            assert isinstance(docs, list) and len(docs) == 1
+            assert docs[0]["title"] == "Bad Doc"
+            assert docs[0]["error_message"] == "Parse failed"
 
 
 # =========================================================================
