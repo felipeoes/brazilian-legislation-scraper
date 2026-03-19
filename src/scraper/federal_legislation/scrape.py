@@ -545,7 +545,7 @@ class CamaraDepScraper(BaseScraper):
         """
         title = doc.get("title", "")
         summary = doc.get("summary", "")
-        situation = doc.get("situation", "")
+        situation = doc.get("situation", "") or "Não Informado"
         metadata_url = doc.get("metadata_url", "")
 
         cached_text_url = self._metadata_to_text_url.get(metadata_url)
@@ -668,7 +668,7 @@ class CamaraDepScraper(BaseScraper):
         summary = doc.get("summary", "")
         metadata_url = doc.get("metadata_url", "")
         document_text_link = doc.get("document_url", "")
-        situation = doc.get("situation", "")
+        situation = doc.get("situation", "") or "Não Informado"
         doc_type = norm_type or self._resolve_norm_type(
             title,
             metadata_url=metadata_url,
