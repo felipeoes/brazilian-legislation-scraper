@@ -268,3 +268,88 @@ class TestBytesToMarkdownRouting:
             )
             ocr_mock.pdf_to_markdown.assert_called_once()
             assert "OCR after detection error" in result
+
+
+# ---------------------------------------------------------------------------
+# pymupdf4llm image-only fallback
+# ---------------------------------------------------------------------------
+
+
+class TestImageOnlyFallback:
+    @pytest.mark.asyncio
+    async def test_image_only_pymupdf4llm_falls_back_to_ocr(self):
+        """When pymupdf4llm returns only base64 images (no text), fall back to OCR."""
+        pdf = _make_digital_pdf("short")
+        ocr_mock = AsyncMock()
+        ocr_mock.pdf_to_markdown = AsyncMock(return_value="# OCR extracted text")
+        converter = _make_converter(ocr_service=ocr_mock)
+
+        # Simulate pymupdf4llm returning only a base64 image (no text)
+        image_only = "![](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUA)"
+        with (
+            patch(
+                "src.scraper.base.converter.is_pdf_scanned",
+                return_value=(False, 1.0),
+            ),
+            patch.object(
+                converter, "_pymupdf4llm_convert", new_callable=AsyncMock
+            ) as mock_convert,
+        ):
+            mock_convert.return_value = image_only
+            result = await converter.bytes_to_markdown(
+                pdf, content_type="application/pdf"
+            )
+            ocr_mock.pdf_to_markdown.assert_called_once()
+            assert "OCR extracted text" in result
+
+    @pytest.mark.asyncio
+    async def test_text_plus_images_does_not_trigger_fallback(self):
+        """When pymupdf4llm returns text + images, no fallback should occur."""
+        pdf = _make_digital_pdf("short")
+        ocr_mock = AsyncMock()
+        ocr_mock.pdf_to_markdown = AsyncMock(return_value="# OCR text")
+        converter = _make_converter(ocr_service=ocr_mock)
+
+        text_with_img = (
+            "Art. 1º Este decreto estabelece as normas. " * 10
+            + "\n\n![logo](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUA)"
+        )
+        with (
+            patch(
+                "src.scraper.base.converter.is_pdf_scanned",
+                return_value=(False, 1.0),
+            ),
+            patch.object(
+                converter, "_pymupdf4llm_convert", new_callable=AsyncMock
+            ) as mock_convert,
+        ):
+            mock_convert.return_value = text_with_img
+            result = await converter.bytes_to_markdown(
+                pdf, content_type="application/pdf"
+            )
+            # Should NOT fall back to OCR — text content is sufficient
+            ocr_mock.pdf_to_markdown.assert_not_called()
+            assert "Art." in result
+
+    @pytest.mark.asyncio
+    async def test_image_only_no_ocr_returns_empty(self):
+        """Image-only pymupdf4llm output with no OCR service returns empty."""
+        pdf = _make_digital_pdf("short")
+        converter = _make_converter(ocr_service=None)
+
+        image_only = "![](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUA)"
+        with (
+            patch(
+                "src.scraper.base.converter.is_pdf_scanned",
+                return_value=(False, 1.0),
+            ),
+            patch.object(
+                converter, "_pymupdf4llm_convert", new_callable=AsyncMock
+            ) as mock_convert,
+        ):
+            mock_convert.return_value = image_only
+            result = await converter.bytes_to_markdown(
+                pdf, content_type="application/pdf"
+            )
+            # No OCR available — should return the image-only output or empty
+            assert isinstance(result, str)

@@ -45,6 +45,10 @@ _SERVER_ERROR_PATTERNS: list[str] = [
 # is rotated. Used only for pre-validation length checks (not applied to returned text).
 _WATERMARK_CHECK_RE = re.compile(r"(?:\n[^\n]{0,2}){15,}")
 
+# Matches markdown base64 image syntax produced by pymupdf4llm when it embeds
+# full-page images instead of extracting text (common with older PDF generators).
+_MD_BASE64_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(data:image/[^)]+\)")
+
 _DISCLAIMER_RE = re.compile(
     r"(Est[ea]\s+(texto|conte[uú]do)|Ess[ea]\s+texto)\s+n[aã]o\s+substitui",
     re.IGNORECASE,
@@ -461,29 +465,6 @@ class MarkdownConverter:
             html = await inline_images_in_html(html, resolved_base, fetcher)
         return await self._convert_html_to_md(html)
 
-    async def pdf_bytes_to_text(self, body: bytes) -> str:
-        """Extract plain text from PDF bytes via PyMuPDF."""
-
-        def _extract() -> str:
-            doc = fitz.open(stream=body, filetype="pdf")
-            try:
-                pages: list[str] = []
-                for page in doc:
-                    text = str(page.get_text("text") or "").strip()
-                    if text:
-                        pages.append(text)
-                # Preserve page boundaries so scraper-specific cleanup can strip
-                # watermark/signature artifacts page-by-page.
-                return "\x0c".join(pages)
-            finally:
-                doc.close()
-
-        try:
-            return cast(str, await run_in_thread(_extract)).strip()
-        except (OSError, ValueError, RuntimeError, TypeError) as e:
-            logger.debug(f"PyMuPDF extraction failed: {e}")
-            return ""
-
     async def _pymupdf4llm_convert(self, body: bytes) -> str:
         """Convert PDF bytes to markdown via pymupdf4llm.
 
@@ -553,7 +534,11 @@ class MarkdownConverter:
         # 2a. Digital PDF → pymupdf4llm (with OCR fallback on validation failure)
         if not use_ocr:
             text_markdown = await self._pymupdf4llm_convert(body)
-            check_text = _WATERMARK_CHECK_RE.sub("", text_markdown).strip()
+            # Strip base64 images before validation — pymupdf4llm sometimes
+            # returns only embedded page images with no extracted text (common
+            # with older PDF generators like Acrobat Distiller 6).
+            text_without_images = _MD_BASE64_IMAGE_RE.sub("", text_markdown)
+            check_text = _WATERMARK_CHECK_RE.sub("", text_without_images).strip()
             if valid_markdown(check_text, min_length=min_length)[0]:
                 return text_markdown.strip()
             logger.debug(

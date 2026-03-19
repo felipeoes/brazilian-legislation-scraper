@@ -629,9 +629,6 @@ class BaseScraper:
     ) -> str:
         return await self._converter.bytes_to_markdown(body, filename, content_type)
 
-    async def _pdf_bytes_to_text(self, body: bytes) -> str:
-        return await self._converter.pdf_bytes_to_text(body)
-
     async def _get_markdown(
         self,
         url: str | None = None,
