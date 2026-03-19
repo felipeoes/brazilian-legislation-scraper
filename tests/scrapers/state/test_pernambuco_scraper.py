@@ -5,7 +5,9 @@ import inspect
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from base_tests import ScraperClassTests, TypesConstantTests
 from bs4 import BeautifulSoup
+from conftest import make_base_scraper
 
 from src.scraper.state_legislation.pernambuco import (
     SITUATIONS,
@@ -13,8 +15,6 @@ from src.scraper.state_legislation.pernambuco import (
     PernambucoAlepeScraper,
 )
 from src.services.request.service import FailedRequest
-from base_tests import TypesConstantTests, ScraperClassTests
-from conftest import make_base_scraper
 
 
 def _make_scraper(**kwargs) -> PernambucoAlepeScraper:

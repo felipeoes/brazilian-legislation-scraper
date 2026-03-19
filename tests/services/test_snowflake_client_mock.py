@@ -4,8 +4,9 @@ These tests replace the slow integration tests that make real network calls
 to Snowflake with fast mocked versions that simulate the same behavior.
 """
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 
 class TestSnowflakeClientMocked:

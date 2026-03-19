@@ -31,16 +31,15 @@ Run with:
 from unittest.mock import AsyncMock
 
 import pytest
+from base_tests import ScraperClassTests, SituationsConstantTests, TypesConstantTests
 from bs4 import BeautifulSoup
+from conftest import make_base_scraper, make_failed_request
 
 from src.scraper.state_legislation.santa_catarina import (
     SITUATIONS,
     TYPES,
     SantaCatarinaScraper,
 )
-from base_tests import TypesConstantTests, ScraperClassTests, SituationsConstantTests
-from conftest import make_base_scraper, make_failed_request
-
 
 # ---------------------------------------------------------------------------
 # Factory helper
@@ -291,7 +290,7 @@ class TestGetDocData:
         doc = self._make_doc(title="Lei 42/2023")
         result = await scraper._get_doc_data(doc)
         assert result is not None
-        assert result["text_markdown"] == valid_md
+        assert result["text_markdown"] == valid_md.strip()
         assert result["situation"] == "Não consta"
         assert result["_content_extension"] == ".mhtml"
         assert result["_raw_content"] == b"fake-mhtml"

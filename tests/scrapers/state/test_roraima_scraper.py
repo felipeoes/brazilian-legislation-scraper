@@ -25,12 +25,11 @@ Run with:
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from base_tests import ScraperClassTests, TypesConstantTests
+from conftest import make_base_scraper, make_failed_request
 
 from src.scraper.base.scraper import DEFAULT_INVALID_SITUATION, DEFAULT_VALID_SITUATION
 from src.scraper.state_legislation.roraima import TYPES, RoraimaAlerScraper
-from conftest import make_base_scraper, make_failed_request
-from base_tests import ScraperClassTests, TypesConstantTests
-
 
 # ---------------------------------------------------------------------------
 # Factory helper
@@ -402,8 +401,8 @@ class TestProcessPdf:
         assert result is not None
         assert result["text_markdown"] == valid_md.strip()
         assert result["document_url"] == "https://example.com/lei.pdf"
-        assert result["_raw_content"] == raw_bytes
-        assert result["_content_extension"] == ".pdf"
+        assert result["raw_content"] == raw_bytes
+        assert result["content_extension"] == ".pdf"
 
     @pytest.mark.asyncio
     async def test_download_convert_called_with_pdf_link(self):

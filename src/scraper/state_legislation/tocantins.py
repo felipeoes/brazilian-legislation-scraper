@@ -1,17 +1,22 @@
 from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from src.scraper.base.schemas import ScrapedDocument
 import re
 from io import BytesIO
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import aiohttp
 from bs4 import BeautifulSoup, Tag
 from loguru import logger
+
 from src.scraper.base.converter import calc_pages, valid_markdown
 from src.scraper.base.scraper import StateScraper
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 
 
 # Type mappings for Tocantins

@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-from io import BytesIO
 import math
 import re
+from io import BytesIO
 from urllib.parse import parse_qs, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from loguru import logger
 from tqdm.asyncio import tqdm
 
-from src.scraper.base.converter import valid_markdown
 from src.scraper.base.schemas import ScrapedDocument
 from src.scraper.base.scraper import StateScraper
 
@@ -70,6 +69,14 @@ _DISCLAIMER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Matches the "PÁGINA X / Y PARA VERIFICAR A AUTENTICIDADE …" watermark that
+# appears on some ES Assembly PDF pages.
+_WATERMARK_RE = re.compile(
+    r"P[ÁáAa]GINA\s+\d+\s*/\s*\d+\s+PARA\s+VERIFICAR\s+A\s+AUTENTICIDADE"
+    r"\s+DESTE\s+DOCUMENTO.*?(?:https?://\S+)",
+    re.IGNORECASE | re.DOTALL,
+)
+
 
 def _collapse_blank_lines(text: str) -> str:
     """Collapse excessive blank lines introduced by artifact removal."""
@@ -127,6 +134,7 @@ def _clean_markdown(text_markdown: str, summary: str = "") -> str:
         text_markdown = text_markdown[: match.start()].strip()
 
     text = _AUTH_FOOTER_RE.sub("", text_markdown)
+    text = _WATERMARK_RE.sub("", text)
     text = _PAGE_NUMBER_RE.sub("", text)
     text = _DISCLAIMER_RE.sub("", text)
     text = _collapse_blank_lines(text)
@@ -150,6 +158,12 @@ class ESAlesScraper(StateScraper):
         pymupdf4llm with LLM OCR fallback.
       - "Digital.aspx" links — document viewer URLs; the embedded PDF path is
         extracted from the ``arquivo`` query param and fetched as a regular PDF.
+
+    Skipped document types:
+      - URLs containing ``/DiariosPDF/`` are skipped entirely. These are Official
+        Gazette (Diário Oficial) edition PDFs that bundle many norms into a single
+        file; they do not represent an individual legislative document and would
+        pollute the dataset with unrelated content.
     """
 
     def __init__(
@@ -285,6 +299,17 @@ class ESAlesScraper(StateScraper):
         """GET the first page and return (content, viewstate, eventvalidation)."""
         return await self._fetch_state_page(url)
 
+    async def _fetch_next_page(
+        self, url: str, viewstate: str, eventvalidation: str
+    ) -> tuple[bytes | None, str | None, str | None]:
+        """POST the lbNext button to advance one page."""
+        return await self._fetch_postback(
+            url,
+            viewstate,
+            eventvalidation,
+            "ctl00$ContentPlaceHolder1$lbNext",
+        )
+
     async def _fetch_postback(
         self,
         url: str,
@@ -306,24 +331,18 @@ class ESAlesScraper(StateScraper):
             },
         )
 
-    async def _fetch_page_content(
-        self, url: str, vs: str, ev: str, target: str, page_num: int
-    ) -> tuple[int, bytes | None]:
-        """Wrapper to fetch a postback and return the (page_num, content)."""
-        content, _, _ = await self._fetch_postback(url, vs, ev, target, "", "100")
-        return page_num, content
+    def _extract_total_count(self, soup: BeautifulSoup) -> int | None:
+        """Extract total result count from the listing page."""
+        tag = soup.find(id="ContentPlaceHolder1_contagem")
+        if tag:
+            m = re.search(r"(\d+)", tag.text.replace(".", ""))
+            if m:
+                return int(m.group(1))
+        return None
 
     async def _scrape_year(self, year: int) -> list[dict]:
-        """Scrape all norms for a year.
-
-        Pagination uses ASP.NET WebForms. By switching to 100 items per page,
-        we can read the repeater controls and concurrently fetch all pages
-        listed in the pager (up to 10 at a time). We take the __VIEWSTATE from
-        the highest fetched page to get the links for the next batch, repeating
-        until all pages are exhausted.
-        """
+        """Scrape all norms for a year using sequential Next-button pagination."""
         url = self._format_search_url(year)
-        all_docs: list[dict] = []
 
         content, vs, ev = await self._fetch_first_page(url)
         if not content or not vs or not ev:
@@ -335,48 +354,36 @@ class ESAlesScraper(StateScraper):
             vs,
             ev,
             "ctl00$ContentPlaceHolder1$ddl_ItensExibidos",
-            arg="",
             items_per_page="100",
         )
-        if not content:
+        if not content or not vs or not ev:
             return []
 
         soup = BeautifulSoup(content, "html.parser")
-        all_docs.extend(self._parse_docs_from_soup(soup))
-        total_pages = 1
-        contagem_div = soup.find("div", id="ContentPlaceHolder1_contagem")
-        if contagem_div and contagem_div.strong:
-            text = contagem_div.strong.get_text(strip=True)
-            if count_match := re.search(r"(\d+)", text):
-                total_pages = math.ceil(int(count_match.group(1)) / 100)
-
-        pbar = tqdm(
-            desc=f"ESPIRITO_SANTO | {year} | Fetching pages",
-            total=total_pages,
-            unit="page",
-            leave=False,
-            dynamic_ncols=True,
-            disable=not self.verbose,
+        total_count = self._extract_total_count(soup)
+        total_pages = math.ceil(total_count / 100) if total_count else 1
+        logger.info(
+            f"ESPIRITO_SANTO | {year} | {total_count or '?'} results, ~{total_pages} pages"
         )
-        pbar.update(1)
 
-        while self._has_next_page(soup):
-            content, vs, ev = await self._fetch_postback(
-                url,
-                vs,
-                ev,
-                "ctl00$ContentPlaceHolder1$lbNext",
-                arg="",
-                items_per_page="100",
-            )
-            if not content or not vs or not ev:
-                break
+        all_docs = self._parse_docs_from_soup(soup)
 
-            soup = BeautifulSoup(content, "html.parser")
-            all_docs.extend(self._parse_docs_from_soup(soup))
-            pbar.update(1)
-
-        pbar.close()
+        # Sequential pagination with progress bar
+        page_progress = tqdm(
+            total=total_pages,
+            initial=1,
+            desc=f"ESPIRITO_SANTO | {year} | Pages",
+        )
+        try:
+            while self._has_next_page(soup):
+                content, vs, ev = await self._fetch_next_page(url, vs, ev)
+                if not content or not vs or not ev:
+                    break
+                soup = BeautifulSoup(content, "html.parser")
+                all_docs.extend(self._parse_docs_from_soup(soup))
+                page_progress.update()
+        finally:
+            page_progress.close()
 
         for doc in all_docs:
             doc["year"] = year
@@ -419,32 +426,38 @@ class ESAlesScraper(StateScraper):
                 logger.info(f"Skipping non-PDF Digital.aspx URL: {url}")
                 return None
 
+        # Skip Official Gazette edition PDFs — they bundle many norms into one file.
+        if "/DiariosPDF/" in url:
+            logger.info(f"Skipping diary PDF: {url}")
+            return None
+
         if self._is_already_scraped(url, doc_info.get("title", "")):
             return None
 
-        # if url ends with .pdf, get only text_markdown
+        # if url ends with .pdf, download, clean, and fall back to LLM OCR if too short
         if url.endswith(".pdf"):
             text_markdown, raw_content, content_ext = await self._download_and_convert(
                 url
             )
+            cleaned = _clean_markdown(text_markdown, summary)
 
-            valid, _reason = valid_markdown(text_markdown)
-            if not valid:
-                # raw_content already holds the PDF bytes from _download_and_convert;
-                # reuse them for the LLM OCR fallback instead of re-downloading.
-                text_markdown = await self._get_markdown(stream=BytesIO(raw_content))
+            if len(cleaned.strip()) < 200:
+                ocr_md = await self._get_markdown(
+                    stream=BytesIO(raw_content), filename=url
+                )
+                cleaned = _clean_markdown(ocr_md, summary)
 
-                valid, reason = valid_markdown(text_markdown)
-                if not valid:
+                if len(cleaned.strip()) < 100:
                     await self._save_doc_error(
                         title=doc_info.get("title", ""),
                         year=doc_info.get("year", ""),
                         html_link=url,
-                        error_message=f"Invalid markdown from PDF: {reason}",
+                        error_message="PDF content too short after OCR fallback",
+                        content=cleaned,
                     )
                     return None
 
-            doc_info["text_markdown"] = _clean_markdown(text_markdown, summary)
+            doc_info["text_markdown"] = cleaned
             if not doc_info["text_markdown"] or not doc_info["text_markdown"].strip():
                 await self._save_doc_error(
                     title=doc_info.get("title", ""),
@@ -472,7 +485,7 @@ class ESAlesScraper(StateScraper):
         # Remove images — alt text from decorative logos pollutes the markdown
         for img in soup.find_all("img"):
             img.decompose()
-        html_string = soup.prettify()
+        html_string = str(soup)
 
         text_markdown = await self._get_markdown(html_content=html_string)
         result = await self._process_doc(

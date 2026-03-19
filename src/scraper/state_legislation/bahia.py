@@ -1,9 +1,11 @@
 from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from src.scraper.base.schemas import ScrapedDocument
 import re
+from typing import TYPE_CHECKING
 from urllib.parse import urlencode, urljoin
 
 from bs4 import BeautifulSoup, Tag
@@ -11,6 +13,9 @@ from loguru import logger
 
 from src.scraper.base.converter import wrap_html
 from src.scraper.base.scraper import StateScraper
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 
 
 def _remove_summary_from_markdown(md: str, summary: str) -> str:
@@ -75,24 +80,89 @@ _TYPE_LABELS.update(
 
 
 class BahiaLegislaScraper(StateScraper):
-    """Webscraper for Bahia state legislation website (https://www.legislabahia.ba.gov.br/)
+    """Webscraper for Bahia state legislation website (https://www.legislabahia.ba.gov.br/).
+
+    The site is a Drupal CMS serving static HTML — no JavaScript rendering needed,
+    so all fetches use pure aiohttp (no Playwright browser).
+
+    **Listing**: a single year-only query (no type/situation filter) returns all
+    document types via ``/documentos?data[min]=YYYY-01-01&data[max]=YYYY-12-31``.
+    Pagination is parsed from the ``ul.pagination`` element.
+
+    **Document detail**: each document page contains structured metadata fields
+    (category, number, date, publication date, ementa) and a ``div.field--name-body``
+    with the norm text. Category from the detail page overrides the listing type.
+    Revogado status is detected via ``span.revogado`` or ``div.alteracao`` text.
+
+    **Rate limit**: capped at 1 rps — the server is unstable and returns frequent
+    HTTP 500 errors at higher rates.
 
     Year start (earliest on source): 1891
-
-    Example search request: https://www.legislabahia.ba.gov.br/documentos?num=&ementa=&exp=&data%5Bmin%5D=2025-01-01&data%5Bmax%5D=2025-12-31&page=0
     """
 
     _REVOGADO_RE = re.compile(r"\brevogad[ao]\b", re.IGNORECASE)
+    _REVOGADO_MARKER_RE = re.compile(r"<REVOGAD[AO]>", re.IGNORECASE)
+    _MAX_RPS = 1
 
     def __init__(
         self,
         base_url: str = "https://www.legislabahia.ba.gov.br",
         **kwargs,
     ):
+        kwargs["rps"] = min(kwargs.get("rps", self._MAX_RPS), self._MAX_RPS)
         super().__init__(base_url, name="BAHIA", types=TYPES, situations={}, **kwargs)
 
     def _normalize_type(self, raw_type: str) -> str:
         return super()._normalize_type(raw_type, aliases=_TYPE_LABELS)
+
+    def _clean_layout_tables(self, soup: Tag) -> None:
+        """Unwrap tables used for page layout to avoid broken markdown generation.
+
+        Many Bahia documents are MS Word exports where the entire text is wrapped
+        in a giant table for page layout. MarkItDown converts this to a markdown
+        table with dozens of empty columns. This method destroys the table structure
+        by turning all table tags into divs, which serializes the text into blocks.
+        """
+        for p in soup.find_all("p", class_="EMPTYCELLSTYLE"):
+            p.decompose()
+
+        for tag_name in ["table", "tbody", "thead", "tfoot", "tr", "th", "td"]:
+            for el in soup.find_all(tag_name):
+                el.name = "div"
+
+    def _strip_revogado(self, soup: Tag) -> bool:
+        """Remove the REVOGADO / REVOGADA marker from the document body.
+
+        The site injects a ``<span class='REVOGADA'>`` (or ``<span class='REVOGADO'>``)
+        element containing the literal text ``<REVOGADA>`` / ``<REVOGADO>`` at the top
+        of some documents. For others, the marker appears inside a ``<p class='LEI'>``
+        without its own span wrapper.
+
+        This method also detects revogado status even when the ``<p class='Alteracao'>``
+        pattern is used (capital A) rather than ``<div class='alteracao'>``.
+
+        Returns True if the document is revogado/revogada, False otherwise.
+        """
+        is_revogado = False
+
+        # Detect via span class (e.g. class='REVOGADA' or 'REVOGADO')
+        for span in soup.find_all("span", class_=self._REVOGADO_RE):
+            is_revogado = True
+            span.decompose()
+
+        # Detect via <p class='Alteracao'> or <div class='alteracao'> text
+        for el in soup.find_all(["p", "div"]):
+            cls = " ".join(el.get("class", []))
+            if re.search(r"\balteracao\b", cls, re.IGNORECASE):
+                if self._REVOGADO_RE.search(el.get_text(strip=True)):
+                    is_revogado = True
+                    break  # keep the element — it contains useful text
+
+        # Strip any leftover <REVOGADO> / <REVOGADA> text nodes
+        for el in soup.find_all(string=self._REVOGADO_MARKER_RE):
+            el.replace_with("")
+
+        return is_revogado
 
     def _build_search_url(
         self,
@@ -196,18 +266,22 @@ class BahiaLegislaScraper(StateScraper):
         if self._is_already_scraped(url, doc_info.get("title", "")):
             return None
 
-        try:
-            soup, mhtml = await self._fetch_soup_and_mhtml(url)
-        except Exception as exc:
-            logger.error(f"Failed to get document data from URL: {url} | Error: {exc}")
+        resp = await self.request_service.fetch_bytes(url)
+        if not resp:
+            logger.error(
+                f"Failed to get document data from URL: {url} | Error: {resp.reason}"
+            )
             await self._save_doc_error(
                 title=doc_info.get("title", "Unknown"),
                 year=doc_info.get("year", ""),
                 norm_type=doc_info.get("type", ""),
                 html_link=url,
-                error_message=f"Failed to fetch document page: {exc}",
+                error_message=f"Failed to fetch document page: {resp.reason}",
             )
             return None
+
+        body, _ = resp
+        soup = BeautifulSoup(body, "html.parser")
 
         category = self._get_field_item_text(soup, "field--name-field-categoria-doc")
         if category:
@@ -238,21 +312,21 @@ class BahiaLegislaScraper(StateScraper):
             remove_style_tags=True,
             remove_script_tags=True,
         )
-
-        html_string = wrap_html(norm_text_tag.prettify())
-
-        is_revogado = bool(norm_text_tag.find("span", class_=self._REVOGADO_RE)) or any(
-            self._REVOGADO_RE.match(div.get_text(strip=True))
-            for div in norm_text_tag.find_all("div", class_="alteracao")
-        )
+        self._clean_layout_tables(norm_text_tag)
+        is_revogado = self._strip_revogado(norm_text_tag)
         if is_revogado:
             doc_info["situation"] = "Revogado"
+
+        html_string = wrap_html(str(norm_text_tag))
 
         doc_info["norm_number"] = norm_number
         doc_info["date"] = date
         doc_info["publication_date"] = publication_date
         doc_info["summary"] = summary
-        result = await self._process_html_doc(doc_info, html_string, url, mhtml)
+        text_markdown = await self._get_markdown(html_content=html_string)
+        result = await self._process_doc(
+            doc_info, url, text_markdown, body, ".html", error_prefix="Invalid markdown"
+        )
         if result is not None and summary:
             md = result.text_markdown
             if md:

@@ -26,16 +26,15 @@ Run with:
 from unittest.mock import AsyncMock
 
 import pytest
+from base_tests import ScraperClassTests, SituationsConstantTests, TypesConstantTests
 from bs4 import BeautifulSoup
+from conftest import make_base_scraper, make_failed_request
 
 from src.scraper.state_legislation.rondonia import (
     SITUATIONS,
     TYPES,
     RondoniaCotelScraper,
 )
-from base_tests import TypesConstantTests, ScraperClassTests, SituationsConstantTests
-from conftest import make_base_scraper, make_failed_request
-
 
 # ---------------------------------------------------------------------------
 # Factory helper
@@ -309,6 +308,7 @@ class TestGetDocData:
             "pdf_link": "http://ditel.casacivil.ro.gov.br/COTEL/Livros/Files/lei1.pdf",
             "title": "Lei Ordinária 1/2023",
             "year": 2023,
+            "type": "Lei Ordinária",
             "id": "1",
             "summary": "Ementa da lei.",
             "situation": "Não consta",
@@ -354,7 +354,7 @@ class TestGetDocData:
         doc = self._make_doc()
         result = await scraper._get_doc_data(doc)
         assert result is not None
-        assert result["text_markdown"] == valid_md
+        assert result["text_markdown"] == valid_md.strip()
         assert result["document_url"] == pdf_link
         assert result["_raw_content"] == pdf_bytes
         assert result["_content_extension"] == ".pdf"

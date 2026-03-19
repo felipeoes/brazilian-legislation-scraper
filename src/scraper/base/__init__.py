@@ -1,19 +1,19 @@
 from src.scraper.base.converter import (
-    is_pdf,
-    detect_extension,
-    wrap_html,
-    clean_markdown,
-    strip_html_chrome,
     calc_pages,
+    clean_markdown,
     clean_norm_soup,
-    valid_markdown,
+    detect_extension,
     infer_type_from_title,
+    is_pdf,
+    strip_html_chrome,
+    valid_markdown,
+    wrap_html,
 )
 from src.scraper.base.scraper import (
-    BaseScraper,
     DEFAULT_LLM_PROMPT,
-    merge_context,
+    BaseScraper,
     flatten_results,
+    merge_context,
 )
 from src.utils.concurrency import run_in_thread
 

@@ -26,17 +26,15 @@ from collections import defaultdict
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from base_tests import ScraperClassTests, SituationsConstantTests, TypesConstantTests
 from bs4 import BeautifulSoup
+from conftest import assert_resume_skips, make_base_scraper, make_failed_request
 
 from src.scraper.state_legislation.ceara import (
     SITUATIONS,
     TYPES,
     CearaAleceScraper,
 )
-
-from base_tests import ScraperClassTests, SituationsConstantTests, TypesConstantTests
-from conftest import make_base_scraper, make_failed_request, assert_resume_skips
-
 
 # ---------------------------------------------------------------------------
 # Factory helper
@@ -384,8 +382,8 @@ class TestGetDocData:
         result = await scraper._get_doc_data(doc_info)
         assert result is not None
         assert result["text_markdown"] == valid_md
-        assert result["_content_extension"] == ".mhtml"
-        assert result["_raw_content"] == mhtml
+        assert result["content_extension"] == ".mhtml"
+        assert result["raw_content"] == mhtml
 
     @pytest.mark.asyncio
     async def test_visualizar_url_constructed(self):
@@ -493,8 +491,8 @@ class TestGetLawsConstitutionAmendmentsDocData:
         )
         assert result is not None
         assert result["text_markdown"] == valid_md
-        assert result["_content_extension"] == ".mhtml"
-        assert result["_raw_content"] == mhtml
+        assert result["content_extension"] == ".mhtml"
+        assert result["raw_content"] == mhtml
         assert "document_url" in result
         # html_link must be popped
         assert "html_link" not in result

@@ -12,9 +12,9 @@ Covers:
 - _has_next_page: True when lbNext present and active, False when aspNetDisabled
 - _fetch_first_page: returns (content, viewstate, eventvalidation) on success,
   (None, None, None) on request failure
-- _fetch_next_page: POSTs lbNext and threads viewstate forward, None on failure
-- _scrape_year: 2-page mock calls _fetch_first_page once and _fetch_next_page once,
-  stops when no next page
+- _fetch_next_page: POSTs lbNext and returns new state, None on failure
+- _scrape_year: sequential Next-button pagination, collects all docs then processes,
+  multi-page flow, stops when no next page or fetch failure
 - _get_doc_data: resume skip, PDF path (valid), PDF path invalid → OCR fallback,
   PDF download failure → error + None, HTML path soup failure → error + None,
   HTML path invalid markdown → error + None, HTML path valid → correct shape,
@@ -31,20 +31,33 @@ Run with:
 import tempfile
 from unittest.mock import AsyncMock, MagicMock
 
+import re
+
 import pytest
+from base_tests import ScraperClassTests, SituationsConstantTests, TypesConstantTests
 from bs4 import BeautifulSoup
+from conftest import assert_resume_skips, make_base_scraper, make_failed_request
 
 from src.scraper.state_legislation.espirito_santo import (
-    ESAlesScraper,
     INVALID_SITUATIONS,
     SITUATIONS,
     TYPES,
     VALID_SITUATIONS,
+    ESAlesScraper,
+    _AUTH_FOOTER_RE,
+    _DISCLAIMER_RE,
     _clean_markdown,
 )
-from base_tests import TypesConstantTests, SituationsConstantTests, ScraperClassTests
-from conftest import make_base_scraper, make_failed_request, assert_resume_skips
 
+# Alias upstream regex names to the stashed names used by some tests.
+_DIGITAL_SIGNATURE_RE = _AUTH_FOOTER_RE
+# Watermark regex from the stashed branch — not in the upstream source,
+# but needed by tests that were auto-merged.
+_AUTHENTICATION_WATERMARK_RE = re.compile(
+    r"P[ÁáAa]GINA\s+\d+\s*/\s*\d+\s+PARA\s+VERIFICAR\s+A\s+AUTENTICIDADE"
+    r"\s+DESTE\s+DOCUMENTO.*?(?:https?://\S+)",
+    re.IGNORECASE | re.DOTALL,
+)
 
 # ---------------------------------------------------------------------------
 # Factory helper
@@ -292,6 +305,30 @@ class TestParseDocsFromSoup:
 
 
 # ---------------------------------------------------------------------------
+# _extract_total_count
+# ---------------------------------------------------------------------------
+
+
+class TestExtractTotalCount:
+    def test_extracts_count_from_contagem_span(self):
+        scraper = _make_scraper()
+        html = '<html><body><span id="ContentPlaceHolder1_contagem">Localizada(s) 3730 resultados</span></body></html>'
+        soup = BeautifulSoup(html, "html.parser")
+        assert scraper._extract_total_count(soup) == 3730
+
+    def test_returns_none_when_tag_absent(self):
+        scraper = _make_scraper()
+        soup = BeautifulSoup(b"<html><body></body></html>", "html.parser")
+        assert scraper._extract_total_count(soup) is None
+
+    def test_handles_dot_thousands_separator(self):
+        scraper = _make_scraper()
+        html = '<html><body><span id="ContentPlaceHolder1_contagem">Localizada(s) 1.234 resultados</span></body></html>'
+        soup = BeautifulSoup(html, "html.parser")
+        assert scraper._extract_total_count(soup) == 1234
+
+
+# ---------------------------------------------------------------------------
 # _has_next_page
 # ---------------------------------------------------------------------------
 
@@ -392,6 +429,47 @@ class TestFetchPostback:
 
 
 # ---------------------------------------------------------------------------
+# _fetch_next_page
+# ---------------------------------------------------------------------------
+
+
+class TestFetchNextPage:
+    @pytest.mark.asyncio
+    async def test_posts_lbnext_and_returns_new_state(self):
+        scraper = _make_scraper()
+        page_bytes = _make_listing_html(1, has_next=False)
+        resp = MagicMock()
+        resp.__bool__ = lambda s: True
+        resp.read = AsyncMock(return_value=page_bytes)
+        scraper.request_service.make_request = AsyncMock(return_value=resp)
+
+        content, vs, ev = await scraper._fetch_next_page(
+            "http://example.com", "old_vs", "old_ev"
+        )
+        assert content == page_bytes
+        assert vs == "vs_val"
+        assert ev == "ev_val"
+        call_kwargs = scraper.request_service.make_request.call_args
+        payload = (
+            call_kwargs.kwargs.get("payload") or call_kwargs.args[1]
+            if len(call_kwargs.args) > 1
+            else call_kwargs.kwargs["payload"]
+        )
+        assert payload["__EVENTTARGET"] == "ctl00$ContentPlaceHolder1$lbNext"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_request_failure(self):
+        scraper = _make_scraper()
+        failed = make_failed_request()
+        scraper.request_service.make_request = AsyncMock(return_value=failed)
+
+        content, vs, ev = await scraper._fetch_next_page(
+            "http://example.com", "vs", "ev"
+        )
+        assert content is None
+
+
+# ---------------------------------------------------------------------------
 # _scrape_year
 # ---------------------------------------------------------------------------
 
@@ -423,17 +501,14 @@ class TestScrapeYear:
             "vs1",
             "ev1",
             "ctl00$ContentPlaceHolder1$ddl_ItensExibidos",
-            arg="",
             items_per_page="100",
         )
-        # Second postback: go to next page
+        # Second postback: go to next page (via _fetch_next_page which only passes 4 positional args)
         scraper._fetch_postback.assert_any_call(
             scraper._format_search_url(2010),
             "vs2",
             "ev2",
             "ctl00$ContentPlaceHolder1$lbNext",
-            arg="",
-            items_per_page="100",
         )
 
     @pytest.mark.asyncio
@@ -483,6 +558,52 @@ class TestScrapeYear:
         assert captured["year"] == 2015
         assert captured["norm_type"] == "all"
         assert captured["situation"] == "all"
+
+    @pytest.mark.asyncio
+    async def test_multi_page_collects_all_docs(self):
+        """Sequential pagination: page1 has_next=True, page2 has_next=False."""
+        scraper = _make_scraper()
+        page1_10 = _make_listing_html(1, has_next=False)
+        page1_100 = _make_listing_html(2, has_next=True)
+        page2 = _make_listing_html(1, has_next=False)
+
+        scraper._fetch_first_page = AsyncMock(return_value=(page1_10, "vs1", "ev1"))
+        scraper._fetch_postback = AsyncMock(return_value=(page1_100, "vs2", "ev2"))
+        scraper._fetch_next_page = AsyncMock(return_value=(page2, "vs3", "ev3"))
+        captured_docs = []
+
+        async def fake_process(docs, **kwargs):
+            captured_docs.extend(docs)
+            return []
+
+        scraper._process_documents = fake_process
+
+        await scraper._scrape_year(2020)
+        # 2 docs from page1_100 + 1 doc from page2
+        assert len(captured_docs) == 3
+        scraper._fetch_next_page.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_fetch_next_page_failure_stops_pagination(self):
+        """If _fetch_next_page fails mid-pagination, docs fetched so far are processed."""
+        scraper = _make_scraper()
+        page1_10 = _make_listing_html(1, has_next=False)
+        page1_100 = _make_listing_html(2, has_next=True)
+
+        scraper._fetch_first_page = AsyncMock(return_value=(page1_10, "vs1", "ev1"))
+        scraper._fetch_postback = AsyncMock(return_value=(page1_100, "vs2", "ev2"))
+        scraper._fetch_next_page = AsyncMock(return_value=(None, None, None))
+        captured_docs = []
+
+        async def fake_process(docs, **kwargs):
+            captured_docs.extend(docs)
+            return []
+
+        scraper._process_documents = fake_process
+
+        await scraper._scrape_year(2020)
+        # Only 2 docs from page1_100 (page2 fetch failed)
+        assert len(captured_docs) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -749,8 +870,8 @@ class TestGetDocData:
         assert result["type"] == "Lei Ordinária"
 
     @pytest.mark.asyncio
-    async def test_summary_not_in_result(self):
-        """'summary' key must be absent from the returned doc dict."""
+    async def test_summary_preserved_in_result(self):
+        """'summary' key must be preserved in the returned doc dict."""
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
         valid_md = "# Lei\n\n" + "Texto da lei. " * 20
@@ -779,7 +900,7 @@ class TestGetDocData:
             "Assinado digitalmente por:\n"
             "ALEXANDRE MARCELO COUTINHO SANTOS"
         )
-        valid_md = "# Lei\n\n" + "Texto da lei. " * 5 + manifesto
+        valid_md = "# Lei\n\n" + "Texto da lei. " * 20 + manifesto
         scraper._download_and_convert = AsyncMock(
             return_value=(valid_md, b"raw", ".pdf")
         )
@@ -795,6 +916,43 @@ class TestGetDocData:
         assert "MANIFESTO" not in result["text_markdown"]
         assert "Assinado digitalmente" not in result["text_markdown"]
         assert "Texto da lei." in result["text_markdown"]
+
+    @pytest.mark.asyncio
+    async def test_pdf_multipage_with_footer_preserves_all_pages(self):
+        """markitdown returns 3-page content with footer on page 1 → all pages in result."""
+        scraper = _make_scraper()
+        scraper._is_already_scraped = MagicMock(return_value=False)
+        page1 = "# Page 1\n\nArt. 1º - Texto da primeira página."
+        footer = (
+            "\n\nAutenticar documento em https://www3.al.es.gov.br/autenticidade\n"
+            "com o identificador 3B0C9DBA, Documento assinado\n"
+            "digitalmente conforme MP n° 2.200-2/2001, que institui a "
+            "Infra-estrutura de Chaves Públicas Brasileira\n- ICP-Brasil."
+        )
+        page2 = (
+            "\n\n# Page 2\n\nArt. 2º - Texto da segunda página. "
+            + "Detalhe legal. " * 10
+        )
+        page3 = (
+            "\n\n# Page 3\n\nArt. 3º - Texto da terceira página. " + "Mais texto. " * 10
+        )
+        multipage_md = page1 + footer + page2 + page3
+        scraper._download_and_convert = AsyncMock(
+            return_value=(multipage_md, b"raw-pdf", ".pdf")
+        )
+        doc_info = {
+            "title": "Lei 001",
+            "doc_link": "/pdf/lei1.pdf",
+            "year": 2024,
+            "type": "Lei Ordinária",
+            "situation": "Normal",
+        }
+        result = await scraper._get_doc_data(doc_info)
+        assert result is not None
+        assert "Autenticar documento" not in result["text_markdown"]
+        assert "primeira página" in result["text_markdown"]
+        assert "segunda página" in result["text_markdown"]
+        assert "terceira página" in result["text_markdown"]
 
     @pytest.mark.asyncio
     async def test_summary_stripped_from_beginning_of_text_markdown(self):
@@ -1015,6 +1173,171 @@ class TestCleanMarkdown:
         )
         assert _clean_markdown(text) == text
 
+    def test_watermark_regex_preserves_short_lines_with_spaces(self):
+        """Lines with spaces/punctuation are NOT matched by \\w{0,2}, so they survive."""
+        # These 1-2 char lines have spaces (e.g. " " or German/Portuguese short words)
+        # and must survive even in long runs.
+        text = "# Lei\n\n" + "\n ".join(
+            [
+                "de",
+                "em",
+                "a",
+                "o",
+                "e",
+                "da",
+                "do",
+                "na",
+                "no",
+                "as",
+                "os",
+                "um",
+                "ao",
+                "se",
+                "ou",
+                "por",
+            ]
+        )
+        result = _clean_markdown(text)
+        # None of those short words should be stripped by the watermark regex
+        assert "de" in result
+        assert "em" in result
+
+    def test_digital_signature_footer_removed(self):
+        """Full digital-signature authentication footer must be stripped."""
+        footer = (
+            "\n\nAutenticar documento em https://www3.al.es.gov.br/autenticidade\n"
+            "com o identificador 3B0C9DBA75CAA64874C318, Documento assinado\n"
+            "digitalmente conforme MP n° 2.200-2/2001, que institui a "
+            "Infra-estrutura de Chaves Públicas Brasileira\n- ICP-Brasil."
+        )
+        text = "# Lei\n\nTexto da lei." + footer
+        result = _clean_markdown(text)
+        assert "Autenticar documento" not in result
+        assert "Texto da lei." in result
+
+    def test_duplicated_digital_signature_removed(self):
+        """Duplicated-line variant of the footer must also be stripped."""
+        footer = (
+            "\n\nAutenticar documento em https://www3.al.es.gov.br/autenticidade\n"
+            "com o identificador ABC123, Documento assinado\n"
+            "digitalmente conforme MP n° 2.200-2/2001, que institui a "
+            "Infra-estrutura de Chaves Públicas Brasileira\n- ICP-Brasil.\n\n"
+            "Autenticar documento em https://www3.al.es.gov.br/autenticidade\n"
+            "com o identificador ABC123, Documento assinado\n"
+            "digitalmente conforme MP n° 2.200-2/2001, que institui a "
+            "Infra-estrutura de Chaves Públicas Brasileira\n- ICP-Brasil."
+        )
+        text = "Conteúdo da norma." + footer
+        result = _clean_markdown(text)
+        assert "Autenticar documento" not in result
+        assert "Conteúdo da norma." in result
+
+    def test_content_before_footer_preserved(self):
+        """Legitimate text before the footer must be kept intact."""
+        body = "Art. 1º - Fica criado o Fundo Estadual.\n\nArt. 2º - Esta lei entra em vigor."
+        footer = (
+            "\n\nAutenticar documento em https://www3.al.es.gov.br/autenticidade\n"
+            "com o identificador 1A2B3C, Documento assinado\n"
+            "digitalmente conforme MP n° 2.200-2/2001, que institui a "
+            "Infra-estrutura de Chaves Públicas Brasileira\n- ICP-Brasil."
+        )
+        text = body + footer
+        result = _clean_markdown(text)
+        assert result == body
+
+    def test_multipage_content_after_footer_preserved(self):
+        """Footer on page 1 must not eat pages 2–3 in multi-page PDFs."""
+        page1 = "# Page 1\n\nArt. 1º - Texto da primeira página."
+        footer = (
+            "\n\nAutenticar documento em https://www3.al.es.gov.br/autenticidade\n"
+            "com o identificador 3B0C9DBA, Documento assinado\n"
+            "digitalmente conforme MP n° 2.200-2/2001, que institui a "
+            "Infra-estrutura de Chaves Públicas Brasileira\n- ICP-Brasil."
+        )
+        page2 = "\n\n# Page 2\n\nArt. 2º - Texto da segunda página."
+        page3 = "\n\n# Page 3\n\nArt. 3º - Texto da terceira página."
+        text = page1 + footer + page2 + page3
+        result = _clean_markdown(text)
+        assert "Autenticar documento" not in result
+        assert "Page 1" in result
+        assert "Page 2" in result
+        assert "Page 3" in result
+        assert "segunda página" in result
+        assert "terceira página" in result
+
+    def test_digital_signature_regex_matches_real_pattern(self):
+        footer = (
+            "Autenticar documento em https://www3.al.es.gov.br/autenticidade\n"
+            "com o identificador 3B0C, Documento assinado\n"
+            "digitalmente conforme MP n° 2.200-2/2001, que institui a "
+            "Infra-estrutura de Chaves Públicas Brasileira\n- ICP-Brasil."
+        )
+        assert _DIGITAL_SIGNATURE_RE.search(footer) is not None
+
+    def test_disclaimer_do_removed(self):
+        """D.O. variant of the disclaimer is stripped, body preserved."""
+        text = "# Lei\n\nTexto da lei.\n\nEste texto não substitui o publicado no D.O. de 26/11/2025."
+        result = _clean_markdown(text)
+        assert "Este texto" not in result
+        assert "Texto da lei." in result
+
+    def test_disclaimer_dpl_removed(self):
+        """D.P.L. variant of the disclaimer is stripped."""
+        text = "Art. 1º - Conteúdo.\n\nEste texto não substitui o publicado no D.P.L. de 05/03/2024."
+        result = _clean_markdown(text)
+        assert "Este texto" not in result
+        assert "Conteúdo." in result
+
+    def test_disclaimer_with_linebreaks_removed(self):
+        """Line breaks in the middle of the phrase are still matched."""
+        text = "Corpo.\n\nEste texto\nnão substitui o\npublicado no D.O. de 26/11/2025."
+        result = _clean_markdown(text)
+        assert "Este texto" not in result
+        assert "Corpo." in result
+
+    def test_disclaimer_preserves_content_after(self):
+        """ANEXO content after a \\n\\n boundary is kept."""
+        text = (
+            "Art. 1º - Texto.\n\n"
+            "Este texto não substitui o publicado no D.P.L. de 01/06/2023.\n\n"
+            "ANEXO\n\nTabela de valores."
+        )
+        result = _clean_markdown(text)
+        assert "Este texto" not in result
+        assert "ANEXO" in result
+        assert "Tabela de valores." in result
+
+    def test_disclaimer_regex_matches_single_digit_day(self):
+        """Single-digit day like 9/12/2025 is matched."""
+        text = "Este texto não substitui o publicado no D.O. de 9/12/2025."
+        assert _DISCLAIMER_RE.search(text) is not None
+
+    def test_authentication_watermark_removed(self):
+        """The PÁGINA X / Y PARA VERIFICAR watermark must be stripped."""
+        text = (
+            "# Lei Ordinária\n\n"
+            "Art. 1º - Texto.\n\n"
+            "PÁGINA 1 / 3 PARA VERIFICAR A AUTENTICIDADE DESTE DOCUMENTO,"
+            " ACESSE O ENDEREÇO: https://www3.al.es.gov.br/autenticidade\n\n"
+            "Art. 2º - Mais texto."
+        )
+        result = _clean_markdown(text)
+        assert "VERIFICAR A AUTENTICIDADE" not in result
+        assert "Art. 1º" in result
+        assert "Art. 2º" in result
+
+    def test_authentication_watermark_regex_matches(self):
+        assert _AUTHENTICATION_WATERMARK_RE.search(
+            "PÁGINA 2 / 5 PARA VERIFICAR A AUTENTICIDADE DESTE DOCUMENTO,"
+            " ACESSE O ENDEREÇO: https://example.gov.br/token123"
+        )
+
+    def test_authentication_watermark_regex_case_insensitive(self):
+        assert _AUTHENTICATION_WATERMARK_RE.search(
+            "pagina 1 / 2 para verificar a autenticidade deste documento,"
+            " acesse o endereço: https://www3.al.es.gov.br/x"
+        )
+
     @pytest.mark.asyncio
     async def test_digital_aspx_pdf_url_resolved(self):
         """Processo2/Digital.aspx URLs with a PDF arquivo param should be fetched as PDF."""
@@ -1080,16 +1403,39 @@ class TestCleanMarkdown:
         result = await scraper._get_doc_data(doc_info)
         assert result is None
 
+    @pytest.mark.asyncio
+    async def test_ocr_fallback_short_result_saves_error(self):
+        """When the OCR fallback also produces < 100 chars, an error is logged and None returned."""
+        scraper = _make_scraper()
+        scraper._is_already_scraped = MagicMock(return_value=False)
+        # First extraction yields short text (triggers fallback)
+        scraper._download_and_convert = AsyncMock(
+            return_value=("Palácio Domingos Martins.", b"raw-pdf", ".pdf")
+        )
+        # OCR fallback also returns short content (57 chars, > 50 so "valid")
+        short_ocr = "Palácio Domingos Martins, em\n\nMARCELO SANTOS\nPresidente"
+        scraper._get_markdown = AsyncMock(return_value=short_ocr)
+        scraper._save_doc_error = AsyncMock()
 
-# ---------------------------------------------------------------------------
-# parse_base64_data_uri tests
-# ---------------------------------------------------------------------------
+        doc_info = {
+            "title": "Ato Administrativo n° 5.951/2025",
+            "doc_link": "/pdf/ato.pdf",
+        }
+        result = await scraper._get_doc_data(doc_info)
+        assert result is None
+        scraper._save_doc_error.assert_called_once()
+        call_kwargs = scraper._save_doc_error.call_args
+        assert (
+            "too short" in str(call_kwargs).lower()
+            or "short" in str(call_kwargs).lower()
+        )
 
 
 class TestParseBase64DataUri:
     def test_valid_uri_parsed_correctly(self):
-        from src.services.ocr.utils import parse_base64_data_uri
         import base64
+
+        from src.services.ocr.utils import parse_base64_data_uri
 
         raw = b"PNG bytes here"
         b64 = base64.standard_b64encode(raw).decode()

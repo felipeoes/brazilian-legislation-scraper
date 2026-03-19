@@ -1,14 +1,21 @@
 from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from src.scraper.base.schemas import ScrapedDocument
 import re
+from typing import TYPE_CHECKING
 from urllib.parse import urlencode
 
 from bs4 import BeautifulSoup
 from loguru import logger
+
 from src.scraper.base.scraper import StateScraper, flatten_results
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
+
 
 TYPES = {
     "Lei Ordinária": "lei ord",

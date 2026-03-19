@@ -16,11 +16,14 @@ if TYPE_CHECKING:
     from src.scraper.base.schemas import ScrapedDocument
 
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urljoin
 
 from src.scraper.base.converter import strip_html_chrome
 from src.scraper.base.scraper import StateScraper
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 
 _RE_TYPE_FROM_TITLE = re.compile(
     r"^(LEI COMPLEMENTAR|LEI|DECRETO LEGISLATIVO|DECRETO-LEI|DECRETO|DEC-|"

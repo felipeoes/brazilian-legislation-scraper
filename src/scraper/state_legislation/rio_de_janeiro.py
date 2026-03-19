@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -7,10 +8,13 @@ import base64
 import copy
 import re
 import urllib.parse
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from bs4 import BeautifulSoup
 from unidecode import unidecode
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 
 from src.scraper.base.converter import (
     strip_html_chrome,
@@ -387,7 +391,7 @@ class RJAlerjScraper(StateScraper):
             else "Sem revogação expressa"
         )
 
-        html_string = content_root.prettify().replace("\n", "")
+        html_string = str(content_root)
         full_html = wrap_html(html_string)
         text_markdown = (await self._get_markdown(html_content=full_html)).strip()
         text_markdown = self._clean_extracted_markdown(text_markdown)
@@ -444,7 +448,7 @@ class RJAlerjScraper(StateScraper):
         self._clean_constitution_section_soup(section_soup)
         content_div = section_soup.find("div", id="divConteudo")
         if content_div:
-            return content_div.prettify().replace("\n", "")
+            return str(content_div)
         return None
 
     async def scrape_constitution(self):

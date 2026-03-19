@@ -3,30 +3,35 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
 import re
+import time
+from datetime import datetime
+from io import BytesIO
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
 import aiofiles
 import aiohttp
 import urllib3
-
-from io import BytesIO
-from datetime import datetime
-from typing import TYPE_CHECKING, Any, Callable, Coroutine
 from bs4 import BeautifulSoup, Tag
-from playwright.async_api import Page
-from src.services.browser.playwright import BrowserService
 from loguru import logger
-from pathlib import Path
+from playwright.async_api import Page
+
 from src.config import LOG_DIR, SAVE_DIR, STATE_LEGISLATION_SAVE_DIR
 from src.database.saver import FileSaver, aggregate_types_summary
+from src.services.browser.playwright import BrowserService
+
+if TYPE_CHECKING:
+    pass
+
+from tqdm import tqdm
+
 from src.scraper.base.converter import (
     MarkdownConverter,
     clean_norm_soup,
     valid_markdown,
 )
 from src.scraper.base.persistence import PersistenceManager, _normalize_year
-from tqdm import tqdm
 from src.services.proxy.service import ProxyService
 from src.services.request.service import RequestService
 
@@ -242,7 +247,7 @@ def merge_context(result: dict | ScrapedDocument, context: dict) -> dict:
     elif context_type:
         doc["type"] = context_type
     else:
-        doc.pop("type", None)
+        doc["type"] = ""
 
     result_situation = _meaningful_context_value(res_dict.get("situation"))
     context_situation = _meaningful_context_value(context.get("situation"))
@@ -251,7 +256,7 @@ def merge_context(result: dict | ScrapedDocument, context: dict) -> dict:
     elif context_situation:
         doc["situation"] = context_situation
     else:
-        doc.pop("situation", None)
+        doc["situation"] = ""
 
     year = _normalize_year(doc.get("year"))
     ctx_year = _normalize_year(context.get("year"))
@@ -294,7 +299,7 @@ class BaseScraper:
         proxy_config: dict | None = None,
         rps: float = 10,
         max_workers: int = 50,
-        max_retries: int = 5,
+        max_retries: int = 6,
         verbose: bool = False,
         overwrite: bool = False,
         disable_cookies: bool = False,
@@ -869,7 +874,7 @@ class BaseScraper:
         *,
         year: int,
         norm_type: str,
-        situation: str = "NA",
+        situation: str = "",
         desc: str = "",
         doc_data_fn=None,
         doc_data_kwargs: dict | None = None,
@@ -958,7 +963,8 @@ class BaseScraper:
         return all_docs
 
     async def _before_scrape(self) -> None:
-        """Hook called once before year iteration begins."""
+        """Hook called once before year iteration begins. Optional to implement in child class."""
+        pass
 
     async def _scrape_type(self, norm_type: str, norm_type_id, year: int) -> list[dict]:
         """Scrape all documents of a single type for a year."""
@@ -1007,7 +1013,7 @@ class BaseScraper:
 
         valid = await self._gather_results(
             tasks,
-            context={"year": year, "type": "NA", "situation": "NA"},
+            context={"year": year, "type": "", "situation": ""},
             desc=f"{self.name} | Year {year}",
         )
 

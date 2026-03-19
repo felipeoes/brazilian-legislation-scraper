@@ -8,7 +8,7 @@ Web scraper for legal documents regarding Brazilian legislation — federal, sta
 
 - **27 state scrapers** — covering all Brazilian states with dedicated scrapers for each state legislature website
 - **Federal legislation** — scrapes Câmara dos Deputados
-- **Regulatory bodies** — CONAMA and ICMBio scrapers
+- **Environment regulatory bodies** — CONAMA and ICMBio scrapers
 - **Async concurrency** — built on `asyncio` + `aiohttp` for non-blocking I/O with independent per-scraper rate limiting for HTTP and shared rate limiting for LLM API calls
 - **LLM providers** — supports OpenAI-compatible APIs and AWS Bedrock Converse for OCR
 - **PDF & image extraction** — converts PDFs to Markdown with embedded images (base64), optional LLM-powered OCR for scanned documents, and inline image preservation for HTML sources

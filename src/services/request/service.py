@@ -1,9 +1,13 @@
+from __future__ import annotations
+
 import asyncio
 import ssl
+from typing import TYPE_CHECKING
+
 import aiohttp
 from aiohttp_socks import (
-    ProxyConnector,
     ProxyConnectionError,
+    ProxyConnector,
     ProxyError,
     ProxyTimeoutError,
 )
@@ -11,12 +15,15 @@ from bs4 import BeautifulSoup
 from loguru import logger
 from tenacity import (
     AsyncRetrying,
+    retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
-    retry_if_exception_type,
 )
 
 from src.utils.concurrency import RateLimiter
+
+if TYPE_CHECKING:
+    from src.services.proxy.service import ProxyService
 
 
 def _make_ssl_context(verify: bool = True) -> ssl.SSLContext:
@@ -71,10 +78,10 @@ class FailedRequest:
 class RequestService:
     def __init__(
         self,
-        rps: float = 10,
+        rps: float,
+        max_retries: int,
         verbose: bool = False,
-        proxy_service=None,
-        max_retries: int = 5,
+        proxy_service: ProxyService | None = None,
         verify_ssl: bool = False,
         disable_cookies: bool = False,
         proxy_timeout: int = 15,
@@ -105,7 +112,7 @@ class RequestService:
         """
         return AsyncRetrying(
             stop=stop_after_attempt(self._max_retries),
-            wait=wait_exponential(multiplier=2, min=2, max=60),
+            wait=wait_exponential(multiplier=2, min=5, max=60),
             retry=retry_if_exception_type(RetryableHTTPError),
             reraise=True,
         )
@@ -270,7 +277,7 @@ class RequestService:
         async def _on_response(resp: aiohttp.ClientResponse):
             try:
                 body = await resp.read()
-            except aiohttp.ClientPayloadError as e:
+            except (aiohttp.ClientPayloadError, asyncio.TimeoutError) as e:
                 raise RetryableHTTPError(str(e)) from e
             return body, resp
 
@@ -309,21 +316,10 @@ class RequestService:
 
         Returns a ``FailedRequest`` (falsy) instead of ``None`` on failure.
         """
-        resp = await self.make_request(url, method=method, **kwargs)
-        if not resp:
-            return resp
-
-        try:
-            body = await resp.text()
-        except UnicodeDecodeError:
-            try:
-                # Attempt to read the raw bytes and decode with ISO-8859-1 for older Brazilian websites
-                raw_bytes = await resp.read()
-                body = raw_bytes.decode("iso-8859-1")
-            except Exception as e:
-                logger.warning(f"Failed to decode response body for {url}: {e}")
-                return FailedRequest(url=url, reason=f"Decoding error: {e}")
-
+        result = await self.fetch_bytes(url, method=method, **kwargs)
+        if not result:
+            return result
+        body, _resp = result
         return BeautifulSoup(body, "html.parser")
 
     async def cleanup(self):

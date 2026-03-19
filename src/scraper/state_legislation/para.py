@@ -1,14 +1,20 @@
 from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from src.scraper.base.schemas import ScrapedDocument
 import re
+from typing import TYPE_CHECKING
 
 from bs4 import BeautifulSoup
 from loguru import logger
 
 from src.scraper.base.scraper import StateScraper, flatten_results
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
+
 
 TYPES = {
     "Decreto Estadual": 2,
@@ -108,7 +114,7 @@ class ParaAlepaScraper(StateScraper):
 
         #   Total de Registros:                      0
         # check if empty page
-        total_count = self.regex_total_count.search(soup.prettify())
+        total_count = self.regex_total_count.search(str(soup))
         if total_count is None or int(total_count.group(1)) == 0:
             return []
 

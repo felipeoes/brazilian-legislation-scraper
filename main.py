@@ -117,7 +117,7 @@ def build_scraper_configs(
         return cfg
 
     return [
-        # --- Federal / regulatory ---
+        # --- Federal / environment ---
         _sc(
             CamaraDepScraper,
             year_start=1808,
@@ -151,7 +151,9 @@ def build_scraper_configs(
             rps=50,
         ),
         _sc(AmapaAlapScraper, aliases=["Amapa", "AP"], year_start=1991),
-        _sc(BahiaLegislaScraper, aliases=["Bahia", "BA"], year_start=1891, rps=5),
+        _sc(
+            BahiaLegislaScraper, aliases=["Bahia", "BA"], year_start=1891, max_retries=7
+        ),
         _sc(
             CearaAleceScraper,
             aliases=["Ceara", "CE"],
@@ -163,19 +165,22 @@ def build_scraper_configs(
             aliases=["DF", "DistritoFederal"],
             year_start=1922,
             llm_config=llm_config,
-            rps=50,
+            rps=100,
+            max_workers=100,
         ),
         _sc(
             ESAlesScraper,
             aliases=["ES", "EspiritoSanto"],
             year_start=1958,
             llm_config=llm_config,
+            rps=50,
         ),
         _sc(
             LegislaGoias,
             aliases=["Goias", "GO"],
             year_start=1887,
             llm_config=llm_config,
+            rps=100,
         ),
         _sc(
             MaranhaoAlemaScraper,

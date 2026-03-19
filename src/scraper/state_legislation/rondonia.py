@@ -1,14 +1,19 @@
 from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from src.scraper.base.schemas import ScrapedDocument
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urljoin
 
 from bs4 import Tag
+
 from src.scraper.base.scraper import StateScraper
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 
 
 TYPES = {

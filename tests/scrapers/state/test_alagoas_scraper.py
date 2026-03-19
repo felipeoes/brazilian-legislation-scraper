@@ -32,12 +32,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
-from src.scraper.state_legislation.alagoas import TYPES, AlagoasSefazScraper
-
 from base_tests import TypesConstantTests
 from conftest import make_base_scraper, make_failed_request
 
+from src.scraper.state_legislation.alagoas import TYPES, AlagoasSefazScraper
 
 # ---------------------------------------------------------------------------
 # Factory helpers

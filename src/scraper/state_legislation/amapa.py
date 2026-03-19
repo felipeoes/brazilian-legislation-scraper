@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -8,7 +9,7 @@ import asyncio
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlencode, urljoin
 
 from bs4 import BeautifulSoup, Tag
@@ -20,7 +21,6 @@ from src.scraper.base.converter import (
     wrap_html,
 )
 from src.scraper.base.scraper import StateScraper, flatten_results
-
 
 TYPES = {
     "Decreto Legislativo": 14,
@@ -490,3 +490,7 @@ class AmapaAlapScraper(StateScraper):
         )
         await self._flush_touched_years()
         return results
+
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument

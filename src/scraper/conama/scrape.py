@@ -1,20 +1,24 @@
 from __future__ import annotations
-from typing import TYPE_CHECKING
+
 import re
 import urllib.parse
 from io import BytesIO
+from typing import TYPE_CHECKING
 
 from bs4 import BeautifulSoup
 from loguru import logger
 
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
+
 from src.scraper.base.converter import strip_html_chrome, valid_markdown
+from src.scraper.base.schemas import ScrapedDocument
 from src.scraper.base.scraper import (
     DEFAULT_INVALID_SITUATION,
     DEFAULT_VALID_SITUATION,
     BaseScraper,
     flatten_results,
 )
-from src.scraper.base.schemas import ScrapedDocument
 
 if TYPE_CHECKING:
     pass

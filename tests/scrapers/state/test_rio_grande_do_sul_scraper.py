@@ -25,17 +25,15 @@ Run with:
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from base_tests import ScraperClassTests, SituationsConstantTests, TypesConstantTests
 from bs4 import BeautifulSoup
+from conftest import make_base_scraper, make_failed_request
 
 from src.scraper.state_legislation.rio_grande_do_sul import (
     SITUATIONS,
     TYPES,
     RSAlrsScraper,
 )
-
-from base_tests import TypesConstantTests, SituationsConstantTests, ScraperClassTests
-from conftest import make_base_scraper, make_failed_request
-
 
 # ---------------------------------------------------------------------------
 # Factory helper

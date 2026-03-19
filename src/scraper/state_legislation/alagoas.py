@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -7,12 +8,17 @@ import base64
 import re
 from io import BytesIO
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import quote
 
 from loguru import logger
 
 from src.scraper.base.converter import calc_pages, valid_markdown
 from src.scraper.base.scraper import StateScraper
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
+
 
 # Documentation-only reference — the API does not require filtering by type.
 # An unfiltered request per year returns all norm types at once; each row

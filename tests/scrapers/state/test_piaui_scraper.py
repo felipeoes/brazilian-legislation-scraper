@@ -15,10 +15,10 @@ Run with:
 from unittest.mock import AsyncMock
 
 import pytest
+from base_tests import ScraperClassTests, TypesConstantTests
+from conftest import make_base_scraper
 
 from src.scraper.state_legislation.piaui import TYPES, PiauiAlepiScraper
-from conftest import make_base_scraper
-from base_tests import ScraperClassTests, TypesConstantTests
 
 
 def _make_scraper(**kwargs) -> PiauiAlepiScraper:

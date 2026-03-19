@@ -20,7 +20,9 @@ Run with:
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from base_tests import ScraperClassTests, SituationsConstantTests, TypesConstantTests
 from bs4 import BeautifulSoup
+from conftest import assert_resume_skips, make_base_scraper
 
 from src.scraper.state_legislation.mato_grosso import (
     HISTORIC_TYPES,
@@ -28,9 +30,6 @@ from src.scraper.state_legislation.mato_grosso import (
     TYPES,
     MTAlmtScraper,
 )
-from base_tests import TypesConstantTests, SituationsConstantTests, ScraperClassTests
-from conftest import make_base_scraper, assert_resume_skips
-
 
 # ---------------------------------------------------------------------------
 # Factory helper

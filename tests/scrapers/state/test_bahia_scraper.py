@@ -25,16 +25,15 @@ Run with:
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from base_tests import ScraperClassTests, SituationsConstantTests, TypesConstantTests
 from bs4 import BeautifulSoup
+from conftest import (
+    assert_resume_skips,
+    make_base_scraper,
+    make_failed_request,
+)
 
 from src.scraper.state_legislation.bahia import SITUATIONS, TYPES, BahiaLegislaScraper
-
-from base_tests import TypesConstantTests, ScraperClassTests, SituationsConstantTests
-from conftest import (
-    make_base_scraper,
-    assert_resume_skips,
-    assert_fetch_failure_saves_error,
-)
 
 
 def _make_scraper(**kwargs) -> BahiaLegislaScraper:
@@ -83,7 +82,7 @@ def _make_doc_soup(
     revogado_span: bool = False,
     revogado_div_text: str = "",
 ) -> bytes:
-    """Build a minimal document page for Bahia."""
+    """Build a minimal document page for Bahia (returns bytes)."""
     revogado_span_html = (
         '<span class="revogado">revogado</span>' if revogado_span else ""
     )
@@ -104,11 +103,10 @@ def _make_doc_soup(
     </body></html>""".encode()
 
 
-def _make_response(body: bytes) -> MagicMock:
-    resp = MagicMock()
-    resp.__bool__ = lambda s: True
-    resp.read = AsyncMock(return_value=body)
-    return resp
+def _mock_fetch_bytes(scraper, body: bytes):
+    """Mock request_service.fetch_bytes to return (body, mock_response)."""
+    mock_resp = MagicMock()
+    scraper.request_service.fetch_bytes = AsyncMock(return_value=(body, mock_resp))
 
 
 class TestTypesConstant(TypesConstantTests):
@@ -235,30 +233,51 @@ class TestGetDocData:
     @pytest.mark.asyncio
     async def test_resume_skip_returns_none(self):
         await assert_resume_skips(
-            _make_scraper(), {"title": "Lei 001", "html_link": "/doc/1"}
+            _make_scraper(),
+            {
+                "title": "Lei 001",
+                "html_link": "/doc/1",
+                "year": 2024,
+                "type": "Lei Ordinária",
+                "situation": "Não consta",
+            },
         )
 
     @pytest.mark.asyncio
     async def test_fetch_failure_logs_error_and_returns_none(self):
-        await assert_fetch_failure_saves_error(
-            _make_scraper(), {"title": "Lei 001", "html_link": "/doc/1"}
+        scraper = _make_scraper()
+        scraper._is_already_scraped = MagicMock(return_value=False)
+        scraper._save_doc_error = AsyncMock()
+        scraper.request_service.fetch_bytes = AsyncMock(
+            return_value=make_failed_request()
         )
+        result = await scraper._get_doc_data(
+            {
+                "title": "Lei 001",
+                "html_link": "/doc/1",
+                "year": 2024,
+                "type": "Lei Ordinária",
+                "situation": "Não consta",
+            }
+        )
+        assert result is None
+        scraper._save_doc_error.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_missing_body_div_returns_none(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._fetch_soup_and_mhtml = AsyncMock(
-            return_value=(
-                BeautifulSoup(
-                    "<html><body><p>no body div here</p></body></html>", "html.parser"
-                ),
-                b"fake-mhtml",
-            )
-        )
+        body = b"<html><body><p>no body div here</p></body></html>"
+        _mock_fetch_bytes(scraper, body)
         scraper._save_doc_error = AsyncMock()
         result = await scraper._get_doc_data(
-            {"title": "Lei 001", "html_link": "/doc/1"}
+            {
+                "title": "Lei 001",
+                "html_link": "/doc/1",
+                "year": 2024,
+                "type": "Lei Ordinária",
+                "situation": "Não consta",
+            }
         )
         assert result is None
         scraper._save_doc_error.assert_called_once()
@@ -267,17 +286,18 @@ class TestGetDocData:
     async def test_revogado_span_sets_situation(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._fetch_soup_and_mhtml = AsyncMock(
-            return_value=(
-                BeautifulSoup(_make_doc_soup(revogado_span=True), "html.parser"),
-                b"fake-mhtml",
-            )
-        )
+        _mock_fetch_bytes(scraper, _make_doc_soup(revogado_span=True))
         scraper._get_markdown = AsyncMock(
             return_value="# Lei\n\n" + "Texto revogado. " * 20
         )
         result = await scraper._get_doc_data(
-            {"title": "Lei 001", "html_link": "/doc/1"}
+            {
+                "title": "Lei 001",
+                "html_link": "/doc/1",
+                "year": 2024,
+                "type": "Lei Ordinária",
+                "situation": "Não consta",
+            }
         )
         assert result is not None
         assert result.get("situation") == "Revogado"
@@ -286,20 +306,20 @@ class TestGetDocData:
     async def test_revogado_div_alteracao_sets_situation(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._fetch_soup_and_mhtml = AsyncMock(
-            return_value=(
-                BeautifulSoup(
-                    _make_doc_soup(revogado_div_text="Revogada pelo art. 13 da Lei X"),
-                    "html.parser",
-                ),
-                b"fake-mhtml",
-            )
+        _mock_fetch_bytes(
+            scraper, _make_doc_soup(revogado_div_text="Revogada pelo art. 13 da Lei X")
         )
         scraper._get_markdown = AsyncMock(
             return_value="# Lei\n\n" + "Texto revogado. " * 20
         )
         result = await scraper._get_doc_data(
-            {"title": "Lei 001", "html_link": "/doc/1"}
+            {
+                "title": "Lei 001",
+                "html_link": "/doc/1",
+                "year": 2024,
+                "type": "Lei Ordinária",
+                "situation": "Não consta",
+            }
         )
         assert result is not None
         assert result.get("situation") == "Revogado"
@@ -308,22 +328,21 @@ class TestGetDocData:
     async def test_annex_note_does_not_set_revogado(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._fetch_soup_and_mhtml = AsyncMock(
-            return_value=(
-                BeautifulSoup(
-                    _make_doc_soup(
-                        revogado_div_text="NOTA: Anexos disponíveis no download."
-                    ),
-                    "html.parser",
-                ),
-                b"fake-mhtml",
-            )
+        _mock_fetch_bytes(
+            scraper,
+            _make_doc_soup(revogado_div_text="NOTA: Anexos disponíveis no download."),
         )
         scraper._get_markdown = AsyncMock(
             return_value="# Lei\n\n" + "Texto regular. " * 20
         )
         result = await scraper._get_doc_data(
-            {"title": "Lei 001", "html_link": "/doc/1"}
+            {
+                "title": "Lei 001",
+                "html_link": "/doc/1",
+                "year": 2024,
+                "type": "Lei Ordinária",
+                "situation": "Não consta",
+            }
         )
         assert result is not None
         assert result.get("situation") != "Revogado"
@@ -332,19 +351,18 @@ class TestGetDocData:
     async def test_document_page_category_overrides_listing_type(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._fetch_soup_and_mhtml = AsyncMock(
-            return_value=(
-                BeautifulSoup(
-                    _make_doc_soup(category="Leis Complementares"), "html.parser"
-                ),
-                b"fake-mhtml",
-            )
-        )
+        _mock_fetch_bytes(scraper, _make_doc_soup(category="Leis Complementares"))
         scraper._get_markdown = AsyncMock(
             return_value="# Lei Complementar\n\n" + "Texto da lei. " * 20
         )
         result = await scraper._get_doc_data(
-            {"title": "Lei 001", "type": "Decreto", "html_link": "/doc/1"}
+            {
+                "title": "Lei 001",
+                "type": "Decreto",
+                "html_link": "/doc/1",
+                "year": 2024,
+                "situation": "Não consta",
+            }
         )
         assert result is not None
         assert result["type"] == "Lei Complementar"
@@ -359,17 +377,18 @@ class TestGetDocData:
             '<p style="color:red">Texto da lei.</p>'
             '<div style="font-weight:bold">Outro trecho.</div>'
         )
-        scraper._fetch_soup_and_mhtml = AsyncMock(
-            return_value=(
-                BeautifulSoup(_make_doc_soup(body_html=body_html), "html.parser"),
-                b"fake-mhtml",
-            )
-        )
+        _mock_fetch_bytes(scraper, _make_doc_soup(body_html=body_html))
         scraper._get_markdown = AsyncMock(
             return_value="# Lei Ordinária\n\n" + "Texto da lei. " * 20
         )
         result = await scraper._get_doc_data(
-            {"title": "Lei 001", "html_link": "/doc/1"}
+            {
+                "title": "Lei 001",
+                "html_link": "/doc/1",
+                "year": 2024,
+                "type": "Lei Ordinária",
+                "situation": "Não consta",
+            }
         )
         assert result is not None
         assert scraper._get_markdown.await_args is not None
@@ -382,13 +401,17 @@ class TestGetDocData:
     async def test_invalid_markdown_returns_none(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._fetch_soup_and_mhtml = AsyncMock(
-            return_value=(BeautifulSoup(_make_doc_soup(), "html.parser"), b"fake-mhtml")
-        )
+        _mock_fetch_bytes(scraper, _make_doc_soup())
         scraper._get_markdown = AsyncMock(return_value="short")
         scraper._save_doc_error = AsyncMock()
         result = await scraper._get_doc_data(
-            {"title": "Lei 001", "html_link": "/doc/1"}
+            {
+                "title": "Lei 001",
+                "html_link": "/doc/1",
+                "year": 2024,
+                "type": "Lei Ordinária",
+                "situation": "Não consta",
+            }
         )
         assert result is None
         scraper._save_doc_error.assert_called_once()
@@ -397,12 +420,8 @@ class TestGetDocData:
     async def test_valid_doc_returns_correct_shape(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._fetch_soup_and_mhtml = AsyncMock(
-            return_value=(
-                BeautifulSoup(_make_doc_soup(), "html.parser"),
-                b"fake-mhtml-content",
-            )
-        )
+        html_bytes = _make_doc_soup()
+        _mock_fetch_bytes(scraper, html_bytes)
         valid_md = "# Lei Ordinária\n\n" + "Texto da lei. " * 20
         scraper._get_markdown = AsyncMock(return_value=valid_md)
         result = await scraper._get_doc_data(
@@ -410,18 +429,20 @@ class TestGetDocData:
                 "title": "Lei Ordinária 001/2022",
                 "type": "Lei Ordinária",
                 "html_link": "/doc/1",
+                "year": 2022,
+                "situation": "Não consta",
             }
         )
         assert result is not None
-        assert result["text_markdown"] == valid_md
+        assert result["text_markdown"] == valid_md.strip()
         assert result["type"] == "Lei Ordinária"
         assert "norm_number" in result
         assert "date" in result
         assert "publication_date" in result
         assert "summary" in result
         assert "document_url" in result
-        assert result["_raw_content"] == b"fake-mhtml-content"
-        assert result["_content_extension"] == ".mhtml"
+        assert result["_raw_content"] == html_bytes
+        assert result["_content_extension"] == ".html"
 
 
 class TestScrapeYear:
@@ -542,6 +563,7 @@ async def test_get_docs_links_constituicao_1989_returns_results(
         assert docs[0]["type"] == "Constituição Estadual Atual 1989"
 
 
+@pytest.mark.integration
 async def test_get_doc_data_year_only_returns_valid_markdown(
     integration_scraper_factory,
 ):

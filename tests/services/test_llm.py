@@ -14,9 +14,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.utils.concurrency import RateLimiter
 from src.services.ocr.config import LLMConfig
-
+from src.utils.concurrency import RateLimiter
 
 # =========================================================================
 # LLMConfig
@@ -438,8 +437,8 @@ class TestLLMUsageTracking:
         assert u.reasoning_tokens == 0
 
     def test_accumulate_usage_single_model(self):
-        from src.services.ocr.protocol import LLMUsage
         from src.services.ocr.llm import LLMOCRService
+        from src.services.ocr.protocol import LLMUsage
 
         svc = object.__new__(LLMOCRService)
         svc._usage = {}
@@ -458,8 +457,8 @@ class TestLLMUsageTracking:
         assert stats["gpt-4o"]["output_tokens"] == 130
 
     def test_accumulate_usage_multiple_models(self):
-        from src.services.ocr.protocol import LLMUsage
         from src.services.ocr.llm import LLMOCRService
+        from src.services.ocr.protocol import LLMUsage
 
         svc = object.__new__(LLMOCRService)
         svc._usage = {}
@@ -477,8 +476,9 @@ class TestLLMUsageTracking:
         assert stats["model-b"]["failed_requests"] == 1
 
     def test_openai_usage_extraction_non_stream(self):
-        from src.services.ocr.clients.openai_client import _openai_usage
         from unittest.mock import MagicMock
+
+        from src.services.ocr.clients.openai_client import _openai_usage
 
         u = MagicMock()
         u.prompt_tokens = 150
@@ -548,10 +548,11 @@ class TestLLMUsageTracking:
 
     @pytest.mark.asyncio
     async def test_call_with_retry_acquires_rate_limiter(self):
-        from src.services.ocr.protocol import LLMUsage
-        from src.services.ocr.llm import LLMOCRService
-        from src.services.ocr.config import LLMConfig
         from unittest.mock import AsyncMock, MagicMock
+
+        from src.services.ocr.config import LLMConfig
+        from src.services.ocr.llm import LLMOCRService
+        from src.services.ocr.protocol import LLMUsage
 
         mock_client = MagicMock()
         mock_client.generate = AsyncMock(
@@ -568,16 +569,18 @@ class TestLLMUsageTracking:
 
     @pytest.mark.asyncio
     async def test_call_with_retry_acquires_rate_limiter_per_retry_attempt(self):
-        from src.services.ocr.protocol import LLMUsage
-        from src.services.ocr.llm import LLMOCRService
-        from src.services.ocr.config import LLMConfig
+        from unittest.mock import AsyncMock, MagicMock
+
         from tenacity import (
             AsyncRetrying,
             retry_if_exception_type,
             stop_after_attempt,
             wait_fixed,
         )
-        from unittest.mock import AsyncMock, MagicMock
+
+        from src.services.ocr.config import LLMConfig
+        from src.services.ocr.llm import LLMOCRService
+        from src.services.ocr.protocol import LLMUsage
 
         mock_client = MagicMock()
         mock_client.generate = AsyncMock(
@@ -603,9 +606,10 @@ class TestLLMUsageTracking:
 
     @pytest.mark.asyncio
     async def test_call_with_retry_uses_shared_rate_limiter_from_config(self):
-        from src.services.ocr.llm import LLMOCRService
-        from src.services.ocr.config import LLMConfig
         from unittest.mock import MagicMock
+
+        from src.services.ocr.config import LLMConfig
+        from src.services.ocr.llm import LLMOCRService
 
         shared_limiter = RateLimiter(42)
         mock_client = MagicMock()
@@ -619,10 +623,11 @@ class TestLLMUsageTracking:
 
     @pytest.mark.asyncio
     async def test_call_with_retry_accumulates_usage(self):
-        from src.services.ocr.protocol import LLMUsage
-        from src.services.ocr.llm import LLMOCRService
-        from src.services.ocr.config import LLMConfig
         from unittest.mock import AsyncMock, MagicMock
+
+        from src.services.ocr.config import LLMConfig
+        from src.services.ocr.llm import LLMOCRService
+        from src.services.ocr.protocol import LLMUsage
 
         mock_client = MagicMock()
         mock_client.generate = AsyncMock(
@@ -644,16 +649,18 @@ class TestLLMUsageTracking:
 
     @pytest.mark.asyncio
     async def test_call_with_retry_counts_failed_attempts_across_model_fallback(self):
-        from src.services.ocr.protocol import LLMUsage
-        from src.services.ocr.llm import LLMOCRService
-        from src.services.ocr.config import LLMConfig
+        from unittest.mock import AsyncMock, MagicMock
+
         from tenacity import (
             AsyncRetrying,
             retry_if_exception_type,
             stop_after_attempt,
             wait_fixed,
         )
-        from unittest.mock import AsyncMock, MagicMock
+
+        from src.services.ocr.config import LLMConfig
+        from src.services.ocr.llm import LLMOCRService
+        from src.services.ocr.protocol import LLMUsage
 
         mock_client = MagicMock()
         mock_client.generate = AsyncMock(
@@ -695,15 +702,17 @@ class TestLLMUsageTracking:
 
     @pytest.mark.asyncio
     async def test_call_with_retry_counts_exhausted_failures(self):
-        from src.services.ocr.llm import LLMOCRService
-        from src.services.ocr.config import LLMConfig
+        from unittest.mock import AsyncMock, MagicMock
+
         from tenacity import (
             AsyncRetrying,
             retry_if_exception_type,
             stop_after_attempt,
             wait_fixed,
         )
-        from unittest.mock import AsyncMock, MagicMock
+
+        from src.services.ocr.config import LLMConfig
+        from src.services.ocr.llm import LLMOCRService
 
         mock_client = MagicMock()
         mock_client.generate = AsyncMock(side_effect=RuntimeError("still failing"))

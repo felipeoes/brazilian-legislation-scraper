@@ -9,8 +9,14 @@ from xml.etree import ElementTree as ET
 from bs4 import BeautifulSoup, Tag
 from loguru import logger
 
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
+
 from src.scraper.base.converter import calc_pages, valid_markdown
-from src.scraper.base.scraper import DEFAULT_VALID_SITUATION, StateScraper
+from src.scraper.base.scraper import (
+    DEFAULT_VALID_SITUATION,
+    StateScraper,
+)
 
 if TYPE_CHECKING:
     from src.scraper.base.schemas import ScrapedDocument
@@ -669,17 +675,25 @@ class MaranhaoAlemaScraper(StateScraper):
         if isinstance(norm_type_id, dict):
             subtypes = norm_type_id["subtypes"]
             norm_type_id = norm_type_id["id"]
-            for subtype, subtype_id in subtypes.items():
-                subtype_results = await self._scrape_norms(
+            subtype_tasks = [
+                self._scrape_norms(
                     norm_type,
                     norm_type_id,
                     year,
                     situation,
-                    subtype=subtype,
-                    subtype_id=subtype_id,
+                    subtype=st,
+                    subtype_id=st_id,
                 )
-                if isinstance(subtype_results, list):
-                    results.extend(subtype_results)
+                for st, st_id in subtypes.items()
+            ]
+            subtype_results_list = await self._gather_results(
+                subtype_tasks,
+                context={"year": year, "type": norm_type},
+                desc=f"{self.name} | {norm_type} | subtypes",
+            )
+            for sub_results in subtype_results_list:
+                if isinstance(sub_results, list):
+                    results.extend(sub_results)
         else:
             subtype_results = await self._scrape_norms(
                 norm_type, norm_type_id, year, situation
@@ -689,7 +703,6 @@ class MaranhaoAlemaScraper(StateScraper):
         return results
 
     async def _scrape_year(self, year: int) -> list[dict]:
-        results = []
         situation_items = (
             self.situations.items()
             if isinstance(self.situations, dict)
@@ -713,6 +726,7 @@ class MaranhaoAlemaScraper(StateScraper):
             context={"year": year},
             desc=f"MARANHAO | year {year}",
         )
+        results = []
         for item in gathered:
             if isinstance(item, list):
                 results.extend(item)

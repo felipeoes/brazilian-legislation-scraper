@@ -37,16 +37,15 @@ Run with:
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from base_tests import ScraperClassTests, SituationsConstantTests, TypesConstantTests
 from bs4 import BeautifulSoup
+from conftest import make_base_scraper, make_failed_request
 
 from src.scraper.state_legislation.tocantins import (
     SITUATIONS,
     TYPES,
     TocantinsScraper,
 )
-from base_tests import TypesConstantTests, ScraperClassTests, SituationsConstantTests
-from conftest import make_base_scraper, make_failed_request
-
 
 # ---------------------------------------------------------------------------
 # Factory helper

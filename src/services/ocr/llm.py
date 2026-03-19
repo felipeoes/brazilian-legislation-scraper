@@ -7,25 +7,26 @@ import base64
 
 import aiohttp
 import fitz
-from src.services.ocr.config import LLMConfig
-from src.services.ocr.protocol import LLMClient, LLMUsage
-from src.utils.concurrency import RateLimiter
-from src.utils import clean_md_tag
 from loguru import logger
 from openai import (
-    RateLimitError,
+    APIConnectionError,
     APITimeoutError,
     InternalServerError,
-    APIConnectionError,
+    RateLimitError,
 )
 from tenacity import (
     AsyncRetrying,
     RetryError,
-    stop_after_attempt,
-    wait_random_exponential,
-    wait_fixed,
     retry_if_exception_type,
+    stop_after_attempt,
+    wait_fixed,
+    wait_random_exponential,
 )
+
+from src.services.ocr.config import LLMConfig
+from src.services.ocr.protocol import LLMClient, LLMUsage
+from src.utils import clean_md_tag
+from src.utils.concurrency import RateLimiter
 
 
 class LLMOCRService:

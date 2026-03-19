@@ -1,14 +1,15 @@
 from __future__ import annotations
-from typing import TYPE_CHECKING
+
+import re
+from typing import TYPE_CHECKING, cast
+from urllib.parse import unquote, urljoin, urlparse
 
 if TYPE_CHECKING:
     from src.scraper.base.schemas import ScrapedDocument
-import re
-from urllib.parse import unquote, urljoin, urlparse
-from typing import cast
 
 from bs4 import BeautifulSoup, Tag
 from loguru import logger
+
 from src.scraper.base.converter import (
     calc_pages,
     infer_type_from_title,
@@ -722,12 +723,12 @@ class CamaraDepScraper(BaseScraper):
                 h1.decompose()
 
             ementa_nodes = content_div.find_all("p", class_="ementa")
-            html_with_ementa = content_div.prettify()
+            html_with_ementa = str(content_div)
 
             for ementa in ementa_nodes:
                 ementa.decompose()
 
-            html_string = content_div.prettify()
+            html_string = str(content_div)
 
             text_markdown = await self._get_markdown(html_content=html_string)
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from typing import TYPE_CHECKING
 from urllib.parse import urlencode, urljoin
 
 from bs4 import BeautifulSoup
@@ -10,6 +11,9 @@ from loguru import logger
 from src.scraper.base.converter import calc_pages, strip_html_chrome, valid_markdown
 from src.scraper.base.schemas import ScrapedDocument
 from src.scraper.base.scraper import StateScraper
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 
 
 TYPES = {
@@ -164,6 +168,7 @@ class MTAlmtScraper(StateScraper):
         if not soup:
             return 0
 
+        """Get total number of norms from search page"""
         total_items = self.regex_total_items.search(str(soup))
         if total_items:
             return int(total_items.group(1).replace(".", ""))

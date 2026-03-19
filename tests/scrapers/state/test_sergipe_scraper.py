@@ -30,17 +30,16 @@ Run with:
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from base_tests import ScraperClassTests, SituationsConstantTests, TypesConstantTests
+from conftest import make_base_scraper, make_failed_request
 
 from src.scraper.state_legislation.sergipe import (
+    INVALID_SITUATIONS,
     SITUATIONS,
     TYPES,
     VALID_SITUATIONS,
-    INVALID_SITUATIONS,
     SergipeLegsonScraper,
 )
-from base_tests import TypesConstantTests, SituationsConstantTests, ScraperClassTests
-from conftest import make_base_scraper, make_failed_request
-
 
 # ---------------------------------------------------------------------------
 # Factory helper
@@ -343,6 +342,7 @@ class TestGetDocData:
             "id": "42",
             "title": "Lei Ordinária 42 de 2023",
             "year": 2023,
+            "type": "Lei Ordinária",
             "summary": "Ementa.",
             "situation": "Em Vigor",
             "date": "2023-01-01T00:00:00",

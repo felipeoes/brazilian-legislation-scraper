@@ -9,6 +9,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+LLM_MODEL = os.environ.get("LLM_MODEL", "")
+PROVIDER_BASE_URL = os.environ.get("PROVIDER_BASE_URL", "")
+
 SAVE_DIR = Path(os.environ.get("SAVE_DIR", "outputs/legislation"))
 
 _raw_state_dir = os.environ.get("STATE_LEGISLATION_SAVE_DIR")

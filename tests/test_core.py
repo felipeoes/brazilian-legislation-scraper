@@ -10,16 +10,15 @@ Covers:
 import asyncio
 import json
 import tempfile
-import fitz
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
+import fitz
 import pytest
 
+from src.services.request.service import FailedRequest, RequestService
 from src.utils import clean_md_tag
 from src.utils.concurrency import RateLimiter
-from src.services.request.service import FailedRequest, RequestService
-
 
 # =========================================================================
 # clean_md_tag utility
@@ -178,6 +177,53 @@ class TestFailedRequest:
         r = repr(fr)
         assert "FailedRequest" in r
         assert "500" in r
+
+
+# =========================================================================
+# RequestService.fetch_bytes — timeout retry
+# =========================================================================
+
+
+class TestFetchBytesTimeoutRetry:
+    """fetch_bytes retries when resp.read() raises TimeoutError."""
+
+    @pytest.mark.asyncio
+    async def test_retries_on_body_read_timeout(self):
+        svc = RequestService(rps=100, max_retries=3, verbose=False)
+
+        call_count = 0
+
+        async def fake_do_request(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            resp = MagicMock()
+            if call_count < 3:
+                resp.read = AsyncMock(side_effect=asyncio.TimeoutError())
+            else:
+                resp.read = AsyncMock(return_value=b"ok")
+            return resp
+
+        svc._do_request = fake_do_request
+
+        result = await svc.fetch_bytes("http://example.com")
+        assert call_count == 3
+        body, _resp = result
+        assert body == b"ok"
+
+    @pytest.mark.asyncio
+    async def test_returns_failed_request_after_all_retries_exhausted(self):
+        svc = RequestService(rps=100, max_retries=2, verbose=False)
+
+        async def fake_do_request(*args, **kwargs):
+            resp = MagicMock()
+            resp.read = AsyncMock(side_effect=asyncio.TimeoutError())
+            return resp
+
+        svc._do_request = fake_do_request
+
+        result = await svc.fetch_bytes("http://example.com")
+        assert not result  # FailedRequest is falsy
+        assert "example.com" in result.url
 
 
 # =========================================================================
@@ -351,6 +397,17 @@ class TestBaseScraperHelpers:
         assert not valid
         assert "server error" in reason
 
+    def test_valid_markdown_dotnet_error(self):
+        from src.scraper.base.converter import valid_markdown
+
+        text = (
+            "Object reference not set to an instance of an object\n"
+            "Nossa equipe resolverá o problema, você pode tentar mais tarde."
+        )
+        valid, reason = valid_markdown(text)
+        assert not valid
+        assert "server error" in reason
+
     def test_valid_markdown_ok(self):
         from src.scraper.base.converter import valid_markdown
 
@@ -387,6 +444,126 @@ class TestBaseScraperHelpers:
 
         assert "Art." in markdown
         assert len(markdown) > 50
+
+    @pytest.mark.asyncio
+    async def test_download_and_convert_non_pdf_with_pdf_content_type(self):
+        """HTML bytes with content-type application/pdf should be detected early."""
+        from src.scraper.base.converter import MarkdownConverter
+        from src.scraper.base.scraper import BaseScraper
+
+        scraper = BaseScraper.__new__(BaseScraper)
+        scraper._converter = MarkdownConverter(scraper)
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.content_type = "application/pdf"
+        mock_resp.headers = {}
+        scraper.request_service = MagicMock()
+        scraper.request_service.fetch_bytes = AsyncMock(
+            return_value=(b"<html><body>Error</body></html>", mock_resp)
+        )
+        scraper.request_service.detect_content_info = MagicMock(
+            return_value=("document.pdf", "application/pdf")
+        )
+
+        md, body, ext = await scraper._download_and_convert(
+            "http://example.com/doc.pdf"
+        )
+        assert md == ""
+        assert body == b""
+        assert ext == ""
+
+    @pytest.mark.asyncio
+    async def test_download_and_convert_non_pdf_with_pdf_url(self):
+        """HTML bytes from a .pdf URL with text/html content-type should be detected."""
+        from src.scraper.base.converter import MarkdownConverter
+        from src.scraper.base.scraper import BaseScraper
+
+        scraper = BaseScraper.__new__(BaseScraper)
+        scraper._converter = MarkdownConverter(scraper)
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.content_type = "text/html"
+        mock_resp.headers = {}
+        scraper.request_service = MagicMock()
+        scraper.request_service.fetch_bytes = AsyncMock(
+            return_value=(b"<html><body>Rate limited</body></html>", mock_resp)
+        )
+        scraper.request_service.detect_content_info = MagicMock(
+            return_value=("document.html", "text/html")
+        )
+
+        md, body, ext = await scraper._download_and_convert(
+            "http://example.com/doc.pdf"
+        )
+        assert md == ""
+        assert body == b""
+
+    @pytest.mark.asyncio
+    async def test_download_and_convert_valid_pdf_passes_check(self):
+        """Bytes starting with %PDF should pass the guard and reach conversion."""
+        from src.scraper.base.converter import MarkdownConverter
+        from src.scraper.base.scraper import BaseScraper
+
+        pdf = fitz.open()
+        page = pdf.new_page()
+        page.insert_text((72, 72), "Art. 1º Conteúdo legal importante. " * 5)
+        pdf_bytes = pdf.tobytes()
+        pdf.close()
+
+        scraper = BaseScraper.__new__(BaseScraper)
+        scraper._converter = MarkdownConverter(scraper)
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.content_type = "application/pdf"
+        mock_resp.headers = {}
+        scraper.request_service = MagicMock()
+        scraper.request_service.fetch_bytes = AsyncMock(
+            return_value=(pdf_bytes, mock_resp)
+        )
+        scraper.request_service.detect_content_info = MagicMock(
+            return_value=("document.pdf", "application/pdf")
+        )
+        scraper._converter.response_to_markdown = AsyncMock(
+            return_value="Art. 1º Conteúdo legal importante."
+        )
+
+        md, body, ext = await scraper._download_and_convert(
+            "http://example.com/doc.pdf"
+        )
+        assert md != ""
+        assert body == pdf_bytes
+        scraper._converter.response_to_markdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_download_and_convert_html_not_flagged(self):
+        """HTML bytes from a .html URL should not be flagged as non-PDF."""
+        from src.scraper.base.converter import MarkdownConverter
+        from src.scraper.base.scraper import BaseScraper
+
+        html_bytes = b"<html><body><h1>Lei 001</h1><p>Conteudo.</p></body></html>"
+        scraper = BaseScraper.__new__(BaseScraper)
+        scraper._converter = MarkdownConverter(scraper)
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.content_type = "text/html"
+        mock_resp.headers = {}
+        scraper.request_service = MagicMock()
+        scraper.request_service.fetch_bytes = AsyncMock(
+            return_value=(html_bytes, mock_resp)
+        )
+        scraper.request_service.detect_content_info = MagicMock(
+            return_value=("document.html", "text/html")
+        )
+        scraper._converter.response_to_markdown = AsyncMock(
+            return_value="# Lei 001\n\nConteudo."
+        )
+
+        md, body, ext = await scraper._download_and_convert(
+            "http://example.com/doc.html"
+        )
+        assert md != ""
+        assert body == html_bytes
+        scraper._converter.response_to_markdown.assert_awaited_once()
 
     def test_flatten_results(self):
         from src.scraper.base.scraper import flatten_results
@@ -429,8 +606,8 @@ class TestBaseScraperHelpers:
 
         merged = merge_context(result, context)
 
-        assert "type" not in merged
-        assert "situation" not in merged
+        assert merged["type"] == ""
+        assert merged["situation"] == ""
 
     def test_merge_context_uses_meaningful_context_type_when_result_blank(self):
         from src.scraper.base.scraper import merge_context
@@ -463,9 +640,9 @@ class TestBaseScraperHelpers:
 
     @pytest.mark.asyncio
     async def test_runtime_logs_are_isolated_per_scraper(self, monkeypatch):
-        import src.scraper.base.scraper as scraper_module
-
         from loguru import logger
+
+        import src.scraper.base.scraper as scraper_module
         from src.scraper.base.scraper import BaseScraper
 
         class DummyLoggingScraper(BaseScraper):
@@ -514,9 +691,9 @@ class TestBaseScraperHelpers:
 
     @pytest.mark.asyncio
     async def test_runtime_log_is_overwritten_each_run(self, monkeypatch):
-        import src.scraper.base.scraper as scraper_module
-
         from loguru import logger
+
+        import src.scraper.base.scraper as scraper_module
         from src.scraper.base.scraper import BaseScraper
 
         class DummyLoggingScraper(BaseScraper):
@@ -568,7 +745,6 @@ class TestBaseScraperHelpers:
     @pytest.mark.asyncio
     async def test_save_doc_error_uses_scraper_log_dir(self, monkeypatch):
         import src.scraper.base.scraper as scraper_module
-
         from src.scraper.base.scraper import BaseScraper
 
         class DummyLoggingScraper(BaseScraper):

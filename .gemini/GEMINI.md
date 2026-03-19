@@ -1,7 +1,7 @@
 # Brazilian Legislation Scraper
 
 ## Project Overview
-This is a Python-based asynchronous web scraper designed to collect legal documents regarding Brazilian legislation at the federal and state levels, as well as from regulatory bodies like CONAMA and ICMBio. It extracts structured data and saves it as JSON files grouped by year.
+This is a Python-based asynchronous web scraper designed to collect legal documents regarding Brazilian legislation at the federal and state levels, as well as from environment regulatory bodies like CONAMA and ICMBio. It extracts structured data and saves it as JSON files grouped by year.
 
 **Key Features & Architecture:**
 - **Concurrency:** Built heavily on `asyncio` and `aiohttp` for non-blocking I/O.

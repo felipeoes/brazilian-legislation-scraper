@@ -7,8 +7,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from src.utils.concurrency import RateLimiter
     from src.services.ocr.protocol import LLMClient
+    from src.utils.concurrency import RateLimiter
 
 
 @dataclass
@@ -56,7 +56,7 @@ class LLMConfig:
         client = BedrockClient(
             base_url=base_url,
             api_key=api_key,
-            request_service=RequestService(),
+            request_service=RequestService(rps=10, max_retries=6),
             inference_config={"maxTokens": 32768},
             performance_config={"latency": "standard"},
         )

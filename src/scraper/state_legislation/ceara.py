@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -7,6 +8,7 @@ import asyncio
 import re
 from collections import defaultdict
 from datetime import datetime
+from typing import TYPE_CHECKING
 from urllib.parse import urlencode, urljoin
 
 from bs4 import BeautifulSoup, Tag
@@ -15,6 +17,10 @@ from loguru import logger
 from src.scraper.base.converter import valid_markdown
 from src.scraper.base.scraper import StateScraper
 from src.services.browser.playwright import BrowserService
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
+
 
 TYPES = {
     "Ato Deliberativo": "ato-deliberativo",

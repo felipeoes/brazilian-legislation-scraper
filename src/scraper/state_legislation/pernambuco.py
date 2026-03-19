@@ -1,10 +1,12 @@
 from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from src.scraper.base.schemas import ScrapedDocument
 import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from urllib.parse import urljoin
 
 import aiohttp
@@ -18,6 +20,9 @@ from src.scraper.base.scraper import (
     StateScraper,
 )
 from src.services.request.service import FailedRequest
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 
 
 TYPES = {

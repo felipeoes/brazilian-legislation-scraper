@@ -8,8 +8,8 @@ from __future__ import annotations
 
 from urllib.parse import quote
 
-
 from loguru import logger
+
 from src.services.request.service import RequestService
 
 from ..protocol import LLMUsage

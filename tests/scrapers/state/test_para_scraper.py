@@ -25,18 +25,16 @@ import tempfile
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from base_tests import ScraperClassTests, SituationsConstantTests, TypesConstantTests
+from conftest import assert_resume_skips, make_base_scraper, make_failed_request
 
 from src.scraper.state_legislation.para import (
+    _FEDERAL_TYPES,
+    _TYPE_NORMALIZE,
     SITUATIONS,
     TYPES,
     ParaAlepaScraper,
-    _FEDERAL_TYPES,
-    _TYPE_NORMALIZE,
 )
-
-from base_tests import TypesConstantTests, SituationsConstantTests, ScraperClassTests
-from conftest import make_base_scraper, make_failed_request, assert_resume_skips
-
 
 # ---------------------------------------------------------------------------
 # Factory helper

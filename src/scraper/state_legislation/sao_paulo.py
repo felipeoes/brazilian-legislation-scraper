@@ -1,16 +1,21 @@
 from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     pass
 import re
 from io import BytesIO
+from typing import TYPE_CHECKING
 from urllib.parse import urlencode, urljoin
 
 from loguru import logger
 
 from src.scraper.base.converter import valid_markdown, wrap_html
 from src.scraper.base.scraper import StateScraper
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 
 
 # We don't have situations for São Paulo, since the website only publishes valid documents (no invalid, no expired, no archived, no revoked, etc.)
@@ -222,7 +227,7 @@ class SaoPauloAlespScraper(StateScraper):
 
     async def _get_doc_data(
         self, doc_info: dict, norm_type: str = "NA", year: str = ""
-    ) -> dict | None:
+    ) -> ScrapedDocument | None:
         """Get document data from given html link"""
         doc_html_link = doc_info["html_link"]
         title = doc_info["title"]

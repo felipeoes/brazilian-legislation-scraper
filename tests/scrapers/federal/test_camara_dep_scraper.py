@@ -16,8 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from bs4 import BeautifulSoup
 
-from src.scraper.federal_legislation.scrape import CamaraDepScraper, TYPES
-
+from src.scraper.federal_legislation.scrape import TYPES, CamaraDepScraper
 
 # ---------------------------------------------------------------------------
 # Helpers

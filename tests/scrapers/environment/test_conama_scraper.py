@@ -21,12 +21,11 @@ import re
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from bs4 import BeautifulSoup
-
-from src.scraper.conama.scrape import TYPES, ConamaScraper
 from base_tests import TypesConstantTests
+from bs4 import BeautifulSoup
 from conftest import make_base_scraper, make_failed_request
 
+from src.scraper.conama.scrape import TYPES, ConamaScraper
 
 # ---------------------------------------------------------------------------
 # Factory helpers

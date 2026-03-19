@@ -1,19 +1,20 @@
 """Tests for DFSinjScraper (Distrito Federal)."""
 
+import json
 import tempfile
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from base_tests import ScraperClassTests, SituationsConstantTests, TypesConstantTests
+from conftest import assert_resume_skips, make_base_scraper
 
 from src.scraper.state_legislation.distrito_federal import (
-    DFSinjScraper,
     INVALID_SITUATIONS,
     SITUATIONS,
     TYPES,
     VALID_SITUATIONS,
+    DFSinjScraper,
 )
-from base_tests import ScraperClassTests, SituationsConstantTests, TypesConstantTests
-from conftest import make_base_scraper, assert_resume_skips
 
 
 def _make_scraper(**kwargs) -> DFSinjScraper:
@@ -88,6 +89,21 @@ Sistema Integrado de Normas Jurídicas do Distrito Federal - SINJ-DF
 Art. 1º Texto principal da norma com conteúdo suficiente para validação.
 Art. 2º Disposições complementares da norma do Distrito Federal.
 Este texto não substitui o publicado no DODF.
+</div></body></html>""".encode("utf-8")
+
+
+def _make_structured_html_body(
+    title_line: str,
+    summary: str = "",
+) -> bytes:
+    """HTML with <p> tags in div_texto — matches the download_url format."""
+    summary_tag = f"\n<p>{summary}</p>" if summary else ""
+    return f"""<html><body><div id="div_texto">
+<p>Sistema Integrado de Normas Jurídicas do Distrito Federal - SINJ-DF</p>
+<p>{title_line}</p>{summary_tag}
+<p>Art. 1º Texto principal da norma com conteúdo suficiente para validação.</p>
+<p>Art. 2º Disposições complementares da norma do Distrito Federal.</p>
+<p>Este texto não substitui o publicado no DODF.</p>
 </div></body></html>""".encode("utf-8")
 
 
@@ -326,14 +342,13 @@ class TestGetDocsLinks:
     @pytest.mark.asyncio
     async def test_returns_docs_with_any_type_and_situation(self):
         scraper = _make_scraper()
-        response = MagicMock()
-        response.__bool__ = lambda s: True
-        response.json = AsyncMock(
-            return_value=_make_search_response(
-                _make_source(norm_type="Tipo Inesperado", situation="Situação Nova")
-            )
+        search_data = _make_search_response(
+            _make_source(norm_type="Tipo Inesperado", situation="Situação Nova")
         )
-        scraper.request_service.make_request = AsyncMock(return_value=response)
+        body = json.dumps(search_data).encode()
+        scraper.request_service.fetch_bytes = AsyncMock(
+            return_value=(body, MagicMock())
+        )
 
         docs = await scraper._get_docs_links(
             scraper.search_url, scraper._build_payload(2010)
@@ -348,25 +363,24 @@ class TestGetDocsLinks:
     @pytest.mark.asyncio
     async def test_uses_fontes_file_id_when_current_file_missing(self):
         scraper = _make_scraper()
-        response = MagicMock()
-        response.__bool__ = lambda s: True
-        response.json = AsyncMock(
-            return_value=_make_search_response(
-                _make_source(
-                    file_id=None,
-                    fontes=[
-                        {
-                            "ar_fonte": {
-                                "id_file": "fonte-id",
-                                "filename": "fonte.html",
-                                "mimetype": "text/html",
-                            }
+        search_data = _make_search_response(
+            _make_source(
+                file_id=None,
+                fontes=[
+                    {
+                        "ar_fonte": {
+                            "id_file": "fonte-id",
+                            "filename": "fonte.html",
+                            "mimetype": "text/html",
                         }
-                    ],
-                )
+                    }
+                ],
             )
         )
-        scraper.request_service.make_request = AsyncMock(return_value=response)
+        body = json.dumps(search_data).encode()
+        scraper.request_service.fetch_bytes = AsyncMock(
+            return_value=(body, MagicMock())
+        )
 
         docs = await scraper._get_docs_links(
             scraper.search_url, scraper._build_payload(2010)
@@ -390,18 +404,15 @@ class TestGetDocData:
         )
 
     @pytest.mark.asyncio
-    async def test_prefers_textoarquivo_html(self):
+    async def test_prefers_download_url_html(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        html_response = MagicMock()
-        html_response.__bool__ = lambda s: True
-        html_response.read = AsyncMock(
-            return_value=_make_html_text_body(
-                "PORTARIA Nº 300, DE 30 DE DEZEMBRO DE 2010."
-            )
+        html_body = _make_structured_html_body(
+            "PORTARIA Nº 300, DE 30 DE DEZEMBRO DE 2010."
         )
-        scraper.request_service.make_request = AsyncMock(return_value=html_response)
-        scraper._capture_mhtml = AsyncMock(return_value=b"fake-mhtml")
+        scraper.request_service.fetch_bytes = AsyncMock(
+            return_value=(html_body, MagicMock())
+        )
 
         result = await scraper._get_doc_data(
             {
@@ -419,27 +430,25 @@ class TestGetDocData:
 
         assert result is not None
         assert result["document_url"].endswith("/Norma/67028/document.html")
-        assert result["_content_extension"] == ".mhtml"
+        assert result["_content_extension"] == ".html"
+        assert isinstance(result["_raw_content"], bytes)
         assert result["text_markdown"].startswith("PORTARIA Nº 300")
         assert "Sistema Integrado" not in result["text_markdown"]
         assert "Este texto não substitui" not in result["text_markdown"]
-        assert scraper.request_service.make_request.await_count == 1
+        assert scraper.request_service.fetch_bytes.await_count == 1
 
     @pytest.mark.asyncio
     async def test_html_endpoint_strips_summary_from_markdown(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
         summary = "Dispõe sobre a alteração da estrutura administrativa."
-        html_response = MagicMock()
-        html_response.__bool__ = lambda s: True
-        html_response.read = AsyncMock(
-            return_value=_make_html_text_body(
-                "PORTARIA Nº 300, DE 30 DE DEZEMBRO DE 2010.",
-                summary=summary,
-            )
+        html_body = _make_structured_html_body(
+            "PORTARIA Nº 300, DE 30 DE DEZEMBRO DE 2010.",
+            summary=summary,
         )
-        scraper.request_service.make_request = AsyncMock(return_value=html_response)
-        scraper._capture_mhtml = AsyncMock(return_value=b"fake-mhtml")
+        scraper.request_service.fetch_bytes = AsyncMock(
+            return_value=(html_body, MagicMock())
+        )
 
         result = await scraper._get_doc_data(
             {
@@ -461,20 +470,31 @@ class TestGetDocData:
         assert result["text_markdown"].startswith("PORTARIA Nº 300")
 
     @pytest.mark.asyncio
-    async def test_prefers_text_url_when_file_is_pdf(self):
-        """When file_name is a PDF, document_url should be text_url, not the PDF download."""
+    async def test_pdf_file_skips_html_from_text_endpoint(self):
+        """When file_name is a PDF and text endpoint returns HTML, skip to /arquivo."""
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        html_response = MagicMock()
-        html_response.__bool__ = lambda s: True
-        html_response.read = AsyncMock(
-            return_value=_make_html_text_body(
-                "PORTARIA Nº 300, DE 30 DE DEZEMBRO DE 2010.",
-                download_href="./Norma/67028/document.pdf",
-            )
+
+        # Attempt 2: text endpoint returns HTML (not PDF binary)
+        html_body = _make_html_text_body(
+            "PORTARIA Nº 300, DE 30 DE DEZEMBRO DE 2010.",
+            download_href="./Norma/67028/document.pdf",
         )
-        scraper.request_service.make_request = AsyncMock(return_value=html_response)
-        scraper._capture_mhtml = AsyncMock(return_value=b"fake-mhtml")
+
+        # Attempt 3: /arquivo returns actual PDF binary
+        pdf_body = b"%PDF-1.4 fake pdf"
+        pdf_response = MagicMock()
+
+        scraper.request_service.fetch_bytes = AsyncMock(
+            side_effect=[(html_body, MagicMock()), (pdf_body, pdf_response)]
+        )
+        scraper.request_service.detect_content_info = MagicMock(
+            return_value=("document.pdf", "application/pdf")
+        )
+        scraper._fetch_diary_pdf_fallback = AsyncMock(return_value=None)
+        scraper._get_markdown = AsyncMock(
+            return_value="# Norma\n\nArt. 1 Texto suficiente. " * 8
+        )
 
         result = await scraper._get_doc_data(
             {
@@ -491,32 +511,102 @@ class TestGetDocData:
         )
 
         assert result is not None
-        # Should use text_url (TextoArquivoNorma.aspx), NOT the PDF download link
+        assert result["document_url"].endswith("/Norma/67028/arquivo")
+        assert result["_content_extension"] == ".pdf"
+        assert scraper.request_service.fetch_bytes.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_pdf_file_accepts_pdf_binary_from_text_endpoint(self):
+        """When file_name is a PDF and text endpoint returns PDF binary, use it."""
+        scraper = _make_scraper()
+        scraper._is_already_scraped = MagicMock(return_value=False)
+        pdf_body = b"%PDF-1.4 fake pdf content"
+        scraper.request_service.fetch_bytes = AsyncMock(
+            return_value=(pdf_body, MagicMock())
+        )
+        scraper._get_markdown = AsyncMock(
+            return_value="# Norma\n\nArt. 1 Texto suficiente. " * 8
+        )
+
+        result = await scraper._get_doc_data(
+            {
+                "title": "Portaria 300 de 30/12/2010",
+                "type": "Portaria",
+                "number": "300",
+                "situation": "Sem Revogação Expressa",
+                "year": 2010,
+                "document_url": f"{scraper.base_url}/Norma/67028/arquivo",
+                "file_id": "text-id",
+                "file_name": "document.pdf",
+                "ch_norma": "67028",
+            }
+        )
+
+        assert result is not None
         assert "TextoArquivoNorma.aspx" in result["document_url"]
-        assert not result["document_url"].endswith(".pdf")
-        assert result["_content_extension"] == ".mhtml"
-        assert scraper.request_service.make_request.await_count == 1
+        assert result["_content_extension"] == ".pdf"
+        assert result["_raw_content"] == pdf_body
+        assert scraper.request_service.fetch_bytes.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_rejects_sinj_server_error_page(self):
+        """SINJ .NET error pages (HTTP 200 with error in div_texto) must not be saved."""
+        scraper = _make_scraper()
+        scraper._is_already_scraped = MagicMock(return_value=False)
+        scraper._save_doc_error = AsyncMock()
+
+        error_body = (
+            b'<html><body><div id="div_texto">'
+            b"Object reference not set to an instance of an object\n"
+            b"Nossa equipe resolver\xc3\xa1 o problema, "
+            b"voc\xc3\xaa pode tentar mais tarde ou entrar em contato conosco."
+            b"</div></body></html>"
+        )
+
+        fallback_resp = MagicMock()
+
+        scraper.request_service.fetch_bytes = AsyncMock(
+            side_effect=[
+                (error_body, MagicMock()),
+                (error_body, MagicMock()),
+                (error_body, fallback_resp),
+            ]
+        )
+        scraper.request_service.detect_content_info = MagicMock(
+            return_value=(None, "text/html")
+        )
+        scraper._get_markdown = AsyncMock(return_value="")
+
+        result = await scraper._get_doc_data(
+            {
+                "title": "Portaria 1350 de 12/12/2025",
+                "type": "Portaria",
+                "number": "1350",
+                "situation": "Sem Revogação Expressa",
+                "year": 2025,
+                "document_url": f"{scraper.base_url}/Norma/abc123/arquivo",
+                "file_id": "text-id",
+                "file_name": "document.html",
+                "ch_norma": "abc123",
+            }
+        )
+
+        assert result is None
 
     @pytest.mark.asyncio
     async def test_falls_back_to_raw_pdf_when_text_endpoint_is_invalid(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        invalid_html_response = MagicMock()
-        invalid_html_response.__bool__ = lambda s: True
-        invalid_html_response.read = AsyncMock(
-            return_value=b"<html><body>sem div_texto</body></html>"
-        )
+        invalid_html_body = b"<html><body>sem div_texto</body></html>"
 
+        pdf_body = b"%PDF-1.4 fake pdf"
         pdf_response = MagicMock()
-        pdf_response.__bool__ = lambda s: True
-        pdf_response.read = AsyncMock(return_value=b"%PDF-1.4 fake pdf")
-        pdf_response.content_type = "application/pdf"
-        pdf_response.headers = {
-            "Content-Disposition": 'inline; filename="document.pdf"'
-        }
 
-        scraper.request_service.make_request = AsyncMock(
-            side_effect=[invalid_html_response, pdf_response]
+        scraper.request_service.fetch_bytes = AsyncMock(
+            side_effect=[
+                (invalid_html_body, MagicMock()),
+                (pdf_body, pdf_response),
+            ]
         )
         scraper.request_service.detect_content_info = MagicMock(
             return_value=("document.pdf", "application/pdf")
@@ -546,12 +636,12 @@ class TestGetDocData:
 
     @pytest.mark.asyncio
     async def test_skips_norm_when_text_is_in_maintenance(self):
+        """Maintenance detected from download_url (Attempt 1 for HTML files)."""
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        response = MagicMock()
-        response.__bool__ = lambda s: True
-        response.read = AsyncMock(return_value=_make_maintenance_body())
-        scraper.request_service.make_request = AsyncMock(return_value=response)
+        scraper.request_service.fetch_bytes = AsyncMock(
+            return_value=(_make_maintenance_body(), MagicMock())
+        )
         scraper._save_doc_error = AsyncMock()
 
         result = await scraper._get_doc_data(
@@ -570,7 +660,95 @@ class TestGetDocData:
 
         assert result is None
         scraper._save_doc_error.assert_awaited_once()
-        assert scraper.request_service.make_request.await_count == 1
+        assert scraper.request_service.fetch_bytes.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_text_url_when_download_url_fails(self):
+        """When download_url (Attempt 1) returns falsy, falls back to text_url (Attempt 2)."""
+        scraper = _make_scraper()
+        scraper._is_already_scraped = MagicMock(return_value=False)
+
+        failed = MagicMock()
+        failed.__bool__ = MagicMock(return_value=False)
+
+        valid_body = _make_html_text_body("PORTARIA Nº 300, DE 30 DE DEZEMBRO DE 2010.")
+
+        scraper.request_service.fetch_bytes = AsyncMock(
+            side_effect=[failed, (valid_body, MagicMock())]
+        )
+
+        result = await scraper._get_doc_data(
+            {
+                "title": "Portaria 300 de 30/12/2010",
+                "type": "Portaria",
+                "number": "300",
+                "situation": "Sem Revogação Expressa",
+                "year": 2010,
+                "document_url": f"{scraper.base_url}/Norma/67028/arquivo",
+                "file_id": "text-id",
+                "file_name": "document.html",
+                "ch_norma": "67028",
+            }
+        )
+
+        assert result is not None
+        assert result["_content_extension"] == ".html"
+        assert isinstance(result["_raw_content"], bytes)
+        assert result["text_markdown"].startswith("PORTARIA Nº 300")
+        assert scraper.request_service.fetch_bytes.await_count == 2
+
+
+class TestExtractHtmlMarkdown:
+    @pytest.mark.asyncio
+    async def test_prefers_markitdown_for_structured_html(self):
+        """div_texto with <p> tags → markitdown path (preserves paragraph breaks)."""
+        from bs4 import BeautifulSoup
+
+        scraper = _make_scraper()
+        html = """<div id="div_texto">
+<p>DECRETO Nº 100, DE 01 DE JANEIRO DE 2025</p>
+<p>Art. 1º Texto principal da norma com conteúdo suficiente para validação.</p>
+<p>Art. 2º Disposições complementares da norma do Distrito Federal.</p>
+</div>"""
+        soup = BeautifulSoup(f"<html><body>{html}</body></html>", "html.parser")
+        # _get_markdown (markitdown) produces paragraph breaks
+        scraper._get_markdown = AsyncMock(
+            return_value=(
+                "DECRETO Nº 100, DE 01 DE JANEIRO DE 2025\n\n"
+                "Art. 1º Texto principal da norma com conteúdo suficiente para validação.\n\n"
+                "Art. 2º Disposições complementares da norma do Distrito Federal."
+            )
+        )
+
+        result = await scraper._extract_html_markdown(
+            soup, {"type": "Decreto", "number": "100"}
+        )
+
+        assert "\n\n" in result
+        scraper._get_markdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_uses_get_text_for_flat_content(self):
+        """div_texto with flat text (no block tags) → get_text path."""
+        from bs4 import BeautifulSoup
+
+        scraper = _make_scraper()
+        html = """<div id="div_texto">
+DECRETO Nº 100, DE 01 DE JANEIRO DE 2025
+Art. 1º Texto principal da norma com conteúdo suficiente para validação.
+Art. 2º Disposições complementares da norma do Distrito Federal.
+</div>"""
+        soup = BeautifulSoup(f"<html><body>{html}</body></html>", "html.parser")
+        scraper._get_markdown = AsyncMock()
+
+        result = await scraper._extract_html_markdown(
+            soup, {"type": "Decreto", "number": "100"}
+        )
+
+        assert result.startswith("DECRETO Nº 100")
+        assert "Art. 1º" in result
+        # get_text path does NOT call _get_markdown
+        scraper._get_markdown.assert_not_awaited()
 
 
 class TestScrapeYear:

@@ -24,16 +24,15 @@ Run with:
 from unittest.mock import AsyncMock
 
 import pytest
+from base_tests import ScraperClassTests, SituationsConstantTests, TypesConstantTests
 from bs4 import BeautifulSoup
+from conftest import make_base_scraper, make_failed_request
 
 from src.scraper.state_legislation.rio_grande_do_norte import (
     SITUATIONS,
     TYPES,
     RNAlrnScraper,
 )
-from base_tests import TypesConstantTests, ScraperClassTests, SituationsConstantTests
-from conftest import make_base_scraper, make_failed_request
-
 
 # ---------------------------------------------------------------------------
 # Factory helper
@@ -221,6 +220,8 @@ class TestGetDocData:
             "pdf_link": "https://www.al.rn.leg.br/pdf/lei42.pdf",
             "title": "Lei Ordinária 42/2022",
             "year": 2022,
+            "type": "Lei Ordinária",
+            "situation": "Não consta",
             "summary": "",
         }
         base.update(kwargs)
@@ -275,7 +276,7 @@ class TestGetDocData:
         doc = self._make_doc()
         result = await scraper._get_doc_data(doc)
         assert result is not None
-        assert result["text_markdown"] == valid_md
+        assert result["text_markdown"] == valid_md.strip()
         assert result["document_url"] == "https://www.al.rn.leg.br/pdf/lei42.pdf"
         assert result["_raw_content"] == pdf_bytes
         assert result["_content_extension"] == ".pdf"

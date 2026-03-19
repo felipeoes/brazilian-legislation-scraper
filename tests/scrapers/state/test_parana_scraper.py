@@ -20,13 +20,12 @@ Run with:
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from base_tests import ScraperClassTests, SituationsConstantTests, TypesConstantTests
 from bs4 import BeautifulSoup
+from conftest import assert_resume_skips, make_base_scraper
 
 from src.scraper.base.scraper import DEFAULT_INVALID_SITUATION, DEFAULT_VALID_SITUATION
 from src.scraper.state_legislation.parana import SITUATIONS, TYPES, ParanaCVScraper
-from base_tests import TypesConstantTests, SituationsConstantTests, ScraperClassTests
-from conftest import make_base_scraper, assert_resume_skips
-
 
 # ---------------------------------------------------------------------------
 # Factory helper
@@ -328,7 +327,13 @@ class TestGetDocData:
         )
         valid_md = "# Lei Estadual 1/2020\n\n" + "Texto da lei. " * 30
         scraper._get_markdown = AsyncMock(return_value=valid_md)
-        doc = {"id": "101", "title": "Lei 1/2020", "date": "01/01/2020"}
+        doc = {
+            "id": "101",
+            "title": "Lei 1/2020",
+            "date": "01/01/2020",
+            "year": 2020,
+            "type": "Lei",
+        }
         result = await scraper._get_doc_data(doc)
         assert result is not None
         assert "text_markdown" in result
@@ -348,7 +353,13 @@ class TestGetDocData:
         )
         valid_md = "# Lei\n\n" + "Revogado pelo Decreto 999. " * 20
         scraper._get_markdown = AsyncMock(return_value=valid_md)
-        doc = {"id": "101", "title": "Lei 1/2020", "date": "01/01/2020"}
+        doc = {
+            "id": "101",
+            "title": "Lei 1/2020",
+            "date": "01/01/2020",
+            "year": 2020,
+            "type": "Lei",
+        }
         result = await scraper._get_doc_data(doc)
         assert result is not None
         assert result["situation"] == DEFAULT_INVALID_SITUATION
@@ -365,7 +376,13 @@ class TestGetDocData:
         )
         valid_md = "# Lei\n\n" + "Dispõe sobre normas. " * 30
         scraper._get_markdown = AsyncMock(return_value=valid_md)
-        doc = {"id": "101", "title": "Lei 1/2020", "date": "01/01/2020"}
+        doc = {
+            "id": "101",
+            "title": "Lei 1/2020",
+            "date": "01/01/2020",
+            "year": 2020,
+            "type": "Lei",
+        }
         result = await scraper._get_doc_data(doc)
         assert result is not None
         assert result["situation"] == DEFAULT_VALID_SITUATION

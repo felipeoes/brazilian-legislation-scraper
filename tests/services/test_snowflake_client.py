@@ -77,9 +77,9 @@ async def snowflake_client():
 
 @pytest.fixture
 def llm_service(snowflake_client):
+    from src.scraper.base.scraper import DEFAULT_LLM_PROMPT
     from src.services.ocr.config import LLMConfig
     from src.services.ocr.llm import LLMOCRService
-    from src.scraper.base.scraper import DEFAULT_LLM_PROMPT
 
     model = os.environ["LLM_MODEL"]
     # Snowflake AI_COMPLETE cap is 600 RPM = 10 RPS

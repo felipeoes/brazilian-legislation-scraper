@@ -2,8 +2,8 @@
 
 import asyncio
 import functools
-from typing import Any, TypeVar
 from collections.abc import Callable
+from typing import Any, TypeVar
 
 from pyrate_limiter import Duration, InMemoryBucket, Limiter, Rate
 

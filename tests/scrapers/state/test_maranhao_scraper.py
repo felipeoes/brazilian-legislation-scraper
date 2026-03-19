@@ -7,16 +7,16 @@ Run with:
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from base_tests import TypesConstantTests
 from bs4 import BeautifulSoup
+from conftest import assert_resume_skips, make_base_scraper
 
 from src.scraper.state_legislation.maranhao import (
-    JSFFormState,
     SITUATIONS,
     TYPES,
+    JSFFormState,
     MaranhaoAlemaScraper,
 )
-from base_tests import TypesConstantTests
-from conftest import make_base_scraper, assert_resume_skips
 
 
 class FakeResponse:

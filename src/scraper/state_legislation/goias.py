@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
+from urllib.parse import urlencode, urljoin
 
-from bs4 import BeautifulSoup
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
+
+import aiohttp
+from bs4 import BeautifulSoup, Tag
 from loguru import logger
-from urllib.parse import urlencode
 
 from src.scraper.base.converter import calc_pages, valid_markdown, wrap_html
 from src.scraper.base.scraper import StateScraper
@@ -29,10 +33,41 @@ TYPES = {
 # situations are gotten from doc data while scraping
 SITUATIONS = {}
 
+_SITE_URL = "https://legisla.casacivil.go.gov.br"
+_DETAIL_API_URL = f"{_SITE_URL}/api/v2/pesquisa/legislacoes"
+_SEARCH_PATH = "/api/v2/pesquisa/legislacoes"
+_REDIRECT_MARKER = "Clique no link abaixo para acessar a:"
+_PDF_STUB_MIN_BODY_LEN = 150
 _TYPE_ID_TO_SUFFIX = {v["id"]: v["url_suffix"] for v in TYPES.values()}
 
 # Pre-compiled for the content-threshold check in _get_doc_data
 _NON_ALPHA_RE = re.compile(r"[^a-zA-ZÀ-ÿ]")
+_SPECIAL_RE = re.compile(r"[^a-zA-ZÀ-ÿ0-9\s]")
+_SPACE_RE = re.compile(r"\s+")
+
+
+def _remove_summary_from_markdown(md: str, summary: str) -> str:
+    """Remove the summary paragraph from text_markdown to avoid duplication.
+
+    Brazilian legislation documents include the ementa as a standalone paragraph
+    near the top of the body. Since the summary is already stored separately, it
+    is stripped here to prevent verbatim repetition inside ``text_markdown``.
+    Only exact standalone-paragraph matches (after normalizing whitespace and
+    stripping markdown formatting chars) are removed; summary text embedded
+    inside article body text is left untouched.
+    """
+    if not summary:
+        return md
+    summary_norm = re.sub(r"\s+", " ", summary).strip()
+    paragraphs = md.split("\n\n")
+    filtered = [
+        p
+        for p in paragraphs
+        if re.sub(r"\s+", " ", re.sub(r"[*_`]+", "", p)).strip() != summary_norm
+    ]
+    if len(filtered) == len(paragraphs):
+        return md  # summary not found as a standalone paragraph
+    return "\n\n".join(filtered)
 
 
 class LegislaGoias(StateScraper):
@@ -45,7 +80,7 @@ class LegislaGoias(StateScraper):
 
     def __init__(
         self,
-        base_url: str = "https://legisla.casacivil.go.gov.br/api/v2/pesquisa/legislacoes",
+        base_url: str = f"{_SITE_URL}{_SEARCH_PATH}",
         **kwargs,
     ):
         super().__init__(
@@ -81,37 +116,189 @@ class LegislaGoias(StateScraper):
             params["tipo_legislacao"] = norm_type_id
         return f"{self.base_url}?{urlencode(params)}"
 
-    def _clean_markdown(self, text_markdown: str) -> str:
-        """Clean markdown text"""
+    def _build_document_url(
+        self, doc_id: int | str, tipo_id: int | None, numero: str
+    ) -> str:
+        """Build the canonical public document URL used for resume keys."""
+        norm_url_suffix = _TYPE_ID_TO_SUFFIX.get(tipo_id, "")
+        if norm_url_suffix == "constituicao-estadual":
+            return f"{_SITE_URL}/pesquisa_legislacao/{doc_id}/{norm_url_suffix}"
+        return f"{_SITE_URL}/pesquisa_legislacao/{doc_id}/{norm_url_suffix}-{numero}"
 
+    def _clean_markdown(self, text_markdown: str) -> str:
+        """Clean markdown text."""
         return text_markdown.replace("javascript:print()", "").strip()
 
+    def _normalize_for_compare(self, text: str) -> str:
+        """Normalize text for body-vs-summary comparison."""
+        normalized = _SPECIAL_RE.sub("", text.lower())
+        return _SPACE_RE.sub("", normalized).strip()
+
+    def _ensure_html_document(self, html_content: str) -> str:
+        """Return a standalone HTML document string."""
+        html_string = html_content.strip()
+        if re.search(r"<(?:!doctype|html|body)\b", html_string, re.IGNORECASE):
+            return html_string
+        return wrap_html(html_string)
+
+    def _extract_pdf_link(self, soup: BeautifulSoup | Tag) -> str:
+        """Extract a downloadable PDF link from the HTML, if present."""
+        pdf_link = ""
+
+        for a_tag in soup.find_all("a", href=True):
+            img = a_tag.find("img", src=re.compile(r"/assets/ver_lei\.jpg$"))
+            if img:
+                pdf_link = urljoin(_SITE_URL, cast(str, a_tag["href"]))
+                a_tag.decompose()
+                break
+
+        if pdf_link:
+            return pdf_link
+
+        baixar_div = soup.find("div", class_="botao-baixar")
+        if baixar_div:
+            a_tag = baixar_div.find("a", href=True)
+            if a_tag:
+                pdf_link = urljoin(_SITE_URL, cast(str, a_tag["href"]))
+            baixar_div.decompose()
+
+        return pdf_link
+
+    def _prepare_inline_html(self, html_content: str) -> tuple[str, str, bool]:
+        """Clean inline HTML and return ``(clean_html, pdf_link, redirect)``."""
+        raw_html = self._ensure_html_document(html_content)
+        soup = BeautifulSoup(raw_html, "html.parser")
+
+        if _REDIRECT_MARKER.lower() in soup.get_text(" ", strip=True).lower():
+            return "", "", True
+
+        pdf_link = self._extract_pdf_link(soup)
+        root = soup.body or soup
+
+        for tag_name in ["meta", "link", "title", "input", "label"]:
+            for tag in root.find_all(tag_name):
+                tag.decompose()
+
+        for tag in root.find_all(id=re.compile(r"ficha-tecnica", re.IGNORECASE)):
+            tag.decompose()
+        for tag in root.find_all(class_=re.compile(r"ficha-tecnica", re.IGNORECASE)):
+            tag.decompose()
+
+        header_table = root.find("table")
+        if (
+            header_table
+            and "GOVERNO DO ESTADO DE GOIÁS"
+            in header_table.get_text(" ", strip=True).upper()
+        ):
+            header_table.decompose()
+
+        self._clean_norm_soup(
+            root,
+            unwrap_links=True,
+            remove_disclaimers=True,
+            remove_images=True,
+            remove_empty_tags=True,
+            unwrap_fonts=True,
+            strip_styles=True,
+            remove_style_tags=True,
+            remove_script_tags=True,
+        )
+
+        return self._ensure_html_document(str(root).strip()), pdf_link, False
+
+    def _should_use_pdf_fallback(
+        self, text_markdown: str, summary: str, *, has_pdf_link: bool
+    ) -> bool:
+        """Return True when inline HTML is likely only a summary/download stub."""
+        if not has_pdf_link:
+            return False
+
+        body_text = self._normalize_for_compare(text_markdown)
+        summary_text = self._normalize_for_compare(summary)
+        if summary_text:
+            body_text = body_text.replace(summary_text, "").strip()
+
+        return len(body_text) < _PDF_STUB_MIN_BODY_LEN
+
+    def _build_doc_info(
+        self, doc: dict, doc_detail: dict, *, norm_type: str, situation: str
+    ) -> dict:
+        """Build the normalized document metadata dict."""
+        title_type = norm_type or (doc_detail.get("tipo_legislacao") or {}).get(
+            "nome", "Norma"
+        )
+
+        return {
+            "id": doc_detail["id"],
+            "norm_number": doc_detail.get("numero", ""),
+            "year": doc_detail.get("ano", doc.get("ano", "")),
+            "type": norm_type,
+            "situation": situation,
+            "date": doc_detail.get("data_legislacao", ""),
+            "title": (
+                f"{title_type} {doc_detail.get('numero', '')} "
+                f"de {doc_detail.get('ano', doc.get('ano', ''))}"
+            ).strip(),
+            "summary": (doc_detail.get("ementa") or "").strip(),
+        }
+
+    async def _process_pdf_link(
+        self, link: str, doc_id: str | int, doc_info: dict
+    ) -> dict | None:
+        """Download a PDF fallback, convert it to markdown, and populate doc_info."""
+        pdf_link = urljoin(_SITE_URL, link).strip()
+        if not pdf_link:
+            logger.error(f"Missing PDF link for doc ID: {doc_id}")
+            return None
+
+        original_document_url = doc_info.get("document_url", "")
+        text_markdown, raw_content, content_ext = await self._download_and_convert(
+            pdf_link
+        )
+        text_markdown = self._clean_markdown(text_markdown)
+
+        result = await self._process_doc(
+            doc_info,
+            pdf_link,
+            text_markdown,
+            raw_content,
+            content_ext or ".pdf",
+            error_prefix="Failed to process PDF",
+        )
+        if result is None:
+            logger.error(f"Failed to extract text from PDF for doc ID: {doc_id}")
+            return None
+
+        summary = doc_info.get("summary", "")
+        if summary and result.get("text_markdown"):
+            result.text_markdown = _remove_summary_from_markdown(
+                result["text_markdown"], summary
+            )
+
+        if original_document_url:
+            result.document_url = original_document_url
+            result.pdf_link = pdf_link
+        else:
+            result.document_url = pdf_link
+
+        return result
+
     async def _get_doc_data(self, doc: dict) -> ScrapedDocument | None:
-        """Get document info from given doc data using API"""
+        """Get document info from the detail API and choose HTML or PDF content."""
         doc_id = doc["id"]
         numero = doc.get("numero", "")
         tipo_legislacao = doc.get("tipo_legislacao", {})
         tipo_nome = tipo_legislacao.get("nome", "")
         tipo_id = tipo_legislacao.get("id")
         ano = doc.get("ano", "")
-        norm_url_suffix = _TYPE_ID_TO_SUFFIX.get(tipo_id, "")
         title = f"{tipo_nome} {numero} de {ano}"
-
-        # Build canonical URL for resume check
-        if norm_url_suffix == "constituicao-estadual":
-            html_link = f"https://legisla.casacivil.go.gov.br/pesquisa_legislacao/{doc_id}/{norm_url_suffix}"
-        else:
-            html_link = f"https://legisla.casacivil.go.gov.br/pesquisa_legislacao/{doc_id}/{norm_url_suffix}-{numero}"
+        html_link = self._build_document_url(doc_id, tipo_id, numero)
 
         if self._is_already_scraped(html_link, title):
             return None
 
-        # Fetch detail API
-        api_url = (
-            f"https://legisla.casacivil.go.gov.br/api/v2/pesquisa/legislacoes/{doc_id}"
-        )
+        api_url = f"{_DETAIL_API_URL}/{doc_id}"
         response = await self.request_service.make_request(api_url)
-
         if not response:
             logger.error(f"Error getting detailed data for doc ID: {doc_id}")
             await self._save_doc_error(
@@ -121,127 +308,86 @@ class LegislaGoias(StateScraper):
             )
             return None
 
-        doc_detail = await response.json()
-
-        # Use detail API situation, fall back to search result situation
+        doc_detail = await cast(aiohttp.ClientResponse, response).json()
         situation = (doc_detail.get("estado_legislacao") or {}).get("nome", "") or (
             doc.get("estado_legislacao") or {}
         ).get("nome", "")
         norm_type = self._resolve_norm_type(doc, doc_detail)
-
-        title_type = norm_type or (doc_detail.get("tipo_legislacao") or {}).get(
-            "nome", "Norma"
+        doc_info = self._build_doc_info(
+            doc,
+            doc_detail,
+            norm_type=norm_type,
+            situation=situation,
         )
-
-        doc_info = {
-            "id": doc_detail["id"],
-            "norm_number": doc_detail["numero"],
-            "year": doc_detail.get("ano"),
-            "type": norm_type,
-            "situation": situation,
-            "date": doc_detail["data_legislacao"],
-            "title": f"{title_type} {doc_detail['numero']} de {doc_detail['ano']}",
-            "summary": doc_detail["ementa"].strip(),
-        }
+        doc_info["document_url"] = html_link
 
         pdf_link = ""
+        html_reason = ""
 
-        # Check if we have formatted content (HTML)
         if doc_detail.get("conteudo"):
-            html_content = doc_detail["conteudo"]
-
-            # Parse HTML with BeautifulSoup to clean it up
-            soup = BeautifulSoup(html_content, "html.parser")
-
-            # check if "Clique no link abaixo para acessar a:" in soup and skip document
-            if (
-                "Clique no link abaixo para acessar a:".lower()
-                in soup.get_text().lower()
-            ):
+            clean_html, pdf_link, has_redirect = self._prepare_inline_html(
+                doc_detail["conteudo"]
+            )
+            if has_redirect:
                 await self._save_doc_error(
                     title=doc_info.get("title", f"Doc ID {doc_id}"),
                     year=doc_detail.get("ano", ""),
                     situation=doc_info.get("situation", ""),
                     norm_type=doc_detail.get("tipo_legislacao", {}).get("nome", ""),
                     html_link=api_url,
-                    error_message="Document redirects via 'Clique no link abaixo' (content not inline)",
+                    error_message=(
+                        "Document redirects via 'Clique no link abaixo' "
+                        "(content not inline)"
+                    ),
                 )
                 return None
 
-            # remove header table, if it contains GOVERNO DO ESTADO DE GOIÁS
-            header_table = soup.find("table")
-            if (
-                header_table
-                and "GOVERNO DO ESTADO DE GOIÁS".lower() in header_table.text.lower()
+            text_markdown = self._clean_markdown(
+                await self._get_markdown(html_content=clean_html)
+            )
+            html_valid, html_reason = valid_markdown(text_markdown)
+            if html_valid and not self._should_use_pdf_fallback(
+                text_markdown,
+                doc_info["summary"],
+                has_pdf_link=bool(pdf_link),
             ):
-                header_table.decompose()
-
-            # remove a tag if it has <img src="/assets/ver_lei.jpg"> and extract pdf link
-            for a_tag in soup.find_all("a"):
-                img = a_tag.find("img", src="/assets/ver_lei.jpg")
-                if img:
-                    pdf_link = a_tag["href"]
-                    a_tag.decompose()
-
-            # If no ver_lei.jpg link, try baixar_div as secondary source
-            if not pdf_link:
-                baixar_div = soup.find("div", class_="botao-baixar")
-                if baixar_div:
-                    a_tag = baixar_div.find("a", href=True)
-                    if a_tag:
-                        pdf_link = a_tag["href"]
-                    baixar_div.decompose()
-
-            # Unwrap layout tables (usually <table border="0" width="100%"> wrapping a 6% and 94% column). Needed for docs like: https://legisla.casacivil.go.gov.br/pesquisa_legislacao/99142/lei-024
-            for layout_table in soup.find_all("table", border="0"):
-                td_main = layout_table.find("td", width=re.compile(r"9[0-9]%"))
-                if td_main:
-                    layout_table.replace_with(*td_main.contents)
-
-            self._clean_norm_soup(soup, unwrap_links=True, remove_disclaimers=True)
-
-            html_string = str(soup)
-
-            if not html_string.startswith("<html"):
-                html_string = wrap_html(html_string)
-
-            # Convert HTML to markdown using direct HTML content
-            text_markdown = await self._get_markdown(html_content=html_string)
-            valid, reason = valid_markdown(text_markdown)
-            if valid:
-                text_markdown = text_markdown.strip()
-                doc_info["text_markdown"] = text_markdown
-                doc_info["_raw_content"] = html_string.encode("utf-8")
+                doc_info["text_markdown"] = _remove_summary_from_markdown(
+                    text_markdown, doc_info["summary"]
+                )
+                doc_info["_raw_content"] = self._ensure_html_document(
+                    doc_detail["conteudo"]
+                ).encode("utf-8")
                 doc_info["_content_extension"] = ".html"
 
-                # Fall back to PDF if the HTML contains little beyond the summary
-                text_stripped = _NON_ALPHA_RE.sub("", text_markdown.lower())
-                summary_stripped = _NON_ALPHA_RE.sub("", doc_info["summary"].lower())
-                if (
-                    len(text_stripped.replace(summary_stripped, "", 1)) < 150
-                ):  # threshold based on experimentation with goias norms
-                    doc_info["text_markdown"] = None
-
-            doc_info["document_url"] = html_link
-
-        # If we don't have HTML content or markdown conversion failed, try PDF
         if not doc_info.get("text_markdown"):
-            # Drop any stale HTML raw-content keys set during the HTML processing
-            # attempt above so they don't shadow the PDF bytes written by
-            # _process_pdf_doc → _process_doc.
-            doc_info.pop("_raw_content", None)
-            doc_info.pop("_content_extension", None)
             if pdf_link:
-                doc_info["pdf_link"] = pdf_link
-            return await self._process_pdf_doc(doc_info)
+                doc_info = await self._process_pdf_link(pdf_link, doc_id, doc_info)
+            else:
+                await self._save_doc_error(
+                    title=doc_info.get("title", f"Doc ID {doc_id}"),
+                    year=doc_detail.get("ano", ""),
+                    situation=doc_info.get("situation", ""),
+                    norm_type=doc_detail.get("tipo_legislacao", {}).get("nome", ""),
+                    html_link=api_url,
+                    error_message=(
+                        html_reason or "No usable inline HTML content or PDF fallback"
+                    ),
+                )
+                return None
 
-        # clean text_markdown (some docs may have the "javascript:print()" string at the end of the document)
-        doc_info["text_markdown"] = self._clean_markdown(doc_info["text_markdown"])
+            if not doc_info:
+                await self._save_doc_error(
+                    title=f"Doc ID {doc_id}",
+                    year=doc_detail.get("ano", ""),
+                    norm_type=doc_detail.get("tipo_legislacao", {}).get("nome", ""),
+                    html_link=pdf_link if pdf_link else api_url,
+                    error_message="PDF processing failed (fallback)",
+                )
+                return None
 
-        # check for error msg
         error_msg = "doesn't work properly without JavaScript enabled"
         if error_msg.lower() in doc_info["text_markdown"].lower():
-            logger.warning(f"Invalid  doc ID: {doc_id}. Year: {doc_detail['ano']}")
+            logger.warning(f"Invalid doc ID: {doc_id}. Year: {doc_detail['ano']}")
             await self._save_doc_error(
                 title=doc_info.get("title", f"Doc ID {doc_id}"),
                 year=doc_detail.get("ano", ""),
@@ -264,7 +410,7 @@ class LegislaGoias(StateScraper):
             logger.error(f"Error fetching search page {page} for year {year}")
             return []
 
-        data = await response.json()
+        data = await cast(aiohttp.ClientResponse, response).json()
         return data.get("resultados", [])
 
     async def _scrape_year(self, year: int) -> list[dict]:
@@ -276,30 +422,20 @@ class LegislaGoias(StateScraper):
             logger.error(f"Error getting data for Year: {year}")
             return []
 
-        data = await response.json()
+        data = await cast(aiohttp.ClientResponse, response).json()
         total_results = data["total_resultados"]
-
         if total_results == 0:
             return []
 
         docs = data.get("resultados", [])
-        pages = calc_pages(total_results, 100)
-
-        if pages > 1:
-            tasks = [
-                self._fetch_search_page(year, page) for page in range(2, pages + 1)
-            ]
-            page_results = await self._gather_results(
-                tasks,
+        docs.extend(
+            await self._fetch_all_pages(
+                lambda page: self._fetch_search_page(year, page),
+                calc_pages(total_results, 100),
+                context={"year": year, "type": "NA", "situation": "NA"},
                 desc=f"GOIAS | year {year} page metadata",
             )
-            for pr in page_results:
-                if isinstance(pr, list):
-                    docs.extend(pr)
-                elif isinstance(pr, Exception):
-                    logger.error(
-                        f"Failed to fetch a search page for year {year} | Error: {pr}"
-                    )
+        )
 
         if not docs:
             return []

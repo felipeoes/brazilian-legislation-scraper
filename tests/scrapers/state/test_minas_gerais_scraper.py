@@ -4,7 +4,9 @@ import tempfile
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from base_tests import ScraperClassTests, SituationsConstantTests, TypesConstantTests
 from bs4 import BeautifulSoup
+from conftest import make_base_scraper, make_failed_request
 
 import src.scraper.state_legislation.minas_gerais as minas_gerais_module
 from src.scraper.base.scraper import DEFAULT_VALID_SITUATION
@@ -13,9 +15,6 @@ from src.scraper.state_legislation.minas_gerais import (
     TYPES,
     MGAlmgScraper,
 )
-
-from base_tests import TypesConstantTests, SituationsConstantTests, ScraperClassTests
-from conftest import make_base_scraper, make_failed_request
 
 
 def _make_scraper(**kwargs) -> MGAlmgScraper:

@@ -3,11 +3,11 @@
 import importlib
 from pathlib import Path
 
-from main import _get_scraper_names, build_scraper_configs
 import src.config as config_module
-from src.services.ocr.config import LLMConfig
+from main import _get_scraper_names, build_scraper_configs
 from src.scraper.conama.scrape import ConamaScraper
 from src.scraper.state_legislation import AlagoasSefazScraper, LegislaGoias
+from src.services.ocr.config import LLMConfig
 
 
 class TestScraperCliNames:

@@ -1,15 +1,16 @@
 from __future__ import annotations
+
 import json
 import re
 from datetime import datetime, timezone
-from typing import cast, TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import aiohttp
 from bs4 import BeautifulSoup
 from loguru import logger
 
-from src.scraper.base.scraper import BaseScraper
 from src.scraper.base.schemas import ScrapedDocument
+from src.scraper.base.scraper import BaseScraper
 
 if TYPE_CHECKING:
     pass
@@ -291,19 +292,21 @@ class ICMBioScraper(BaseScraper):
         )
 
         if not response or response.status != 200:
-            status = response.status if response else "No response"
-            logger.error(f"PowerBI API error: {status}")
+            detail = getattr(response, "reason", None) or (
+                response.status if response else "No response"
+            )
+            logger.error(f"PowerBI API error: {detail}")
             return None, None, True
 
         # Response content-type is text/plain, so read as text then parse
-        text = await cast(aiohttp.ClientResponse, response).text()
-        data = json.loads(text)
+        text = await cast(aiohttp.ClientResponse, response).text(errors="replace")
 
         try:
+            data = json.loads(text)
             dsr = data["results"][0]["result"]["data"]["dsr"]
             ds = dsr["DS"][0]
-        except (KeyError, IndexError) as e:
-            logger.error(f"Unexpected PowerBI response structure: {e}")
+        except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
+            logger.error(f"Unexpected PowerBI response: {e}")
             return None, None, True
 
         is_complete = ds.get("IC", True)
@@ -383,7 +386,7 @@ class ICMBioScraper(BaseScraper):
             return None
 
         title = row.get("ato", "")
-        date_str = row.get("publicacao", "")
+        date_str = str(row.get("publicacao", ""))
 
         # Extract year from date string (MM/DD/YYYY)
         try:
@@ -418,6 +421,11 @@ class ICMBioScraper(BaseScraper):
         logger.info("ICMBIO | Fetching all rows from PowerBI API...")
         all_rows = await self._fetch_all_rows()
         logger.info(f"ICMBIO | Total rows fetched: {len(all_rows)}")
+
+        if not all_rows:
+            logger.warning(
+                "ICMBIO | PowerBI API returned no rows — scraper will produce 0 results"
+            )
 
         docs_by_year: dict[int, list[dict]] = {}
         skipped = 0
@@ -509,7 +517,7 @@ class ICMBioScraper(BaseScraper):
 
         # _html_to_markdown wraps the fragment, converts via html-to-markdown, and
         # applies _clean_markdown — all in one step.
-        text_markdown = await self._html_to_markdown(text_div.prettify())
+        text_markdown = await self._html_to_markdown(str(text_div))
         if not text_markdown or not text_markdown.strip():
             logger.warning(f"Empty markdown from {document_url}")
             await self._save_doc_error(
@@ -567,3 +575,7 @@ class ICMBioScraper(BaseScraper):
         logger.debug(f"Finished scraping for Year: {year} | Results: {len(results)}")
 
         return results
+
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument

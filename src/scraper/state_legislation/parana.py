@@ -20,9 +20,9 @@ from loguru import logger
 
 from src.scraper.base.converter import valid_markdown, wrap_html
 from src.scraper.base.scraper import (
-    StateScraper,
-    DEFAULT_VALID_SITUATION,
     DEFAULT_INVALID_SITUATION,
+    DEFAULT_VALID_SITUATION,
+    StateScraper,
 )
 
 TYPES = {
@@ -271,7 +271,7 @@ class ParanaCVScraper(StateScraper):
         if table:
             table.decompose()
 
-        html_string = form.prettify().replace("\n ANEXOS:", "").strip()
+        html_string = str(form).replace("\n ANEXOS:", "").strip()
         html_string = html_string.replace("javascript:listarAssinaturas();", "")
         html_string = wrap_html(html_string)
 
@@ -316,3 +316,7 @@ class ParanaCVScraper(StateScraper):
         )
 
     # _scrape_year uses default from StateScraper
+
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument

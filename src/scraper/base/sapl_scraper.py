@@ -9,16 +9,18 @@ This base class provides the shared logic for:
 
 from __future__ import annotations
 
-
 import re
-
 from collections import defaultdict
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from loguru import logger
-from src.scraper.base.schemas import ScrapedDocument
+
 from src.scraper.base.converter import valid_markdown
+from src.scraper.base.schemas import ScrapedDocument
 from src.scraper.base.scraper import (
     DEFAULT_INVALID_SITUATION,
     DEFAULT_VALID_SITUATION,

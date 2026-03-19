@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from urllib.parse import urlencode, urljoin
 
 from bs4 import BeautifulSoup
@@ -12,6 +12,9 @@ from loguru import logger
 from src.scraper.base.converter import valid_markdown, wrap_html
 from src.scraper.base.schemas import ScrapedDocument
 from src.scraper.base.scraper import DEFAULT_VALID_SITUATION, StateScraper
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 
 TYPES = [
     "Ato das Disposições Constitucionais Transitórias",

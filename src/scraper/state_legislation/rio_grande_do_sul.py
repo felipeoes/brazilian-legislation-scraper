@@ -1,15 +1,22 @@
 from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from src.scraper.base.schemas import ScrapedDocument
 import re
+from typing import TYPE_CHECKING
 from urllib.parse import urlencode
 
 from bs4 import BeautifulSoup
+from loguru import logger
+
 from src.scraper.base.converter import valid_markdown, wrap_html
 from src.scraper.base.scraper import StateScraper
-from loguru import logger
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
+
 
 # ALRS does not have a type field, norm type is gotten while scraping
 TYPES = {}
@@ -172,7 +179,7 @@ class RSAlrsScraper(StateScraper):
             )
             return None
 
-        soup_text = soup.prettify().lower()
+        soup_text = str(soup).lower()
         if "a página não pode ser exibida" in soup_text:
             logger.error(f"Error getting document data: {html_link}")
             await self._save_doc_error(
@@ -215,7 +222,7 @@ class RSAlrsScraper(StateScraper):
             )
             return None
 
-        soup_text = soup.prettify().lower()
+        soup_text = str(soup).lower()
         if "norma sem texto" in soup_text or "sem texto para exibi" in soup_text:
             await self._save_doc_error(
                 title=doc_info.get("title", "Unknown"),

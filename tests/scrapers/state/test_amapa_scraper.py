@@ -6,14 +6,13 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from base_tests import SituationsConstantTests, TypesConstantTests
 from bs4 import BeautifulSoup
+from conftest import assert_resume_skips, make_base_scraper
 
 from src.scraper.base.scraper import StateScraper
 from src.scraper.state_legislation.amapa import SITUATIONS, TYPES, AmapaAlapScraper
 from src.services.request.service import FailedRequest
-
-from base_tests import SituationsConstantTests, TypesConstantTests
-from conftest import make_base_scraper, assert_resume_skips
 
 
 def _make_scraper(**kwargs) -> AmapaAlapScraper:

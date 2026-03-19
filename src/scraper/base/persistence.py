@@ -5,7 +5,6 @@ Extracted from BaseScraper; access via ``self._persister`` on any BaseScraper su
 
 from __future__ import annotations
 
-
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:

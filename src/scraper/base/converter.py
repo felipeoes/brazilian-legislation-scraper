@@ -6,20 +6,18 @@ Access via ``self._converter`` on any BaseScraper subclass.
 
 from __future__ import annotations
 
-
 import re
 import string
-
-import aiohttp
-import fitz
-import pymupdf4llm
-
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+import aiohttp
+import fitz
+import pymupdf4llm
 from bs4 import BeautifulSoup, Tag
-from html_to_markdown import ConversionOptions, convert as html_to_md
+from html_to_markdown import ConversionOptions
+from html_to_markdown import convert as html_to_md
 from loguru import logger
 
 from src.utils import clean_md_tag, inline_images_in_html, run_in_thread
@@ -39,6 +37,7 @@ _SERVER_ERROR_PATTERNS: list[str] = [
     "http request failed",
     "service unavailable",
     "doesn't work properly without javascript enabled",
+    "object reference not set to an instance of an object",
 ]
 
 # Matches runs of 15+ consecutive lines with ≤2 characters — the digital-authentication
@@ -62,6 +61,15 @@ _CLEAN_NORM_EMPTY_TAGS = ["h1", "h2", "h3", "h4", "h5", "h6", "div", "span", "b"
 def is_pdf(body: bytes, content_type: str = "") -> bool:
     """Check if content is a PDF based on content type or magic bytes."""
     return "pdf" in content_type.lower() or body[:4] == b"%PDF"
+
+
+def _expects_pdf(ext: str, content_type: str = "", url: str = "") -> bool:
+    """Return True if the extension, content-type, or URL indicates PDF was expected."""
+    return (
+        ext.lower() == ".pdf"
+        or "pdf" in (content_type or "").lower()
+        or url.lower().endswith(".pdf")
+    )
 
 
 _IMAGE_MAGIC_BYTES: list[bytes] = [
@@ -510,7 +518,6 @@ class MarkdownConverter:
         Non-PDF HTML goes through ``html-to-markdown`` with image inlining.
         """
         is_pdf_ = is_pdf(body, content_type)
-        ocr_service = getattr(self._scraper, "ocr_service", None)
 
         # ---- Non-PDF: convert via html-to-markdown ----
         if not is_pdf_:
@@ -531,6 +538,8 @@ class MarkdownConverter:
             min_length = max(50, page_count * 100)
         except Exception:
             pass
+
+        ocr_service = getattr(self._scraper, "ocr_service", None)
 
         # 1. Determine if the PDF is scanned
         try:
@@ -578,7 +587,6 @@ class MarkdownConverter:
     ) -> str:
         """Convert a raw byte stream (PDF or image) to markdown."""
         raw = stream.read()
-        ocr_service = getattr(self._scraper, "ocr_service", None)
 
         if filename:
             ext = Path(filename).suffix.lower()
@@ -586,8 +594,8 @@ class MarkdownConverter:
         else:
             is_image = _is_image_bytes(raw)
 
-        if is_image and ocr_service:
-            return await ocr_service.images_to_markdown([raw])
+        if is_image and self._scraper.ocr_service:
+            return await self._scraper.ocr_service.images_to_markdown([raw])
         if is_image:
             logger.warning("No LLM OCR service configured; cannot process image.")
             return ""
@@ -701,6 +709,15 @@ class MarkdownConverter:
             return "", b"", ""
         filename, content_type = request_service.detect_content_info(client_resp)
         ext = detect_extension(content_type, filename)
+
+        if body and _expects_pdf(ext, content_type, url) and body[:4] != b"%PDF":
+            snippet = body[:200].decode("utf-8", errors="replace")
+            logger.warning(
+                f"Expected PDF but received non-PDF content from {url} "
+                f"(content_type={content_type!r}, ext={ext!r}, "
+                f"first_bytes={snippet!r})"
+            )
+            return "", b"", ""
 
         markdown = await self.response_to_markdown(
             body, filename, content_type, base_url=url

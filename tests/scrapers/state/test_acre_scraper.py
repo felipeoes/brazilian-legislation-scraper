@@ -18,13 +18,13 @@ from collections import defaultdict
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from bs4 import BeautifulSoup
 
-from src.scraper.state_legislation.acre import TYPES, AcreLegisScraper
-
+from src.scraper.base.schemas import ScrapedDocument
 from base_tests import TypesConstantTests
+from bs4 import BeautifulSoup
 from conftest import make_base_scraper
 
+from src.scraper.state_legislation.acre import TYPES, AcreLegisScraper
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -334,7 +334,14 @@ class TestScrapeType:
             )
         )
 
-        fake_doc = {"title": "Constituição Estadual", "year": 2026}
+        fake_doc = ScrapedDocument(
+            title="placeholder",
+            year=2026,
+            type="Constituição Estadual",
+            situation="Vigente",
+            text_markdown="content",
+            document_url="http://test",
+        )
         with (
             patch.object(
                 scraper, "_process_html_doc", new=AsyncMock(return_value=fake_doc)

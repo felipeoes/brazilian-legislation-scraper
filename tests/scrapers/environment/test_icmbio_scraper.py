@@ -29,7 +29,6 @@ from src.scraper.icmbio.scrape import (
     ICMBioScraper,
 )
 
-
 # =========================================================================
 # _build_query_payload
 # =========================================================================
@@ -392,6 +391,16 @@ class TestICMBioRowToDoc:
         assert doc is not None
         assert doc["situation"] == "em vigência"
 
+    def test_int_publicacao_does_not_crash(self):
+        """Bug 4: if epoch-ms conversion fails, publicacao stays as int.
+        _row_to_doc must not raise AttributeError on int.strip()."""
+        scraper = self._make_scraper()
+        # Before fix: int.strip() → AttributeError. After fix: str() conversion
+        # makes it parseable (though the year will be nonsensical).
+        doc = scraper._row_to_doc(self._valid_row(publicacao=1609459200000))
+        # The key assertion: no AttributeError was raised
+        assert doc is not None or doc is None  # either outcome is fine, no crash
+
 
 # =========================================================================
 # _before_scrape
@@ -448,6 +457,22 @@ class TestICMBioBeforeScrape:
         scraper = self._make_scraper([])
         await scraper._before_scrape()
         assert scraper._docs_by_year == {}
+
+    @pytest.mark.asyncio
+    async def test_empty_rows_logs_warning(self):
+        """Bug 2: when PowerBI API returns no rows, a WARNING must be logged."""
+        from loguru import logger as _logger
+
+        scraper = self._make_scraper([])
+
+        messages = []
+        sink_id = _logger.add(lambda m: messages.append(str(m)), level="WARNING")
+        try:
+            await scraper._before_scrape()
+        finally:
+            _logger.remove(sink_id)
+
+        assert any("PowerBI API returned no rows" in m for m in messages)
 
     @pytest.mark.asyncio
     async def test_mixed_years_correct_bucketing(self):
@@ -552,6 +577,53 @@ class TestICMBioFetchPage:
         ds, tokens, complete = await scraper._fetch_page()
         assert complete is False
         assert tokens == restart_tokens
+
+    @pytest.mark.asyncio
+    async def test_invalid_json_returns_none(self):
+        """Bug 1: non-JSON response must not crash — returns (None, None, True)."""
+        resp = MagicMock()
+        resp.status = 200
+        resp.__bool__ = lambda self: True
+
+        async def _text(**kwargs):
+            return "<html>Server Error</html>"
+
+        resp.text = _text
+        scraper = self._make_scraper(resp)
+        ds, tokens, complete = await scraper._fetch_page()
+        assert ds is None
+        assert tokens is None
+        assert complete is True
+
+    @pytest.mark.asyncio
+    async def test_none_intermediate_value_returns_none(self):
+        """Bug 5: None intermediate in DSR path must not crash — returns (None, None, True)."""
+        resp = self._mock_response(200, {"results": [{"result": {"data": None}}]})
+        scraper = self._make_scraper(resp)
+        ds, tokens, complete = await scraper._fetch_page()
+        assert ds is None
+        assert tokens is None
+        assert complete is True
+
+    @pytest.mark.asyncio
+    async def test_failed_request_reason_logged(self):
+        """Bug 3: FailedRequest.reason must appear in the log message."""
+        from loguru import logger as _logger
+
+        failed = MagicMock()
+        failed.__bool__ = lambda self: False
+        failed.reason = "HTTP 403 (failed after 5 attempts)"
+        failed.status = 403
+        scraper = self._make_scraper(failed)
+
+        messages = []
+        sink_id = _logger.add(lambda m: messages.append(str(m)), level="ERROR")
+        try:
+            await scraper._fetch_page()
+        finally:
+            _logger.remove(sink_id)
+
+        assert any("HTTP 403 (failed after 5 attempts)" in m for m in messages)
 
     @pytest.mark.asyncio
     async def test_missing_ic_defaults_to_complete(self):

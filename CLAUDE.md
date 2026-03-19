@@ -43,7 +43,7 @@ BaseScraper                          # src/scraper/base/scraper.py — async HTT
        ├─ SAPLBaseScraper            # src/scraper/base/sapl_scraper.py — for SAPL REST API sites (Paraíba, Piauí, Roraima)
        └─ (27 state scrapers)       # src/scraper/state_legislation/<state>.py
   └─ CamaraDepScraper               # federal
-  └─ ConamaScraper, ICMBioScraper   # regulatory bodies
+  └─ ConamaScraper, ICMBioScraper   # environment regulatory bodies
 ```
 
 All scrapers inherit from `BaseScraper`. State scrapers go through `StateScraper`. States using the SAPL REST API extend `SAPLBaseScraper`.

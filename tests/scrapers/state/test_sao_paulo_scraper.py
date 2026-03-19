@@ -32,7 +32,9 @@ import tempfile
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from base_tests import ScraperClassTests, SituationsConstantTests, TypesConstantTests
 from bs4 import BeautifulSoup
+from conftest import make_base_scraper, make_failed_request
 
 from src.scraper.state_legislation.sao_paulo import (
     INVALID_SITUATIONS,
@@ -41,10 +43,6 @@ from src.scraper.state_legislation.sao_paulo import (
     VALID_SITUATIONS,
     SaoPauloAlespScraper,
 )
-
-from base_tests import TypesConstantTests, SituationsConstantTests, ScraperClassTests
-from conftest import make_base_scraper, make_failed_request
-
 
 # ---------------------------------------------------------------------------
 # Factory helper
@@ -393,7 +391,7 @@ class TestGetDocData:
         scraper._get_norm_data = AsyncMock(return_value={})
         result = await scraper._get_doc_data(self._base_doc_info(".pdf"), year=2020)
         assert result is not None
-        assert result["text_markdown"] == valid_md
+        assert result["text_markdown"] == valid_md.strip()
         assert result["_content_extension"] == ".pdf"
 
     @pytest.mark.asyncio
@@ -423,7 +421,7 @@ class TestGetDocData:
 
         result = await scraper._get_doc_data(self._base_doc_info(), year=2020)
         assert result is not None
-        assert result["text_markdown"] == valid_md
+        assert result["text_markdown"] == valid_md.strip()
         assert result["_content_extension"] == ".mhtml"
 
     @pytest.mark.asyncio
@@ -466,7 +464,7 @@ class TestGetDocData:
         result = await scraper._get_doc_data(self._base_doc_info(), year=2020)
         assert result is not None
         assert result["_content_extension"] == ".pdf"
-        assert result["text_markdown"] == valid_md
+        assert result["text_markdown"] == valid_md.strip()
 
     @pytest.mark.asyncio
     async def test_iframe_no_src_falls_through_to_html(self):

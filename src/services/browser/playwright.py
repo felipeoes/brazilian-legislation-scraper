@@ -1,14 +1,15 @@
 """Playwright browser service for async web scraping."""
 
 import asyncio
+
 from bs4 import BeautifulSoup
 from loguru import logger
 from playwright.async_api import (
-    async_playwright,
     Browser,
     BrowserContext,
     Page,
     Playwright,
+    async_playwright,
 )
 from playwright_stealth import Stealth
 
@@ -46,6 +47,8 @@ class BrowserService:
         self.page: Page | None = None
         self.pages: list[Page] = []
         self._page_pool: asyncio.Queue[Page] = asyncio.Queue()
+        # Pages created as overflow when the pool is exhausted; closed on release.
+        self._temp_pages: set[Page] = set()
 
     async def _init_pages(self) -> None:
         """Create the page pool or single page from the current browser context."""
@@ -149,24 +152,34 @@ class BrowserService:
     async def get_available_page(self) -> Page:
         """Return the next available page from the pool (blocks until one is free).
 
-        Raises RuntimeError if no page becomes available within 180 seconds, to
-        prevent silent deadlocks when a page is never released back to the pool.
+        If no page becomes available within 180 seconds the pool is considered
+        exhausted.  Rather than raising, a *temporary* overflow page is created,
+        tracked in ``_temp_pages``, and returned.  Temporary pages are **closed**
+        (not re-queued) when returned via :meth:`release_page`, so the pool size
+        remains stable.
         Replaces closed pages transparently before returning.
         """
         try:
             page = await asyncio.wait_for(self._page_pool.get(), timeout=180.0)
+            if page.is_closed():
+                page = await self._browser_context.new_page()
+            return page
         except asyncio.TimeoutError:
-            raise RuntimeError(
-                f"{self.owner_class_name}: timed out waiting for an available page "
-                "after 180 s — a page may have been acquired but never released"
+            logger.warning(
+                f"{self.owner_class_name}: page pool exhausted after 180 s — "
+                "spawning a temporary overflow page (will be closed after use)"
             )
-        if page.is_closed():
-            page = await self._browser_context.new_page()
-        return page
+            temp_page = await self._browser_context.new_page()
+            self._temp_pages.add(temp_page)
+            return temp_page
 
     def release_page(self, page: Page) -> None:
-        """Return *page* to the pool for reuse."""
-        self._page_pool.put_nowait(page)
+        """Return *page* to the pool, or close it if it was a temporary overflow page."""
+        if page in self._temp_pages:
+            self._temp_pages.discard(page)
+            asyncio.create_task(page.close())
+        else:
+            self._page_pool.put_nowait(page)
 
     async def cleanup(self) -> None:
         """Close all pages, the browser, and stop Playwright."""
@@ -176,6 +189,12 @@ class BrowserService:
             except Exception as e:
                 logger.debug(f"Error closing page: {e}")
         self.pages.clear()
+        for p in list(self._temp_pages):
+            try:
+                await p.close()
+            except Exception as e:
+                logger.debug(f"Error closing temp page: {e}")
+        self._temp_pages.clear()
         if self.page:
             try:
                 await self.page.close()
