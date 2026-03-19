@@ -278,7 +278,9 @@ class CamaraDepScraper(BaseScraper):
 
     1. ``"texto - republicação"`` (last match)
     2. ``"texto - publicação original"`` (last match)
-    3. Any link containing ``"texto"``
+    3. ``"texto - emenda"`` — last HTML match, else last match
+    4. Other ``"texto - *"`` (e.g. "texto - exposição de motivos") — last HTML match, else last
+    5. Any link containing ``"texto"`` — last HTML match, else last match
 
     Resolved mappings are cached in ``_metadata_to_text_url`` and persisted
     across restarts by ``_load_scraped_keys``, so already-visited metadata
@@ -541,7 +543,9 @@ class CamaraDepScraper(BaseScraper):
     ) -> dict | None:
         """Resolve the actual text URL from a document's metadata page.
 
-        Priority: "texto - republicação" > "texto - publicação original" > "texto -" > "texto"
+        Priority: "texto - republicação" > "texto - publicação original"
+                  > "texto - emenda" > other "texto - *" > bare "texto"
+        Within each bucket, HTML links are preferred over PDFs.
         """
         title = doc.get("title", "")
         summary = doc.get("summary", "")
@@ -609,7 +613,9 @@ class CamaraDepScraper(BaseScraper):
 
         original_links = []
         repub_links = []
-        other_links = []
+        emenda_links = []  # "texto - emenda" (amendment text)
+        dash_links = []  # other "texto - *" (e.g. "texto - exposição de motivos")
+        bare_links = []  # bare "texto" match (e.g. "texto da emenda" → PDF)
 
         for sessao_div in sessao_divs:
             for link in sessao_div.find_all("a", href=True):
@@ -618,17 +624,34 @@ class CamaraDepScraper(BaseScraper):
                     original_links.append(link)
                 elif "texto - republicação" in link_text:
                     repub_links.append(link)
-                elif "texto -" in link_text or "texto" in link_text:
-                    other_links.append(link)
+                elif "texto - emenda" in link_text:
+                    emenda_links.append(link)
+                elif "texto -" in link_text:
+                    dash_links.append(link)
+                elif "texto" in link_text:
+                    bare_links.append(link)
 
-        # Priority: republicação > publicação original > any "texto" link
+        # Priority: republicação > publicação original > emenda > "texto - *" > bare "texto"
+        # Within each bucket, prefer HTML links (.html) over PDFs (.pdf).
+        def _prefer_html(links: list) -> str | None:
+            html = [
+                lnk["href"] for lnk in links if lnk["href"].lower().endswith(".html")
+            ]
+            fallback = [lnk["href"] for lnk in links]
+            candidates = html or fallback
+            return candidates[-1] if candidates else None
+
         chosen = None
         if repub_links:
-            chosen = repub_links[-1]["href"]
+            chosen = _prefer_html(repub_links)
         elif original_links:
-            chosen = original_links[-1]["href"]
-        elif other_links:
-            chosen = other_links[-1]["href"]
+            chosen = _prefer_html(original_links)
+        elif emenda_links:
+            chosen = _prefer_html(emenda_links)
+        elif dash_links:
+            chosen = _prefer_html(dash_links)
+        elif bare_links:
+            chosen = _prefer_html(bare_links)
 
         if chosen is None:
             logger.error(f"Could not find text link for document: {title}")
