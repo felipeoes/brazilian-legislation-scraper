@@ -174,8 +174,7 @@ def build_scraper_configs(
         _sc(
             LegislaGoias,
             aliases=["Goias", "GO"],
-            year_start=1978,
-            year_end=1978,
+            year_start=1887,
             llm_config=llm_config,
         ),
         _sc(

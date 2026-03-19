@@ -7,28 +7,22 @@ Access via ``self._converter`` on any BaseScraper subclass.
 from __future__ import annotations
 
 
-import os
 import re
 import string
 
 import aiohttp
 import fitz
+import pymupdf4llm
 
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from bs4 import BeautifulSoup, Tag
+from html_to_markdown import ConversionOptions, convert as html_to_md
 from loguru import logger
-from markitdown import MarkItDown
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
 
-from src.utils import clean_md_tag, run_in_thread
+from src.utils import clean_md_tag, inline_images_in_html, run_in_thread
 
 if TYPE_CHECKING:
     from src.scraper.base.scraper import BaseScraper
@@ -46,6 +40,11 @@ _SERVER_ERROR_PATTERNS: list[str] = [
     "service unavailable",
     "doesn't work properly without javascript enabled",
 ]
+
+# Matches runs of 15+ consecutive lines with ≤2 characters — the digital-authentication
+# sidebar watermarks that PyMuPDF extracts as individual single-character lines when text
+# is rotated. Used only for pre-validation length checks (not applied to returned text).
+_WATERMARK_CHECK_RE = re.compile(r"(?:\n[^\n]{0,2}){15,}")
 
 _DISCLAIMER_RE = re.compile(
     r"(Est[ea]\s+(texto|conte[uú]do)|Ess[ea]\s+texto)\s+n[aã]o\s+substitui",
@@ -84,6 +83,139 @@ def _is_image_bytes(raw: bytes) -> bool:
     return False
 
 
+def _pdf_page_count(body: bytes) -> int:
+    """Return the number of pages in a PDF, or 1 on any error."""
+    try:
+        doc = fitz.open(stream=body, filetype="pdf")
+        count = doc.page_count
+        doc.close()
+        return max(1, count)
+    except Exception:
+        return 1
+
+
+_OCR_METADATA_KEYWORDS: list[str] = [
+    "tesseract",
+    "ocr",
+    "abbyy",
+    "omnipage",
+    "paper capture",
+    "scanner",
+    "scanned",
+    "clearscan",
+    "readiris",
+    "iris",
+]
+
+# Regex to detect the invisible-text rendering operator (``3 Tr``) in raw PDF
+# page streams.  Presence strongly indicates an OCR text layer overlaid on a
+# scanned image.
+_INVISIBLE_TEXT_RE = re.compile(rb"(?:\s|^)3\s+Tr(?:\s|$)")
+
+
+def is_pdf_scanned(
+    content: bytes,
+    max_pages_to_check: int = 10,
+) -> tuple[bool, float]:
+    """Determine whether a PDF is primarily a scanned/image document.
+
+    Analyses metadata, image coverage, text density and invisible-text
+    operators on a sample of pages.
+
+    Returns:
+        ``(is_scanned, confidence)`` where *confidence* represents how
+        certain the heuristic is about the result (0–1).
+    """
+    try:
+        doc = fitz.open(stream=content, filetype="pdf")
+    except Exception as exc:
+        raise ValueError(f"Could not open PDF: {exc}") from exc
+
+    total_pages = len(doc)
+    if total_pages == 0:
+        doc.close()
+        return False, 0.0
+
+    # 1. Metadata check for obvious OCR engines
+    producer = doc.metadata.get("producer", "").lower() if doc.metadata else ""
+    creator = doc.metadata.get("creator", "").lower() if doc.metadata else ""
+    metadata_text = producer + " " + creator
+    has_ocr_metadata = any(kw in metadata_text for kw in _OCR_METADATA_KEYWORDS)
+
+    # 2. Sample pages (distributed evenly)
+    if total_pages <= max_pages_to_check:
+        pages_to_check = list(range(total_pages))
+    else:
+        step = total_pages / max_pages_to_check
+        pages_to_check = sorted(
+            list(set(int(i * step) for i in range(max_pages_to_check)))
+        )
+
+    page_scores: list[float] = []
+    for page_num in pages_to_check:
+        page = doc[page_num]
+        page_area = page.rect.width * page.rect.height
+        if page_area <= 0:
+            continue
+
+        # Image coverage
+        images = page.get_image_info()
+        total_img_area = sum(
+            max(0, img["bbox"][2] - img["bbox"][0])
+            * max(0, img["bbox"][3] - img["bbox"][1])
+            for img in images
+        )
+        coverage = min(1.0, total_img_area / page_area)
+
+        # Text density
+        text = page.get_text().strip()
+        text_length = len(text)
+
+        # Invisible text operator (``3 Tr``) in raw page stream
+        contents = page.read_contents()
+        has_invisible_text = bool(_INVISIBLE_TEXT_RE.search(contents))
+
+        # --- Scoring heuristic ---
+        score = 0.5
+        is_blank = False
+
+        if coverage > 0.8:
+            if has_invisible_text or has_ocr_metadata:
+                score = 1.0
+            elif text_length < 50:
+                score = 1.0
+            elif text_length > 200:
+                score = 0.9
+            else:
+                if page.rect.width > page.rect.height:
+                    score = 0.2  # landscape → likely a presentation slide
+                else:
+                    score = 0.8
+        elif coverage > 0.1:
+            if text_length < 50:
+                score = 0.8
+            else:
+                score = 0.1
+        else:
+            if text_length > 10:
+                score = 0.0
+            else:
+                is_blank = True
+
+        if not is_blank:
+            page_scores.append(score)
+
+    doc.close()
+
+    if not page_scores:
+        return False, 1.0
+
+    avg_score = sum(page_scores) / len(page_scores)
+    is_scanned = avg_score > 0.5
+    confidence = avg_score if is_scanned else (1.0 - avg_score)
+    return is_scanned, round(confidence, 4)
+
+
 def detect_extension(content_type: str, filename: str | None = None) -> str:
     """Determine file extension from content type or filename."""
     if filename:
@@ -108,8 +240,15 @@ def detect_extension(content_type: str, filename: str | None = None) -> str:
 
 
 def wrap_html(content: str) -> str:
-    """Wrap HTML fragment in <html><body> tags for markitdown conversion."""
+    """Wrap HTML fragment in ``<html><body>`` tags for conversion."""
     return f"<html><body>{content}</body></html>"
+
+
+# Shared options for html-to-markdown conversion.
+_HTML_TO_MD_OPTIONS = ConversionOptions(
+    heading_style="atx",
+    strip_tags=["script", "style", "svg"],
+)
 
 
 def clean_markdown(
@@ -118,7 +257,8 @@ def clean_markdown(
 ) -> str:
     """Clean markdown text by removing links and applying custom replacements."""
     text = clean_md_tag(text)
-    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    # Negative lookbehind for '!' preserves image syntax ![alt](data:...)
+    text = re.sub(r"(?<!!)\[([^\]]*)\]\([^)]*\)", r"\1", text)
     if replace:
         for find, replacement in replace:
             text = re.sub(find, replacement, text)
@@ -155,7 +295,7 @@ def clean_norm_soup(
     *,
     remove_disclaimers: bool = True,
     unwrap_links: bool = True,
-    remove_images: bool = True,
+    remove_images: bool = False,
     remove_empty_tags: bool = True,
     unwrap_fonts: bool = False,
     strip_styles: bool = False,
@@ -264,12 +404,9 @@ class MarkdownConverter:
     """Handles all markdown conversion, HTML cleaning, and content validation.
 
     Uses a back-reference to the owning scraper so that services
-    (``request_service``, ``ocr_service``) and ``_markitdown`` are
-    always read from the scraper — compatible with ``object.__new__()``
-    test instantiation.
+    (``request_service``, ``ocr_service``) are always read from the
+    scraper — compatible with ``object.__new__()`` test instantiation.
     """
-
-    _markitdown = MarkItDown()  # class-level singleton
 
     def __init__(self, scraper: BaseScraper):
         self._scraper = scraper
@@ -278,52 +415,43 @@ class MarkdownConverter:
     # Async methods — require services from the back-referenced scraper
     # ------------------------------------------------------------------
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type((OSError, RuntimeError)),
-        reraise=True,
-    )
-    async def convert_to_md(
-        self,
-        source: BytesIO,
-        filename: str = "document.html",
-    ) -> str:
-        """Convert a BytesIO stream to markdown via markitdown (with retry)."""
-        _, ext = os.path.splitext(filename)
-        if not ext:
-            ext = ".html"
+    # ---------- HTML conversion via html-to-markdown --------------------
 
-        markitdown = getattr(self._scraper, "_markitdown", self._markitdown)
-
+    async def _convert_html_to_md(self, html: str) -> str:
+        """Convert an HTML string to markdown via ``html-to-markdown``."""
         try:
-            source.seek(0)
-            result = await run_in_thread(
-                markitdown.convert_stream,
-                source,
-                file_extension=ext,
-            )
-            markdown = result.text_content or ""
-
-            if not markdown or not markdown.strip():
-                raise ValueError("markitdown returned empty content")
-
-            markdown = markdown.strip()
-            markdown = re.sub(r"(\n[-|]{3,}\s*)+$", "", markdown).strip()
-
-            return markdown
-
+            result = await run_in_thread(html_to_md, html, _HTML_TO_MD_OPTIONS)
+            return (result or "").strip()
         except Exception as e:
-            error_msg = str(e).lower()
-            if "invalid float value" in error_msg or "gray stroke color" in error_msg:
-                logger.warning(
-                    f"Document contains invalid color definitions, skipping: {e}"
-                )
-                return ""
-            if "data format error" in error_msg or "not valid" in error_msg:
-                logger.warning(f"Invalid or corrupted document: {e}")
-                return ""
-            raise
+            logger.debug(f"html-to-markdown conversion failed: {e}")
+            return ""
+
+    async def _create_image_fetcher(self):
+        """Return an ``async (url) -> bytes | None`` using RequestService."""
+        request_service = self._scraper.request_service
+
+        async def _fetch(url: str) -> bytes | None:
+            result = await request_service.fetch_bytes(url)
+            if not result or not isinstance(result, tuple):
+                return None
+            body, resp = result
+            if resp.status >= 400:
+                return None
+            return body
+
+        return _fetch
+
+    async def _convert_html_with_images(
+        self,
+        html: str,
+        base_url: str | None = None,
+    ) -> str:
+        """Inline images as base64 then convert HTML to markdown."""
+        resolved_base = base_url or getattr(self._scraper, "base_url", "")
+        if resolved_base:
+            fetcher = await self._create_image_fetcher()
+            html = await inline_images_in_html(html, resolved_base, fetcher)
+        return await self._convert_html_to_md(html)
 
     async def pdf_bytes_to_text(self, body: bytes) -> str:
         """Extract plain text from PDF bytes via PyMuPDF."""
@@ -336,14 +464,36 @@ class MarkdownConverter:
                     text = str(page.get_text("text") or "").strip()
                     if text:
                         pages.append(text)
-                return "\n\n".join(pages)
+                # Preserve page boundaries so scraper-specific cleanup can strip
+                # watermark/signature artifacts page-by-page.
+                return "\x0c".join(pages)
             finally:
                 doc.close()
 
         try:
             return cast(str, await run_in_thread(_extract)).strip()
         except (OSError, ValueError, RuntimeError, TypeError) as e:
-            logger.warning(f"PyMuPDF extraction failed: {e}")
+            logger.debug(f"PyMuPDF extraction failed: {e}")
+            return ""
+
+    async def _pymupdf4llm_convert(self, body: bytes) -> str:
+        """Convert PDF bytes to markdown via pymupdf4llm.
+
+        Runs the (synchronous) conversion off the event loop.
+        """
+
+        def _convert() -> str:
+            doc = fitz.open(stream=body, filetype="pdf")
+            try:
+                return pymupdf4llm.to_markdown(doc, embed_images=True)
+            finally:
+                doc.close()
+
+        try:
+            result = await run_in_thread(_convert)
+            return (result or "").strip()
+        except Exception as e:
+            logger.debug(f"pymupdf4llm conversion failed: {e}")
             return ""
 
     async def bytes_to_markdown(
@@ -351,33 +501,76 @@ class MarkdownConverter:
         body: bytes,
         filename: str = "document.pdf",
         content_type: str = "",
+        base_url: str | None = None,
     ) -> str:
-        """Convert raw bytes to markdown with markitdown, falling back to OCR for PDFs."""
+        """Convert raw bytes to markdown.
+
+        For PDFs, uses ``is_pdf_scanned`` to decide between pymupdf4llm
+        (digital documents) and LLM OCR (scanned / low-confidence).
+        Non-PDF HTML goes through ``html-to-markdown`` with image inlining.
+        """
         is_pdf_ = is_pdf(body, content_type)
         ocr_service = getattr(self._scraper, "ocr_service", None)
 
+        # ---- Non-PDF: convert via html-to-markdown ----
+        if not is_pdf_:
+            try:
+                html_str = body.decode("utf-8", errors="replace")
+                text_markdown = await self._convert_html_with_images(html_str, base_url)
+                check_text = _WATERMARK_CHECK_RE.sub("", text_markdown).strip()
+                if valid_markdown(check_text, min_length=50)[0]:
+                    return text_markdown.strip()
+            except Exception as e:
+                logger.debug(f"HTML-to-markdown conversion failed: {e}")
+            return ""
+
+        # ---- PDF pipeline ----
+        min_length = 50
         try:
-            text_markdown = await self.convert_to_md(
-                BytesIO(body),
-                filename=filename or ("document.pdf" if is_pdf_ else "document.html"),
-            )
-            if valid_markdown(text_markdown, min_length=50)[0]:
+            page_count = await run_in_thread(_pdf_page_count, body)
+            min_length = max(50, page_count * 100)
+        except Exception:
+            pass
+
+        # 1. Determine if the PDF is scanned
+        try:
+            scanned, confidence = await run_in_thread(is_pdf_scanned, body)
+        except Exception as e:
+            logger.debug(f"Scan detection failed, assuming scanned: {e}")
+            scanned, confidence = True, 0.5
+
+        use_ocr = scanned or confidence < 0.7
+
+        # 2a. Digital PDF → pymupdf4llm (with OCR fallback on validation failure)
+        if not use_ocr:
+            text_markdown = await self._pymupdf4llm_convert(body)
+            check_text = _WATERMARK_CHECK_RE.sub("", text_markdown).strip()
+            if valid_markdown(check_text, min_length=min_length)[0]:
                 return text_markdown.strip()
-        except (OSError, ValueError, RuntimeError, TypeError) as e:
-            logger.warning(f"markitdown extraction failed: {e}")
+            logger.debug(
+                "pymupdf4llm output failed validation — falling back to LLM OCR"
+            )
+            if ocr_service:
+                return await ocr_service.pdf_to_markdown(body)
+            logger.warning("pymupdf4llm output invalid and no OCR service configured.")
+            return text_markdown.strip() if text_markdown else ""
 
-        if is_pdf_:
-            fitz_text = await self.pdf_bytes_to_text(body)
-            if valid_markdown(fitz_text, min_length=50)[0]:
-                return fitz_text.strip()
-
-        if is_pdf_ and ocr_service:
+        # 2b. Scanned / low-confidence → LLM OCR (with pymupdf4llm last resort)
+        if ocr_service:
             return await ocr_service.pdf_to_markdown(body)
 
-        if is_pdf_:
-            logger.warning(
-                "PDF extraction yielded little text and no OCR service configured."
-            )
+        # No OCR service — try pymupdf4llm as degraded fallback
+        logger.warning(
+            "PDF appears scanned but no OCR service configured — "
+            "trying pymupdf4llm as fallback."
+        )
+        text_markdown = await self._pymupdf4llm_convert(body)
+        if text_markdown:
+            return text_markdown.strip()
+
+        logger.warning(
+            "PDF extraction yielded little text and no OCR service configured."
+        )
         return ""
 
     async def stream_to_markdown(
@@ -401,12 +594,8 @@ class MarkdownConverter:
         return await self.bytes_to_markdown(raw, filename=filename or "document.pdf")
 
     async def html_to_markdown(self, html_content: str) -> str:
-        """Wrap an HTML fragment and convert it to cleaned markdown in one step."""
-        wrapped = wrap_html(html_content)
-        md = await self.convert_to_md(
-            BytesIO(wrapped.encode("utf-8")),
-            filename="document.html",
-        )
+        """Convert an HTML fragment to cleaned markdown in one step."""
+        md = await self._convert_html_to_md(html_content)
         return clean_markdown(md)
 
     async def response_to_markdown(
@@ -414,13 +603,17 @@ class MarkdownConverter:
         body: bytes,
         filename: str | None = None,
         content_type: str = "",
+        base_url: str | None = None,
     ) -> str:
         """Convert raw response bytes to markdown via the standard pipeline."""
         used_filename = filename or (
             "document.pdf" if is_pdf(body, content_type) else "document.html"
         )
         return await self.bytes_to_markdown(
-            body, filename=used_filename, content_type=content_type
+            body,
+            filename=used_filename,
+            content_type=content_type,
+            base_url=base_url,
         )
 
     async def response_or_url_to_markdown(
@@ -428,6 +621,7 @@ class MarkdownConverter:
         response: aiohttp.ClientResponse | None,
         url: str | None,
         filename: str | None = None,
+        base_url: str | None = None,
     ) -> str:
         """Fetch (if needed) and convert an HTTP response to markdown."""
         request_service = self._scraper.request_service
@@ -450,7 +644,10 @@ class MarkdownConverter:
             or ("document.pdf" if is_pdf(body, content_type) else "document.html")
         )
         return await self.bytes_to_markdown(
-            body, filename=used_filename, content_type=content_type
+            body,
+            filename=used_filename,
+            content_type=content_type,
+            base_url=base_url,
         )
 
     async def get_markdown(
@@ -460,22 +657,22 @@ class MarkdownConverter:
         stream: BytesIO | None = None,
         html_content: str | None = None,
         filename: str | None = None,
+        base_url: str | None = None,
     ) -> str:
-        """Get markdown from various input sources using markitdown.
+        """Get markdown from various input sources.
 
+        Uses pymupdf4llm for PDFs and html-to-markdown for HTML.
         Priority: stream > html_content > response > url
         """
         try:
             if stream is not None:
                 result = await self.stream_to_markdown(stream, filename)
             elif html_content is not None:
-                buffer = BytesIO(html_content.encode("utf-8"))
-                try:
-                    result = await self.convert_to_md(buffer, filename="document.html")
-                except (OSError, ValueError, RuntimeError, TypeError):
-                    result = ""
+                result = await self._convert_html_with_images(html_content, base_url)
             else:
-                result = await self.response_or_url_to_markdown(response, url, filename)
+                result = await self.response_or_url_to_markdown(
+                    response, url, filename, base_url
+                )
         except Exception as e:
             logger.error(f"Error converting to markdown: {e}")
             return ""
@@ -505,7 +702,9 @@ class MarkdownConverter:
         filename, content_type = request_service.detect_content_info(client_resp)
         ext = detect_extension(content_type, filename)
 
-        markdown = await self.response_to_markdown(body, filename, content_type)
+        markdown = await self.response_to_markdown(
+            body, filename, content_type, base_url=url
+        )
         markdown = clean_markdown(markdown) if markdown else ""
 
         if is_pdf(body, content_type) and (not ext or ext == ".bin"):

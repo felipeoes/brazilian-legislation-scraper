@@ -312,7 +312,18 @@ class RequestService:
         resp = await self.make_request(url, method=method, **kwargs)
         if not resp:
             return resp
-        body = await resp.text(errors="replace")
+
+        try:
+            body = await resp.text()
+        except UnicodeDecodeError:
+            try:
+                # Attempt to read the raw bytes and decode with ISO-8859-1 for older Brazilian websites
+                raw_bytes = await resp.read()
+                body = raw_bytes.decode("iso-8859-1")
+            except Exception as e:
+                logger.warning(f"Failed to decode response body for {url}: {e}")
+                return FailedRequest(url=url, reason=f"Decoding error: {e}")
+
         return BeautifulSoup(body, "html.parser")
 
     async def cleanup(self):

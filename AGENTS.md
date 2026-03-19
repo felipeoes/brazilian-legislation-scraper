@@ -151,6 +151,19 @@ Scraper classes must be named `<StateName>Scraper` (e.g., `AcreLegisScraper`).
   `LOG_DIR`.
 - LLM providers: `openai` (default, OpenAI-compatible), `bedrock` (AWS Bedrock), `snowflake`.
 
+## Image Preservation
+
+Images are preserved as base64 data URIs in the final markdown output:
+
+- **PDFs**: `pymupdf4llm.to_markdown(doc, embed_images=True)` embeds images natively.
+- **HTML**: `<img>` sources are fetched concurrently, converted to base64 data URIs via
+  `inline_images_in_html()` (`src/utils/image_inliner.py`), then converted to markdown
+  with `html-to-markdown`.
+- **HTML→Markdown**: Uses the `html-to-markdown` library (not markitdown, which truncates
+  base64 data).
+- `clean_norm_soup()` defaults to `remove_images=False`.
+- `clean_markdown()` preserves `![alt](data:...)` image syntax via negative lookbehind regex.
+
 ## Key Helper Methods (BaseScraper)
 
 | Method | Purpose |
@@ -159,7 +172,7 @@ Scraper classes must be named `<StateName>Scraper` (e.g., `AcreLegisScraper`).
 | `_save_doc_result(result, ...)` | Persists a document (raw file + `data.json` append) |
 | `_save_doc_error(title, ...)` | Logs a document-level failure to the error log |
 | `_is_already_scraped(url, title)` | Resume support — returns `True` if already saved |
-| `_get_markdown(...)` | Converts url/response/stream/html to Markdown |
+| `_get_markdown(...)` | Converts url/response/stream/html to Markdown (pass `base_url` for image URL resolution) |
 | `_download_and_convert(url)` | Fetches raw bytes and converts to Markdown |
 | `_gather_results(coros, desc)` | `asyncio.gather` with error filtering + tqdm bar |
 

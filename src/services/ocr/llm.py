@@ -135,11 +135,11 @@ class LLMOCRService:
         )
 
     def _pdf_bytes_to_images(self, content: bytes) -> list[bytes]:
-        """Render each PDF page to a PNG at 50 DPI and return the raw bytes."""
+        """Render each PDF page to a PNG at default DPI (72) and return the raw bytes."""
         doc = fitz.open(stream=content, filetype="pdf")
         pages: list[bytes] = []
         for page_num in range(doc.page_count):
-            pix = doc.load_page(page_num).get_pixmap(dpi=50)
+            pix = doc.load_page(page_num).get_pixmap()
             pages.append(pix.tobytes("png"))
         doc.close()
         return pages
@@ -204,7 +204,10 @@ class LLMOCRService:
             content_blocks.append(
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                    "image_url": {
+                        "url": f"data:image/png;base64,{image_b64}",
+                        "detail": "high",
+                    },
                 }
             )
             valid_count += 1
@@ -225,15 +228,14 @@ class LLMOCRService:
             return ""
 
         content_blocks: list[dict] = [{"type": "text", "text": self.prompt}]
-        for i, doc_bytes in enumerate(docs):
+        for doc_bytes in docs:
             doc_b64 = base64.standard_b64encode(doc_bytes).decode()
             content_blocks.append(
                 {
-                    "type": "document",
-                    "document": {
-                        "name": f"document_{i}",
-                        "format": doc_format,
-                        "source": {"bytes": doc_b64},
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:application/{doc_format};base64,{doc_b64}",
+                        "detail": "high",
                     },
                 }
             )

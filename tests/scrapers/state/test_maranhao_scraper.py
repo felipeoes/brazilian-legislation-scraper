@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from bs4 import BeautifulSoup
 
-import src.scraper.state_legislation.maranhao as maranhao_module
 from src.scraper.state_legislation.maranhao import (
     JSFFormState,
     SITUATIONS,
@@ -26,13 +25,6 @@ class FakeResponse:
 
     async def text(self, errors: str = "replace") -> str:
         return self._text
-
-
-@pytest.fixture(autouse=True)
-def _patch_client_response(monkeypatch, request):
-    if request.node.get_closest_marker("integration"):
-        return
-    monkeypatch.setattr(maranhao_module, "ClientResponse", FakeResponse)
 
 
 def _make_scraper(**kwargs) -> MaranhaoAlemaScraper:
@@ -232,12 +224,11 @@ class TestFormParsing:
 
 
 class TestGetDocsLinks:
-    @pytest.mark.asyncio
-    async def test_parses_docs_from_results_html(self):
+    def test_parses_docs_from_results_html(self):
         scraper = _make_scraper()
         html = _make_result_rows_html(count=2, norm_label="Lei Complementar")
 
-        docs = await scraper._get_docs_links(html, "Lei")
+        docs = scraper._get_docs_links(html, "Lei")
 
         assert docs is not None
         assert len(docs) == 2
@@ -247,11 +238,10 @@ class TestGetDocsLinks:
         assert docs[0]["summary"] == "Ementa do doc 1"
         assert docs[0]["pdf_link"] == "https://legislacao.al.ma.leg.br/pdf/doc1.pdf"
 
-    @pytest.mark.asyncio
-    async def test_empty_rows_return_empty_list(self):
+    def test_empty_rows_return_empty_list(self):
         scraper = _make_scraper()
 
-        docs = await scraper._get_docs_links("<html><body></body></html>", "Lei")
+        docs = scraper._get_docs_links("<html><body></body></html>", "Lei")
 
         assert docs == []
 
@@ -289,7 +279,13 @@ class TestGetDocData:
         )
 
         result = await scraper._get_doc_data(
-            {"title": "Lei 001", "pdf_link": "/pdf/lei001.pdf", "year": 2020}
+            {
+                "title": "Lei 001",
+                "pdf_link": "/pdf/lei001.pdf",
+                "year": 2020,
+                "type": "Lei",
+                "situation": "Vigente",
+            }
         )
 
         assert result is not None

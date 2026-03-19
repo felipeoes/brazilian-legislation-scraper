@@ -369,21 +369,18 @@ class TestGetDocData:
     @pytest.mark.asyncio
     async def test_get_doc_data_strips_ementa_when_body_exists(self):
         scraper = build_unit_scraper()
-        fake_soup = BeautifulSoup(
-            """
+        fake_html = b"""
             <html><body><div id="content">
-                <h1>DECRETO Nº 365, DE 10 DE SETEMBRO DE 1845</h1>
+                <h1>DECRETO N\xc2\xba 365, DE 10 DE SETEMBRO DE 1845</h1>
                 <div class="textoNorma">
-                    <p class="ementa">Approva a Pensão annual de hum conto e duzentos mil réis.</p>
-                    <p>Art. 1º Fica mantida a concessão da pensão.</p>
-                    <p>Art. 2º Revogam-se as disposições em contrário.</p>
+                    <p class="ementa">Approva a Pens\xc3\xa3o annual de hum conto e duzentos mil r\xc3\xa9is.</p>
+                    <p>Art. 1\xc2\xba Fica mantida a concess\xc3\xa3o da pens\xc3\xa3o.</p>
+                    <p>Art. 2\xc2\xba Revogam-se as disposi\xc3\xa7\xc3\xb5es em contr\xc3\xa1rio.</p>
                 </div>
             </div></body></html>
-            """,
-            "html.parser",
-        )
-        scraper._fetch_soup_and_mhtml = AsyncMock(
-            return_value=(fake_soup, b"fake-mhtml-content")
+            """
+        scraper.request_service.fetch_bytes = AsyncMock(
+            return_value=(fake_html, "text/html")
         )
 
         markdown_calls = []
@@ -416,19 +413,16 @@ class TestGetDocData:
     @pytest.mark.asyncio
     async def test_get_doc_data_falls_back_to_ementa_when_it_is_the_only_text(self):
         scraper = build_unit_scraper()
-        fake_soup = BeautifulSoup(
-            """
+        fake_html = b"""
             <html><body><div id="content">
-                <h1>DECRETO Nº 365, DE 10 DE SETEMBRO DE 1845</h1>
+                <h1>DECRETO N\xc2\xba 365, DE 10 DE SETEMBRO DE 1845</h1>
                 <div class="textoNorma">
-                    <p class="ementa">Approva a Pensão annual de hum conto e duzentos mil réis.</p>
+                    <p class="ementa">Approva a Pens\xc3\xa3o annual de hum conto e duzentos mil r\xc3\xa9is.</p>
                 </div>
             </div></body></html>
-            """,
-            "html.parser",
-        )
-        scraper._fetch_soup_and_mhtml = AsyncMock(
-            return_value=(fake_soup, b"fake-mhtml-content")
+            """
+        scraper.request_service.fetch_bytes = AsyncMock(
+            return_value=(fake_html, "text/html")
         )
 
         markdown_calls = []
@@ -456,6 +450,6 @@ class TestGetDocData:
         assert stripped_soup.find("p", class_="ementa") is None
         assert fallback_soup.find("h1") is None
         assert fallback_soup.find("p", class_="ementa") is not None
-        assert result["_raw_content"] == b"fake-mhtml-content"
-        assert result["_content_extension"] == ".mhtml"
+        assert result["raw_content"] == fake_html
+        assert result["content_extension"] == ".html"
         assert scraper._save_doc_error.await_count == 0

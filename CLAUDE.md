@@ -73,13 +73,23 @@ All scrapers inherit from `BaseScraper`. State scrapers go through `StateScraper
 5. Export the class from `src/scraper/state_legislation/__init__.py`.
 6. Add a `ScraperConfig` entry in `main.py` → `build_scraper_configs()`.
 
+### Image Preservation
+
+Images are preserved as base64 data URIs in the final markdown output:
+
+- **PDFs**: `pymupdf4llm.to_markdown(doc, embed_images=True)` embeds images natively as `![](data:image/png;base64,...)`.
+- **HTML**: `<img>` sources are fetched concurrently, converted to base64 data URIs via `inline_images_in_html()` (`src/utils/image_inliner.py`), then the inlined HTML is converted to markdown with `html-to-markdown`.
+- **HTML→Markdown**: All HTML-to-markdown conversion uses the `html-to-markdown` library (not markitdown, which truncates base64 data).
+- `clean_norm_soup()` defaults to `remove_images=False` — images are kept unless explicitly removed.
+- `clean_markdown()` uses a negative lookbehind regex to preserve `![alt](data:...)` image syntax while stripping regular links.
+
 ### Key Patterns
 
 - Use `_process_documents()` to run `_get_doc_data` → `_with_save` → `_gather_results` in one call (replaces 5-line boilerplate). For scrapers passing extra kwargs to `_get_doc_data`, use `doc_data_kwargs` or `doc_data_fn`.
 - Use `_save_doc_result()` to persist documents immediately (supports raw file saving + `data.json` append).
 - Use `_save_doc_error()` to log document-level failures.
 - Use `_is_already_scraped()` for resume support — checks `(document_url, title)` keys loaded by `_load_scraped_keys()`.
-- Use `_get_markdown()` for flexible content-to-markdown conversion (accepts url, response, stream, or html_content).
+- Use `_get_markdown()` for flexible content-to-markdown conversion (accepts url, response, stream, or html_content). Pass `base_url` for correct relative image URL resolution.
 - Use `_download_and_convert()` when you also need the raw bytes (e.g., for saving source PDFs).
 - LLM configuration uses the `LLMConfig` dataclass (`src/services/ocr/config.py`), passed directly to `BaseScraper` and `LLMOCRService`.
 - Environment variables are centralized in `src/config.py` — import `SAVE_DIR`, `STATE_LEGISLATION_SAVE_DIR`, `LOG_DIR`, etc. from there.

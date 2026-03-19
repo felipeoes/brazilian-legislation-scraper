@@ -11,7 +11,7 @@ Web scraper for legal documents regarding Brazilian legislation — federal, sta
 - **Regulatory bodies** — CONAMA and ICMBio scrapers
 - **Async concurrency** — built on `asyncio` + `aiohttp` for non-blocking I/O with independent per-scraper rate limiting for HTTP and shared rate limiting for LLM API calls
 - **LLM providers** — supports OpenAI-compatible APIs and AWS Bedrock Converse for OCR
-- **PDF & image extraction** — converts PDFs to Markdown, with optional LLM-powered OCR for image-based documents
+- **PDF & image extraction** — converts PDFs to Markdown with embedded images (base64), optional LLM-powered OCR for scanned documents, and inline image preservation for HTML sources
 - **Playwright support** — async Chromium automation for JavaScript-rendered pages (3 state scrapers)
 - **Proxy rotation** — optional proxy support from a file or HTTP endpoint
 - **SAPL integration** — dedicated base class for state legislatures using the SAPL REST API
@@ -144,7 +144,8 @@ uv run main.py --list
 │   │   └── request/
 │   │       └── service.py           # RequestService — async HTTP with rate limiting & retries
 │   └── utils/
-│       └── __init__.py              # clean_md_tag() — strips markdown code block wrappers
+│       ├── __init__.py              # clean_md_tag() — strips markdown code block wrappers
+│       └── image_inliner.py         # inline_images_in_html() — async base64 image inlining
 ```
 
 ## Architecture
@@ -169,6 +170,7 @@ The project uses an **async-first** concurrency model with optimized parallelism
 
 ### Technology Stack
 - **HTTP I/O** — `aiohttp.ClientSession` for non-blocking requests with per-scraper sliding-window rate limiting
+- **HTML→Markdown** — `html-to-markdown` for HTML content conversion with full base64 image preservation; `pymupdf4llm` for PDF-to-markdown with embedded images
 - **LLM OCR** — vision model-based PDF/image extraction via OpenAI-compatible API or AWS Bedrock Converse API
 - **File I/O** — `aiofiles` for non-blocking JSON writes
 - **Browser automation** (3 scrapers) — Playwright async API (natively async, no thread wrappers)

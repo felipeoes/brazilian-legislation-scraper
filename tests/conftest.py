@@ -128,7 +128,6 @@ def make_base_scraper(
     scraper.browser_service = None
     scraper.request_service = MagicMock()
     scraper.request_service.cleanup = AsyncMock()
-    scraper._markitdown = MagicMock()
     scraper._converter = MarkdownConverter(scraper)
     scraper._persister = PersistenceManager(scraper)
     for key, value in overrides.items():
@@ -179,7 +178,7 @@ def make_mock_response(
     resp.read = MagicMock(return_value=read_fut)
 
     text_fut: asyncio.Future[str] = asyncio.Future()
-    text_fut.set_result(raw.decode("utf-8", errors="replace"))
+    text_fut.set_result(raw.decode("utf-8"))
     resp.text = MagicMock(return_value=text_fut)
 
     return resp

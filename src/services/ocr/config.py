@@ -90,7 +90,7 @@ class LLMConfig:
         logger.info(
             f"Using Snowflake provider | Model: {model} | Account: {client.account}"
         )
-        return cls(client=client, model=model, rps=100)
+        return cls(client=client, model=model, rps=50)
 
     @classmethod
     def _create_openai_client(
@@ -109,13 +109,10 @@ class LLMConfig:
             client=OpenAIClient(
                 raw_client,
                 max_completion_tokens=65536,
-                extra_body={
-                    "reasoning_effort": "high",  # since we will be using gemini 3.1 flash lite, we can set this to high to get better results on OCR tasks
-                    "media_resolution": "MEDIA_RESOLUTION_HIGH",
-                },
+                reasoning_effort="high",
             ),
             model=model,
-            rps=2,
+            rps=50,
         )
 
     @classmethod

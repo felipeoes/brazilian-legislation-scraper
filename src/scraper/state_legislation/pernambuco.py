@@ -189,7 +189,7 @@ class PernambucoAlepeScraper(StateScraper):
             return None
         client_response = response
         assert isinstance(client_response, aiohttp.ClientResponse)
-        html = await client_response.text(errors="replace")
+        html = await client_response.text()
         return BeautifulSoup(html, "html.parser")
 
     @staticmethod
@@ -551,7 +551,6 @@ class PernambucoAlepeScraper(StateScraper):
                 content_div,
                 remove_disclaimers=True,
                 unwrap_links=True,
-                remove_images=True,
                 remove_empty_tags=True,
                 strip_styles=True,
             )

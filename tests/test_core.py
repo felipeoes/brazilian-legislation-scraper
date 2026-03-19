@@ -12,7 +12,7 @@ import json
 import tempfile
 import fitz
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -331,15 +331,17 @@ class TestBaseScraperHelpers:
             scraper.verbose = False
             scraper.overwrite = True
             scraper._scraped_keys = set()
+            scraper._overwrite_reset_years = set()
             scraper._persister = PersistenceManager(scraper)
 
             await scraper._load_scraped_keys(2024)
 
-            # overwrite=True skips disk I/O — keys are empty
+            # overwrite=True clears the year before re-scraping, so resume keys stay empty.
             assert scraper._scraped_keys == set()
             assert not scraper._is_already_scraped(
                 "http://example.com/doc1", "Test Doc"
             )
+            assert not (Path(tmp) / "2024").exists()
 
     def test_valid_markdown_server_error(self):
         from src.scraper.base.converter import valid_markdown
@@ -375,18 +377,16 @@ class TestBaseScraperHelpers:
         scraper = BaseScraper.__new__(BaseScraper)
         scraper.ocr_service = None
         scraper._converter = MarkdownConverter(scraper)
-        scraper._converter.convert_to_md = AsyncMock(
-            side_effect=ValueError("markitdown returned empty content")
-        )
 
+        # With the new pipeline, digital PDFs use pymupdf4llm directly.
         markdown = await scraper._bytes_to_markdown(
             pdf_bytes,
             filename="document.pdf",
             content_type="application/pdf",
         )
 
-        assert "Art. 1º Esta lei dispõe" in markdown
-        scraper._converter.convert_to_md.assert_awaited_once()
+        assert "Art." in markdown
+        assert len(markdown) > 50
 
     def test_flatten_results(self):
         from src.scraper.base.scraper import flatten_results

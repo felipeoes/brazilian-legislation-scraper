@@ -1,17 +1,17 @@
 from __future__ import annotations
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from src.scraper.base.schemas import ScrapedDocument
 import asyncio
 import re
+from typing import cast
+from urllib.parse import urlencode, urljoin
+
 from bs4 import BeautifulSoup
 from bs4.element import NavigableString, Tag
 from loguru import logger
+
 from src.scraper.base.converter import valid_markdown, wrap_html
+from src.scraper.base.schemas import ScrapedDocument
 from src.scraper.base.scraper import DEFAULT_VALID_SITUATION, StateScraper
-from typing import cast
-from urllib.parse import urlencode, urljoin
 
 TYPES = [
     "Ato das Disposições Constitucionais Transitórias",
@@ -432,11 +432,13 @@ class MGAlmgScraper(StateScraper):
         detail_link = doc_info.get("html_link", "")
         title = doc_info.get("title", "Unknown")
         detail_url = urljoin(self.base_url, detail_link)
+        norm_type = doc_info.get("type", "")
 
         soup_data = await self.request_service.get_soup(detail_url)
         if not soup_data:
             await self._save_doc_error(
                 title=title,
+                norm_type=norm_type,
                 html_link=detail_url,
                 error_message="Failed to fetch document page (soup is None)",
             )
@@ -447,6 +449,7 @@ class MGAlmgScraper(StateScraper):
         if not text_links:
             await self._save_doc_error(
                 title=title,
+                norm_type=norm_type,
                 html_link=detail_url,
                 error_message="No text link found (Texto atualizado/original)",
             )
@@ -528,6 +531,7 @@ class MGAlmgScraper(StateScraper):
         if text_norm_span is None:
             await self._save_doc_error(
                 title=title,
+                norm_type=norm_type,
                 html_link=document_page_url or detail_url,
                 error_message=last_text_error,
             )
@@ -554,22 +558,20 @@ class MGAlmgScraper(StateScraper):
             if not valid:
                 await self._save_doc_error(
                     title=title,
+                    norm_type=norm_type,
                     html_link=pdf_link,
                     error_message=f"Invalid PDF markdown: {reason}",
                 )
                 return None
 
-            from src.scraper.base.schemas import ScrapedDocument
-
             res = {
                 **data,
+                "year": doc_info.get("year", 0),
                 "text_markdown": text_markdown,
                 "document_url": pdf_link,
                 "raw_content": raw_content,
                 "content_extension": content_ext or ".pdf",
             }
-            if "year" not in res:
-                res["year"] = doc_info.get("year", 0)
             return ScrapedDocument(**res)
 
         html_string = wrap_html(html_string)
@@ -579,6 +581,7 @@ class MGAlmgScraper(StateScraper):
         if not valid:
             await self._save_doc_error(
                 title=title,
+                norm_type=norm_type,
                 html_link=document_page_url,
                 error_message=f"Invalid markdown: {reason}",
             )
@@ -586,15 +589,12 @@ class MGAlmgScraper(StateScraper):
 
         result = {
             **data,
+            "year": doc_info.get("year", 0),
             "text_markdown": text_markdown,
             "document_url": document_page_url,
             "raw_content": page_mhtml,
             "content_extension": ".mhtml",
         }
-        from src.scraper.base.schemas import ScrapedDocument
-
-        if isinstance(result, dict) and "year" not in result:
-            result["year"] = doc_info.get("year", 0)
         return ScrapedDocument(**result)
 
     async def _scrape_year(self, year: int) -> list[dict]:
@@ -602,6 +602,9 @@ class MGAlmgScraper(StateScraper):
         first_url = self._build_search_url(year, 1)
         first_soup = await self.request_service.get_soup(first_url)
         if not first_soup:
+            logger.warning(
+                f"MINAS GERAIS | {year} | Failed to fetch page 1 — skipping year"
+            )
             return []
         first_soup = cast(BeautifulSoup, first_soup)
 

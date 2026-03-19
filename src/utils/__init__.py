@@ -1,4 +1,5 @@
 from src.utils.concurrency import RateLimiter, run_in_thread
+from src.utils.image_inliner import inline_images_in_html
 
 
 def clean_md_tag(md_content: str) -> str:
@@ -12,4 +13,4 @@ def clean_md_tag(md_content: str) -> str:
     return md_content
 
 
-__all__ = ["RateLimiter", "run_in_thread", "clean_md_tag"]
+__all__ = ["RateLimiter", "run_in_thread", "clean_md_tag", "inline_images_in_html"]

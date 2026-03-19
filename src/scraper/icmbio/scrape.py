@@ -296,7 +296,7 @@ class ICMBioScraper(BaseScraper):
             return None, None, True
 
         # Response content-type is text/plain, so read as text then parse
-        text = await cast(aiohttp.ClientResponse, response).text(errors="replace")
+        text = await cast(aiohttp.ClientResponse, response).text()
         data = json.loads(text)
 
         try:
@@ -504,11 +504,10 @@ class ICMBioScraper(BaseScraper):
             cast(BeautifulSoup, text_div),
             unwrap_links=True,
             remove_disclaimers=True,
-            remove_images=True,
             remove_empty_tags=True,
         )
 
-        # _html_to_markdown wraps the fragment, converts via MarkItDown, and
+        # _html_to_markdown wraps the fragment, converts via html-to-markdown, and
         # applies _clean_markdown — all in one step.
         text_markdown = await self._html_to_markdown(text_div.prettify())
         if not text_markdown or not text_markdown.strip():

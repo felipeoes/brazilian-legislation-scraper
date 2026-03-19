@@ -220,12 +220,16 @@ def _meaningful_context_value(value: Any) -> str | None:
 def merge_context(result: dict | ScrapedDocument, context: dict) -> dict:
     """Merge a document result dict with its scraping context."""
     if isinstance(result, ScrapedDocument):
-        # Convert to dict but preserve raw_content/content_extension
+        # Convert to dict but preserve raw_content/content_extension.
+        # Use underscore-prefixed keys so save_doc_result's dict branch can
+        # find them via pop("_raw_content") / pop("_content_extension").
+        # Writing these after model_dump() also overwrites any stale underscore
+        # extras that scrapers (e.g. Goiás) may have left on the ScrapedDocument.
         res_dict = result.model_dump()
         if result.raw_content is not None:
-            res_dict["raw_content"] = result.raw_content
+            res_dict["_raw_content"] = result.raw_content
         if result.content_extension is not None:
-            res_dict["content_extension"] = result.content_extension
+            res_dict["_content_extension"] = result.content_extension
     else:
         res_dict = result
 
@@ -348,7 +352,6 @@ class BaseScraper:
                 self._types_summary: dict[str, dict] = {}
                 self._mhtml_browser: BrowserService | None = None
 
-                self._markitdown = MarkdownConverter._markitdown
                 self.browser_service: BrowserService | None = (
                     BrowserService(
                         multiple_pages=multiple_pages,
@@ -362,6 +365,7 @@ class BaseScraper:
                 )
                 self.saver: FileSaver | None = None
                 self._scraped_keys: set[tuple[str, str]] = set()
+                self._overwrite_reset_years: set[int] = set()
 
                 # Composed delegates
                 self._converter = MarkdownConverter(self)
@@ -590,7 +594,7 @@ class BaseScraper:
         *,
         remove_disclaimers: bool = True,
         unwrap_links: bool = True,
-        remove_images: bool = True,
+        remove_images: bool = False,
         remove_empty_tags: bool = True,
         unwrap_fonts: bool = False,
         strip_styles: bool = False,
@@ -630,6 +634,7 @@ class BaseScraper:
         stream: BytesIO | None = None,
         html_content: str | None = None,
         filename: str | None = None,
+        base_url: str | None = None,
     ) -> str:
         return await self._converter.get_markdown(
             url=url,
@@ -637,6 +642,7 @@ class BaseScraper:
             stream=stream,
             html_content=html_content,
             filename=filename,
+            base_url=base_url,
         )
 
     # ------------------------------------------------------------------
@@ -725,7 +731,9 @@ class BaseScraper:
 
         Stores *mhtml_content* as the raw file (`.mhtml` extension).
         """
-        text_markdown = await self._get_markdown(html_content=html_content)
+        text_markdown = await self._get_markdown(
+            html_content=html_content, base_url=url
+        )
         return await self._process_doc(
             doc_info,
             url,
@@ -870,7 +878,12 @@ class BaseScraper:
         ctx = {"year": year, "type": norm_type, "situation": situation}
         fn = doc_data_fn or self._get_doc_data
         kw = doc_data_kwargs or {}
-        tasks = [self._with_save(fn(doc, **kw), ctx) for doc in documents]
+        # Enrich each doc with context fields (year/type/situation) so that
+        # ScrapedDocument validation succeeds when _get_doc_data calls
+        # _process_pdf_doc/_process_html_doc.  Doc-specific values take
+        # precedence over context defaults (dict merge order: ctx first, then doc).
+        enriched = [{**ctx, **doc} for doc in documents]
+        tasks = [self._with_save(fn(doc, **kw), ctx) for doc in enriched]
         results = await self._gather_results(
             tasks,
             context=ctx,

@@ -1,16 +1,16 @@
 from __future__ import annotations
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from src.scraper.base.schemas import ScrapedDocument
 
 from io import BytesIO
+import math
+import re
 from urllib.parse import parse_qs, urljoin, urlparse
 
-import re
 from bs4 import BeautifulSoup
 from loguru import logger
+from tqdm.asyncio import tqdm
+
 from src.scraper.base.converter import valid_markdown
+from src.scraper.base.schemas import ScrapedDocument
 from src.scraper.base.scraper import StateScraper
 
 TYPES = {
@@ -44,10 +44,36 @@ INVALID_SITUATIONS = {
 
 SITUATIONS = {**VALID_SITUATIONS, **INVALID_SITUATIONS}
 
-# Matches runs of 15+ consecutive lines with ≤2 characters — the digital-authentication
-# sidebar watermark that PyMuPDF extracts as single-character lines when text is rotated.
-# Threshold is set high (15) to avoid false-positive removal of legitimate short lines.
-_VERTICAL_WATERMARK_RE = re.compile(r"(?:\n[^\n]{0,2}){15,}")
+# Matches the digital-signature manifest block that always appears at the end of
+# ES Assembly PDFs.  Everything from this marker onward is stripped.
+_MANIFESTO_RE = re.compile(r"MANIFESTO\s+DE\s+ASSINATURAS", re.IGNORECASE)
+
+# Matches the authentication footer emitted by the ES Assembly viewer. This block
+# may wrap across multiple lines and, in some PDFs, straddle a page boundary.
+_AUTH_FOOTER_RE = re.compile(
+    r"(?:^\s*P[áa]gina\s+\d+(?:\s+de\s+\d+)?\s*$\s*)?"
+    r"^\s*Autenticar documento em https://www3\.al\.es\.gov\.br/autenticidade\s*$"
+    r"[\s\S]{0,120}?com o identificador\s+[0-9A-F]+\s*,?\s*"
+    r"[\s\S]{0,220}?ICP-Brasil\.?"
+    r"(?:\s*^\s*P[áa]gina\s+\d+(?:\s+de\s+\d+)?\s*$)?",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Matches standalone page-number lines left by PDF extraction.
+_PAGE_NUMBER_RE = re.compile(r"(?im)^\s*P[áa]gina\s+\d+(?:\s+de\s+\d+)?\s*$")
+
+# Matches editorial disclaimer lines that appear in ES HTML exports.
+_DISCLAIMER_RE = re.compile(
+    r"(?:(?<=\n)|^)\s*(?:Est[ea]|Ess[ea])\s+texto\s+n[aã]o\s+substitui\s+"
+    r"o\s+publicado\s+no\s+(?:D\.?\s*P\.?\s*L\.?|D\.?\s*O\.?(?:\s*E\.?)?)"
+    r"\s+de\s+[^\n.]+\.?",
+    re.IGNORECASE,
+)
+
+
+def _collapse_blank_lines(text: str) -> str:
+    """Collapse excessive blank lines introduced by artifact removal."""
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
 def _strip_summary(text_markdown: str, summary: str) -> str:
@@ -65,15 +91,45 @@ def _strip_summary(text_markdown: str, summary: str) -> str:
         return text_markdown
     pattern = r"\s+".join(re.escape(w) for w in words)
     match = re.search(pattern, text_markdown, re.IGNORECASE)
-    # Only strip when the match is close to the start of the document.
-    if match and match.start() < 300:
+    if not match:
+        return text_markdown
+
+    prefix = text_markdown[: match.start()]
+    prefix_lines = [line.strip() for line in prefix.splitlines() if line.strip()]
+    prefix_substantive = re.sub(r"[\W_]+", "", prefix, flags=re.UNICODE)
+
+    # Be conservative: ES Ales listings sometimes use a long excerpt from the
+    # first operative paragraph as the "summary". Strip only when the match is
+    # genuinely at the beginning of the document and the preceding text is
+    # limited to a short title/header block.
+    if (
+        match.start() < 300
+        and len(prefix_lines) <= 3
+        and len(prefix_substantive) <= 120
+    ):
         return text_markdown[match.end() :].lstrip()
     return text_markdown
 
 
 def _clean_markdown(text_markdown: str, summary: str = "") -> str:
-    """Remove watermark garbage and strip the listing summary from *text_markdown*."""
-    text = _VERTICAL_WATERMARK_RE.sub("", text_markdown).strip()
+    """Remove ES-specific PDF/HTML artefacts and strip the listing summary.
+
+    pymupdf4llm already strips page-number footers, authentication watermarks,
+    and sidebar text that the old PyMuPDF plain-text extractor used to include.
+    The only ES-specific artefacts that survive are:
+
+    * The "MANIFESTO DE ASSINATURAS" digital-signature block at the end of PDFs.
+    * Authentication footer / page-number / disclaimer lines that may appear in
+      HTML→markdown output from the ES Assembly website.
+    """
+    match = _MANIFESTO_RE.search(text_markdown)
+    if match:
+        text_markdown = text_markdown[: match.start()].strip()
+
+    text = _AUTH_FOOTER_RE.sub("", text_markdown)
+    text = _PAGE_NUMBER_RE.sub("", text)
+    text = _DISCLAIMER_RE.sub("", text)
+    text = _collapse_blank_lines(text)
     return _strip_summary(text, summary)
 
 
@@ -91,7 +147,7 @@ class ESAlesScraper(StateScraper):
         not Playwright.
       - "NORMA ORIGINAL" links (.pdf) — scanned PDFs at
         /Arquivo/Documents/legislacao/image/. Downloaded and converted via
-        markitdown with LLM OCR fallback.
+        pymupdf4llm with LLM OCR fallback.
       - "Digital.aspx" links — document viewer URLs; the embedded PDF path is
         extracted from the ``arquivo`` query param and fetched as a regular PDF.
     """
@@ -287,60 +343,40 @@ class ESAlesScraper(StateScraper):
 
         soup = BeautifulSoup(content, "html.parser")
         all_docs.extend(self._parse_docs_from_soup(soup))
+        total_pages = 1
+        contagem_div = soup.find("div", id="ContentPlaceHolder1_contagem")
+        if contagem_div and contagem_div.strong:
+            text = contagem_div.strong.get_text(strip=True)
+            if count_match := re.search(r"(\d+)", text):
+                total_pages = math.ceil(int(count_match.group(1)) / 100)
 
-        visited_pages = {1}
-        vs_val = vs
-        ev_val = ev
+        pbar = tqdm(
+            desc=f"ESPIRITO_SANTO | {year} | Fetching pages",
+            total=total_pages,
+            unit="page",
+            leave=False,
+            dynamic_ncols=True,
+            disable=not self.verbose,
+        )
+        pbar.update(1)
 
-        while True:
-            if not vs_val or not ev_val:
+        while self._has_next_page(soup):
+            content, vs, ev = await self._fetch_postback(
+                url,
+                vs,
+                ev,
+                "ctl00$ContentPlaceHolder1$lbNext",
+                arg="",
+                items_per_page="100",
+            )
+            if not content or not vs or not ev:
                 break
 
-            pager_container = soup.find(id="ContentPlaceHolder1_rptPaging")
-            if not pager_container:
-                break
+            soup = BeautifulSoup(content, "html.parser")
+            all_docs.extend(self._parse_docs_from_soup(soup))
+            pbar.update(1)
 
-            tasks = []
-            for a in pager_container.find_all("a"):
-                href = a.get("href", "")
-                if "javascript:__doPostBack" in href:
-                    target = href.split("'")[1]
-                    page_num = int(a.text.strip())
-                    if page_num not in visited_pages:
-                        visited_pages.add(page_num)
-                        tasks.append(
-                            self._fetch_page_content(
-                                url, vs_val, ev_val, target, page_num
-                            )
-                        )
-
-            if not tasks:
-                break
-
-            desc = f"ESPIRITO_SANTO | {year} | Pagers"
-            results = await self._gather_results(tasks, desc=desc)
-
-            highest_page_num = 0
-            highest_page_soup = None
-
-            for page_num, content_bytes in results:
-                if not content_bytes:
-                    continue
-                s = BeautifulSoup(content_bytes, "html.parser")
-                all_docs.extend(self._parse_docs_from_soup(s))
-
-                if page_num > highest_page_num:
-                    highest_page_num = page_num
-                    highest_page_soup = s
-
-            if highest_page_soup is None:
-                break
-
-            soup = highest_page_soup
-            vs_tag = soup.find(id="__VIEWSTATE")
-            ev_tag = soup.find(id="__EVENTVALIDATION")
-            vs_val = vs_tag["value"] if vs_tag else None
-            ev_val = ev_tag["value"] if ev_tag else None
+        pbar.close()
 
         for doc in all_docs:
             doc["year"] = year
@@ -363,6 +399,7 @@ class ESAlesScraper(StateScraper):
         )
         if inferred_type:
             doc_info["type"] = inferred_type
+
         # Grab summary before discarding it; used to strip it from text_markdown.
         summary = doc_info.pop("summary", "")
         url = urljoin(self.base_url, doc_link)
@@ -408,10 +445,17 @@ class ESAlesScraper(StateScraper):
                     return None
 
             doc_info["text_markdown"] = _clean_markdown(text_markdown, summary)
+            if not doc_info["text_markdown"] or not doc_info["text_markdown"].strip():
+                await self._save_doc_error(
+                    title=doc_info.get("title", ""),
+                    year=doc_info.get("year", ""),
+                    html_link=url,
+                    error_message="Markdown empty after ES-specific cleanup",
+                )
+                return None
             doc_info["document_url"] = url
             doc_info["raw_content"] = raw_content
             doc_info["content_extension"] = content_ext
-            from src.scraper.base.schemas import ScrapedDocument
 
             return ScrapedDocument(**doc_info)
 
@@ -440,5 +484,14 @@ class ESAlesScraper(StateScraper):
             error_prefix="Invalid markdown",
         )
         if result:
-            result.text_markdown = _clean_markdown(result.text_markdown, summary)
+            cleaned = _clean_markdown(result.text_markdown, summary)
+            if not cleaned or not cleaned.strip():
+                await self._save_doc_error(
+                    title=doc_info.get("title", ""),
+                    year=doc_info.get("year", ""),
+                    html_link=url,
+                    error_message="Markdown empty after ES-specific cleanup",
+                )
+                return None
+            result.text_markdown = cleaned
         return result

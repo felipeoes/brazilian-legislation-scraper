@@ -71,6 +71,14 @@ class PersistenceManager:
     async def load_scraped_keys(self, year: int) -> None:
         """Load already-scraped (url, title) keys for resume logic."""
         if self._scraper.overwrite:
+            saver = self._scraper.saver
+            reset_years = getattr(self._scraper, "_overwrite_reset_years", None)
+            if reset_years is None:
+                reset_years = set()
+                self._scraper._overwrite_reset_years = reset_years
+            if saver and year not in reset_years:
+                await saver.reset_year(year)
+                reset_years.add(year)
             self._scraper._scraped_keys = set()
             return
         saver = self._scraper.saver

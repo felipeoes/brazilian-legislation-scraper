@@ -81,10 +81,10 @@ class AlagoasSefazScraper(StateScraper):
 
     **Markdown extraction strategy (year boundary):**
 
-    * ``year < 2000`` — documents are scanned PDF images.  Markitdown can
+    * ``year < 2000`` — documents are scanned PDF images.  The converter can
       open them but yields many OCR errors.  When ``llm_config`` is supplied,
       the LLM OCR service is invoked directly (``ocr_service.pdf_to_markdown``)
-      for these years, bypassing markitdown entirely.  Without ``llm_config``
+      for these years, bypassing pymupdf4llm entirely.  Without ``llm_config``
       the scraper falls back to ``_get_markdown`` and logs a warning.
     * ``year >= 2000`` — documents carry a proper text layer; ``_get_markdown``
       handles them correctly without LLM assistance.
@@ -188,7 +188,7 @@ class AlagoasSefazScraper(StateScraper):
           open them but produces many OCR errors.  When an ``ocr_service`` is
           configured (i.e. ``llm_config`` was supplied to the scraper), LLM OCR
           is used directly via ``ocr_service.pdf_to_markdown()``, bypassing
-          markitdown entirely.  If no ``ocr_service`` is available the scraper
+          pymupdf4llm entirely.  If no ``ocr_service`` is available the scraper
           falls back to ``_get_markdown`` with a warning.
         * ``year >= 2000`` — documents have a proper text layer and
           ``_get_markdown`` works correctly without LLM assistance.

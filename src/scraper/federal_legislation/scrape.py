@@ -675,8 +675,26 @@ class CamaraDepScraper(BaseScraper):
         )
 
         try:
-            soup, mhtml = await self._fetch_soup_and_mhtml(document_text_link)
-            soup = cast(BeautifulSoup, soup)
+            resp_or_failed = await self.request_service.fetch_bytes(document_text_link)
+            if not resp_or_failed:
+                logger.error(
+                    f"Failed to fetch document page for markdown conversion: "
+                    f"{document_text_link} | {resp_or_failed.reason}"
+                )
+                await self._save_doc_error(
+                    title=title,
+                    year=year,
+                    situation=situation,
+                    norm_type=doc_type,
+                    html_link=document_text_link,
+                    metadata_url=metadata_url,
+                    error_message=resp_or_failed.reason,
+                )
+                return None
+            html_bytes, _ = resp_or_failed
+            html_text = html_bytes.decode("utf-8")
+            soup = BeautifulSoup(html_text, "html.parser")
+
             # Extract main content area; fall back progressively
             content_div = cast(
                 BeautifulSoup | Tag,
@@ -695,7 +713,7 @@ class CamaraDepScraper(BaseScraper):
                     {"class_": "publicacoesTI"},
                 ],
             )
-            self._clean_norm_soup(content_div, remove_images=False)
+            self._clean_norm_soup(content_div)
 
             # Strip elements already captured in dedicated fields:
             #   <h1>  → duplicates `title`
@@ -746,8 +764,8 @@ class CamaraDepScraper(BaseScraper):
                 metadata_url=metadata_url,
                 text_markdown=text_markdown.strip(),
                 document_url=document_text_link,
-                raw_content=mhtml,
-                content_extension=".mhtml",
+                raw_content=html_bytes,
+                content_extension=".html",
             )
         except Exception as e:
             logger.error(f"Error converting document to markdown: {title} - {e}")

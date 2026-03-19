@@ -129,7 +129,7 @@ class LegislaAMScraper(StateScraper):
             return None
 
         # Remove the "Este texto não substitui..." disclaimer and other common artifacts.
-        self._clean_norm_soup(norm_element, remove_images=False)
+        self._clean_norm_soup(norm_element)
 
         # add html tags to the text
         empty_soup = BeautifulSoup(

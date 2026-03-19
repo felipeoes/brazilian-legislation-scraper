@@ -307,6 +307,57 @@ class TestGetTypeYearDocs:
         assert "Expand=3" in requests_made[1]
         assert "Start=3" in requests_made[1]
 
+    @pytest.mark.asyncio
+    async def test_bad_position_string_returns_empty(self):
+        """If the year's entry has an unparseable position attribute, return []."""
+        entries = (
+            '<viewentry position="bad" descendants="5">\n'
+            '  <entrydata columnnumber="0" name="wano" category="true">'
+            "<number>2025</number></entrydata>\n"
+            "</viewentry>\n"
+        )
+        xml = f'<?xml version="1.0"?>\n<viewentries>\n{entries}</viewentries>'
+        scraper = _make_scraper()
+        resp = MagicMock()
+        resp.__bool__ = lambda s: True
+        resp.text = AsyncMock(return_value=xml)
+        scraper.request_service.make_request = AsyncMock(return_value=resp)
+        result = await scraper._get_type_year_docs(
+            "Lei Estadual", "/Lei%20Estadual", 2025
+        )
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_stops_searching_after_year_found(self):
+        """Loop breaks after finding the target year — no extra category requests."""
+        # Two year entries: 2025 first (valid), then a duplicate 2025 entry.
+        # Only one docs request should follow the single category request.
+        cat_xml = _make_category_xml([(2025, 2, 3), (2024, 3, 10)])
+        docs_xml = _make_docs_xml(
+            expand_pos=2,
+            docs=[{"unid": "AABBCCDD" * 4, "title": "LEI Nº 1/2025"}],
+        )
+
+        requests_made: list[str] = []
+
+        async def mock_make_request(url, **kwargs):
+            requests_made.append(url)
+            xml_content = cat_xml if len(requests_made) == 1 else docs_xml
+            resp = MagicMock()
+            resp.__bool__ = lambda s: True
+            resp.text = AsyncMock(return_value=xml_content)
+            return resp
+
+        scraper = _make_scraper()
+        scraper.request_service.make_request = mock_make_request
+
+        result = await scraper._get_type_year_docs(
+            "Lei Estadual", "/Lei%20Estadual", 2025
+        )
+        # Exactly one category request + one docs request
+        assert len(requests_made) == 2
+        assert len(result) == 1
+
 
 # ---------------------------------------------------------------------------
 # _get_doc_data
@@ -332,6 +383,17 @@ class TestGetDocData:
         scraper._save_doc_error.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_failed_soup_error_includes_norm_type(self):
+        scraper = _make_scraper()
+        scraper._is_already_scraped = MagicMock(return_value=False)
+        scraper._fetch_soup_and_mhtml = AsyncMock(side_effect=Exception("timeout"))
+        scraper._save_doc_error = AsyncMock()
+        doc = {"title": "Lei 1", "html_link": "/lei1.nsf/view", "type": "Lei Estadual"}
+        await scraper._get_doc_data(doc)
+        call_kwargs = scraper._save_doc_error.call_args.kwargs
+        assert call_kwargs.get("norm_type") == "Lei Estadual"
+
+    @pytest.mark.asyncio
     async def test_missing_body_saves_error_and_returns_none(self):
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
@@ -346,6 +408,24 @@ class TestGetDocData:
         result = await scraper._get_doc_data(doc)
         assert result is None
         scraper._save_doc_error.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_missing_body_error_includes_norm_type(self):
+        scraper = _make_scraper()
+        scraper._is_already_scraped = MagicMock(return_value=False)
+        soup = BeautifulSoup("<html></html>", "html.parser")
+        for tag in soup.find_all("body"):
+            tag.decompose()
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
+        scraper._save_doc_error = AsyncMock()
+        doc = {
+            "title": "Lei 1",
+            "html_link": "/lei1.nsf/view",
+            "type": "Decreto",
+        }
+        await scraper._get_doc_data(doc)
+        call_kwargs = scraper._save_doc_error.call_args.kwargs
+        assert call_kwargs.get("norm_type") == "Decreto"
 
     @pytest.mark.asyncio
     async def test_invalid_markdown_saves_error_and_returns_none(self):
@@ -374,7 +454,13 @@ class TestGetDocData:
         )
         valid_md = "# Lei Estadual\n\n" + "Texto legislativo. " * 30
         scraper._get_markdown = AsyncMock(return_value=valid_md)
-        doc = {"title": "Lei 1", "html_link": "/lei1.nsf/view"}
+        doc = {
+            "title": "Lei 1",
+            "html_link": "/lei1.nsf/view",
+            "year": 2025,
+            "type": "Lei Estadual",
+            "situation": "Não consta",
+        }
         result = await scraper._get_doc_data(doc)
         assert result is not None
         assert "# Lei Estadual" in result["text_markdown"]
@@ -411,7 +497,13 @@ class TestGetDocData:
             return "# Lei\n\n" + "Conteúdo. " * 30
 
         scraper._get_markdown = fake_get_markdown
-        doc = {"title": "Lei 1", "html_link": "/lei1.nsf/view"}
+        doc = {
+            "title": "Lei 1",
+            "html_link": "/lei1.nsf/view",
+            "year": 2025,
+            "type": "Lei Estadual",
+            "situation": "Não consta",
+        }
         await scraper._get_doc_data(doc)
 
         assert len(captured_html) == 1
@@ -432,7 +524,13 @@ class TestGetDocData:
         scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
         valid_md = "# Lei\n\n" + "Conteúdo legislativo. " * 30
         scraper._get_markdown = AsyncMock(return_value=valid_md)
-        doc = {"title": "Lei 1", "html_link": "/lei1.nsf/view"}
+        doc = {
+            "title": "Lei 1",
+            "html_link": "/lei1.nsf/view",
+            "year": 2025,
+            "type": "Lei Estadual",
+            "situation": "Não consta",
+        }
         result = await scraper._get_doc_data(doc)
         assert result is not None
         assert "html_link" not in result
@@ -525,3 +623,42 @@ class TestScrapeYear:
         assert "Decreto" in types_called
         decreto_call = next(c for c in calls if c["norm_type"] == "Decreto")
         assert decreto_call["count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_listing_tuple_mapping_not_broken_by_failed_task(self):
+        """Tuple-based listing preserves type→docs association even when some tasks fail.
+
+        If a listing task raises an exception, _gather_results filters it out.
+        The remaining (type_name, docs) tuples must still map correctly so that
+        "Decreto" docs are not attributed to "Constituição Estadual" etc.
+        """
+        scraper = _make_scraper()
+
+        async def fake_get_docs(type_name, type_path, year):
+            if type_name == "Decreto":
+                return [{"title": "DECRETO Nº 1", "html_link": "/d1"}]
+            raise RuntimeError("simulated listing failure")
+
+        scraper._get_type_year_docs = fake_get_docs
+        scraper._is_already_scraped = MagicMock(return_value=False)
+
+        process_calls: list[dict] = []
+
+        async def fake_process(docs, **kwargs):
+            process_calls.append({"norm_type": kwargs["norm_type"], "count": len(docs)})
+            return [{"title": d["title"]} for d in docs]
+
+        async def fake_gather(tasks, **kw):
+            # Replicate _gather_results: collect results, filter exceptions/None
+            raw = await asyncio.gather(*tasks, return_exceptions=True)
+            return [r for r in raw if not isinstance(r, Exception) and r is not None]
+
+        scraper._process_documents = fake_process
+        scraper._gather_results = fake_gather
+
+        await scraper._scrape_year(2025)
+
+        # Only Decreto had docs and no exception
+        assert len(process_calls) == 1
+        assert process_calls[0]["norm_type"] == "Decreto"
+        assert process_calls[0]["count"] == 1

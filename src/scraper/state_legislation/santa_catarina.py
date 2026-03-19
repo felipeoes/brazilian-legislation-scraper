@@ -1,8 +1,3 @@
-from __future__ import annotations
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from src.scraper.base.schemas import ScrapedDocument
 """Santa Catarina state legislation scraper.
 
 Scrapes the ALESC legislation system at ``leis.alesc.sc.gov.br``.
@@ -12,6 +7,13 @@ Search: GET ``/legislativo?ano={year}&page={page}`` (legislative acts)
         GET ``/executivo?ano={year}&page={page}`` (executive decrees)
 Document: GET ``/ato-normativo/{path}/{id}`` returns full HTML content.
 """
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 
 import re
 from typing import Any

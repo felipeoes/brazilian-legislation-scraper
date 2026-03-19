@@ -1,19 +1,19 @@
 from __future__ import annotations
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from src.scraper.base.schemas import ScrapedDocument
 import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from urllib.parse import urljoin
 from xml.etree import ElementTree as ET
 
-from aiohttp import ClientResponse
 from bs4 import BeautifulSoup, Tag
 from loguru import logger
 
 from src.scraper.base.converter import calc_pages, valid_markdown
 from src.scraper.base.scraper import DEFAULT_VALID_SITUATION, StateScraper
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 
 TYPES = {
     "Constituição Estadual": "constituicao-estadual/detalhe.html?dswid=-4293",
@@ -31,6 +31,8 @@ TYPES = {
 }
 
 SITUATIONS = {"Não consta": "Não consta"}
+
+_CONSTITUTION_YEAR = 1989
 
 
 @dataclass(slots=True)
@@ -359,14 +361,11 @@ class MaranhaoAlemaScraper(StateScraper):
 
     async def _get_search_form_state(self) -> JSFFormState | None:
         response = await self.request_service.make_request(self._build_search_url())
-        if not isinstance(response, ClientResponse):
+        if not response:
             logger.error("MARANHAO | Failed to fetch search page")
             return None
-        client_response: ClientResponse = response
 
-        soup = BeautifulSoup(
-            await client_response.text(errors="replace"), "html.parser"
-        )
+        soup = BeautifulSoup(await response.text(), "html.parser")
         form_state = self._extract_form_state(soup)
         if form_state is None:
             logger.error("MARANHAO | Failed to extract search form state")
@@ -382,14 +381,11 @@ class MaranhaoAlemaScraper(StateScraper):
             method="POST",
             payload=self._build_type_change_payload(form_state, norm_type_id),
         )
-        if not isinstance(response, ClientResponse):
+        if not response:
             logger.error("MARANHAO | Failed to load Lei subtypes")
             return None
-        client_response: ClientResponse = response
 
-        updates = self._parse_partial_response(
-            await client_response.text(errors="replace")
-        )
+        updates = self._parse_partial_response(await response.text())
         panel_html = updates.get("painel_tipo_doc", "")
         if not panel_html:
             logger.error("MARANHAO | Missing Lei subtype panel in JSF response")
@@ -411,7 +407,7 @@ class MaranhaoAlemaScraper(StateScraper):
         match = self._TOTAL_RESULTS_RE.search(text)
         return int(match.group(1)) if match else 0
 
-    async def _get_docs_links(
+    def _get_docs_links(
         self, source: str | BeautifulSoup, norm_type: str
     ) -> list[dict] | None:
         soup = (
@@ -502,16 +498,13 @@ class MaranhaoAlemaScraper(StateScraper):
                 subtype_values=subtype_values,
             ),
         )
-        if not isinstance(response, ClientResponse):
+        if not response:
             logger.error(
                 f"MARANHAO | Failed search request | {norm_type} | {subtype or ''} | {year}"
             )
             return None, None, "", ()
-        client_response: ClientResponse = response
 
-        soup = BeautifulSoup(
-            await client_response.text(errors="replace"), "html.parser"
-        )
+        soup = BeautifulSoup(await response.text(), "html.parser")
         result_state = self._extract_form_state(soup)
         if result_state is None:
             logger.error(
@@ -544,25 +537,22 @@ class MaranhaoAlemaScraper(StateScraper):
                 subtype_values=subtype_values,
             ),
         )
-        if not isinstance(response, ClientResponse):
+        if not response:
             logger.error(f"MARANHAO | Failed to fetch results page {page}")
             return []
-        client_response: ClientResponse = response
 
-        updates = self._parse_partial_response(
-            await client_response.text(errors="replace")
-        )
+        updates = self._parse_partial_response(await response.text())
         table_html = updates.get("table_resultados", "")
         if not table_html:
             logger.error(f"MARANHAO | Missing table_resultados in page {page} response")
             return []
 
-        return await self._get_docs_links(table_html, effective_type) or []
+        return self._get_docs_links(table_html, effective_type) or []
 
     async def _scrape_norms(
         self,
         norm_type: str,
-        norm_type_id: str,
+        norm_type_id: str | int,
         year: int,
         situation: str,
         subtype: str | None = None,
@@ -583,7 +573,7 @@ class MaranhaoAlemaScraper(StateScraper):
             return []
 
         effective_type = subtype or norm_type
-        documents = await self._get_docs_links(soup, effective_type) or []
+        documents = self._get_docs_links(soup, effective_type) or []
         total_pages = calc_pages(total_docs, self._rows_per_page)
 
         if total_pages > 1:
@@ -619,12 +609,11 @@ class MaranhaoAlemaScraper(StateScraper):
     ) -> dict | None:
         url = urljoin(f"{self.base_url}/ged/", norm_type_id)
         soup = await self.request_service.get_soup(url)
-        if not isinstance(soup, BeautifulSoup):
+        if not soup:
             logger.error("MARANHAO | Failed to fetch constitution page")
             return None
-        soup_obj: BeautifulSoup = soup
 
-        object_tag = soup_obj.find("object", {"class": "view-pdf-constituicao"})
+        object_tag = soup.find("object", {"class": "view-pdf-constituicao"})
         if not isinstance(object_tag, Tag):
             logger.error("MARANHAO | Constitution PDF object not found")
             return None
@@ -649,7 +638,7 @@ class MaranhaoAlemaScraper(StateScraper):
             return None
 
         queue_item = {
-            "year": 1989,
+            "year": _CONSTITUTION_YEAR,
             "situation": DEFAULT_VALID_SITUATION,
             "type": norm_type,
             "title": "Constituição Estadual do Maranhão",
@@ -712,18 +701,19 @@ class MaranhaoAlemaScraper(StateScraper):
             else [(t, None) for t in self.types]
         )
 
-        for situation, situation_id in situation_items:
-            for norm_type, norm_type_id in type_items:
-                try:
-                    type_results = await self._scrape_situation_type(
-                        year,
-                        situation,
-                        situation_id,
-                        norm_type,
-                        norm_type_id,
-                    )
-                    if isinstance(type_results, list):
-                        results.extend(type_results)
-                except Exception as exc:
-                    logger.error(f"MARANHAO | Year {year} | {norm_type} | Error: {exc}")
+        tasks = [
+            self._scrape_situation_type(
+                year, situation, situation_id, norm_type, norm_type_id
+            )
+            for situation, situation_id in situation_items
+            for norm_type, norm_type_id in type_items
+        ]
+        gathered = await self._gather_results(
+            tasks,
+            context={"year": year},
+            desc=f"MARANHAO | year {year}",
+        )
+        for item in gathered:
+            if isinstance(item, list):
+                results.extend(item)
         return results

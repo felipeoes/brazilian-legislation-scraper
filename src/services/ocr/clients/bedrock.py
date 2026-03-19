@@ -71,10 +71,12 @@ class BedrockClient:
         OpenAI format examples:
             {"type": "text", "text": "hello"}
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+            {"type": "image_url", "image_url": {"url": "data:application/pdf;base64,...", "detail": "high"}}
 
         Bedrock format examples:
             {"text": "hello"}
             {"image": {"format": "png", "source": {"bytes": "<base64>"}}}
+            {"document": {"name": "document", "format": "pdf", "source": {"bytes": "<base64>"}}}
         """
         if "type" not in block and any(
             k in block
@@ -96,11 +98,19 @@ class BedrockClient:
 
         if block_type == "image_url":
             data_url = block["image_url"]["url"]
-            img_format, img_b64 = parse_base64_data_uri(data_url)
+            fmt, b64 = parse_base64_data_uri(data_url)
+            if fmt == "pdf":
+                return {
+                    "document": {
+                        "name": "document",
+                        "format": "pdf",
+                        "source": {"bytes": b64},
+                    }
+                }
             return {
                 "image": {
-                    "format": img_format,
-                    "source": {"bytes": img_b64},
+                    "format": fmt,
+                    "source": {"bytes": b64},
                 }
             }
 

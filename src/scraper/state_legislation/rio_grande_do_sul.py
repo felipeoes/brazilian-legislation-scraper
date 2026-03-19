@@ -121,7 +121,7 @@ class RSAlrsScraper(StateScraper):
         """Remove RS ALRS PDF footer artifacts that leak between pages.
 
         The footer of every page in the RS ALRS PDFs contains the URL
-        http://www.al.rs.gov.br/legis which markitdown extracts at each
+        http://www.al.rs.gov.br/legis which html-to-markdown extracts at each
         page break in several forms:
           - bare line:            'http://www.al.rs.gov.br/legis'
           - with page number:     'http://www.al.rs.gov.br/legis  4'

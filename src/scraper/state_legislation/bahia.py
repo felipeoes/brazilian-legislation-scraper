@@ -234,7 +234,6 @@ class BahiaLegislaScraper(StateScraper):
         self._clean_norm_soup(
             norm_text_tag,
             unwrap_links=False,
-            remove_images=False,
             strip_styles=True,
             remove_style_tags=True,
             remove_script_tags=True,

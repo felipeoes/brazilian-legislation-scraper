@@ -123,13 +123,22 @@ class MSAlemsScraper(StateScraper):
             for data in entry.findall("entrydata"):
                 if data.get("name") == "wano" and data.get("columnnumber") == "0":
                     num_el = data.find("number")
-                    if num_el is not None:
-                        try:
-                            if int(num_el.text) == year:
-                                expand_pos = int(entry.get("position", 0))
-                                doc_count = int(entry.get("descendants", 0))
-                        except (ValueError, TypeError):
-                            pass
+                    if num_el is None:
+                        continue
+                    try:
+                        entry_year = int(num_el.text)
+                    except (ValueError, TypeError):
+                        continue
+                    if entry_year != year:
+                        continue
+                    try:
+                        expand_pos = int(entry.get("position", "0"))
+                        doc_count = int(entry.get("descendants", 0))
+                    except (ValueError, TypeError):
+                        pass
+                    break  # done scanning this entry's columns
+            if expand_pos is not None:
+                break  # year found with a valid position — stop
 
         if expand_pos is None:
             return []
@@ -206,6 +215,7 @@ class MSAlemsScraper(StateScraper):
             await self._save_doc_error(
                 title=doc_info.get("title", ""),
                 year=doc_info.get("year", ""),
+                norm_type=doc_info.get("type", ""),
                 html_link=url,
                 error_message=f"Failed to retrieve document page: {exc}",
             )
@@ -224,6 +234,7 @@ class MSAlemsScraper(StateScraper):
             await self._save_doc_error(
                 title=doc_info.get("title", ""),
                 year=doc_info.get("year", ""),
+                norm_type=doc_info.get("type", ""),
                 html_link=url,
                 error_message="No <body> tag found in document page",
             )
@@ -240,27 +251,32 @@ class MSAlemsScraper(StateScraper):
         """List all types for *year* via ReadViewEntries, then process docs."""
         situation = self.default_situation
 
-        # Fetch document listings for all types concurrently
+        # Fetch document listings for all types concurrently.
+        # Each task returns a (type_name, docs) tuple so the association is
+        # preserved regardless of which tasks succeed or fail.
+        async def _listing_task(
+            type_name: str, type_path: str
+        ) -> tuple[str, list[dict]]:
+            docs = await self._get_type_year_docs(type_name, type_path, year)
+            return type_name, docs
+
         listing_tasks = [
-            self._get_type_year_docs(type_name, type_path, year)
+            _listing_task(type_name, type_path)
             for type_name, type_path in self.types.items()
         ]
-        listing_results = await self._gather_results(
+        listing_results: list[tuple[str, list[dict]]] = await self._gather_results(
             listing_tasks,
             context={"year": year, "type": "NA", "situation": situation},
             desc=f"MATO GROSSO DO SUL | {year} | listing",
         )
 
         by_type: dict[str, list] = defaultdict(list)
-        for i, (type_name, _) in enumerate(self.types.items()):
-            docs = listing_results[i] if i < len(listing_results) else None
-            if docs:
-                for doc in docs:
-                    # Filter already-scraped before processing
-                    if not self._is_already_scraped(
-                        doc.get("html_link", ""), doc.get("title", "")
-                    ):
-                        by_type[type_name].append(doc)
+        for type_name, docs in listing_results:
+            for doc in docs:
+                if not self._is_already_scraped(
+                    doc.get("html_link", ""), doc.get("title", "")
+                ):
+                    by_type[type_name].append(doc)
 
         if not by_type:
             return []

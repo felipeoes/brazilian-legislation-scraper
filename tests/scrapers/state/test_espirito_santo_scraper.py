@@ -36,12 +36,11 @@ from bs4 import BeautifulSoup
 
 from src.scraper.state_legislation.espirito_santo import (
     ESAlesScraper,
+    INVALID_SITUATIONS,
     SITUATIONS,
     TYPES,
     VALID_SITUATIONS,
-    INVALID_SITUATIONS,
     _clean_markdown,
-    _VERTICAL_WATERMARK_RE,
 )
 from base_tests import TypesConstantTests, SituationsConstantTests, ScraperClassTests
 from conftest import make_base_scraper, make_failed_request, assert_resume_skips
@@ -402,21 +401,37 @@ class TestScrapeYear:
     async def test_year_full_flow_calls_methods_correctly(self):
         scraper = _make_scraper()
         page1_10 = _make_listing_html(1, has_next=False)
-        page1_100 = _make_listing_html(2, has_next=False)
+        page1_100 = _make_listing_html(2, has_next=True)
+        page2 = _make_listing_html(2, has_next=False)
 
         scraper._fetch_first_page = AsyncMock(return_value=(page1_10, "vs1", "ev1"))
-        scraper._fetch_postback = AsyncMock(return_value=(page1_100, "vs2", "ev2"))
-        scraper._gather_results = AsyncMock(return_value=[])
+        scraper._fetch_postback = AsyncMock(
+            side_effect=[
+                (page1_100, "vs2", "ev2"),
+                (page2, "vs3", "ev3"),
+            ]
+        )
         scraper._process_documents = AsyncMock(return_value=[])
 
         await scraper._scrape_year(2010)
 
         scraper._fetch_first_page.assert_called_once()
-        scraper._fetch_postback.assert_called_once_with(
+        assert scraper._fetch_postback.call_count == 2
+        # First postback: switch to 100 items
+        scraper._fetch_postback.assert_any_call(
             scraper._format_search_url(2010),
             "vs1",
             "ev1",
             "ctl00$ContentPlaceHolder1$ddl_ItensExibidos",
+            arg="",
+            items_per_page="100",
+        )
+        # Second postback: go to next page
+        scraper._fetch_postback.assert_any_call(
+            scraper._format_search_url(2010),
+            "vs2",
+            "ev2",
+            "ctl00$ContentPlaceHolder1$lbNext",
             arg="",
             items_per_page="100",
         )
@@ -438,7 +453,6 @@ class TestScrapeYear:
         page1_100 = _make_listing_html(2, has_next=False)
         scraper._fetch_first_page = AsyncMock(return_value=(page1_10, "vs1", "ev1"))
         scraper._fetch_postback = AsyncMock(return_value=(page1_100, "vs2", "ev2"))
-        scraper._gather_results = AsyncMock(return_value=[])
         captured_docs = []
 
         async def fake_process(docs, **kwargs):
@@ -457,7 +471,6 @@ class TestScrapeYear:
         page1_100 = _make_listing_html(1, has_next=False)
         scraper._fetch_first_page = AsyncMock(return_value=(page1_10, "vs1", "ev1"))
         scraper._fetch_postback = AsyncMock(return_value=(page1_100, "vs2", "ev2"))
-        scraper._gather_results = AsyncMock(return_value=[])
         captured = {}
 
         async def fake_process(docs, **kwargs):
@@ -481,7 +494,14 @@ class TestGetDocData:
     @pytest.mark.asyncio
     async def test_resume_skip_returns_none(self):
         await assert_resume_skips(
-            _make_scraper(), {"title": "Lei 001", "doc_link": "/pdf/lei1.pdf"}
+            _make_scraper(),
+            {
+                "title": "Lei 001",
+                "type": "Lei",
+                "situation": "Vigente",
+                "doc_link": "/pdf/lei1.pdf",
+                "year": 2010,
+            },
         )
 
     @pytest.mark.asyncio
@@ -493,7 +513,13 @@ class TestGetDocData:
         scraper._download_and_convert = AsyncMock(
             return_value=(valid_md, b"raw", ".pdf")
         )
-        doc_info = {"title": "Lei 001", "doc_link": "/pdf/lei1.pd"}
+        doc_info = {
+            "title": "Lei 001",
+            "type": "Lei",
+            "situation": "Vigente",
+            "doc_link": "/pdf/lei1.pd",
+            "year": 2010,
+        }
         result = await scraper._get_doc_data(doc_info)
         assert result is not None
         assert result["document_url"].endswith(".pdf")
@@ -506,7 +532,13 @@ class TestGetDocData:
         scraper._download_and_convert = AsyncMock(
             return_value=(valid_md, b"raw", ".pdf")
         )
-        doc_info = {"title": "Lei 001", "doc_link": "/pdf/lei1.pdf"}
+        doc_info = {
+            "title": "Lei 001",
+            "type": "Lei",
+            "situation": "Vigente",
+            "doc_link": "/pdf/lei1.pdf",
+            "year": 2010,
+        }
         result = await scraper._get_doc_data(doc_info)
         assert result is not None
         assert result["text_markdown"] == valid_md.strip()
@@ -524,7 +556,13 @@ class TestGetDocData:
         valid_md = "# Lei\n\n" + "Texto via OCR. " * 20
         scraper._get_markdown = AsyncMock(return_value=valid_md)
 
-        doc_info = {"title": "Lei 001", "doc_link": "/pdf/lei1.pdf"}
+        doc_info = {
+            "title": "Lei 001",
+            "type": "Lei",
+            "situation": "Vigente",
+            "doc_link": "/pdf/lei1.pdf",
+            "year": 2010,
+        }
         result = await scraper._get_doc_data(doc_info)
         assert result is not None
         assert result["text_markdown"] == valid_md.strip()
@@ -548,7 +586,13 @@ class TestGetDocData:
         # OCR fallback also fails (returns invalid markdown).
         scraper._get_markdown = AsyncMock(return_value="short")
         scraper._save_doc_error = AsyncMock()
-        doc_info = {"title": "Lei 001", "doc_link": "/pdf/lei1.pdf"}
+        doc_info = {
+            "title": "Lei 001",
+            "type": "Lei",
+            "situation": "Vigente",
+            "doc_link": "/pdf/lei1.pdf",
+            "year": 2010,
+        }
         result = await scraper._get_doc_data(doc_info)
         assert result is None
         scraper._save_doc_error.assert_called_once()
@@ -560,7 +604,13 @@ class TestGetDocData:
         scraper._download_and_convert = AsyncMock(return_value=("short", b"", ".pdf"))
         scraper._get_markdown = AsyncMock(return_value="short")
         scraper._save_doc_error = AsyncMock()
-        doc_info = {"title": "Lei 001", "doc_link": "/pdf/lei1.pdf", "year": 2023}
+        doc_info = {
+            "title": "Lei 001",
+            "type": "Lei",
+            "situation": "Vigente",
+            "doc_link": "/pdf/lei1.pdf",
+            "year": 2023,
+        }
         await scraper._get_doc_data(doc_info)
         call_kwargs = scraper._save_doc_error.call_args.kwargs
         assert call_kwargs["year"] == 2023
@@ -571,7 +621,13 @@ class TestGetDocData:
         scraper._is_already_scraped = MagicMock(return_value=False)
         scraper.request_service.get_soup = AsyncMock(return_value=make_failed_request())
         scraper._save_doc_error = AsyncMock()
-        doc_info = {"title": "Lei 001", "doc_link": "/html/lei1.html"}
+        doc_info = {
+            "title": "Lei 001",
+            "type": "Lei",
+            "situation": "Vigente",
+            "doc_link": "/html/lei1.html",
+            "year": 2010,
+        }
         result = await scraper._get_doc_data(doc_info)
         assert result is None
         scraper._save_doc_error.assert_called_once()
@@ -585,7 +641,13 @@ class TestGetDocData:
         )
         scraper._get_markdown = AsyncMock(return_value="short")
         scraper._save_doc_error = AsyncMock()
-        doc_info = {"title": "Lei 001", "doc_link": "/html/lei1.html"}
+        doc_info = {
+            "title": "Lei 001",
+            "type": "Lei",
+            "situation": "Vigente",
+            "doc_link": "/html/lei1.html",
+            "year": 2010,
+        }
         result = await scraper._get_doc_data(doc_info)
         assert result is None
         scraper._save_doc_error.assert_called_once()
@@ -598,7 +660,13 @@ class TestGetDocData:
         scraper.request_service.get_soup = AsyncMock(return_value=soup)
         valid_md = "# Lei\n\n" + "Texto da lei. " * 20
         scraper._get_markdown = AsyncMock(return_value=valid_md)
-        doc_info = {"title": "Lei 001", "doc_link": "/html/lei1.html"}
+        doc_info = {
+            "title": "Lei 001",
+            "type": "Lei",
+            "situation": "Vigente",
+            "doc_link": "/html/lei1.html",
+            "year": 2010,
+        }
         result = await scraper._get_doc_data(doc_info)
         assert result is not None
         assert result["text_markdown"] == valid_md.strip()
@@ -626,7 +694,13 @@ class TestGetDocData:
             return "# Lei\n\n" + "Texto da lei. " * 20
 
         scraper._get_markdown = capture_html
-        doc_info = {"title": "Lei 001", "doc_link": "/html/lei1.html"}
+        doc_info = {
+            "title": "Lei 001",
+            "type": "Lei",
+            "situation": "Vigente",
+            "doc_link": "/html/lei1.html",
+            "year": 2010,
+        }
         await scraper._get_doc_data(doc_info)
         assert "<img" not in captured_html.get("html", "")
         assert "Garbage" not in captured_html.get("html", "")
@@ -642,7 +716,10 @@ class TestGetDocData:
         )
         doc_info = {
             "title": "Lei 001",
+            "type": "Lei",
+            "situation": "Vigente",
             "doc_link": "/pdf/lei1.pdf",
+            "year": 2010,
             "norm_type": "Lei Ordinária",
         }
         result = await scraper._get_doc_data(doc_info)
@@ -661,6 +738,8 @@ class TestGetDocData:
         doc_info = {
             "title": "Lei Ordinária n° 1/2025",
             "doc_link": "/pdf/lei1.pdf",
+            "year": 2010,
+            "situation": "Vigente",
             "norm_type": "",
         }
 
@@ -680,28 +759,42 @@ class TestGetDocData:
         )
         doc_info = {
             "title": "Lei 001",
+            "type": "Lei",
+            "situation": "Vigente",
             "doc_link": "/pdf/lei1.pdf",
+            "year": 2010,
             "summary": "Texto da lei listing excerpt.",
         }
         result = await scraper._get_doc_data(doc_info)
         assert result is not None
-        assert "summary" not in result
+        assert result["summary"] == ""
 
     @pytest.mark.asyncio
-    async def test_vertical_watermark_stripped_from_pdf(self):
-        """Runs of single-char lines (digital-cert watermark) must be removed."""
+    async def test_manifesto_stripped_from_pdf(self):
+        """MANIFESTO DE ASSINATURAS block at end of PDF must be removed."""
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
-        # 16 single-char lines — exceeds the {15,} threshold
-        watermark = "\n9\nD\nB\n7\n5\nC\nA\nA\n6\n4\n8\n7\nC\n3\n1\n8"
-        valid_md_with_watermark = "# Lei\n\n" + "Texto da lei. " * 5 + watermark
-        scraper._download_and_convert = AsyncMock(
-            return_value=(valid_md_with_watermark, b"raw", ".pdf")
+        manifesto = (
+            "\n\nMANIFESTO DE\nASSINATURAS\n\n"
+            "Assinado digitalmente por:\n"
+            "ALEXANDRE MARCELO COUTINHO SANTOS"
         )
-        doc_info = {"title": "Lei 001", "doc_link": "/pdf/lei1.pdf"}
+        valid_md = "# Lei\n\n" + "Texto da lei. " * 5 + manifesto
+        scraper._download_and_convert = AsyncMock(
+            return_value=(valid_md, b"raw", ".pdf")
+        )
+        doc_info = {
+            "title": "Lei 001",
+            "type": "Lei",
+            "situation": "Vigente",
+            "doc_link": "/pdf/lei1.pdf",
+            "year": 2010,
+        }
         result = await scraper._get_doc_data(doc_info)
         assert result is not None
-        assert "\n9\nD\nB" not in result["text_markdown"]
+        assert "MANIFESTO" not in result["text_markdown"]
+        assert "Assinado digitalmente" not in result["text_markdown"]
+        assert "Texto da lei." in result["text_markdown"]
 
     @pytest.mark.asyncio
     async def test_summary_stripped_from_beginning_of_text_markdown(self):
@@ -717,7 +810,10 @@ class TestGetDocData:
         )
         doc_info = {
             "title": "Ato 001",
+            "type": "Ato",
+            "situation": "Vigente",
             "doc_link": "/pdf/ato1.pdf",
+            "year": 2010,
             "summary": summary,
         }
         result = await scraper._get_doc_data(doc_info)
@@ -732,12 +828,13 @@ class TestGetDocData:
 
 
 class TestCleanMarkdown:
-    def test_watermark_removed(self):
-        # 16 single-char lines — exceeds the {15,} threshold
-        text = "# Lei\n\nTexto." + "\n9\nD\nB\n7\n5\nC\nA\nA\n6\n4\n8\n7\nC\n3\n1\n8"
-        result = _clean_markdown(text)
-        assert "\n9\nD\nB" not in result
-        assert "Texto." in result
+    _AUTH_FOOTER = (
+        "Autenticar documento em https://www3.al.es.gov.br/autenticidade\n"
+        "com o identificador 3400340032003000300034003A00540052004100, "
+        "Documento assinado\ndigitalmente conforme MP n° 2.200-2/2001, que "
+        "institui a Infra-estrutura de Chaves Públicas Brasileira\n"
+        "- ICP-Brasil."
+    )
 
     def test_clean_text_unchanged(self):
         text = "# Lei\n\nTexto da lei normal.\n\nPalavras legais."
@@ -757,20 +854,166 @@ class TestCleanMarkdown:
         result = _clean_markdown(text, summary)
         assert summary in result
 
+    def test_long_summary_excerpt_inside_body_is_not_stripped(self):
+        summary = (
+            "NOMEAR, NA FORMA DO ARTIGO 12, INCISO II, DA LEI COMPLEMENTAR Nº 46, "
+            "DE 31 DE JANEIRO DE 1994, CAROLINE QUEIROZ DOS SANTOS, PARA EXERCER "
+            "O CARGO EM COMISSÃO DE TÉCNICO SÊNIOR DE GABINETE DE REPRESENTAÇÃO "
+            "PARLAMENTAR - II, NO GABINETE DO(A) DEPUTADO(A) HUDSON LEAL, POR "
+            "SOLICITAÇÃO DO(A) PRÓPRIO DEPUTADO(A)."
+        )
+        result = _clean_markdown(self._PAGE1_CONTENT, summary)
+        assert result == self._PAGE1_CONTENT
+
     def test_empty_summary_does_nothing(self):
         text = "# Lei\n\nTexto."
         assert _clean_markdown(text, "") == text.strip()
 
-    def test_vertical_watermark_regex_matches_real_pattern(self):
-        # 16 single-char lines — exceeds the {15,} threshold
-        watermark = "\n9\nD\nB\n7\n5\nC\nA\nA\n6\n4\n8\n7\nC\n3\n1\n8"
-        assert _VERTICAL_WATERMARK_RE.search(watermark) is not None
+    # ------------------------------------------------------------------
+    # Manifesto / multi-section cleanup tests (pymupdf4llm format)
+    # ------------------------------------------------------------------
 
-    def test_short_single_char_runs_below_threshold_preserved(self):
-        # 10 single-char lines + "Fim" (2 chars matched) = 11 total — below {15,}
-        text = "# Lei\n\nTexto.\na\nb\nc\nd\ne\nf\ng\nh\ni\nj\nFim."
+    _PAGE1_CONTENT = (
+        "ATO Nº\n\n"
+        "A MESA DIRETORA DA ASSEMBLEIA LEGISLATIVA DO ESTADO DO ESPÍRITO SANTO,\n"
+        "legais, e considerando o previsto no Processo nº\n"
+        "usando de suas atribuições\n"
+        "000028031/2025, resolve:\n\n"
+        "NOMEAR, na forma do artigo 12, inciso II, da Lei Complementar nº 46, de 31 de janeiro\n"
+        "de 1994, CAROLINE QUEIROZ DOS SANTOS, para exercer o cargo em comissão de TÉCNICO\n"
+        "SÊNIOR DE GABINETE DE REPRESENTAÇÃO PARLAMENTAR -\n"
+        "II, no gabinete do(a)\n"
+        "Deputado(a) HUDSON LEAL, por solicitação do(a) próprio Deputado(a).\n\n"
+        "Palácio Domingos Martins,\n\n"
+        "MARCELO SANTOS\n"
+        "Presidente"
+    )
+
+    _MANIFESTO_BLOCK = (
+        "MANIFESTO DE\nASSINATURAS\n\n\n\n"
+        "Assinado digitalmente por:\n"
+        "ALEXANDRE MARCELO COUTINHO SANTOS\n"
+        "CPF: ***.507.277-**\n"
+        "Certificado emitido por AC SyngularID Multipla\n"
+        "Data: 09/12/2025 19:07:20 -03:00"
+    )
+
+    def test_pymupdf4llm_manifesto_stripped(self):
+        """pymupdf4llm-style output: content + manifesto in a single block."""
+        raw = self._PAGE1_CONTENT + "\n\n\n" + self._MANIFESTO_BLOCK
+        result = _clean_markdown(raw)
+        assert result == self._PAGE1_CONTENT
+
+    def test_manifesto_content_not_in_output(self):
+        """MANIFESTO DE ASSINATURAS and digital signature must not appear."""
+        raw = self._PAGE1_CONTENT + "\n\n\n" + self._MANIFESTO_BLOCK
+        result = _clean_markdown(raw)
+        assert "MANIFESTO" not in result
+        assert "ASSINATURAS" not in result
+        assert "Assinado digitalmente" not in result
+
+    def test_multi_section_content_preserved(self):
+        """Legal text that spans multiple sections must be fully preserved."""
+        page2_text = (
+            "Art. 3º As disposições anteriores aplicam-se subsidiariamente.\n\n"
+            "Art. 4º Esta Lei entra em vigor na data de sua publicação."
+        )
+        raw = (
+            self._PAGE1_CONTENT + "\n\n" + page2_text + "\n\n\n" + self._MANIFESTO_BLOCK
+        )
+        result = _clean_markdown(raw)
+        assert self._PAGE1_CONTENT in result
+        assert page2_text in result
+        assert "MANIFESTO" not in result
+
+    def test_auth_footer_removed_from_single_page(self):
+        text = (
+            "RESOLUÇÃO Nº 1\n\n"
+            "Art. 1º Fica concedida a medalha.\n\n"
+            "MARCELO SANTOS\nPresidente\n\n" + self._AUTH_FOOTER
+        )
         result = _clean_markdown(text)
-        assert "a\nb\nc" in result
+        assert result == (
+            "RESOLUÇÃO Nº 1\n\n"
+            "Art. 1º Fica concedida a medalha.\n\n"
+            "MARCELO SANTOS\nPresidente"
+        )
+
+    def test_auth_footer_and_page_number_removed_from_single_page(self):
+        text = "Art. 1º Texto principal.\n\n" + self._AUTH_FOOTER + "\n\nPágina 1"
+        result = _clean_markdown(text)
+        assert result == "Art. 1º Texto principal."
+        assert "Página 1" not in result
+
+    def test_auth_footer_split_across_lines_removed(self):
+        raw = (
+            "Art. 1º Texto da primeira página.\n\n"
+            "Autenticar documento em https://www3.al.es.gov.br/autenticidade\n"
+            "com o identificador 3400340032003000300034003A00540052004100, "
+            "Documento assinado\ndigitalmente conforme MP n° 2.200-2/2001, que "
+            "institui a Infra-estrutura de Chaves Públicas Brasileira\n"
+            "- ICP-Brasil.\n\n"
+            "Art. 2º Texto da segunda página."
+        )
+        result = _clean_markdown(raw)
+        assert result == (
+            "Art. 1º Texto da primeira página.\n\nArt. 2º Texto da segunda página."
+        )
+
+    def test_multi_section_content_preserved_when_auth_footer_repeats(self):
+        page2 = "Art. 2º Esta Resolução entra em vigor na data de sua publicação."
+        raw = (
+            self._PAGE1_CONTENT
+            + "\n\n"
+            + self._AUTH_FOOTER
+            + "\n\n"
+            + page2
+            + "\n\n"
+            + self._AUTH_FOOTER
+            + "\n\nPágina 2"
+        )
+        result = _clean_markdown(raw)
+        assert self._PAGE1_CONTENT in result
+        assert page2 in result
+        assert "Autenticar documento em" not in result
+        assert "ICP-Brasil" not in result
+        assert "Página 2" not in result
+
+    def test_html_disclaimer_removed(self):
+        text = (
+            "Lei nº 1\n\n"
+            "Art. 1º Texto da lei.\n\n"
+            "Este texto não substitui o publicado no D.P.L. de 11/09/2025."
+        )
+        result = _clean_markdown(text)
+        assert result == "Lei nº 1\n\nArt. 1º Texto da lei."
+
+    def test_html_disclaimer_removed_with_line_breaks_and_do_variant(self):
+        text = (
+            "Lei nº 2\n\n"
+            "Art. 1º Texto da lei.\n\n"
+            "Este texto não substitui\no publicado no D.O. de 30/12/2025."
+        )
+        result = _clean_markdown(text)
+        assert result == "Lei nº 2\n\nArt. 1º Texto da lei."
+
+    def test_inline_pagina_reference_is_preserved(self):
+        text = "Art. 1º Consulte a Página 12 do Anexo I para detalhes."
+        assert _clean_markdown(text) == text
+
+    def test_inline_disclaimer_like_phrase_is_preserved(self):
+        text = (
+            "O parecer registra a frase Este texto não substitui o publicado no "
+            "D.O. de 30/12/2025. apenas como exemplo."
+        )
+        assert _clean_markdown(text) == text
+
+    def test_autenticidade_reference_outside_footer_is_preserved(self):
+        text = (
+            "Art. 1º O sistema de autenticidade deverá permanecer disponível "
+            "durante o horário de expediente."
+        )
+        assert _clean_markdown(text) == text
 
     @pytest.mark.asyncio
     async def test_digital_aspx_pdf_url_resolved(self):
@@ -787,7 +1030,13 @@ class TestCleanMarkdown:
             "&arquivo=Arquivo/Documents/RNSG/RNSG952025/doc.pdf"
             "&identificador=abc"
         )
-        doc_info = {"title": "Lei 001", "doc_link": digital_aspx_link}
+        doc_info = {
+            "title": "Lei 001",
+            "type": "Lei",
+            "situation": "Vigente",
+            "doc_link": digital_aspx_link,
+            "year": 2010,
+        }
         result = await scraper._get_doc_data(doc_info)
         assert result is not None
         # Should resolve to the direct PDF URL
@@ -805,7 +1054,13 @@ class TestCleanMarkdown:
             "?id=12345"
             "&arquivo=Arquivo/Documents/XPTO/doc.docx"
         )
-        doc_info = {"title": "Lei 001", "doc_link": digital_aspx_link}
+        doc_info = {
+            "title": "Lei 001",
+            "type": "Lei",
+            "situation": "Vigente",
+            "doc_link": digital_aspx_link,
+            "year": 2010,
+        }
         result = await scraper._get_doc_data(doc_info)
         assert result is None
 
@@ -815,7 +1070,13 @@ class TestCleanMarkdown:
         scraper = _make_scraper()
         scraper._is_already_scraped = MagicMock(return_value=False)
         digital_aspx_link = "/Sistema/Protocolo/Processo2/Digital.aspx?id=12345"
-        doc_info = {"title": "Lei 001", "doc_link": digital_aspx_link}
+        doc_info = {
+            "title": "Lei 001",
+            "type": "Lei",
+            "situation": "Vigente",
+            "doc_link": digital_aspx_link,
+            "year": 2010,
+        }
         result = await scraper._get_doc_data(doc_info)
         assert result is None
 

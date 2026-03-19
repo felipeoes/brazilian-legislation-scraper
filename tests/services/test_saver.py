@@ -67,6 +67,33 @@ class TestFileSaver:
             assert ("http://example.com/doc1", "Test Doc") in keys
 
     @pytest.mark.asyncio
+    async def test_reset_year_removes_existing_year_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            saver = FileSaver(save_dir=Path(tmp), flush_interval=100)
+            doc = {
+                "year": 2024,
+                "document_url": "http://example.com/doc1.pdf",
+                "title": "Test Doc",
+                "text_markdown": "content",
+                "type": "Lei",
+                "situation": "Vigente",
+            }
+            await saver.save_document(
+                doc,
+                raw_content=b"%PDF-1.4...",
+                content_extension=".pdf",
+            )
+            await saver.flush(2024)
+
+            year_dir = Path(tmp) / "2024"
+            assert (year_dir / "data.json").exists()
+            assert (year_dir / "docs").exists()
+
+            await saver.reset_year(2024)
+
+            assert not year_dir.exists()
+
+    @pytest.mark.asyncio
     async def test_validate_data_rejects_incomplete(self):
         with tempfile.TemporaryDirectory() as tmp:
             saver = FileSaver(save_dir=Path(tmp), flush_interval=100)

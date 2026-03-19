@@ -38,9 +38,9 @@ _NON_ALPHA_RE = re.compile(r"[^a-zA-ZÀ-ÿ]")
 class LegislaGoias(StateScraper):
     """Webscraper for Goias state legislation website (https://legisla.casacivil.go.gov.br)
 
-    Year start (earliest on source): 1798
+    Year start (earliest on source): 1887
 
-    Example search request: https://legisla.casacivil.go.gov.br/api/v2/pesquisa/legislacoes?ano=1798&ordenarPor=data&page=1&qtd_por_pagina=100
+    Example search request: https://legisla.casacivil.go.gov.br/api/v2/pesquisa/legislacoes?ano=1887&ordenarPor=data&page=1&qtd_por_pagina=100
     """
 
     def __init__(
@@ -136,6 +136,7 @@ class LegislaGoias(StateScraper):
         doc_info = {
             "id": doc_detail["id"],
             "norm_number": doc_detail["numero"],
+            "year": doc_detail.get("ano"),
             "type": norm_type,
             "situation": situation,
             "date": doc_detail["data_legislacao"],
@@ -191,9 +192,13 @@ class LegislaGoias(StateScraper):
                         pdf_link = a_tag["href"]
                     baixar_div.decompose()
 
-            self._clean_norm_soup(
-                soup, unwrap_links=True, remove_images=True, remove_disclaimers=True
-            )
+            # Unwrap layout tables (usually <table border="0" width="100%"> wrapping a 6% and 94% column). Needed for docs like: https://legisla.casacivil.go.gov.br/pesquisa_legislacao/99142/lei-024
+            for layout_table in soup.find_all("table", border="0"):
+                td_main = layout_table.find("td", width=re.compile(r"9[0-9]%"))
+                if td_main:
+                    layout_table.replace_with(*td_main.contents)
+
+            self._clean_norm_soup(soup, unwrap_links=True, remove_disclaimers=True)
 
             html_string = str(soup)
 
@@ -221,6 +226,11 @@ class LegislaGoias(StateScraper):
 
         # If we don't have HTML content or markdown conversion failed, try PDF
         if not doc_info.get("text_markdown"):
+            # Drop any stale HTML raw-content keys set during the HTML processing
+            # attempt above so they don't shadow the PDF bytes written by
+            # _process_pdf_doc → _process_doc.
+            doc_info.pop("_raw_content", None)
+            doc_info.pop("_content_extension", None)
             if pdf_link:
                 doc_info["pdf_link"] = pdf_link
             return await self._process_pdf_doc(doc_info)
@@ -244,7 +254,7 @@ class LegislaGoias(StateScraper):
 
         from src.scraper.base.schemas import ScrapedDocument
 
-        return ScrapedDocument(year=doc_detail.get("ano"), **doc_info)
+        return ScrapedDocument(**doc_info)
 
     async def _fetch_search_page(self, year: int, page: int) -> list[dict]:
         """Fetch a specific page from the search API."""

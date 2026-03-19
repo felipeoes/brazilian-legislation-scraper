@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import re
+import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from unidecode import unidecode
@@ -283,6 +284,18 @@ class FileSaver:
     async def cleanup(self) -> None:
         """Flush remaining documents."""
         await self.flush_all()
+
+    async def reset_year(self, year: int) -> None:
+        """Remove all persisted artifacts for a year and reset in-memory state."""
+        lock = self._get_year_lock(year)
+        async with lock:
+            state = self._get_year_state(year)
+            state.pending_docs = {}
+            state.shard_seq = None
+
+            year_dir = self._year_dir(year)
+            if year_dir.exists():
+                shutil.rmtree(year_dir)
 
     async def _load_shard_data(
         self, shard_files: list[Path]

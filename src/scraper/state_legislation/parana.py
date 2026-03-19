@@ -1,8 +1,3 @@
-from __future__ import annotations
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from src.scraper.base.schemas import ScrapedDocument
 """Paraná state legislation scraper using direct HTTP requests.
 
 Scrapes the Casa Civil legislation system at ``legislacao.pr.gov.br``
@@ -10,6 +5,12 @@ by posting search forms and fetching document pages via HTTP — no
 browser or VPN required.
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.scraper.base.schemas import ScrapedDocument
 
 import re
 from urllib.parse import urljoin

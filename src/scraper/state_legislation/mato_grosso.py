@@ -1,13 +1,14 @@
 from __future__ import annotations
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from src.scraper.base.schemas import ScrapedDocument
+import asyncio
 import re
-from urllib.parse import urljoin, urlencode
+from urllib.parse import urlencode, urljoin
+
 from bs4 import BeautifulSoup
 from loguru import logger
+
 from src.scraper.base.converter import calc_pages, strip_html_chrome, valid_markdown
+from src.scraper.base.schemas import ScrapedDocument
 from src.scraper.base.scraper import StateScraper
 
 
@@ -89,7 +90,6 @@ class MTAlmtScraper(StateScraper):
         )
         self.historic_types = HISTORIC_TYPES
         self.max_year_historic = 1978
-        self.min_year = 1979
         self.token = None
         self.regex_total_items = re.compile(r"Total de registros:\s+([\d.]+)")
 
@@ -160,11 +160,11 @@ class MTAlmtScraper(StateScraper):
             return f"{self.base_url}/norma-juridica?{urlencode(params)}"
 
     def _get_total_norms(self, soup: BeautifulSoup) -> int:
+        """Get total number of norms from search page"""
         if not soup:
             return 0
 
-        """Get total number of norms from search page"""
-        total_items = self.regex_total_items.search(soup.prettify())
+        total_items = self.regex_total_items.search(str(soup))
         if total_items:
             return int(total_items.group(1).replace(".", ""))
 
@@ -187,13 +187,20 @@ class MTAlmtScraper(StateScraper):
 
         docs = []
         for item in items:
-            title_raw = item.find("h5").text.strip()
+            h5 = item.find("h5")
+            muted = item.find("div", class_="text-muted")
+            if h5 is None or muted is None:
+                logger.debug(
+                    "Skipping malformed listing item (missing h5 or text-muted)"
+                )
+                continue
+            title_raw = h5.text.strip()
             norm_type = (
                 title_raw.split(" - ")[0].strip()
                 if " - " in title_raw
                 else self._infer_norm_type(title_raw, is_historic=is_historic)
             )
-            summary = item.find("div", class_="text-muted").text.strip()
+            summary = muted.text.strip()
             links = item.find_all("a", href=True)
             if len(links) < 2:
                 continue
@@ -242,8 +249,12 @@ class MTAlmtScraper(StateScraper):
             f"{norm_base_url}/compilado?exibirAnotacao=1&marcoHistorico={marco}"
         )
 
-        ficha_soup = await self.request_service.get_soup(ficha_url)
-        compilado_soup = await self.request_service.get_soup(compilado_url)
+        ficha_soup, compilado_soup = await asyncio.gather(
+            self.request_service.get_soup(ficha_url),
+            self.request_service.get_soup(compilado_url),
+        )
+
+        norm_type = doc_info.get("type", "")
 
         if not ficha_soup:
             logger.error(f"Error getting soup for {ficha_url}")
@@ -251,6 +262,7 @@ class MTAlmtScraper(StateScraper):
                 title=doc_info.get("title", ""),
                 year=doc_info.get("year", ""),
                 html_link=ficha_url,
+                norm_type=norm_type,
                 error_message="Failed to get document page",
             )
             return None
@@ -292,6 +304,7 @@ class MTAlmtScraper(StateScraper):
                 title=doc_info.get("title", ""),
                 year=doc_info.get("year", ""),
                 html_link=compilado_url,
+                norm_type=norm_type,
                 error_message="Failed to get compilado page",
             )
             return None
@@ -302,6 +315,7 @@ class MTAlmtScraper(StateScraper):
                 title=doc_info.get("title", ""),
                 year=doc_info.get("year", ""),
                 html_link=compilado_url,
+                norm_type=norm_type,
                 error_message="turbo-frame not found in compilado page",
             )
             return None
@@ -321,6 +335,7 @@ class MTAlmtScraper(StateScraper):
                 title=doc_info.get("title", ""),
                 year=doc_info.get("year", ""),
                 html_link=capture_url,
+                norm_type=norm_type,
                 error_message=f"MHTML capture failed: {exc}",
             )
             return None
@@ -331,6 +346,7 @@ class MTAlmtScraper(StateScraper):
                 title=doc_info.get("title", ""),
                 year=doc_info.get("year", ""),
                 html_link=doc_info.get("document_url", compilado_url),
+                norm_type=norm_type,
                 error_message=reason,
             )
             return None
@@ -342,13 +358,11 @@ class MTAlmtScraper(StateScraper):
             "date": date if date else "",
             "subject": subject if subject else "",
             "tags": tags if tags else "",
-            "situation": situation if situation else "",
+            "situation": situation if situation else doc_info.get("situation", ""),
             "text_markdown": text_markdown,
             "raw_content": raw_content,
             "content_extension": content_ext,
         }
-
-        from src.scraper.base.schemas import ScrapedDocument
 
         return ScrapedDocument(**doc_data)
 
@@ -362,6 +376,11 @@ class MTAlmtScraper(StateScraper):
         # Page 1: fetch once for total count + first page of docs
         url_p1 = self._build_search_url("", year, 1, is_historic)
         soup_p1 = await self.request_service.get_soup(url_p1)
+        if not soup_p1:
+            logger.warning(
+                f"MATO GROSSO | {year} | Failed to fetch page 1 — skipping year"
+            )
+            return []
         total_items = self._get_total_norms(soup_p1)
         if total_items == 0:
             return []

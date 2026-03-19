@@ -477,7 +477,7 @@ class TestGetDocData:
             return_value=(text_soup, b"fake-mhtml")
         )
         scraper._is_already_scraped = MagicMock(return_value=False)
-        valid_md = "# Lei\n\n" + "Texto da lei. " * 20
+        valid_md = "# Lei\n\n" + ("Texto da lei. " * 20).strip()
         scraper._get_markdown = AsyncMock(return_value=valid_md)
 
         result = await scraper._get_doc_data(
@@ -678,6 +678,53 @@ class TestGetDocData:
         assert "https://www.alma.gov.br" not in html_content
         assert "(trecho a partir de 00:39:28s):" in html_content
 
+    @pytest.mark.asyncio
+    async def test_failed_detail_soup_passes_norm_type_to_error(self):
+        scraper = _make_scraper()
+        failed = make_failed_request()
+        scraper.request_service.get_soup = AsyncMock(return_value=failed)
+        scraper._save_doc_error = AsyncMock()
+
+        await scraper._get_doc_data(
+            {"title": "Lei nº 1", "summary": "x", "html_link": "/lei/1", "type": "Lei"}
+        )
+
+        call_kwargs = scraper._save_doc_error.call_args.kwargs
+        assert call_kwargs.get("norm_type") == "Lei"
+
+    @pytest.mark.asyncio
+    async def test_no_text_link_passes_norm_type_to_error(self):
+        scraper = _make_scraper()
+        detail_soup = _make_detail_soup(text_links=[])
+        scraper.request_service.get_soup = AsyncMock(return_value=detail_soup)
+        scraper._save_doc_error = AsyncMock()
+
+        await scraper._get_doc_data(
+            {"title": "Lei nº 1", "summary": "x", "html_link": "/lei/1", "type": "Lei"}
+        )
+
+        call_kwargs = scraper._save_doc_error.call_args.kwargs
+        assert call_kwargs.get("norm_type") == "Lei"
+
+    @pytest.mark.asyncio
+    async def test_no_text_norma_span_passes_norm_type_to_error(self):
+        scraper = _make_scraper()
+        detail_soup = _make_detail_soup()
+        text_soup = BeautifulSoup(
+            "<html><body><div>no span here</div></body></html>", "html.parser"
+        )
+        scraper.request_service.get_soup = AsyncMock(return_value=detail_soup)
+        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(text_soup, b""))
+        scraper._is_already_scraped = MagicMock(return_value=False)
+        scraper._save_doc_error = AsyncMock()
+
+        await scraper._get_doc_data(
+            {"title": "Lei nº 1", "summary": "x", "html_link": "/lei/1", "type": "Lei"}
+        )
+
+        call_kwargs = scraper._save_doc_error.call_args.kwargs
+        assert call_kwargs.get("norm_type") == "Lei"
+
 
 class TestScrapeYear:
     @pytest.mark.asyncio
@@ -712,6 +759,20 @@ class TestScrapeYear:
         scraper.request_service.get_soup = AsyncMock(return_value=failed)
 
         assert await scraper._scrape_year(2022) == []
+
+    @pytest.mark.asyncio
+    async def test_failed_first_page_logs_warning(self):
+        from unittest.mock import patch
+
+        scraper = _make_scraper()
+        failed = make_failed_request()
+        scraper.request_service.get_soup = AsyncMock(return_value=failed)
+
+        with patch("src.scraper.state_legislation.minas_gerais.logger") as mock_log:
+            await scraper._scrape_year(2022)
+
+        mock_log.warning.assert_called_once()
+        assert "Failed to fetch page 1" in mock_log.warning.call_args[0][0]
 
 
 @pytest.mark.integration

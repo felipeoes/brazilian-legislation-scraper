@@ -379,10 +379,16 @@ class TestGetDocData:
         scraper._download_and_convert = AsyncMock(
             return_value=(valid_md, b"raw_bytes", ".pdf")
         )
-        doc_info = {"title": "Decreto 001", "pdf_link": "/pdf/doc1.pdf"}
+        doc_info = {
+            "title": "Decreto 001",
+            "pdf_link": "/pdf/doc1.pdf",
+            "year": 2020,
+            "type": "Decreto Estadual",
+            "situation": "Não consta",
+        }
         result = await scraper._get_doc_data(doc_info)
         assert result is not None
-        assert result["text_markdown"] == valid_md
+        assert result["text_markdown"] == valid_md.strip()
         assert result["document_url"] == "/pdf/doc1.pdf"
         assert result["_raw_content"] == b"raw_bytes"
         assert result["_content_extension"] == ".pdf"
@@ -395,7 +401,13 @@ class TestGetDocData:
         scraper._download_and_convert = AsyncMock(
             return_value=(valid_md, b"raw_bytes", ".pdf")
         )
-        doc_info = {"title": "Decreto 001", "pdf_link": "/pdf/doc1.pdf"}
+        doc_info = {
+            "title": "Decreto 001",
+            "pdf_link": "/pdf/doc1.pdf",
+            "year": 2020,
+            "type": "Decreto Estadual",
+            "situation": "Não consta",
+        }
         result = await scraper._get_doc_data(doc_info)
         assert result is not None
         assert "pdf_link" not in result

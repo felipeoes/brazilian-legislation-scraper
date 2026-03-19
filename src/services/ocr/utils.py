@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-_DATA_URI_RE = re.compile(r"data:image/([a-zA-Z0-9]+);base64,(.*)", re.DOTALL)
+_DATA_URI_RE = re.compile(r"data:[^/]+/([a-zA-Z0-9]+);base64,(.*)", re.DOTALL)
 
 
 def parse_base64_data_uri(data_url: str) -> tuple[str, str]:

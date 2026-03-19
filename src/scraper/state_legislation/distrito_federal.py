@@ -418,7 +418,6 @@ class DFSinjScraper(StateScraper):
             norm_text_tag,
             remove_disclaimers=True,
             unwrap_links=True,
-            remove_images=True,
             remove_empty_tags=True,
             strip_styles=True,
             remove_style_tags=True,
@@ -480,7 +479,7 @@ class DFSinjScraper(StateScraper):
             return {}
 
         client_response = cast(aiohttp.ClientResponse, response)
-        html = await client_response.text(errors="replace")
+        html = await client_response.text()
         match = re.search(
             r"json_norma\s*=\s*(\{.*?\});\s*var\s+highlight",
             html,

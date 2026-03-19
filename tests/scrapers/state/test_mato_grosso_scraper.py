@@ -49,7 +49,6 @@ def _make_scraper(**kwargs) -> MTAlmtScraper:
         situations=dict(SITUATIONS),
         historic_types=dict(HISTORIC_TYPES),
         max_year_historic=1978,
-        min_year=1979,
         token="test_token",
         regex_total_items=re.compile(r"Total de registros:\s+([\d.]+)"),
         **kwargs,
@@ -405,6 +404,8 @@ def _make_doc_info():
     return {
         "title": "Lei 001/2020",
         "year": 2020,
+        "type": "Lei Ordinária",
+        "situation": "Não consta",
         "document_url": "https://www.al.mt.gov.br/norma-juridica/urn:lex:br;mato.grosso:estadual:lei.ordinaria:2020-12-30;11281",
         "norm_link": "/norma-juridica/urn:lex:br;mato.grosso:estadual:lei.ordinaria:2020-12-30;11281",
         "summary": "Ementa",
@@ -450,6 +451,7 @@ class TestGetDocData:
         scraper._save_doc_error.assert_called_once()
         call_kwargs = scraper._save_doc_error.call_args.kwargs
         assert call_kwargs.get("error_message") == "Failed to get document page"
+        assert call_kwargs.get("norm_type") == "Lei Ordinária"
 
     @pytest.mark.asyncio
     async def test_compilado_failed_saves_error_and_returns_none(self):
@@ -467,6 +469,7 @@ class TestGetDocData:
         scraper._save_doc_error.assert_called_once()
         call_kwargs = scraper._save_doc_error.call_args.kwargs
         assert call_kwargs.get("error_message") == "Failed to get compilado page"
+        assert call_kwargs.get("norm_type") == "Lei Ordinária"
 
     @pytest.mark.asyncio
     async def test_compilado_no_turbo_frame_saves_error_and_returns_none(self):
@@ -481,6 +484,7 @@ class TestGetDocData:
         scraper._save_doc_error.assert_called_once()
         call_kwargs = scraper._save_doc_error.call_args.kwargs
         assert "turbo-frame" in call_kwargs.get("error_message", "")
+        assert call_kwargs.get("norm_type") == "Lei Ordinária"
 
     @pytest.mark.asyncio
     async def test_invalid_markdown_saves_error(self):
@@ -496,6 +500,8 @@ class TestGetDocData:
         result = await scraper._get_doc_data(_make_doc_info())
         assert result is None
         scraper._save_doc_error.assert_called_once()
+        call_kwargs = scraper._save_doc_error.call_args.kwargs
+        assert call_kwargs.get("norm_type") == "Lei Ordinária"
 
     @pytest.mark.asyncio
     async def test_valid_doc_returns_correct_shape(self):
@@ -515,3 +521,140 @@ class TestGetDocData:
         assert result["_raw_content"] == b"fake-mhtml"
         assert "norm_link" not in result  # popped
         assert result.get("situation") == "Vigente"
+
+    @pytest.mark.asyncio
+    async def test_get_soup_called_twice_concurrently(self):
+        """Both ficha and compilado are fetched (concurrent gather)."""
+        scraper = _make_scraper()
+        scraper._is_already_scraped = MagicMock(return_value=False)
+        scraper._save_doc_error = AsyncMock()
+        scraper._get_markdown = AsyncMock(return_value=_make_valid_md())
+        scraper._capture_mhtml = AsyncMock(return_value=b"fake-mhtml")
+        scraper.request_service.get_soup = AsyncMock(
+            side_effect=[_make_ficha_soup(), _make_compilado_soup()]
+        )
+        await scraper._get_doc_data(_make_doc_info())
+        assert scraper.request_service.get_soup.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_situation_falls_back_to_doc_info_when_absent(self):
+        """When ficha page has no Situação field, situation is taken from doc_info."""
+        scraper = _make_scraper()
+        scraper._is_already_scraped = MagicMock(return_value=False)
+        scraper._save_doc_error = AsyncMock()
+        scraper._get_markdown = AsyncMock(return_value=_make_valid_md())
+        scraper._capture_mhtml = AsyncMock(return_value=b"fake-mhtml")
+        ficha_no_situacao = BeautifulSoup(
+            "<html><body><ul>"
+            "<li><strong>Publicação:</strong> 01/01/2020</li>"
+            "</ul></body></html>",
+            "html.parser",
+        )
+        scraper.request_service.get_soup = AsyncMock(
+            side_effect=[ficha_no_situacao, _make_compilado_soup()]
+        )
+        doc_info = {**_make_doc_info(), "situation": "Não consta"}
+        result = await scraper._get_doc_data(doc_info)
+        assert result is not None
+        assert result.get("situation") == "Não consta"
+
+
+# ---------------------------------------------------------------------------
+# _extract_docs_from_soup — None guard
+# ---------------------------------------------------------------------------
+
+
+class TestExtractDocsFromSoupNoneGuards:
+    def test_skips_item_missing_h5(self):
+        scraper = _make_scraper()
+        html = """<html><body>
+            <div class="col-12"><h5>Form</h5><div class="text-muted">x</div></div>
+            <div class="col-12"><h5>Filter</h5><div class="text-muted">x</div></div>
+            <div class="col-12">
+                <div class="text-muted">No h5 here</div>
+                <a href="/a">A</a><a href="/b">B</a>
+            </div>
+            <div class="col-12"><nav>pag</nav></div>
+        </body></html>"""
+        soup = BeautifulSoup(html, "html.parser")
+        docs = scraper._extract_docs_from_soup(soup, is_historic=False)
+        assert docs == []
+
+    def test_skips_item_missing_text_muted(self):
+        scraper = _make_scraper()
+        html = """<html><body>
+            <div class="col-12"><h5>Form</h5><div class="text-muted">x</div></div>
+            <div class="col-12"><h5>Filter</h5><div class="text-muted">x</div></div>
+            <div class="col-12">
+                <h5>Lei Ordinária - 001/2020</h5>
+                <a href="/a">A</a><a href="/b">B</a>
+            </div>
+            <div class="col-12"><nav>pag</nav></div>
+        </body></html>"""
+        soup = BeautifulSoup(html, "html.parser")
+        docs = scraper._extract_docs_from_soup(soup, is_historic=False)
+        assert docs == []
+
+    def test_valid_item_still_extracted_alongside_malformed(self):
+        """A valid item is still returned when a preceding item is malformed."""
+        scraper = _make_scraper()
+        html = """<html><body>
+            <div class="col-12"><h5>Form</h5><div class="text-muted">x</div></div>
+            <div class="col-12"><h5>Filter</h5><div class="text-muted">x</div></div>
+            <div class="col-12">
+                <div class="text-muted">No h5 — will be skipped</div>
+                <a href="/bad-a">A</a><a href="/bad-b">B</a>
+            </div>
+            <div class="col-12">
+                <h5>Lei Ordinária - 001/2020</h5>
+                <div class="text-muted">Good ementa</div>
+                <a href="/download/1">PDF</a>
+                <a href="/norma/1">Ver</a>
+            </div>
+            <div class="col-12"><nav>pag</nav></div>
+        </body></html>"""
+        soup = BeautifulSoup(html, "html.parser")
+        docs = scraper._extract_docs_from_soup(soup, is_historic=False)
+        assert len(docs) == 1
+        assert docs[0]["type"] == "Lei Ordinária"
+
+
+# ---------------------------------------------------------------------------
+# _scrape_year — soup_p1 failure guard
+# ---------------------------------------------------------------------------
+
+
+class TestScrapeYearSoupFailure:
+    @pytest.mark.asyncio
+    async def test_failed_page1_logs_warning_and_returns_empty(self):
+        from unittest.mock import patch
+
+        scraper = _make_scraper()
+        failed = MagicMock()
+        failed.__bool__ = MagicMock(return_value=False)
+        scraper.request_service.get_soup = AsyncMock(return_value=failed)
+        scraper._set_token = AsyncMock()
+        scraper.token = "tok"
+
+        with patch("src.scraper.state_legislation.mato_grosso.logger") as mock_log:
+            result = await scraper._scrape_year(2020)
+
+        assert result == []
+        mock_log.warning.assert_called_once()
+        assert "Failed to fetch page 1" in mock_log.warning.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_zero_results_returns_empty_without_warning(self):
+        from unittest.mock import patch
+
+        scraper = _make_scraper()
+        html = "<html><body><p>Total de registros: 0</p></body></html>"
+        soup = BeautifulSoup(html, "html.parser")
+        scraper.request_service.get_soup = AsyncMock(return_value=soup)
+        scraper.token = "tok"
+
+        with patch("src.scraper.state_legislation.mato_grosso.logger") as mock_log:
+            result = await scraper._scrape_year(2020)
+
+        assert result == []
+        mock_log.warning.assert_not_called()

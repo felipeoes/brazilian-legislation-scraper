@@ -173,7 +173,7 @@ class TocantinsScraper(StateScraper):
 
     @staticmethod
     def _has_table_artifacts(text_markdown: str) -> bool:
-        """Detect markitdown outputs that are mostly broken pipe tables."""
+        """Detect html-to-markdown outputs that are mostly broken pipe tables."""
         if not text_markdown:
             return False
 
