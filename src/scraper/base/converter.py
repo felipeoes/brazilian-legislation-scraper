@@ -468,13 +468,19 @@ class MarkdownConverter:
     async def _pymupdf4llm_convert(self, body: bytes) -> str:
         """Convert PDF bytes to markdown via pymupdf4llm.
 
+        Uses the ``pymupdf_rag`` backend directly to avoid pymupdf4llm 1.27+'s
+        layout engine, which requires Tesseract even for digital PDFs. Scanned
+        PDFs are handled upstream via ``LLMOCRService``.
+
         Runs the (synchronous) conversion off the event loop.
         """
 
         def _convert() -> str:
             doc = fitz.open(stream=body, filetype="pdf")
             try:
-                return pymupdf4llm.to_markdown(doc, embed_images=True)
+                return pymupdf4llm.helpers.pymupdf_rag.to_markdown(
+                    doc, embed_images=True
+                )
             finally:
                 doc.close()
 
