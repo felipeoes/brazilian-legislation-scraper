@@ -478,8 +478,13 @@ class MarkdownConverter:
         def _convert() -> str:
             doc = fitz.open(stream=body, filetype="pdf")
             try:
+                # table_strategy=None disables find_tables(), which uses a
+                # module-level TEXTPAGE global in pymupdf/table.py that can be
+                # None for certain PDFs, causing 'NoneType' has no attr
+                # 'extractRAWDICT'. Table text is still extracted as plain text
+                # via force_text=True (the default).
                 return pymupdf4llm.helpers.pymupdf_rag.to_markdown(
-                    doc, embed_images=True
+                    doc, embed_images=True, table_strategy=None
                 )
             finally:
                 doc.close()
@@ -547,9 +552,8 @@ class MarkdownConverter:
             check_text = _WATERMARK_CHECK_RE.sub("", text_without_images).strip()
             if valid_markdown(check_text, min_length=min_length)[0]:
                 return text_markdown.strip()
-            logger.debug(
-                "pymupdf4llm output failed validation — falling back to LLM OCR"
-            )
+
+            # pymupdf4llm output failed validation — falling back to LLM OCR
             if ocr_service:
                 return await ocr_service.pdf_to_markdown(body)
             logger.warning("pymupdf4llm output invalid and no OCR service configured.")
