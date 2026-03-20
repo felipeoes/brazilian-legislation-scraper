@@ -205,12 +205,12 @@ class AcreLegisScraper(StateScraper):
                 "type": "Constituição Estadual",
                 "situation": self.default_situation,
                 "summary": "Constituição Estadual do Estado do Acre",
+                "title": "Constituição Estadual",
             }
             doc = await self._process_html_doc(
                 doc_data, html_string, document_url, mhtml
             )
             if doc:
-                doc.title = "Constituição Estadual"
                 saved = await self._save_doc_result(doc)
                 if saved is not None:
                     # Update doc from saved dict if needed, but ScrapedDocument is preferred

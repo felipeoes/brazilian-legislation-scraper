@@ -663,9 +663,7 @@ class TestICMBioGetDocData:
         scraper._is_already_scraped = MagicMock(return_value=False)
         scraper._save_doc_result = AsyncMock(return_value=None)
         scraper._save_doc_error = AsyncMock(return_value=None)
-        scraper._html_to_markdown = AsyncMock(
-            return_value="# Converted markdown content"
-        )
+        scraper._get_markdown = AsyncMock(return_value="# Converted markdown content")
         scraper._clean_norm_soup = MagicMock(side_effect=lambda soup, **kwargs: soup)
         scraper._wrap_html = MagicMock(
             side_effect=lambda html: f"<html><body>{html}</body></html>"
@@ -749,7 +747,7 @@ class TestICMBioGetDocData:
                 b"fake-mhtml",
             )
         )
-        scraper._html_to_markdown = AsyncMock(return_value="   ")
+        scraper._get_markdown = AsyncMock(return_value="   ")
         result = await scraper._get_doc_data(self._valid_doc_info())
         assert result is None
         scraper._save_doc_error.assert_awaited_once()
@@ -766,7 +764,7 @@ class TestICMBioGetDocData:
                 b"fake-mhtml",
             )
         )
-        scraper._html_to_markdown = AsyncMock(
+        scraper._get_markdown = AsyncMock(
             return_value="The requested URL was not found on this server."
         )
         result = await scraper._get_doc_data(self._valid_doc_info())
@@ -776,6 +774,7 @@ class TestICMBioGetDocData:
     @pytest.mark.asyncio
     async def test_happy_path_saves_and_returns_result(self):
         scraper = self._make_scraper()
+        doc = self._valid_doc_info()
         scraper._fetch_soup_and_mhtml = AsyncMock(
             return_value=(
                 BeautifulSoup(
@@ -792,7 +791,7 @@ class TestICMBioGetDocData:
 
         scraper._save_doc_result = capture_save
 
-        result = await scraper._get_doc_data(self._valid_doc_info())
+        result = await scraper._get_doc_data(doc)
         assert result is not None
         assert "text_markdown" in result
         assert result["text_markdown"] == "# Converted markdown content"
@@ -800,6 +799,9 @@ class TestICMBioGetDocData:
         assert result["title"] == "IN Nº 1"
         assert result["_raw_content"] == b"fake-mhtml-content"
         assert result["_content_extension"] == ".mhtml"
+        assert (
+            scraper._get_markdown.await_args.kwargs["base_url"] == doc["document_url"]
+        )
 
     @pytest.mark.asyncio
     async def test_happy_path_clean_norm_soup_called(self):
@@ -824,13 +826,13 @@ class TestICMBioGetDocData:
 
         scraper = self._make_scraper()
 
-        html_sent_to_markdown = []
+        markdown_calls = []
 
-        async def capture_html(html_content):
-            html_sent_to_markdown.append(html_content)
+        async def capture_markdown(*, html_content, base_url=None):
+            markdown_calls.append({"html_content": html_content, "base_url": base_url})
             return "# Body content only"
 
-        scraper._html_to_markdown = capture_html
+        scraper._get_markdown = capture_markdown
         scraper._fetch_soup_and_mhtml = AsyncMock(
             return_value=(
                 BeautifulSoup(
@@ -847,8 +849,9 @@ class TestICMBioGetDocData:
 
         result = await scraper._get_doc_data(self._valid_doc_info())
         assert result is not None
-        assert len(html_sent_to_markdown) == 1
-        converted_html = html_sent_to_markdown[0]
+        assert len(markdown_calls) == 1
+        converted_html = markdown_calls[0]["html_content"]
+        assert markdown_calls[0]["base_url"] == self._valid_doc_info()["document_url"]
         soup = BS(converted_html, "html.parser")
         # identifica and ementa must be absent
         assert soup.find("p", class_="identifica") is None

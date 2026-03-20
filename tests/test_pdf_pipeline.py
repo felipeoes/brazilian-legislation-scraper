@@ -68,11 +68,17 @@ def _make_scanned_pdf() -> bytes:
     return content
 
 
+def _make_png_bytes() -> bytes:
+    """Return bytes with a PNG signature for image inlining tests."""
+    return b"\x89PNG\r\n\x1a\nfake-png"
+
+
 def _make_converter(**overrides) -> MarkdownConverter:
     """Create a MarkdownConverter with a mock scraper."""
     scraper = MagicMock()
     scraper.ocr_service = overrides.pop("ocr_service", None)
     scraper.base_url = overrides.pop("base_url", "http://example.com")
+    scraper._pymupdf_image_size_limit = overrides.pop("_pymupdf_image_size_limit", 0.1)
     for k, v in overrides.items():
         setattr(scraper, k, v)
     return MarkdownConverter(scraper)
@@ -176,6 +182,75 @@ class TestBytesToMarkdownRouting:
             mock_convert.assert_called_once()
             assert "Hello world" in result
 
+
+class TestHtmlImageInlining:
+    @pytest.mark.asyncio
+    async def test_get_markdown_inlines_relative_image_url(self):
+        converter = _make_converter()
+        response = MagicMock(status=200)
+        converter._scraper.request_service.fetch_bytes = AsyncMock(
+            return_value=(_make_png_bytes(), response)
+        )
+        html = (
+            "<div><p>Body content.</p>"
+            '<img src="/images/DO1_2016_05_20/TABLE(page=69,417.524,37.686,758.872,311.598)"'
+            ' alt="table"></div>'
+        )
+
+        result = await converter.get_markdown(
+            html_content=html,
+            base_url="https://www.in.gov.br/web/dou/-/instrucao-normativa",
+        )
+
+        converter._scraper.request_service.fetch_bytes.assert_awaited_once_with(
+            "https://www.in.gov.br/images/DO1_2016_05_20/TABLE(page=69,417.524,37.686,758.872,311.598)"
+        )
+        assert "data:image/png;base64," in result
+        assert "/images/DO1_2016_05_20/TABLE" not in result
+
+    @pytest.mark.asyncio
+    async def test_get_markdown_uses_data_src_when_src_missing(self):
+        converter = _make_converter()
+        response = MagicMock(status=200)
+        converter._scraper.request_service.fetch_bytes = AsyncMock(
+            return_value=(_make_png_bytes(), response)
+        )
+        html = '<div><img data-src="/images/data-src-table.png" alt="table"></div>'
+
+        result = await converter.get_markdown(
+            html_content=html,
+            base_url="https://www.in.gov.br/web/dou/-/instrucao-normativa",
+        )
+
+        converter._scraper.request_service.fetch_bytes.assert_awaited_once_with(
+            "https://www.in.gov.br/images/data-src-table.png"
+        )
+        assert "data:image/png;base64," in result
+        assert "data-src-table.png" not in result
+
+    @pytest.mark.asyncio
+    async def test_get_markdown_uses_srcset_when_src_missing(self):
+        converter = _make_converter()
+        response = MagicMock(status=200)
+        converter._scraper.request_service.fetch_bytes = AsyncMock(
+            return_value=(_make_png_bytes(), response)
+        )
+        html = (
+            '<div><img srcset="/images/one-x.png 1x, /images/two-x.png 2x" '
+            'alt="table"></div>'
+        )
+
+        result = await converter.get_markdown(
+            html_content=html,
+            base_url="https://www.in.gov.br/web/dou/-/instrucao-normativa",
+        )
+
+        converter._scraper.request_service.fetch_bytes.assert_awaited_once_with(
+            "https://www.in.gov.br/images/one-x.png"
+        )
+        assert "data:image/png;base64," in result
+        assert "one-x.png" not in result
+
     @pytest.mark.asyncio
     async def test_digital_pdf_uses_pymupdf4llm(self):
         """Digital PDFs should use pymupdf4llm, not html-to-markdown."""
@@ -195,15 +270,21 @@ class TestBytesToMarkdownRouting:
 
     @pytest.mark.asyncio
     async def test_scanned_pdf_uses_ocr(self):
-        """Scanned PDFs should route to LLM OCR when available."""
+        """Scanned PDFs should route to LLM OCR when markitdown also fails."""
         pdf = _make_scanned_pdf()
         ocr_mock = AsyncMock()
         ocr_mock.pdf_to_markdown = AsyncMock(return_value="# OCR Result\nArt. 1º ...")
         converter = _make_converter(ocr_service=ocr_mock)
 
-        result = await converter.bytes_to_markdown(pdf, content_type="application/pdf")
-        ocr_mock.pdf_to_markdown.assert_called_once_with(pdf)
-        assert "OCR Result" in result
+        with patch.object(
+            converter, "_markitdown_convert", new_callable=AsyncMock
+        ) as mock_md:
+            mock_md.return_value = ""
+            result = await converter.bytes_to_markdown(
+                pdf, content_type="application/pdf"
+            )
+            ocr_mock.pdf_to_markdown.assert_called_once_with(pdf)
+            assert "OCR Result" in result
 
     @pytest.mark.asyncio
     async def test_low_confidence_digital_uses_ocr(self):
@@ -213,10 +294,16 @@ class TestBytesToMarkdownRouting:
         ocr_mock.pdf_to_markdown = AsyncMock(return_value="# OCR low conf")
         converter = _make_converter(ocr_service=ocr_mock)
 
-        with patch(
-            "src.scraper.base.converter.is_pdf_scanned",
-            return_value=(False, 0.5),
+        with (
+            patch(
+                "src.scraper.base.converter.is_pdf_scanned",
+                return_value=(False, 0.5),
+            ),
+            patch.object(
+                converter, "_markitdown_convert", new_callable=AsyncMock
+            ) as mock_md,
         ):
+            mock_md.return_value = ""
             result = await converter.bytes_to_markdown(
                 pdf, content_type="application/pdf"
             )
@@ -225,19 +312,26 @@ class TestBytesToMarkdownRouting:
 
     @pytest.mark.asyncio
     async def test_digital_pdf_falls_back_to_ocr_on_validation_failure(self):
-        """If pymupdf4llm output fails validation, fall back to OCR."""
+        """If pymupdf4llm and markitdown both fail validation, fall back to OCR."""
         pdf = _make_digital_pdf("x")  # very short text → validation will fail
         ocr_mock = AsyncMock()
         ocr_mock.pdf_to_markdown = AsyncMock(return_value="# OCR fallback content here")
         converter = _make_converter(ocr_service=ocr_mock)
 
-        with patch(
-            "src.scraper.base.converter.is_pdf_scanned",
-            return_value=(False, 0.9),
+        with (
+            patch(
+                "src.scraper.base.converter.is_pdf_scanned",
+                return_value=(False, 0.9),
+            ),
+            patch.object(
+                converter, "_markitdown_convert", new_callable=AsyncMock
+            ) as mock_md,
         ):
+            mock_md.return_value = ""
             result = await converter.bytes_to_markdown(
                 pdf, content_type="application/pdf"
             )
+            mock_md.assert_called_once()
             ocr_mock.pdf_to_markdown.assert_called_once()
             assert "OCR fallback" in result
 
@@ -253,19 +347,26 @@ class TestBytesToMarkdownRouting:
 
     @pytest.mark.asyncio
     async def test_scan_detection_failure_assumes_scanned(self):
-        """If scan detection raises, assume scanned and use OCR."""
+        """If scan detection raises, assume scanned and try markitdown → OCR."""
         pdf = _make_digital_pdf("test content")
         ocr_mock = AsyncMock()
         ocr_mock.pdf_to_markdown = AsyncMock(return_value="# OCR after detection error")
         converter = _make_converter(ocr_service=ocr_mock)
 
-        with patch(
-            "src.scraper.base.converter.is_pdf_scanned",
-            side_effect=RuntimeError("detection failed"),
+        with (
+            patch(
+                "src.scraper.base.converter.is_pdf_scanned",
+                side_effect=RuntimeError("detection failed"),
+            ),
+            patch.object(
+                converter, "_markitdown_convert", new_callable=AsyncMock
+            ) as mock_md,
         ):
+            mock_md.return_value = ""
             result = await converter.bytes_to_markdown(
                 pdf, content_type="application/pdf"
             )
+            mock_md.assert_called_once()
             ocr_mock.pdf_to_markdown.assert_called_once()
             assert "OCR after detection error" in result
 
@@ -277,14 +378,13 @@ class TestBytesToMarkdownRouting:
 
 class TestImageOnlyFallback:
     @pytest.mark.asyncio
-    async def test_image_only_pymupdf4llm_falls_back_to_ocr(self):
-        """When pymupdf4llm returns only base64 images (no text), fall back to OCR."""
+    async def test_image_only_pymupdf4llm_falls_back_to_markitdown_then_ocr(self):
+        """When pymupdf4llm returns only base64 images, try markitdown then OCR."""
         pdf = _make_digital_pdf("short")
         ocr_mock = AsyncMock()
         ocr_mock.pdf_to_markdown = AsyncMock(return_value="# OCR extracted text")
         converter = _make_converter(ocr_service=ocr_mock)
 
-        # Simulate pymupdf4llm returning only a base64 image (no text)
         image_only = "![](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUA)"
         with (
             patch(
@@ -294,11 +394,16 @@ class TestImageOnlyFallback:
             patch.object(
                 converter, "_pymupdf4llm_convert", new_callable=AsyncMock
             ) as mock_convert,
+            patch.object(
+                converter, "_markitdown_convert", new_callable=AsyncMock
+            ) as mock_md,
         ):
             mock_convert.return_value = image_only
+            mock_md.return_value = ""
             result = await converter.bytes_to_markdown(
                 pdf, content_type="application/pdf"
             )
+            mock_md.assert_called_once()
             ocr_mock.pdf_to_markdown.assert_called_once()
             assert "OCR extracted text" in result
 
@@ -333,7 +438,7 @@ class TestImageOnlyFallback:
 
     @pytest.mark.asyncio
     async def test_image_only_no_ocr_returns_empty(self):
-        """Image-only pymupdf4llm output with no OCR service returns empty."""
+        """Image-only pymupdf4llm + failed markitdown with no OCR returns empty."""
         pdf = _make_digital_pdf("short")
         converter = _make_converter(ocr_service=None)
 
@@ -346,10 +451,109 @@ class TestImageOnlyFallback:
             patch.object(
                 converter, "_pymupdf4llm_convert", new_callable=AsyncMock
             ) as mock_convert,
+            patch.object(
+                converter, "_markitdown_convert", new_callable=AsyncMock
+            ) as mock_md,
         ):
             mock_convert.return_value = image_only
+            mock_md.return_value = ""
             result = await converter.bytes_to_markdown(
                 pdf, content_type="application/pdf"
             )
-            # No OCR available — should return the image-only output or empty
+            mock_md.assert_called_once()
+            assert isinstance(result, str)
+
+
+# ---------------------------------------------------------------------------
+# _markitdown_convert
+# ---------------------------------------------------------------------------
+
+
+class TestMarkitdownConvert:
+    @pytest.mark.asyncio
+    async def test_converts_digital_pdf(self):
+        """markitdown should extract text from a simple digital PDF."""
+        pdf = _make_digital_pdf(
+            "Art. 1º Ficam criadas as seguintes secretarias de estado."
+        )
+        converter = _make_converter()
+        result = await converter._markitdown_convert(pdf)
+        assert "Art." in result
+        assert len(result) > 20
+
+    @pytest.mark.asyncio
+    async def test_returns_content_for_non_pdf_bytes(self):
+        """markitdown doesn't raise on non-PDF; it returns whatever it can parse."""
+        converter = _make_converter()
+        result = await converter._markitdown_convert(b"not a pdf")
+        # markitdown treats arbitrary bytes as text — not an error
+        assert isinstance(result, str)
+
+
+# ---------------------------------------------------------------------------
+# markitdown fallback chain
+# ---------------------------------------------------------------------------
+
+
+class TestMarkitdownFallbackChain:
+    @pytest.mark.asyncio
+    async def test_pymupdf4llm_fails_markitdown_succeeds(self):
+        """When pymupdf4llm fails validation, markitdown should rescue."""
+        pdf = _make_digital_pdf("x")  # too short for pymupdf4llm validation
+        ocr_mock = AsyncMock()
+        ocr_mock.pdf_to_markdown = AsyncMock(return_value="# OCR text")
+        converter = _make_converter(ocr_service=ocr_mock)
+
+        valid_md = "Art. 1º Este decreto estabelece as normas gerais. " * 5
+        with (
+            patch(
+                "src.scraper.base.converter.is_pdf_scanned",
+                return_value=(False, 0.9),
+            ),
+            patch.object(
+                converter, "_markitdown_convert", new_callable=AsyncMock
+            ) as mock_md,
+        ):
+            mock_md.return_value = valid_md
+            result = await converter.bytes_to_markdown(
+                pdf, content_type="application/pdf"
+            )
+            mock_md.assert_called_once()
+            ocr_mock.pdf_to_markdown.assert_not_called()
+            assert "Art." in result
+
+    @pytest.mark.asyncio
+    async def test_scanned_pdf_markitdown_succeeds_skips_ocr(self):
+        """For scanned PDFs, if markitdown succeeds, skip LLM OCR."""
+        pdf = _make_scanned_pdf()
+        ocr_mock = AsyncMock()
+        ocr_mock.pdf_to_markdown = AsyncMock(return_value="# OCR text")
+        converter = _make_converter(ocr_service=ocr_mock)
+
+        valid_md = "Art. 1º Decreto que regula a matéria em questão. " * 5
+        with patch.object(
+            converter, "_markitdown_convert", new_callable=AsyncMock
+        ) as mock_md:
+            mock_md.return_value = valid_md
+            result = await converter.bytes_to_markdown(
+                pdf, content_type="application/pdf"
+            )
+            mock_md.assert_called_once()
+            ocr_mock.pdf_to_markdown.assert_not_called()
+            assert "Art." in result
+
+    @pytest.mark.asyncio
+    async def test_scanned_pdf_no_ocr_markitdown_fails_tries_pymupdf4llm(self):
+        """Scanned PDF, no OCR, markitdown fails → pymupdf4llm last resort."""
+        pdf = _make_scanned_pdf()
+        converter = _make_converter(ocr_service=None)
+
+        with patch.object(
+            converter, "_markitdown_convert", new_callable=AsyncMock
+        ) as mock_md:
+            mock_md.return_value = ""
+            result = await converter.bytes_to_markdown(
+                pdf, content_type="application/pdf"
+            )
+            mock_md.assert_called_once()
             assert isinstance(result, str)

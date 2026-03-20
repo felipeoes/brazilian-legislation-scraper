@@ -235,6 +235,26 @@ class TestCleanDouHtml:
         scraper._clean_dou_html(soup)
         assert "não substitui" not in soup.get_text()
 
+    def test_removes_publicacao_dou_reference_element(self):
+        scraper = _make_scraper()
+        soup = self._soup(
+            "<html><body><p>Art. 1°</p><p>o publicado no Publicação DOU nº 063, "
+            "de 01/04/1996, pág. 5439</p></body></html>"
+        )
+        scraper._clean_dou_html(soup)
+        assert "Publicação DOU" not in soup.get_text()
+        assert "Art. 1°" in soup.get_text()
+
+    def test_removes_boletim_servico_reference_element(self):
+        scraper = _make_scraper()
+        soup = self._soup(
+            "<html><body><p>Art. 1°</p><p>Publicado no Boletim de Serviço nº 939, "
+            "de 23/11/84, do Ministério do Interior.</p></body></html>"
+        )
+        scraper._clean_dou_html(soup)
+        assert "Boletim de Serviço" not in soup.get_text()
+        assert "Art. 1°" in soup.get_text()
+
     def test_unwraps_non_dou_links(self):
         scraper = _make_scraper()
         soup = self._soup('<html><body><a href="/outro">Art. 1°</a></body></html>')
@@ -297,6 +317,108 @@ class TestCleanPdfMarkdown:
         result = scraper._clean_pdf_markdown(text)
         assert "in.gov.br" not in result
 
+    def test_removes_publicacao_dou_suffix_on_same_block(self):
+        scraper = _make_scraper()
+        text = (
+            "Art. 1° Conteúdo legal completo.\n\n"
+            "o publicado no Publicação DOU nº 063, de 01/04/1996, pág. 5439"
+        )
+        result = scraper._clean_pdf_markdown(text)
+        assert "Publicação DOU" not in result
+        assert "5439" not in result
+        assert result == "Art. 1° Conteúdo legal completo."
+
+    def test_removes_publicacao_dou_suffix_with_wrapped_page_number(self):
+        scraper = _make_scraper()
+        text = (
+            "Art. 1° Conteúdo legal completo.\n\n"
+            "o publicado na Publicação DOU nº 012, de 11/12/1995, pág.\n\n20391"
+        )
+        result = scraper._clean_pdf_markdown(text)
+        assert "Publicação DOU" not in result
+        assert "20391" not in result
+        assert result == "Art. 1° Conteúdo legal completo."
+
+    def test_removes_trailing_dou_suffix_without_publicacao_label(self):
+        scraper = _make_scraper()
+        text = (
+            "Art. 3° Conteúdo legal completo.\n\n"
+            "_ o publicado no DOU, de 22 de novembro de 1985._"
+        )
+        result = scraper._clean_pdf_markdown(text)
+        assert "publicado no DOU" not in result
+        assert result == "Art. 3° Conteúdo legal completo."
+
+    def test_removes_pre_1990_imprensa_nacional_notice(self):
+        scraper = _make_scraper()
+        text = (
+            "Art. 8° Conteúdo legal completo.\n\n"
+            "** http://portal.imprensanacional.gov.br/** **devido a data**\n"
+            "**de publicação ser anterior ao ano de 1990.**"
+        )
+        result = scraper._clean_pdf_markdown(text)
+        assert "portal.imprensanacional.gov.br" not in result
+        assert "anterior ao ano de 1990" not in result
+        assert result == "Art. 8° Conteúdo legal completo."
+
+    def test_removes_publication_block_before_following_notes(self):
+        scraper = _make_scraper()
+        text = (
+            "Art. 4° Conteúdo legal completo.\n\n"
+            "_ o publicado no DOU, de 23 de novembro de 1984._\n\n"
+            "3\n4\n\n"
+            "Nota editorial."
+        )
+        result = scraper._clean_pdf_markdown(text)
+        assert "publicado no DOU" not in result
+        assert "Nota editorial." in result
+
+    def test_removes_boletim_servico_footer_with_ministry(self):
+        scraper = _make_scraper()
+        text = (
+            "Art. 5° Conteúdo legal completo.\n\n"
+            "o publicado no Boletim de Serviço nº 948, de 25/11/85, "
+            "do Ministério do Interior"
+        )
+        result = scraper._clean_pdf_markdown(text)
+        assert "Boletim de Serviço" not in result
+        assert "Ministério do Interior" not in result
+        assert result == "Art. 5° Conteúdo legal completo."
+
+    def test_removes_boletim_servico_footer_without_comma_after_number(self):
+        scraper = _make_scraper()
+        text = (
+            "Art. 6° Conteúdo legal completo.\n\n"
+            "o publicado no Boletim de Serviço nº 921 de 20/7/84, "
+            "do Ministério do Interior"
+        )
+        result = scraper._clean_pdf_markdown(text)
+        assert "Boletim de Serviço" not in result
+        assert result == "Art. 6° Conteúdo legal completo."
+
+    def test_removes_boletim_servico_mi_footer_with_numeric_markers(self):
+        scraper = _make_scraper()
+        text = (
+            "Art. 7° Conteúdo legal completo.\n\n"
+            "o publicado no Boletim de Serviço/MI, de 1 de novembro de 1984.\n\n"
+            "1\n2\n\n"
+            "Nota editorial."
+        )
+        result = scraper._clean_pdf_markdown(text)
+        assert "Boletim de Serviço/MI" not in result
+        assert "\n\n1\n2\n\n" not in result
+        assert "Nota editorial." in result
+
+    def test_removes_local_file_footer_block(self):
+        scraper = _make_scraper()
+        text = (
+            "Art. 8° Conteúdo legal completo.\n\n"
+            "file:///C:/Users/97785458120/Desktop/res1384.html 1/1"
+        )
+        result = scraper._clean_pdf_markdown(text)
+        assert "file:///" not in result
+        assert result == "Art. 8° Conteúdo legal completo."
+
     def test_does_not_double_clean_markdown_links(self):
         """_clean_pdf_markdown must NOT call _clean_markdown internally.
         _get_markdown already applies _clean_markdown; a second call would be
@@ -313,6 +435,24 @@ class TestCleanPdfMarkdown:
         result = scraper._clean_pdf_markdown(legal)
         assert "Art. 1°" in result
         assert "§ 1°" in result
+
+    def test_preserves_inline_publicacao_dou_reference_in_body(self):
+        scraper = _make_scraper()
+        text = (
+            "Art. 2° A nota registra que o publicado na Publicação DOU nº 012, "
+            "de 11/12/1995, pág. 20391 deve ser consultado em conjunto com o anexo."
+        )
+        result = scraper._clean_pdf_markdown(text)
+        assert result == text
+
+    def test_preserves_header_block_with_boletim_reference(self):
+        scraper = _make_scraper()
+        text = (
+            "**RESOLUÇÃO CONAMA nº 11, de 26 de setembro de 1984**\n"
+            "Publicada no Boletim de Serviço/MI, de 1º de novembro de 1984"
+        )
+        result = scraper._clean_pdf_markdown(text)
+        assert result == text
 
 
 # ---------------------------------------------------------------------------

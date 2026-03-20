@@ -507,7 +507,7 @@ class ICMBioScraper(BaseScraper):
             p.decompose()
 
         # Structural cleanup before conversion: unwrap links, strip disclaimer
-        # notices, remove images and empty tags.
+        # notices, and remove empty tags while preserving images for inlining.
         text_div = self._clean_norm_soup(
             cast(BeautifulSoup, text_div),
             unwrap_links=True,
@@ -515,9 +515,10 @@ class ICMBioScraper(BaseScraper):
             remove_empty_tags=True,
         )
 
-        # _html_to_markdown wraps the fragment, converts via html-to-markdown, and
-        # applies _clean_markdown — all in one step.
-        text_markdown = await self._html_to_markdown(str(text_div))
+        text_markdown = await self._get_markdown(
+            html_content=str(text_div),
+            base_url=document_url,
+        )
         if not text_markdown or not text_markdown.strip():
             logger.warning(f"Empty markdown from {document_url}")
             await self._save_doc_error(

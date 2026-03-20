@@ -281,6 +281,7 @@ class BaseScraper:
     _iterate_situations: bool = False
     _mhtml_wait_until: str = "load"
     _mhtml_timeout: int = 60_000  # 60s per attempt × 5 attempts = up to 5 minutes total
+    _pymupdf_image_size_limit: float = 0.1
 
     def __init__(
         self,

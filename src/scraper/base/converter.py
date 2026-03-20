@@ -14,11 +14,12 @@ from typing import TYPE_CHECKING, cast
 
 import aiohttp
 import fitz
-import pymupdf4llm
+import pymupdf4llm.helpers.pymupdf_rag
 from bs4 import BeautifulSoup, Tag
 from html_to_markdown import ConversionOptions
 from html_to_markdown import convert as html_to_md
 from loguru import logger
+from markitdown import MarkItDown
 
 from src.utils import clean_md_tag, inline_images_in_html, run_in_thread
 
@@ -472,15 +473,31 @@ class MarkdownConverter:
         layout engine, which requires Tesseract even for digital PDFs. Scanned
         PDFs are handled upstream via ``LLMOCRService``.
 
+        On failure (e.g. ``extractRAWDICT`` errors from table parsing), retries
+        with ``table_strategy=None`` to skip table detection entirely.
+
         Runs the (synchronous) conversion off the event loop.
         """
+        image_size_limit = getattr(self._scraper, "_pymupdf_image_size_limit", 0.1)
 
         def _convert() -> str:
             doc = fitz.open(stream=body, filetype="pdf")
             try:
-                return pymupdf4llm.helpers.pymupdf_rag.to_markdown(
-                    doc, embed_images=True
-                )
+                try:
+                    return pymupdf4llm.helpers.pymupdf_rag.to_markdown(
+                        doc,
+                        embed_images=True,
+                        image_size_limit=image_size_limit,
+                    )
+                except Exception:
+                    # Retry without table detection — works around
+                    # extractRAWDICT / min() errors on malformed tables.
+                    return pymupdf4llm.helpers.pymupdf_rag.to_markdown(
+                        doc,
+                        embed_images=True,
+                        table_strategy=None,
+                        image_size_limit=image_size_limit,
+                    )
             finally:
                 doc.close()
 
@@ -489,6 +506,26 @@ class MarkdownConverter:
             return (result or "").strip()
         except Exception as e:
             logger.debug(f"pymupdf4llm conversion failed: {e}")
+            return ""
+
+    async def _markitdown_convert(self, body: bytes) -> str:
+        """Convert PDF bytes to markdown via Microsoft's markitdown library.
+
+        Used as an intermediate fallback when pymupdf4llm produces only
+        embedded images instead of extracting text.  markitdown is
+        synchronous, so the call is offloaded via ``run_in_thread()``.
+        """
+
+        def _convert() -> str:
+            md = MarkItDown()
+            result = md.convert_stream(BytesIO(body), file_extension=".pdf")
+            return result.markdown
+
+        try:
+            result = await run_in_thread(_convert)
+            return (result or "").strip()
+        except Exception as e:
+            logger.debug(f"markitdown conversion failed: {e}")
             return ""
 
     async def bytes_to_markdown(
@@ -500,9 +537,13 @@ class MarkdownConverter:
     ) -> str:
         """Convert raw bytes to markdown.
 
-        For PDFs, uses ``is_pdf_scanned`` to decide between pymupdf4llm
-        (digital documents) and LLM OCR (scanned / low-confidence).
-        Non-PDF HTML goes through ``html-to-markdown`` with image inlining.
+        For PDFs the conversion priority is:
+        **pymupdf4llm → markitdown → LLM OCR**.
+
+        ``is_pdf_scanned`` decides the initial strategy: digital PDFs try
+        pymupdf4llm first, while scanned PDFs skip straight to markitdown
+        and then LLM OCR.  Non-PDF HTML goes through ``html-to-markdown``
+        with image inlining.
         """
         is_pdf_ = is_pdf(body, content_type)
 
@@ -518,7 +559,7 @@ class MarkdownConverter:
                 logger.debug(f"HTML-to-markdown conversion failed: {e}")
             return ""
 
-        # ---- PDF pipeline ----
+        # ---- PDF pipeline: pymupdf4llm → markitdown → LLM OCR ----
         min_length = 50
         try:
             page_count = await run_in_thread(_pdf_page_count, body)
@@ -537,7 +578,7 @@ class MarkdownConverter:
 
         use_ocr = scanned or confidence < 0.7
 
-        # 2a. Digital PDF → pymupdf4llm (with OCR fallback on validation failure)
+        # 2a. Digital PDF → pymupdf4llm first
         if not use_ocr:
             text_markdown = await self._pymupdf4llm_convert(body)
             # Strip base64 images before validation — pymupdf4llm sometimes
@@ -548,13 +589,29 @@ class MarkdownConverter:
             if valid_markdown(check_text, min_length=min_length)[0]:
                 return text_markdown.strip()
 
-            # pymupdf4llm output failed validation — falling back to LLM OCR
+            # pymupdf4llm output failed validation — try markitdown
+            text_markdown = await self._markitdown_convert(body)
+            check_text = _WATERMARK_CHECK_RE.sub("", text_markdown).strip()
+            if valid_markdown(check_text, min_length=min_length)[0]:
+                return text_markdown.strip()
+
+            # markitdown also failed — fall back to LLM OCR
             if ocr_service:
+                logger.debug(
+                    "PDF appears digital but text extraction failed — trying LLM OCR."
+                )
                 return await ocr_service.pdf_to_markdown(body)
-            logger.warning("pymupdf4llm output invalid and no OCR service configured.")
+            logger.warning(
+                "pymupdf4llm and markitdown output invalid and no OCR service configured."
+            )
             return text_markdown.strip() if text_markdown else ""
 
-        # 2b. Scanned / low-confidence → LLM OCR (with pymupdf4llm last resort)
+        # 2b. Scanned / low-confidence → markitdown first (free), then LLM OCR
+        text_markdown = await self._markitdown_convert(body)
+        check_text = _WATERMARK_CHECK_RE.sub("", text_markdown).strip()
+        if valid_markdown(check_text, min_length=min_length)[0]:
+            return text_markdown.strip()
+
         if ocr_service:
             return await ocr_service.pdf_to_markdown(body)
 
