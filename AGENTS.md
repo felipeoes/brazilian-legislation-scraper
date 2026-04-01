@@ -49,13 +49,24 @@ uv run pytest tests/ -k "acre" -m "not integration"  # filter by keyword, skip i
 ### Class Hierarchy
 
 ```
-BaseScraper                          # src/scraper/base/scraper.py
+BrowserMixin                         # src/scraper/base/browser_mixin.py — Playwright page pool, MHTML capture
+PaginationMixin                      # src/scraper/base/pagination.py — _gather_results, _process_documents, _fetch_all_pages
+
+BaseScraper(BrowserMixin, PaginationMixin)  # src/scraper/base/scraper.py
   └─ StateScraper                    # same file — sets STATE_LEGISLATION_SAVE_DIR default
        ├─ SAPLBaseScraper            # src/scraper/base/sapl_scraper.py (Paraíba, Piauí, Roraima)
        └─ <27 state scrapers>        # src/scraper/state_legislation/<state>.py
   └─ CamaraDepScraper               # src/scraper/federal_legislation/
   └─ ConamaScraper, ICMBioScraper   # src/scraper/conama/, src/scraper/icmbio/
 ```
+
+Supporting modules in `src/scraper/base/`:
+- **`content_utils.py`** — content-detection and markdown-cleaning helpers (`is_pdf`,
+  `clean_markdown`, `clean_norm_soup`, `detect_extension`, etc.). Re-exported from
+  `converter.py` for backward compatibility.
+- **`summary_utils.py`** — run-summary and LLM-usage formatting functions
+  (`merge_context`, `flatten_results`, `_build_run_summary`, etc.). Re-exported from
+  `scraper.py` for backward compatibility.
 
 ### Services (composed into BaseScraper)
 
@@ -65,7 +76,8 @@ BaseScraper                          # src/scraper/base/scraper.py
   sends to LLM vision model. Clients in `src/services/ocr/clients/` implement `LLMClient`
   protocol: `OpenAIClient`, `BedrockClient`, `SnowflakeClient`.
 - **BrowserService** (`src/services/browser/playwright.py`) — Playwright page pool for
-  JS-rendered sites (Maranhão, Paraná, Pernambuco).
+  JS-rendered sites (Maranhão, Paraná, Pernambuco). Browser lifecycle and MHTML capture
+  methods live in `BrowserMixin` (`src/scraper/base/browser_mixin.py`).
 - **ProxyService** (`src/services/proxy/service.py`) — proxy rotation from file or endpoint.
 - **FileSaver** (`src/database/saver.py`) — async JSON persistence via `aiofiles`, grouped
   by year into `data.json` files with document-level resume support.
@@ -166,15 +178,23 @@ Images are preserved as base64 data URIs in the final markdown output:
 
 ## Key Helper Methods (BaseScraper)
 
-| Method | Purpose |
-|---|---|
-| `_process_documents(docs, ...)` | Runs `_get_doc_data` → `_with_save` → `_gather_results` |
-| `_save_doc_result(result, ...)` | Persists a document (raw file + `data.json` append) |
-| `_save_doc_error(title, ...)` | Logs a document-level failure to the error log |
-| `_is_already_scraped(url, title)` | Resume support — returns `True` if already saved |
-| `_get_markdown(...)` | Converts url/response/stream/html to Markdown (pass `base_url` for image URL resolution) |
-| `_download_and_convert(url)` | Fetches raw bytes and converts to Markdown |
-| `_gather_results(coros, desc)` | `asyncio.gather` with error filtering + tqdm bar |
+| Method | Source | Purpose |
+|---|---|---|
+| `_process_documents(docs, ...)` | `PaginationMixin` (`pagination.py`) | Runs `_get_doc_data` → `_with_save` → `_gather_results` |
+| `_gather_results(coros, desc)` | `PaginationMixin` (`pagination.py`) | `asyncio.gather` with error filtering + tqdm bar |
+| `_fetch_all_pages(...)` | `PaginationMixin` (`pagination.py`) | Concurrent page fetching with auto-pagination |
+| `_save_doc_result(result, ...)` | `BaseScraper` (`scraper.py`) | Persists a document (raw file + `data.json` append) |
+| `_save_doc_error(title, ...)` | `BaseScraper` (`scraper.py`) | Logs a document-level failure to the error log |
+| `_is_already_scraped(url, title)` | `BaseScraper` (`scraper.py`) | Resume support — returns `True` if already saved |
+| `_get_markdown(...)` | `BaseScraper` (`scraper.py`) | Converts url/response/stream/html to Markdown (pass `base_url` for image URL resolution) |
+| `_download_and_convert(url)` | `BaseScraper` (`scraper.py`) | Fetches raw bytes and converts to Markdown |
+| `initialize_playwright(...)` | `BrowserMixin` (`browser_mixin.py`) | Sets up Playwright browser and page pool |
+| `_capture_mhtml(page)` | `BrowserMixin` (`browser_mixin.py`) | Captures MHTML snapshot of a rendered page |
+
+Content-detection helpers (`is_pdf`, `clean_markdown`, `clean_norm_soup`, `detect_extension`,
+etc.) live in `content_utils.py`; `converter.py` re-exports them for backward compatibility.
+Summary/reporting helpers (`merge_context`, `flatten_results`, `_build_run_summary`, etc.)
+live in `summary_utils.py`; `scraper.py` re-exports them for backward compatibility.
 
 The LLM OCR prompt (`DEFAULT_LLM_PROMPT`) is defined in `src/scraper/base/scraper.py`.
 Override the `llm_prompt` attribute only when a scraper genuinely needs different instructions.
