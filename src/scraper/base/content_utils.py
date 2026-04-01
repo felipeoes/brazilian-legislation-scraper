@@ -276,6 +276,56 @@ def calc_pages(total: int, per_page: int) -> int:
     return (total + per_page - 1) // per_page
 
 
+def _remove_unwanted_tags(soup: BeautifulSoup | Tag, tag_names: list[str]) -> None:
+    """Decompose all occurrences of the given tag names (img, style, script, etc.)."""
+    if tag_names:
+        for tag in soup.find_all(tag_names):
+            tag.decompose()
+
+
+def _strip_boilerplate(soup: BeautifulSoup | Tag) -> None:
+    """Remove disclaimer paragraphs common in Brazilian legislation pages."""
+    for tag in list(soup.find_all(["p", "span", "div"])):
+        if tag.decomposed:
+            continue
+        txt = tag.get_text(strip=True)
+        if _DISCLAIMER_RE.search(txt) and len(txt) < 300:
+            tag.decompose()
+
+
+def _clean_links(soup: BeautifulSoup | Tag) -> None:
+    """Remove empty anchor tags and unwrap anchors that contain text."""
+    for tag in list(soup.find_all("a")):
+        if tag.decomposed:
+            continue
+        if not tag.get_text(strip=True):
+            tag.decompose()
+        else:
+            tag.unwrap()
+
+
+def _unwrap_font_tags(soup: BeautifulSoup | Tag) -> None:
+    """Unwrap ``<font>`` tags, keeping their inner content."""
+    for tag in list(soup.find_all("font")):
+        if not tag.decomposed:
+            tag.unwrap()
+
+
+def _remove_empty_elements(soup: BeautifulSoup | Tag) -> None:
+    """Remove empty heading, div, span, and bold tags."""
+    for tag in list(soup.find_all(_CLEAN_NORM_EMPTY_TAGS)):
+        if tag.decomposed:
+            continue
+        if not tag.get_text(strip=True):
+            tag.decompose()
+
+
+def _clean_attributes(soup: BeautifulSoup | Tag) -> None:
+    """Strip inline ``style`` attributes from all remaining tags."""
+    for tag in soup.find_all(style=True):
+        del tag["style"]
+
+
 def clean_norm_soup(
     soup: BeautifulSoup | Tag,
     *,
@@ -294,53 +344,27 @@ def clean_norm_soup(
     content-level artifact removal common to Brazilian legislation pages.
     All options are independently toggleable.
     """
-    # --- Pass 1: decompose simple leaf-level tags ---
-    simple_remove: list[str] = []
+    # Decompose unwanted leaf-level tags
+    tags_to_remove: list[str] = []
     if remove_images:
-        simple_remove.append("img")
+        tags_to_remove.append("img")
     if remove_style_tags:
-        simple_remove.append("style")
+        tags_to_remove.append("style")
     if remove_script_tags:
-        simple_remove.append("script")
-    if simple_remove:
-        for tag in soup.find_all(simple_remove):
-            tag.decompose()
+        tags_to_remove.append("script")
+    _remove_unwanted_tags(soup, tags_to_remove)
 
-    # --- Pass 2: combined content-level cleanup ---
-    disclaimer_tags = {"p", "span", "div"} if remove_disclaimers else set()
-    empty_tag_names = set(_CLEAN_NORM_EMPTY_TAGS) if remove_empty_tags else set()
-    needs_combined = (
-        remove_disclaimers
-        or unwrap_links
-        or unwrap_fonts
-        or remove_empty_tags
-        or strip_styles
-    )
-    if needs_combined:
-        for tag in list(soup.find_all(True)):
-            if tag.decomposed:
-                continue
-            name = tag.name
-            if remove_disclaimers and name in disclaimer_tags:
-                txt = tag.get_text(strip=True)
-                if _DISCLAIMER_RE.search(txt) and len(txt) < 300:
-                    tag.decompose()
-                    continue
-            if unwrap_links and name == "a":
-                if not tag.get_text(strip=True):
-                    tag.decompose()
-                else:
-                    tag.unwrap()
-                continue
-            if unwrap_fonts and name == "font":
-                tag.unwrap()
-                continue
-            if remove_empty_tags and name in empty_tag_names:
-                if not tag.get_text(strip=True):
-                    tag.decompose()
-                    continue
-            if strip_styles and tag.get("style"):
-                del tag["style"]
+    # Content-level cleanup passes
+    if remove_disclaimers:
+        _strip_boilerplate(soup)
+    if unwrap_links:
+        _clean_links(soup)
+    if unwrap_fonts:
+        _unwrap_font_tags(soup)
+    if remove_empty_tags:
+        _remove_empty_elements(soup)
+    if strip_styles:
+        _clean_attributes(soup)
 
     return soup
 
