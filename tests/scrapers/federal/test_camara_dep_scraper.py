@@ -16,7 +16,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from bs4 import BeautifulSoup
 
-from src.scraper.federal_legislation.scrape import TYPES, CamaraDepScraper
+from src.scraper.federal_legislation.scrape import (
+    COVERAGE,
+    EXPORT_MAX_DOCS,
+    ORDERING,
+    TYPES,
+    CamaraDepScraper,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -41,9 +47,16 @@ def build_scraper(save_dir: Path) -> CamaraDepScraper:
 def build_unit_scraper() -> Any:
     scraper = object.__new__(CamaraDepScraper)
     scraper.verbose = False
+    scraper.overwrite = False
+    scraper.name = "LEGISLACAO_FEDERAL"
+    scraper.base_url = "https://www.camara.leg.br/legislacao/"
+    scraper.coverage = COVERAGE
+    scraper.ordering = ORDERING
+    scraper.export_max_docs = EXPORT_MAX_DOCS
     scraper.request_service = MagicMock()
     scraper._save_doc_error = AsyncMock()
     scraper._metadata_to_text_url = {}
+    scraper._scraped_keys = set()
     return scraper
 
 
@@ -452,3 +465,393 @@ class TestGetDocData:
         assert result["raw_content"] == fake_html
         assert result["content_extension"] == ".html"
         assert scraper._save_doc_error.await_count == 0
+
+
+# ---------------------------------------------------------------------------
+# New safety-net tests  — _extract_total_results
+# ---------------------------------------------------------------------------
+
+
+class TestExtractTotalResults:
+    """Unit tests for CamaraDepScraper._extract_total_results."""
+
+    @staticmethod
+    def _wrap(inner_html: str) -> BeautifulSoup:
+        return BeautifulSoup(f"<html><body>{inner_html}</body></html>", "html.parser")
+
+    def test_extracts_count_from_well_formed_div(self):
+        soup = self._wrap(
+            '<div class="busca-info__resultado busca-info__resultado--informado">'
+            "  Foram encontrados 42"
+            "</div>"
+        )
+        assert CamaraDepScraper._extract_total_results(soup) == 42
+
+    def test_returns_none_when_div_missing(self):
+        soup = self._wrap("<p>nothing here</p>")
+        assert CamaraDepScraper._extract_total_results(soup) is None
+
+    def test_returns_none_when_text_has_no_number(self):
+        soup = self._wrap(
+            '<div class="busca-info__resultado busca-info__resultado--informado">'
+            "  Nenhum documento encontrado"
+            "</div>"
+        )
+        assert CamaraDepScraper._extract_total_results(soup) is None
+
+    def test_extracts_large_count(self):
+        soup = self._wrap(
+            '<div class="busca-info__resultado busca-info__resultado--informado">'
+            "  Encontrados 12345"
+            "</div>"
+        )
+        assert CamaraDepScraper._extract_total_results(soup) == 12345
+
+
+# ---------------------------------------------------------------------------
+# New safety-net tests  — _parse_listing_page_documents
+# ---------------------------------------------------------------------------
+
+
+class TestParseListingPageDocuments:
+    """Unit tests for CamaraDepScraper._parse_listing_page_documents."""
+
+    def test_parses_single_result_item(self):
+        scraper = build_unit_scraper()
+        soup = BeautifulSoup(
+            """
+            <ul>
+              <li class="busca-resultados__item">
+                <h3 class="busca-resultados__cabecalho">
+                  <a href="https://www2.camara.leg.br/legin/fed/decret/2020/norma.html">
+                    Decreto nº 10.000
+                  </a>
+                </h3>
+                <p class="busca-resultados__descricao js-fade-read-more">
+                  Ementa: Dispõe sobre coisas.
+                </p>
+                <p class="busca-resultados__situacao">
+                  Situação: Não consta revogação expressa
+                </p>
+              </li>
+            </ul>
+            """,
+            "html.parser",
+        )
+        docs = scraper._parse_listing_page_documents(soup)
+        assert len(docs) == 1
+        assert docs[0]["title"] == "Decreto nº 10.000"
+        assert docs[0]["summary"] == "Dispõe sobre coisas."
+        assert docs[0]["situation"] == "Não consta revogação expressa"
+        assert docs[0]["metadata_url"].endswith("norma.html")
+
+    def test_skips_items_without_heading(self):
+        scraper = build_unit_scraper()
+        soup = BeautifulSoup(
+            """
+            <ul>
+              <li class="busca-resultados__item">
+                <p>No heading here</p>
+              </li>
+            </ul>
+            """,
+            "html.parser",
+        )
+        assert scraper._parse_listing_page_documents(soup) == []
+
+    def test_skips_items_without_anchor(self):
+        scraper = build_unit_scraper()
+        soup = BeautifulSoup(
+            """
+            <ul>
+              <li class="busca-resultados__item">
+                <h3 class="busca-resultados__cabecalho">
+                  Plain text, no link
+                </h3>
+              </li>
+            </ul>
+            """,
+            "html.parser",
+        )
+        assert scraper._parse_listing_page_documents(soup) == []
+
+    def test_handles_missing_summary_and_situation(self):
+        scraper = build_unit_scraper()
+        soup = BeautifulSoup(
+            """
+            <ul>
+              <li class="busca-resultados__item">
+                <h3 class="busca-resultados__cabecalho">
+                  <a href="https://example.com/doc">Decreto nº 5</a>
+                </h3>
+              </li>
+            </ul>
+            """,
+            "html.parser",
+        )
+        docs = scraper._parse_listing_page_documents(soup)
+        assert len(docs) == 1
+        assert docs[0]["summary"] == ""
+        assert docs[0]["situation"] == ""
+
+    def test_parses_multiple_items(self):
+        scraper = build_unit_scraper()
+        soup = BeautifulSoup(
+            """
+            <ul>
+              <li class="busca-resultados__item">
+                <h3 class="busca-resultados__cabecalho">
+                  <a href="https://example.com/d1">Lei nº 1</a>
+                </h3>
+              </li>
+              <li class="busca-resultados__item">
+                <h3 class="busca-resultados__cabecalho">
+                  <a href="https://example.com/d2">Lei nº 2</a>
+                </h3>
+              </li>
+            </ul>
+            """,
+            "html.parser",
+        )
+        docs = scraper._parse_listing_page_documents(soup)
+        assert len(docs) == 2
+        assert docs[0]["title"] == "Lei nº 1"
+        assert docs[1]["title"] == "Lei nº 2"
+
+
+# ---------------------------------------------------------------------------
+# New safety-net tests  — _get_document_text_link (additional edge cases)
+# ---------------------------------------------------------------------------
+
+
+class TestGetDocumentTextLinkEdgeCases:
+    """Additional edge-case tests for _get_document_text_link."""
+
+    @staticmethod
+    def _make_doc(**overrides):
+        doc = {
+            "title": "Decreto nº 500, de 01/01/2020",
+            "summary": "Dispõe sobre algo.",
+            "metadata_url": "https://www2.camara.leg.br/legin/fed/decret/2020/decreto-500-norma.html",
+            "situation": "Não consta revogação expressa",
+        }
+        doc.update(overrides)
+        return doc
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_failed_fetch(self):
+        from conftest import make_failed_request
+
+        scraper = build_unit_scraper()
+        failed = make_failed_request(
+            url="https://www2.camara.leg.br/legin/fed/decret/2020/decreto-500-norma.html",
+            reason="Connection refused",
+            status=503,
+        )
+        scraper.request_service.get_soup = AsyncMock(return_value=failed)
+
+        result = await scraper._get_document_text_link(
+            self._make_doc(), year=2020, norm_type="Decreto"
+        )
+        assert result is None
+        scraper._save_doc_error.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_h1_not_found(self):
+        scraper = build_unit_scraper()
+        scraper.request_service.get_soup = AsyncMock(
+            return_value=BeautifulSoup(
+                "<html><body><h1>Not Found</h1></body></html>",
+                "html.parser",
+            )
+        )
+
+        result = await scraper._get_document_text_link(
+            self._make_doc(), year=2020, norm_type="Decreto"
+        )
+        assert result is None
+        scraper._save_doc_error.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_sessao_divs(self):
+        scraper = build_unit_scraper()
+        scraper.request_service.get_soup = AsyncMock(
+            return_value=BeautifulSoup(
+                "<html><body><p>No sessao divs at all</p></body></html>",
+                "html.parser",
+            )
+        )
+
+        result = await scraper._get_document_text_link(
+            self._make_doc(), year=2020, norm_type="Decreto"
+        )
+        assert result is None
+        scraper._save_doc_error.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_text_links_in_sessao(self):
+        scraper = build_unit_scraper()
+        scraper.request_service.get_soup = AsyncMock(
+            return_value=BeautifulSoup(
+                """
+                <html><body>
+                  <div class="sessao">
+                    <a href="other.html">Origem: Poder Executivo</a>
+                  </div>
+                </body></html>
+                """,
+                "html.parser",
+            )
+        )
+
+        result = await scraper._get_document_text_link(
+            self._make_doc(), year=2020, norm_type="Decreto"
+        )
+        assert result is None
+        scraper._save_doc_error.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_prefers_html_over_pdf_within_same_bucket(self):
+        scraper = build_unit_scraper()
+        scraper.request_service.get_soup = AsyncMock(
+            return_value=BeautifulSoup(
+                """
+                <html><body>
+                  <div class="sessao">
+                    <a href="decreto-publicacaooriginal.pdf">Texto - Publicação Original</a>
+                    <a href="decreto-publicacaooriginal.html">Texto - Publicação Original</a>
+                  </div>
+                </body></html>
+                """,
+                "html.parser",
+            )
+        )
+
+        result = await scraper._get_document_text_link(
+            self._make_doc(), year=2020, norm_type="Decreto"
+        )
+        assert result is not None
+        assert result["document_url"].endswith(".html")
+
+    @pytest.mark.asyncio
+    async def test_defaults_situation_to_nao_informado(self):
+        scraper = build_unit_scraper()
+        scraper.request_service.get_soup = AsyncMock(
+            return_value=BeautifulSoup(
+                """
+                <html><body>
+                  <div class="sessao">
+                    <a href="decreto-publicacaooriginal.html">Texto - Publicação Original</a>
+                  </div>
+                </body></html>
+                """,
+                "html.parser",
+            )
+        )
+
+        doc = self._make_doc(situation="")
+        result = await scraper._get_document_text_link(
+            doc, year=2020, norm_type="Decreto"
+        )
+        assert result is not None
+        assert result["situation"] == "Não Informado"
+
+
+# ---------------------------------------------------------------------------
+# New safety-net tests  — _scrape_type
+# ---------------------------------------------------------------------------
+
+
+class TestScrapeType:
+    """Unit tests for the three-phase _scrape_type pipeline."""
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_initial_fetch_fails(self):
+        from conftest import make_failed_request
+
+        scraper = build_unit_scraper()
+        scraper.request_service.get_soup = AsyncMock(return_value=make_failed_request())
+
+        results = await scraper._scrape_type("Decreto", "Decreto", 2020)
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_total_is_none(self):
+        scraper = build_unit_scraper()
+        scraper.request_service.get_soup = AsyncMock(
+            return_value=BeautifulSoup(
+                "<html><body><p>No total element</p></body></html>",
+                "html.parser",
+            )
+        )
+
+        results = await scraper._scrape_type("Decreto", "Decreto", 2020)
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_total_is_zero(self):
+        scraper = build_unit_scraper()
+        scraper.request_service.get_soup = AsyncMock(
+            return_value=BeautifulSoup(
+                "<html><body>"
+                '<div class="busca-info__resultado busca-info__resultado--informado">'
+                "  Encontrados 0"
+                "</div>"
+                "</body></html>",
+                "html.parser",
+            )
+        )
+
+        results = await scraper._scrape_type("Decreto", "Decreto", 2020)
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_uses_export_path_when_total_within_threshold(self):
+        scraper = build_unit_scraper()
+
+        listing_soup = BeautifulSoup(
+            "<html><body>"
+            '<div class="busca-info__resultado busca-info__resultado--informado">'
+            "  Encontrados 2"
+            "</div>"
+            "</body></html>",
+            "html.parser",
+        )
+
+        export_soup = BeautifulSoup(
+            """
+            <div id="impressaoPDF">
+              <ul>
+                <li>
+                  <a href="https://www2.camara.leg.br/legin/fed/decret/2020/d1-norma.html">
+                    Decreto nº 1
+                  </a>
+                  <p><span class="bold">Situação: </span>Não consta revogação expressa</p>
+                </li>
+                <li>
+                  <a href="https://www2.camara.leg.br/legin/fed/decret/2020/d2-norma.html">
+                    Decreto nº 2
+                  </a>
+                  <p><span class="bold">Situação: </span>Revogada</p>
+                </li>
+              </ul>
+            </div>
+            """,
+            "html.parser",
+        )
+
+        scraper.request_service.get_soup = AsyncMock(
+            side_effect=[listing_soup, export_soup]
+        )
+
+        scraper._gather_results = AsyncMock(return_value=[])
+        scraper._process_documents = AsyncMock(return_value=[{"title": "doc"}])
+        scraper._is_already_scraped = MagicMock(return_value=False)
+
+        results = await scraper._scrape_type("Decreto", "Decreto", 2020)
+
+        # _gather_results was called for Phase 2 (text link resolution)
+        scraper._gather_results.assert_called()
+        # _process_documents was called for Phase 3
+        scraper._process_documents.assert_called_once()
+        assert results == [{"title": "doc"}]
