@@ -12,6 +12,8 @@ from src.scraper.base.converter import (
 from src.scraper.base.scraper import (
     DEFAULT_LLM_PROMPT,
     BaseScraper,
+)
+from src.scraper.base.summary_utils import (
     flatten_results,
     merge_context,
 )
