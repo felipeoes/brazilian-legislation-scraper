@@ -429,6 +429,156 @@ class MGAlmgScraper(StateScraper):
             return True
         return len(clean_text) >= 350
 
+    @staticmethod
+    def _is_mg_error_page(page_title: str) -> bool:
+        """Check if a page title indicates an ALMG error/access-denied page."""
+        return "Acesso Proibido" in page_title or "Erro" in page_title
+
+    async def _try_fetch_text_norma(
+        self, url: str, title: str
+    ) -> tuple[Tag | None, bytes | None, str]:
+        """Fetch a single text-page URL with retries, looking for span.textNorma.
+
+        Returns (text_norm_span, mhtml_bytes, error_message).
+        On success error_message is empty.
+        """
+        last_error = "Failed to fetch document text page"
+        for attempt in range(_TEXT_PAGE_ATTEMPTS):
+            try:
+                soup, mhtml_bytes = await self._fetch_soup_and_mhtml(url)
+            except Exception as exc:
+                last_error = f"Failed to fetch document text page: {exc}"
+                if attempt + 1 < _TEXT_PAGE_ATTEMPTS:
+                    await asyncio.sleep(_TEXT_PAGE_RETRY_SLEEP_SECONDS * (attempt + 1))
+                continue
+
+            soup = cast(BeautifulSoup, soup)
+            candidate_span = soup.find("span", class_="textNorma")
+            if candidate_span is not None:
+                return candidate_span, mhtml_bytes, ""
+
+            page_title = (
+                self._clean_text(soup.title.get_text(" ", strip=True))
+                if soup.title
+                else ""
+            )
+            if self._is_mg_error_page(page_title):
+                last_error = (
+                    f"Unexpected error page while fetching document text: {page_title}"
+                )
+                if attempt + 1 < _TEXT_PAGE_ATTEMPTS:
+                    await asyncio.sleep(_TEXT_PAGE_RETRY_SLEEP_SECONDS * (attempt + 1))
+            else:
+                last_error = "Could not find span.textNorma in document page"
+                break
+
+            if attempt + 1 < _TEXT_PAGE_ATTEMPTS:
+                logger.debug(
+                    f"Retrying Minas Gerais text page for '{title}' | url={url} | attempt={attempt + 2}"
+                )
+
+        return None, None, last_error
+
+    async def _resolve_mg_text_page(
+        self, text_links: list[str], title: str
+    ) -> tuple[str, Tag | None, bytes | None, str]:
+        """Iterate candidate text-page URLs and return the first with textNorma.
+
+        Returns (document_page_url, text_norm_span, page_mhtml, error_message).
+        On success error_message is empty.  When the document is already scraped
+        text_norm_span is ``None`` *and* error_message is empty (no error to log).
+        """
+        last_error = "Failed to fetch document text page"
+        for text_link in text_links:
+            candidate_url = urljoin(self.base_url, text_link)
+            if candidate_url.rstrip("/") == self.base_url.rstrip("/"):
+                last_error = (
+                    "Document link resolves to base URL (no document text available)"
+                )
+                continue
+
+            if self._is_already_scraped(candidate_url, title):
+                return "", None, None, ""
+
+            span, mhtml, error = await self._try_fetch_text_norma(candidate_url, title)
+            if span is not None:
+                return candidate_url, span, mhtml, ""
+
+            if error:
+                last_error = error
+
+        return "", None, None, last_error
+
+    async def _convert_mg_content(
+        self,
+        text_norm_span: Tag,
+        document_page_url: str,
+        page_mhtml: bytes | None,
+        title: str,
+        norm_type: str,
+        data: dict,
+        year: int,
+    ) -> ScrapedDocument | None:
+        """Convert a textNorma span to a ScrapedDocument (HTML or PDF path)."""
+        html_string, plain_text, pdf_links = self._prepare_text_norma_html(
+            text_norm_span,
+            document_page_url,
+        )
+
+        if pdf_links and not self._has_substantive_html_text(plain_text):
+            pdf_link = pdf_links[0]
+
+            if self._is_already_scraped(pdf_link, title):
+                return None
+
+            logger.info(
+                f"Document {title} is an image PDF, extracting text from image. URL: {document_page_url}"
+            )
+            text_markdown, raw_content, content_ext = await self._download_and_convert(
+                pdf_link
+            )
+
+            valid, reason = valid_markdown(text_markdown)
+            if not valid:
+                await self._save_doc_error(
+                    title=title,
+                    norm_type=norm_type,
+                    html_link=pdf_link,
+                    error_message=f"Invalid PDF markdown: {reason}",
+                )
+                return None
+
+            return ScrapedDocument(
+                **data,
+                year=year,
+                text_markdown=text_markdown,
+                document_url=pdf_link,
+                raw_content=raw_content,
+                content_extension=content_ext or ".pdf",
+            )
+
+        html_string = wrap_html(html_string)
+        text_markdown = await self._get_markdown(html_content=html_string)
+
+        valid, reason = valid_markdown(text_markdown)
+        if not valid:
+            await self._save_doc_error(
+                title=title,
+                norm_type=norm_type,
+                html_link=document_page_url,
+                error_message=f"Invalid markdown: {reason}",
+            )
+            return None
+
+        return ScrapedDocument(
+            **data,
+            year=year,
+            text_markdown=text_markdown,
+            document_url=document_page_url,
+            raw_content=page_mhtml,
+            content_extension=".mhtml",
+        )
+
     async def _get_doc_data(self, doc_info: dict) -> ScrapedDocument | None:
         """Get document data from a listing entry."""
         doc_info = dict(doc_info)
@@ -474,131 +624,31 @@ class MGAlmgScraper(StateScraper):
             ),
         }
 
-        last_text_error = "Failed to fetch document text page"
-        document_page_url = ""
-        text_norm_span = None
-        page_mhtml: bytes | None = None
-        for text_link in text_links:
-            candidate_url = urljoin(self.base_url, text_link)
-            if candidate_url.rstrip("/") == self.base_url.rstrip("/"):
-                last_text_error = (
-                    "Document link resolves to base URL (no document text available)"
-                )
-                continue
-
-            if self._is_already_scraped(candidate_url, title):
-                return None
-
-            for attempt in range(_TEXT_PAGE_ATTEMPTS):
-                try:
-                    soup, mhtml_bytes = await self._fetch_soup_and_mhtml(candidate_url)
-                except Exception as exc:
-                    last_text_error = f"Failed to fetch document text page: {exc}"
-                    if attempt + 1 < _TEXT_PAGE_ATTEMPTS:
-                        await asyncio.sleep(
-                            _TEXT_PAGE_RETRY_SLEEP_SECONDS * (attempt + 1)
-                        )
-                    continue
-
-                soup = cast(BeautifulSoup, soup)
-                candidate_span = soup.find("span", class_="textNorma")
-                if candidate_span is not None:
-                    document_page_url = candidate_url
-                    text_norm_span = candidate_span
-                    page_mhtml = mhtml_bytes
-                    break
-
-                page_title = (
-                    self._clean_text(soup.title.get_text(" ", strip=True))
-                    if soup.title
-                    else ""
-                )
-                if "Acesso Proibido" in page_title or "Erro" in page_title:
-                    last_text_error = f"Unexpected error page while fetching document text: {page_title}"
-                    if attempt + 1 < _TEXT_PAGE_ATTEMPTS:
-                        await asyncio.sleep(
-                            _TEXT_PAGE_RETRY_SLEEP_SECONDS * (attempt + 1)
-                        )
-                else:
-                    last_text_error = "Could not find span.textNorma in document page"
-                    break
-
-                if attempt + 1 < _TEXT_PAGE_ATTEMPTS:
-                    logger.debug(
-                        f"Retrying Minas Gerais text page for '{title}' | url={candidate_url} | attempt={attempt + 2}"
-                    )
-
-            if text_norm_span is not None:
-                break
-
-        if text_norm_span is None:
-            await self._save_doc_error(
-                title=title,
-                norm_type=norm_type,
-                html_link=document_page_url or detail_url,
-                error_message=last_text_error,
-            )
-            return None
-
-        html_string, plain_text, pdf_links = self._prepare_text_norma_html(
-            text_norm_span,
+        (
             document_page_url,
-        )
-        if pdf_links and not self._has_substantive_html_text(plain_text):
-            pdf_link = pdf_links[0]
-
-            if self._is_already_scraped(pdf_link, title):
-                return None
-
-            logger.info(
-                f"Document {title} is an image PDF, extracting text from image. URL: {document_page_url}"
-            )
-            text_markdown, raw_content, content_ext = await self._download_and_convert(
-                pdf_link
-            )
-
-            valid, reason = valid_markdown(text_markdown)
-            if not valid:
+            text_norm_span,
+            page_mhtml,
+            error,
+        ) = await self._resolve_mg_text_page(text_links, title)
+        if text_norm_span is None:
+            if error:
                 await self._save_doc_error(
                     title=title,
                     norm_type=norm_type,
-                    html_link=pdf_link,
-                    error_message=f"Invalid PDF markdown: {reason}",
+                    html_link=document_page_url or detail_url,
+                    error_message=error,
                 )
-                return None
-
-            res = {
-                **data,
-                "year": doc_info.get("year", 0),
-                "text_markdown": text_markdown,
-                "document_url": pdf_link,
-                "raw_content": raw_content,
-                "content_extension": content_ext or ".pdf",
-            }
-            return ScrapedDocument(**res)
-
-        html_string = wrap_html(html_string)
-        text_markdown = await self._get_markdown(html_content=html_string)
-
-        valid, reason = valid_markdown(text_markdown)
-        if not valid:
-            await self._save_doc_error(
-                title=title,
-                norm_type=norm_type,
-                html_link=document_page_url,
-                error_message=f"Invalid markdown: {reason}",
-            )
             return None
 
-        result = {
-            **data,
-            "year": doc_info.get("year", 0),
-            "text_markdown": text_markdown,
-            "document_url": document_page_url,
-            "raw_content": page_mhtml,
-            "content_extension": ".mhtml",
-        }
-        return ScrapedDocument(**result)
+        return await self._convert_mg_content(
+            text_norm_span,
+            document_page_url,
+            page_mhtml,
+            title,
+            norm_type,
+            data,
+            doc_info.get("year", 0),
+        )
 
     async def _scrape_year(self, year: int) -> list[dict]:
         """Scrape all norms for a year using the mixed year-only search."""

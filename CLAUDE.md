@@ -38,7 +38,10 @@ Tests use `pytest-asyncio` with `asyncio_mode = auto`. Integration tests are mar
 ### Class Hierarchy
 
 ```
-BaseScraper                          # src/scraper/base/scraper.py — async HTTP, PDF/OCR, markdown, save/resume
+BrowserMixin                         # src/scraper/base/browser_mixin.py — Playwright page pool, MHTML capture
+PaginationMixin                      # src/scraper/base/pagination.py — _gather_results, _process_documents, _fetch_all_pages
+
+BaseScraper(BrowserMixin, PaginationMixin)  # src/scraper/base/scraper.py — async HTTP, PDF/OCR, markdown, save/resume
   └─ StateScraper                    # same file — sets STATE_LEGISLATION_SAVE_DIR default
        ├─ SAPLBaseScraper            # src/scraper/base/sapl_scraper.py — for SAPL REST API sites (Paraíba, Piauí, Roraima)
        └─ (27 state scrapers)       # src/scraper/state_legislation/<state>.py
@@ -48,11 +51,15 @@ BaseScraper                          # src/scraper/base/scraper.py — async HTT
 
 All scrapers inherit from `BaseScraper`. State scrapers go through `StateScraper`. States using the SAPL REST API extend `SAPLBaseScraper`.
 
+Supporting modules in `src/scraper/base/`:
+- **`content_utils.py`** — content-detection and markdown-cleaning helpers (`is_pdf`, `clean_markdown`, `clean_norm_soup`, `detect_extension`, etc.). Re-exported from `converter.py` for backward compatibility.
+- **`summary_utils.py`** — run-summary and LLM-usage formatting functions (`merge_context`, `flatten_results`, `_build_run_summary`, etc.). Re-exported from `scraper.py` for backward compatibility.
+
 ### Services (composed into BaseScraper)
 
 - **RequestService** (`src/services/request/service.py`) — `aiohttp` with per-scraper `RateLimiter`, retries via `tenacity`, optional proxy rotation. On failure, `make_request` / `get_soup` return a **falsy** `FailedRequest` sentinel (with `.url`, `.status`, `.reason`) instead of `None` — always use `if not resp:` (not `is None`) to check for errors.
 - **LLMOCRService** (`src/services/ocr/llm.py`) — renders PDF pages to PNG via PyMuPDF, sends to LLM vision model. Provider clients live in `src/services/ocr/clients/` and implement the `LLMClient` protocol (`src/services/ocr/protocol.py`): `OpenAIClient`, `BedrockClient`, `SnowflakeClient`.
-- **BrowserService** (`src/services/browser/playwright.py`) — Playwright page pool for JS-rendered sites. Used by Maranhão, Paraná, and Pernambuco.
+- **BrowserService** (`src/services/browser/playwright.py`) — Playwright page pool for JS-rendered sites. Used by Maranhão, Paraná, and Pernambuco. Browser lifecycle and MHTML capture methods live in `BrowserMixin` (`src/scraper/base/browser_mixin.py`).
 - **ProxyService** (`src/services/proxy/service.py`) — proxy rotation from file or HTTP endpoint.
 - **FileSaver** (`src/database/saver.py`) — async JSON persistence via `aiofiles`. Saves documents grouped by year into `data.json` files with document-level resume support. MHTML capture is injected via `mhtml_capture_fn` callback (not owned).
 
@@ -85,12 +92,14 @@ Images are preserved as base64 data URIs in the final markdown output:
 
 ### Key Patterns
 
-- Use `_process_documents()` to run `_get_doc_data` → `_with_save` → `_gather_results` in one call (replaces 5-line boilerplate). For scrapers passing extra kwargs to `_get_doc_data`, use `doc_data_kwargs` or `doc_data_fn`.
+- Use `_process_documents()` (from `PaginationMixin` in `pagination.py`) to run `_get_doc_data` → `_with_save` → `_gather_results` in one call (replaces 5-line boilerplate). For scrapers passing extra kwargs to `_get_doc_data`, use `doc_data_kwargs` or `doc_data_fn`.
 - Use `_save_doc_result()` to persist documents immediately (supports raw file saving + `data.json` append).
 - Use `_save_doc_error()` to log document-level failures.
 - Use `_is_already_scraped()` for resume support — checks `(document_url, title)` keys loaded by `_load_scraped_keys()`.
 - Use `_get_markdown()` for flexible content-to-markdown conversion (accepts url, response, stream, or html_content). Pass `base_url` for correct relative image URL resolution.
 - Use `_download_and_convert()` when you also need the raw bytes (e.g., for saving source PDFs).
+- Content-detection helpers (`is_pdf`, `clean_markdown`, `clean_norm_soup`, etc.) live in `content_utils.py`; `converter.py` re-exports them for backward compatibility.
+- Summary/reporting helpers (`merge_context`, `flatten_results`, `_build_run_summary`, etc.) live in `summary_utils.py`; `scraper.py` re-exports them for backward compatibility.
 - LLM configuration uses the `LLMConfig` dataclass (`src/services/ocr/config.py`), passed directly to `BaseScraper` and `LLMOCRService`.
 - Environment variables are centralized in `src/config.py` — import `SAVE_DIR`, `STATE_LEGISLATION_SAVE_DIR`, `LOG_DIR`, etc. from there.
 - The LLM OCR prompt is in Portuguese and defined as the module-level constant `DEFAULT_LLM_PROMPT` in `src/scraper/base/scraper.py`. Override `llm_prompt` only if a scraper needs different extraction instructions.

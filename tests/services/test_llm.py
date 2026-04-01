@@ -91,7 +91,7 @@ class TestLLMConfig:
 
 class TestLLMUsageTotals:
     def test_llm_usage_totals(self):
-        from src.scraper.base.scraper import _llm_usage_totals
+        from src.scraper.base.summary_utils import _llm_usage_totals
 
         totals = _llm_usage_totals(
             {
@@ -134,7 +134,7 @@ class TestLLMUsageTotals:
 
 class TestLLMUsageFormatting:
     def test_format_llm_usage_includes_model_breakdown(self):
-        from src.scraper.base.scraper import _format_llm_usage
+        from src.scraper.base.summary_utils import _format_llm_usage
 
         formatted = _format_llm_usage(
             {
@@ -172,7 +172,7 @@ class TestLLMUsageFormatting:
         )
 
     def test_format_llm_usage_empty(self):
-        from src.scraper.base.scraper import _format_llm_usage
+        from src.scraper.base.summary_utils import _format_llm_usage
 
         assert (
             _format_llm_usage({})

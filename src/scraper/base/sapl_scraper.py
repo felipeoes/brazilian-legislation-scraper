@@ -283,6 +283,98 @@ class SAPLBaseScraper(StateScraper):
             out.append(raw_line)
         return out
 
+    # ------------------------------------------------------------------
+    # _find_content_start – decomposed helpers
+    # ------------------------------------------------------------------
+
+    def _find_exact_title_match(
+        self,
+        compact_lines: list[str],
+        normalized_expected: str,
+    ) -> int | None:
+        """Return the index of the first line that exactly matches (or starts with) the expected title.
+
+        Returns ``None`` when no match is found.
+        """
+        for idx, compact in enumerate(compact_lines):
+            norm = normalize_title_text(compact)
+            if norm and (
+                norm == normalized_expected or norm.startswith(normalized_expected)
+            ):
+                return idx
+        return None
+
+    def _find_fuzzy_title_match(
+        self,
+        lines: list[str],
+        expected_title: str,
+        title_candidates: list[int],
+    ) -> int | None:
+        """Score each title candidate against *expected_title* and return the best if score ≥ 3.
+
+        Returns ``None`` when no candidate scores high enough.
+        """
+        scored = [
+            (self._title_match_score(lines[idx], expected_title), idx)
+            for idx in title_candidates
+        ]
+        best_score, best_idx = max(scored, default=(0, None))
+        if best_idx is not None and best_score >= 3:
+            return best_idx
+        return None
+
+    def _find_first_norm_content_index(self, compact_lines: list[str]) -> int | None:
+        """Return the index of the first line that looks like norm body content.
+
+        Matches ``Art.``, ``Capítulo``, ``Título``, ``Seção``, ``Anexo``, or
+        ``PALÁCIO`` patterns.  Returns ``None`` when nothing matches.
+        """
+        return next(
+            (
+                idx
+                for idx, compact in enumerate(compact_lines)
+                if re.match(
+                    r"^(art\.|cap[ií]tulo|t[ií]tulo|se[çc][aã]o|anexo\b)",
+                    compact.lower(),
+                )
+                or compact.upper().startswith("PALÁCIO")
+            ),
+            None,
+        )
+
+    def _select_best_title_candidate(
+        self,
+        compact_lines: list[str],
+        title_candidates: list[int],
+    ) -> int:
+        """Pick the best SAPL-title candidate, preferring numbered ones before the first article.
+
+        Candidates appearing after the first norm-body line are deprioritised.
+        Among the remaining candidates, numbered ones (containing digits) are
+        preferred over unnumbered ones.
+        """
+        first_norm = self._find_first_norm_content_index(compact_lines)
+        if first_norm is not None:
+            before = [idx for idx in title_candidates if idx <= first_norm]
+            title_candidates = before or title_candidates
+
+        numbered = [
+            idx
+            for idx in title_candidates
+            if re.search(r"\b\d{1,4}\b", compact_lines[idx])
+        ]
+        return numbered[-1] if numbered else title_candidates[-1]
+
+    def _collect_title_candidates(self, compact_lines: list[str]) -> list[int]:
+        """Return indices of lines matching ``_SAPL_TITLE_RE``."""
+        return [
+            idx
+            for idx, compact in enumerate(compact_lines)
+            if self._SAPL_TITLE_RE.match(compact)
+        ]
+
+    # ------------------------------------------------------------------
+
     def _find_content_start(self, lines: list[str], expected_title: str | None) -> int:
         """Return the index of the first line of the actual norm content.
 
@@ -293,56 +385,25 @@ class SAPLBaseScraper(StateScraper):
         normalized_expected = (
             normalize_title_text(expected_title) if expected_title else ""
         )
-        # Precompute compact form once for all lines (used by multiple branches below)
         compact_lines = [" ".join(line.split()) for line in lines]
-
-        title_candidates = [
-            idx
-            for idx, compact in enumerate(compact_lines)
-            if self._SAPL_TITLE_RE.match(compact)
-        ]
+        title_candidates = self._collect_title_candidates(compact_lines)
 
         if normalized_expected:
-            for idx, compact in enumerate(compact_lines):
-                norm_line = normalize_title_text(compact)
-                if norm_line and (
-                    norm_line == normalized_expected
-                    or norm_line.startswith(normalized_expected)
-                ):
-                    return idx
+            exact = self._find_exact_title_match(compact_lines, normalized_expected)
+            if exact is not None:
+                return exact
 
-        if normalized_expected and title_candidates:
-            scored = [
-                (self._title_match_score(lines[idx], expected_title), idx)
-                for idx in title_candidates
-            ]
-            best_score, best_idx = max(scored, default=(0, None))
-            if best_idx is not None and best_score >= 3:
-                return best_idx
+            if title_candidates:
+                fuzzy = self._find_fuzzy_title_match(
+                    lines,
+                    expected_title,  # type: ignore[arg-type]
+                    title_candidates,
+                )
+                if fuzzy is not None:
+                    return fuzzy
 
         if title_candidates:
-            first_norm_content_idx = next(
-                (
-                    idx
-                    for idx, compact in enumerate(compact_lines)
-                    if re.match(
-                        r"^(art\.|cap[ií]tulo|t[ií]tulo|se[çc][aã]o|anexo\b)",
-                        compact.lower(),
-                    )
-                    or compact.upper().startswith("PALÁCIO")
-                ),
-                None,
-            )
-            if first_norm_content_idx is not None:
-                title_candidates = [
-                    idx for idx in title_candidates if idx <= first_norm_content_idx
-                ] or title_candidates
-            numbered = [
-                idx
-                for idx in title_candidates
-                if re.search(r"\b\d{1,4}\b", compact_lines[idx])
-            ]
-            return numbered[-1] if numbered else title_candidates[-1]
+            return self._select_best_title_candidate(compact_lines, title_candidates)
 
         return 0
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
@@ -8,15 +7,13 @@ import time
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Coroutine
+from typing import TYPE_CHECKING, Any
 
 import aiofiles
 import aiohttp
 import urllib3
 from bs4 import BeautifulSoup, Tag
 from loguru import logger
-from playwright.async_api import Page
-
 from src.config import LOG_DIR, SAVE_DIR, STATE_LEGISLATION_SAVE_DIR
 from src.database.saver import FileSaver, aggregate_types_summary
 from src.services.browser.playwright import BrowserService
@@ -31,7 +28,9 @@ from src.scraper.base.converter import (
     clean_norm_soup,
     valid_markdown,
 )
-from src.scraper.base.persistence import PersistenceManager, _normalize_year
+from src.scraper.base.browser_mixin import BrowserMixin
+from src.scraper.base.pagination import PaginationMixin
+from src.scraper.base.persistence import PersistenceManager
 from src.services.proxy.service import ProxyService
 from src.services.request.service import RequestService
 
@@ -69,213 +68,16 @@ Nota: o documento recebido pode estar em branco ou inválido. Nesses casos, reto
 Retorne **EXCLUSIVAMENTE** o conteúdo extraído. Não inclua a tag ```markdown, não inclua saudações, introduções ou qualquer explicação adicional, antes ou depois do texto."""
 
 
-def _format_duration(seconds: float) -> str:
-    """Format seconds into a human-readable string."""
-    m, s = divmod(int(seconds), 60)
-    h, m = divmod(m, 60)
-    parts = []
-    if h:
-        parts.append(f"{h}h")
-    if m:
-        parts.append(f"{m}m")
-    parts.append(f"{s}s")
-    return " ".join(parts)
+from src.scraper.base.summary_utils import (  # noqa: E402
+    _build_llm_usage_summary,
+    _build_run_summary,
+    _coerce_summary_runs,
+    flatten_results,
+    merge_context,  # noqa: F401  # re-exported — used by tests
+)
 
 
-def _llm_usage_totals(llm_usage: dict[str, dict]) -> dict[str, int]:
-    """Aggregate per-model LLM usage into a single totals dict."""
-    totals = {
-        "requests": 0,
-        "successful_requests": 0,
-        "failed_requests": 0,
-        "input_tokens": 0,
-        "cached_tokens": 0,
-        "output_tokens": 0,
-        "reasoning_tokens": 0,
-    }
-    for usage in llm_usage.values():
-        requests = int(usage.get("requests", 0) or 0)
-        failed_requests = int(usage.get("failed_requests", 0) or 0)
-        successful_requests = usage.get("successful_requests")
-        if successful_requests is None:
-            successful_requests = max(requests - failed_requests, 0)
-        else:
-            successful_requests = int(successful_requests or 0)
-        totals["requests"] += requests
-        totals["successful_requests"] += successful_requests
-        totals["failed_requests"] += failed_requests
-        for key in totals:
-            if key in {"requests", "successful_requests", "failed_requests"}:
-                continue
-            totals[key] += int(usage.get(key, 0) or 0)
-    return totals
-
-
-def _format_llm_usage(llm_usage: dict[str, dict]) -> str:
-    """Build a compact human-readable LLM usage string with per-model details."""
-
-    def _fmt(usage: dict[str, int]) -> str:
-        requests = int(usage.get("requests", 0) or 0)
-        failed_requests = int(usage.get("failed_requests", 0) or 0)
-        successful_requests = usage.get("successful_requests")
-        if successful_requests is None:
-            successful_requests = max(requests - failed_requests, 0)
-        else:
-            successful_requests = int(successful_requests or 0)
-        return (
-            f"{requests} reqs ({successful_requests} ok, {failed_requests} failed), "
-            f"{int(usage.get('input_tokens', 0) or 0)} input, "
-            f"{int(usage.get('cached_tokens', 0) or 0)} cached, "
-            f"{int(usage.get('output_tokens', 0) or 0)} output, "
-            f"{int(usage.get('reasoning_tokens', 0) or 0)} reasoning"
-        )
-
-    totals = _llm_usage_totals(llm_usage)
-    model_breakdown = "; ".join(
-        f"{model}: {_fmt(usage)}" for model, usage in sorted(llm_usage.items())
-    )
-    summary = f"LLM total {_fmt(totals)}"
-    if model_breakdown:
-        summary += f" | {model_breakdown}"
-    return summary
-
-
-def _build_llm_usage_summary(llm_usage_by_model: dict[str, dict]) -> dict[str, Any]:
-    """Build structured LLM usage summary for a run."""
-    return {
-        "models": llm_usage_by_model,
-        "totals": _llm_usage_totals(llm_usage_by_model),
-        "human": _format_llm_usage(llm_usage_by_model),
-    }
-
-
-def _build_run_summary(
-    *,
-    scraper: str,
-    year_start: int,
-    year_end: int,
-    total_documents: int,
-    total_errors: int,
-    elapsed_seconds: float,
-    completed_at: str,
-    types_summary: dict[str, dict],
-    llm_usage: dict[str, Any],
-) -> dict[str, Any]:
-    """Build a single-run summary snapshot."""
-    rounded_elapsed = round(elapsed_seconds, 2)
-    return {
-        "scraper": scraper,
-        "year_start": year_start,
-        "year_end": year_end,
-        "total_documents": total_documents,
-        "total_errors": total_errors,
-        "elapsed_seconds": rounded_elapsed,
-        "elapsed_human": _format_duration(rounded_elapsed),
-        "completed_at": completed_at,
-        "types_summary": types_summary,
-        "llm_usage": llm_usage,
-    }
-
-
-def _empty_llm_usage_summary() -> dict[str, Any]:
-    """Return an empty structured LLM usage summary."""
-    return _build_llm_usage_summary({})
-
-
-def _coerce_summary_runs(summary_data: Any) -> list[dict[str, Any]]:
-    """Extract historical run snapshots from existing summary data."""
-    if not isinstance(summary_data, dict):
-        return []
-
-    existing_runs = summary_data.get("runs")
-    if isinstance(existing_runs, list):
-        return [run for run in existing_runs if isinstance(run, dict)]
-
-    if "completed_at" not in summary_data:
-        return []
-
-    return [
-        {
-            "scraper": summary_data.get("scraper", ""),
-            "year_start": summary_data.get("year_start"),
-            "year_end": summary_data.get("year_end"),
-            "total_documents": int(summary_data.get("total_documents", 0) or 0),
-            "total_errors": int(summary_data.get("total_errors", 0) or 0),
-            "elapsed_seconds": round(
-                float(summary_data.get("elapsed_seconds", 0) or 0), 2
-            ),
-            "elapsed_human": str(summary_data.get("elapsed_human", "0s") or "0s"),
-            "completed_at": str(summary_data.get("completed_at", "")),
-            "types_summary": summary_data.get("types_summary", {}) or {},
-            "llm_usage": summary_data.get("llm_usage") or _empty_llm_usage_summary(),
-        }
-    ]
-
-
-def _meaningful_context_value(value: Any) -> str | None:
-    """Return a cleaned context value unless it is a generic placeholder."""
-    normalized = str(value or "").strip()
-    if not normalized:
-        return None
-    if normalized.casefold() in {"na", "n/a", "all"}:
-        return None
-    return normalized
-
-
-def merge_context(result: dict | ScrapedDocument, context: dict) -> dict:
-    """Merge a document result dict with its scraping context."""
-    if isinstance(result, ScrapedDocument):
-        # Convert to dict but preserve raw_content/content_extension.
-        # Use underscore-prefixed keys so save_doc_result's dict branch can
-        # find them via pop("_raw_content") / pop("_content_extension").
-        # Writing these after model_dump() also overwrites any stale underscore
-        # extras that scrapers (e.g. Goiás) may have left on the ScrapedDocument.
-        res_dict = result.model_dump()
-        if result.raw_content is not None:
-            res_dict["_raw_content"] = result.raw_content
-        if result.content_extension is not None:
-            res_dict["_content_extension"] = result.content_extension
-    else:
-        res_dict = result
-
-    doc = {**context, **res_dict}
-
-    result_type = _meaningful_context_value(res_dict.get("type"))
-    context_type = _meaningful_context_value(context.get("type"))
-    if result_type:
-        doc["type"] = result_type
-    elif context_type:
-        doc["type"] = context_type
-    else:
-        doc["type"] = ""
-
-    result_situation = _meaningful_context_value(res_dict.get("situation"))
-    context_situation = _meaningful_context_value(context.get("situation"))
-    if result_situation:
-        doc["situation"] = result_situation
-    elif context_situation:
-        doc["situation"] = context_situation
-    else:
-        doc["situation"] = ""
-
-    year = _normalize_year(doc.get("year"))
-    ctx_year = _normalize_year(context.get("year"))
-    doc["year"] = year if year is not None else ctx_year
-    return doc
-
-
-def flatten_results(results: list) -> list[dict | ScrapedDocument]:
-    """Flatten a list of results (some of which may be sub-lists) into a single list."""
-    flat: list[dict | ScrapedDocument] = []
-    for item in results:
-        if isinstance(item, list):
-            flat.extend(item)
-        elif item is not None:
-            flat.append(item)
-    return flat
-
-
-class BaseScraper:
+class BaseScraper(BrowserMixin, PaginationMixin):
     """Base class for legislation scrapers (async)"""
 
     _iterate_situations: bool = False
@@ -434,35 +236,10 @@ class BaseScraper:
 
         logger.debug(init_log)
 
-    # ------------------------------------------------------------------
-    # Playwright (async browser automation)
-    # ------------------------------------------------------------------
-
-    @property
-    def page(self) -> Page | None:
-        """Active Playwright page (single-page mode)."""
-        return self.browser_service.page if self.browser_service else None
-
     @property
     def default_situation(self) -> str:
         """Return the first configured situation, or 'Não consta' if none defined."""
         return next(iter(self.situations), "Não consta")
-
-    async def initialize_playwright(self):
-        """Initialize Playwright browser (async — must be called from scrape())."""
-        if self.browser_service:
-            await self.browser_service.initialize()
-
-    async def _get_available_page(self) -> Page:
-        """Get available page from the pool (async)."""
-        if not self.browser_service:
-            raise RuntimeError("Browser service is not initialized.")
-        return await self.browser_service.get_available_page()
-
-    async def _release_page(self, page: Page):
-        """Release page back to the pool."""
-        if self.browser_service:
-            self.browser_service.release_page(page)
 
     def _initialize_saver(self):
         """Initialize saver class. Called automatically at end of __init__."""
@@ -472,108 +249,6 @@ class BaseScraper:
             verbose=self.verbose,
             max_workers=self.max_workers,
         )
-
-    _MHTML_ERROR_MARKERS = (
-        b"Azion - Default error page",
-        b"<title>403 Forbidden</title>",
-        b"<title>Access Denied</title>",
-        b"<title>Error</title>",
-        b"Acesso Proibido",
-        b"Erro 403",
-        b"error/error.css",
-        b"The website encountered an unexpected error",
-    )
-
-    @classmethod
-    def _is_mhtml_error_page(cls, content: bytes) -> bool:
-        head = content[:8192]
-        return any(marker in head for marker in cls._MHTML_ERROR_MARKERS)
-
-    async def _capture_mhtml(self, url: str) -> bytes:
-        """Capture an MHTML snapshot of a URL using a lazily-initialized browser.
-
-        Retries up to 3 times with configurable ``_mhtml_timeout`` per attempt.
-        Raises RuntimeError if the captured content looks like an error page.
-        """
-        if self._mhtml_browser is None:
-            self._mhtml_browser = BrowserService(
-                headless=True,
-                multiple_pages=True,
-                max_workers=self.max_workers,
-                owner_class_name=f"{self.__class__.__name__}_mhtml",
-            )
-            await self._mhtml_browser.initialize()
-
-        page = await self._mhtml_browser.get_available_page()
-        try:
-            last_error: Exception | None = None
-            for _ in range(self.request_service.max_retries):
-                try:
-                    result = await self._mhtml_browser.capture_mhtml(
-                        url,
-                        page=page,
-                        wait_until=self._mhtml_wait_until,
-                        timeout=self._mhtml_timeout,
-                    )
-                    if self._is_mhtml_error_page(result):
-                        raise RuntimeError(
-                            f"MHTML capture returned error page for {url}"
-                        )
-                    return result
-                except Exception as e:
-                    last_error = e
-            raise last_error  # type: ignore[misc]
-        finally:
-            self._mhtml_browser.release_page(page)
-
-    async def _fetch_soup_and_mhtml(
-        self,
-        url: str,
-        *,
-        wait_until: str | None = None,
-        timeout: int | None = None,
-        wait_for_selector: str | None = None,
-    ) -> tuple[BeautifulSoup, bytes]:
-        """Fetch a URL via browser, returning ``(BeautifulSoup, mhtml_bytes)``.
-
-        Single navigation: extracts both rendered HTML (for parsing/markdown)
-        and MHTML archive (for raw file storage). Uses the lazily-initialized
-        ``_mhtml_browser`` with page pool, retries, and error page detection.
-
-        If *wait_for_selector* is given, waits for that CSS selector to
-        appear in the DOM after navigation (useful for SPA pages that
-        render content asynchronously via JS).
-        """
-        if self._mhtml_browser is None:
-            self._mhtml_browser = BrowserService(
-                headless=True,
-                multiple_pages=True,
-                max_workers=self.max_workers,
-                owner_class_name=f"{self.__class__.__name__}_mhtml",
-            )
-            await self._mhtml_browser.initialize()
-
-        page = await self._mhtml_browser.get_available_page()
-        try:
-            last_error: Exception | None = None
-            for _ in range(self.request_service.max_retries):
-                try:
-                    await self.request_service._rate_limiter.acquire()
-                    html, mhtml = await self._mhtml_browser.fetch_and_capture(
-                        url,
-                        page=page,
-                        wait_until=wait_until or self._mhtml_wait_until,
-                        timeout=timeout or self._mhtml_timeout,
-                        wait_for_selector=wait_for_selector,
-                    )
-                    if self._is_mhtml_error_page(mhtml):
-                        raise RuntimeError(f"Browser returned error page for {url}")
-                    return BeautifulSoup(html, "html.parser"), mhtml
-                except Exception as e:
-                    last_error = e
-            raise last_error  # type: ignore[misc]
-        finally:
-            self._mhtml_browser.release_page(page)
 
     # ------------------------------------------------------------------
     # HTTP requests (async via RequestService)
@@ -795,170 +470,8 @@ class BaseScraper:
         )
 
     # ------------------------------------------------------------------
-    # Results gathering
+    # Results gathering — see PaginationMixin (src/scraper/base/pagination.py)
     # ------------------------------------------------------------------
-
-    async def _with_save(self, coro, context: dict):
-        result = await coro
-        if result is None:
-            return None
-
-        is_list = isinstance(result, list)
-        items = result if is_list else [result]
-        saved = []
-        for r in items:
-            doc = merge_context(r, context)
-            s = await self._save_doc_result(doc)
-            if s is None:
-                logger.warning(
-                    f"Save failed for '{doc.get('title', '?')}', discarding result"
-                )
-                continue
-            saved.append(s)
-        if not saved:
-            return None
-        return saved if is_list else saved[0]
-
-    async def _save_gather_errors(
-        self,
-        results: list,
-        context: dict,
-        desc: str = "",
-    ) -> list:
-        ctx = {"year": "", "type": "", "situation": "", **context}
-        valid = []
-        for result in results:
-            if isinstance(result, Exception):
-                self.error_count += 1
-                logger.error(f"{desc} | Error: {result}")
-                if self.saver:
-                    error_data = {
-                        "title": desc or "Unknown",
-                        "html_link": "",
-                        **ctx,
-                    }
-                    await self.saver.save_error(error_data, error_message=str(result))
-                continue
-            if result is None:
-                continue
-            valid.append(result)
-        return valid
-
-    async def _gather_results(
-        self,
-        tasks: list,
-        context: dict | None = None,
-        desc: str = "",
-    ) -> list:
-        if not tasks:
-            return []
-
-        if self.verbose:
-            progress = tqdm(total=len(tasks), desc=desc or "Gathering")
-            wrapped_tasks = [asyncio.create_task(task) for task in tasks]
-            for task in wrapped_tasks:
-                task.add_done_callback(lambda _: progress.update())
-            try:
-                results = await asyncio.gather(*wrapped_tasks, return_exceptions=True)
-            finally:
-                progress.close()
-        else:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-        return await self._save_gather_errors(results, context or {}, desc)
-
-    async def _process_documents(
-        self,
-        documents: list,
-        *,
-        year: int,
-        norm_type: str,
-        situation: str = "",
-        desc: str = "",
-        doc_data_fn=None,
-        doc_data_kwargs: dict | None = None,
-    ) -> list[dict]:
-        """Wrap each document through _get_doc_data -> _with_save -> _gather_results."""
-        ctx = {"year": year, "type": norm_type, "situation": situation}
-        fn = doc_data_fn or self._get_doc_data
-        kw = doc_data_kwargs or {}
-        # Enrich each doc with context fields (year/type/situation) so that
-        # ScrapedDocument validation succeeds when _get_doc_data calls
-        # _process_pdf_doc/_process_html_doc.  Doc-specific values take
-        # precedence over context defaults (dict merge order: ctx first, then doc).
-        enriched = [{**ctx, **doc} for doc in documents]
-        tasks = [self._with_save(fn(doc, **kw), ctx) for doc in enriched]
-        results = await self._gather_results(
-            tasks,
-            context=ctx,
-            desc=desc or f"{self.name} | {norm_type}",
-        )
-        logger.debug(
-            f"Finished scraping for Year: {year} | Type: {norm_type} "
-            f"| Situation: {situation} | Results: {len(results)}"
-        )
-        return results
-
-    async def _fetch_all_pages(
-        self,
-        make_task: Callable[[int], Coroutine],
-        total_pages: int,
-        *,
-        start_page: int = 2,
-        context: dict | None = None,
-        desc: str = "",
-    ) -> list:
-        """Fetch pages ``start_page``..``total_pages`` concurrently and flatten."""
-        if total_pages < start_page:
-            return []
-        tasks = [make_task(page) for page in range(start_page, total_pages + 1)]
-        results = await self._gather_results(tasks, context=context, desc=desc)
-        return flatten_results(results)
-
-    async def _paginate_until_end(
-        self,
-        *,
-        make_task: Callable[[int], Coroutine[Any, Any, tuple[list[dict], bool]]],
-        context: dict,
-        desc: str = "",
-        initial_batch: int = 1,
-        batch_growth: int | None = None,
-        max_batch: int | None = None,
-        max_iterations: int = 1000,
-    ) -> list[dict]:
-        """Fetch pages in growing batches until a page signals end-of-results."""
-        batch = initial_batch
-        growth = batch_growth if batch_growth is not None else self.max_workers
-        cap = max_batch or self.max_workers
-        page = 1
-        all_docs: list[dict] = []
-        iterations = 0
-
-        while iterations < max_iterations:
-            tasks = [make_task(p) for p in range(page, page + batch)]
-            results = await self._gather_results(tasks, context=context, desc=desc)
-
-            reached_end = False
-            batch_docs: list[dict] = []
-            for docs, ended in results:
-                if ended:
-                    reached_end = True
-                if docs:
-                    batch_docs.extend(docs)
-
-            all_docs.extend(batch_docs)
-            if reached_end or not batch_docs:
-                break
-
-            page += batch
-            batch = min(batch + growth, cap)
-            iterations += 1
-        else:
-            logger.warning(
-                f"_paginate_until_end: reached max_iterations={max_iterations} "
-                f"without end signal — stopping ({desc})"
-            )
-
-        return all_docs
 
     async def _before_scrape(self) -> None:
         """Hook called once before year iteration begins. Optional to implement in child class."""

@@ -87,6 +87,15 @@ INVALID_SITUATIONS = {
 SITUATIONS = VALID_SITUATIONS | INVALID_SITUATIONS
 
 
+def _ensure_str(value: object) -> str:
+    """Convert a possibly-None value to a string, returning '' for falsy."""
+    return str(value) if value else ""
+
+
+# Sentinel: a fetch attempt did not produce a result; try the next path.
+_ATTEMPT_FAILED: object = object()
+
+
 def _build_stop_next_heading_re(
     types: dict, type_aliases: dict[str, tuple[str, ...]]
 ) -> re.Pattern[str]:
@@ -741,6 +750,20 @@ class DFSinjScraper(StateScraper):
         docs, _ = await self._fetch_search_page(payload)
         return docs
 
+    @classmethod
+    def _check_markdown(cls, text_markdown: str) -> tuple[bool, str]:
+        """Check if markdown is valid and free of SINJ site chrome.
+
+        Returns ``(usable, reason)`` where *usable* is ``False`` when the
+        text fails validation or contains site chrome.
+        """
+        valid, reason = valid_markdown(text_markdown)
+        if not valid:
+            return False, reason
+        if cls._looks_like_site_chrome(text_markdown):
+            return False, "contains site chrome"
+        return True, ""
+
     async def _handle_maintenance(self, soup: BeautifulSoup, doc: dict) -> bool:
         """Log a maintenance error and return True if *soup* is a maintenance page."""
         if not self._is_maintenance_soup(soup):
@@ -756,25 +779,21 @@ class DFSinjScraper(StateScraper):
         )
         return True
 
-    async def _get_doc_data(self, doc_info: dict) -> ScrapedDocument | None:
-        """Fetch a single norm, preferring the download URL for HTML documents.
+    def _resolve_doc_urls(
+        self, doc_info: dict
+    ) -> tuple[dict, str, str, str, str, bool, str] | None:
+        """Extract URLs from *doc_info* and check resume status.
 
-        Attempt order for **HTML** files (``download_url`` available, not PDF):
-          1. Fetch ``download_url`` (``/Norma/{ch_norma}/{file_name}``)
-          2. Fallback: text endpoint (``TextoArquivoNorma.aspx?id_file=…``)
-          3. Fallback: ``/arquivo`` endpoint
-          4. Diary PDF slice
-          5. Generic markitdown from ``/arquivo`` body
-
-        For **PDF** files (``file_name`` ends with ``.pdf``):
-          Attempt 1 is skipped; starts from the text endpoint.
+        Returns ``(doc, title, fallback_url, text_url, download_url,
+        pdf_file, file_id)`` or ``None`` when the document was already
+        scraped.
         """
         doc = dict(doc_info)
         document_url = doc.get("document_url", "")
         title = doc.get("title", "Unknown")
-        file_id = str(doc.get("file_id") or "").strip()
-        file_name = doc.get("file_name") or ""
-        ch_norma = str(doc.get("ch_norma") or "")
+        file_id = _ensure_str(doc.get("file_id")).strip()
+        file_name = _ensure_str(doc.get("file_name"))
+        ch_norma = _ensure_str(doc.get("ch_norma"))
         fallback_url = document_url or self._build_raw_url(self.base_url, ch_norma)
         text_url = self._build_text_url(self.base_url, file_id) if file_id else ""
         download_url = (
@@ -790,151 +809,228 @@ class DFSinjScraper(StateScraper):
 
         if self._is_already_scraped(primary_url, title):
             return None
+        return (doc, title, fallback_url, text_url, download_url, pdf_file, file_id)
 
-        try:
-            # --- Attempt 1: download_url (HTML files only) ---
-            if download_url and not pdf_file:
-                result = await self.request_service.fetch_bytes(download_url)
-                if result:
-                    body, _resp = result
-                    soup = BeautifulSoup(body, "html.parser")
-                    if await self._handle_maintenance(soup, doc):
-                        return None
-                    text_markdown = await self._extract_html_markdown(soup, doc)
-                    valid, _ = valid_markdown(text_markdown)
-                    if valid and not self._looks_like_site_chrome(text_markdown):
-                        doc["text_markdown"] = text_markdown
-                        doc["document_url"] = download_url
-                        doc["_raw_content"] = body
-                        doc["_content_extension"] = ".html"
-                        return doc
+    async def _try_download_url_path(
+        self, doc: dict, download_url: str, pdf_file: bool
+    ) -> dict | None:
+        """Attempt 1: fetch the download URL for non-PDF documents.
 
-            # --- Attempt 2: compiled HTML text endpoint ---
-            if file_id:
-                result = await self.request_service.fetch_bytes(text_url)
-                if result:
-                    body, _resp = result
+        Returns the populated *doc* on success, ``None`` on maintenance
+        (hard stop), or the ``_ATTEMPT_FAILED`` sentinel when this path
+        did not produce a result.
+        """
+        if not download_url or pdf_file:
+            return _ATTEMPT_FAILED
+        result = await self.request_service.fetch_bytes(download_url)
+        if not result:
+            return _ATTEMPT_FAILED
+        body, _resp = result
+        soup = BeautifulSoup(body, "html.parser")
+        if await self._handle_maintenance(soup, doc):
+            return None
+        text_markdown = await self._extract_html_markdown(soup, doc)
+        usable, _ = self._check_markdown(text_markdown)
+        if not usable:
+            return _ATTEMPT_FAILED
+        doc["text_markdown"] = text_markdown
+        doc["document_url"] = download_url
+        doc["_raw_content"] = body
+        doc["_content_extension"] = ".html"
+        return doc
 
-                    if pdf_file:
-                        # For PDF files: only accept actual PDF binary from
-                        # the text endpoint.  HTML renderings lose formatting
-                        # and are not the authoritative source.
-                        if is_pdf(body, ""):
-                            text_markdown = await self._get_markdown(
-                                stream=BytesIO(body),
-                                filename=file_name or "document.pdf",
-                            )
-                            valid, _ = valid_markdown(text_markdown)
-                            if valid and not self._looks_like_site_chrome(
-                                text_markdown
-                            ):
-                                doc["text_markdown"] = text_markdown
-                                doc["document_url"] = text_url
-                                doc["_raw_content"] = body
-                                doc["_content_extension"] = ".pdf"
-                                return doc
-                        # else: HTML rendering of PDF — fall through to Attempt 3
-                    else:
-                        soup = BeautifulSoup(body, "html.parser")
-                        if await self._handle_maintenance(soup, doc):
-                            return None
-                        text_markdown = await self._extract_html_markdown(soup, doc)
-                        valid, _ = valid_markdown(text_markdown)
-                        if valid and not self._looks_like_site_chrome(text_markdown):
-                            doc["text_markdown"] = text_markdown
-                            doc["document_url"] = download_url or text_url
-                            doc["_raw_content"] = body
-                            doc["_content_extension"] = ".html"
-                            return doc
+    async def _try_text_endpoint(
+        self,
+        doc: dict,
+        text_url: str,
+        html_doc_url: str,
+        pdf_file: bool,
+        file_id: str,
+    ) -> dict | None:
+        """Attempt 2: fetch the compiled text endpoint.
 
-            # --- Attempt 3: raw /arquivo endpoint ---
-            result = await self.request_service.fetch_bytes(fallback_url)
-            if not result:
-                raise RuntimeError(f"No response for {fallback_url}")
+        For PDF files only actual PDF binary is accepted.  For HTML files
+        markdown is extracted from the parsed content.  Returns the
+        populated *doc* on success, ``None`` on maintenance, or the
+        ``_ATTEMPT_FAILED`` sentinel otherwise.
+        """
+        if not file_id:
+            return _ATTEMPT_FAILED
+        result = await self.request_service.fetch_bytes(text_url)
+        if not result:
+            return _ATTEMPT_FAILED
+        body, _resp = result
 
-            body, resp = result
-            filename, content_type = self.request_service.detect_content_info(resp)
-
-            if is_pdf(body, content_type):
-                # --- Attempt 3b: direct PDF conversion (bytes already in memory) ---
-                text_markdown = await self._get_markdown(
-                    stream=BytesIO(body),
-                    filename=filename or doc.get("file_name") or "document.pdf",
-                )
-                valid, reason = valid_markdown(text_markdown)
-                if valid and not self._looks_like_site_chrome(text_markdown):
-                    doc["text_markdown"] = text_markdown
-                    doc["document_url"] = fallback_url
-                    doc["_raw_content"] = body
-                    doc["_content_extension"] = detect_extension(content_type, filename)
-                    return doc
-
-                # --- Attempt 4 (PDF): diary PDF slice — only for image/scanned PDFs ---
-                diary_fallback = await self._fetch_diary_pdf_fallback(doc)
-                if diary_fallback is not None:
-                    text_markdown, raw_content, content_ext, diary_url = diary_fallback
-                    doc["text_markdown"] = text_markdown
-                    doc["document_url"] = diary_url
-                    doc["_raw_content"] = raw_content
-                    doc["_content_extension"] = content_ext
-                    return doc
-
-                await self._save_doc_error(
-                    title=title,
-                    year=doc.get("year", ""),
-                    situation=doc.get("situation", ""),
-                    norm_type=doc.get("type", ""),
-                    html_link=fallback_url,
-                    error_message=f"Could not extract valid markdown from PDF: {reason}",
-                )
-                return None
-
-            # HTML path from /arquivo
-            soup = BeautifulSoup(body, "html.parser")
-            if await self._handle_maintenance(soup, doc):
-                return None
-
-            text_markdown = await self._extract_html_markdown(soup, doc)
-            valid, reason = valid_markdown(text_markdown)
-            if valid and not self._looks_like_site_chrome(text_markdown):
-                doc["text_markdown"] = text_markdown
-                doc["document_url"] = fallback_url
-                doc["_raw_content"] = body
-                doc["_content_extension"] = ".html"
-                return doc
-
-            # --- Attempt 4 (HTML): diary PDF slice ---
-            diary_fallback = await self._fetch_diary_pdf_fallback(doc)
-            if diary_fallback is not None:
-                text_markdown, raw_content, content_ext, diary_url = diary_fallback
-                doc["text_markdown"] = text_markdown
-                doc["document_url"] = diary_url
-                doc["_raw_content"] = raw_content
-                doc["_content_extension"] = content_ext
-                return doc
-
-            # --- Attempt 5: generic markdown from full HTML page ---
+        if pdf_file:
+            if not is_pdf(body, ""):
+                return _ATTEMPT_FAILED
+            file_name = _ensure_str(doc.get("file_name"))
             text_markdown = await self._get_markdown(
                 stream=BytesIO(body),
-                filename=filename or doc.get("file_name") or "document.html",
+                filename=file_name or "document.pdf",
             )
-            valid, reason = valid_markdown(text_markdown)
-            if not valid or self._looks_like_site_chrome(text_markdown):
-                await self._save_doc_error(
-                    title=title,
-                    year=doc.get("year", ""),
-                    situation=doc.get("situation", ""),
-                    norm_type=doc.get("type", ""),
-                    html_link=fallback_url,
-                    error_message=f"Could not extract valid markdown: {reason}",
-                )
-                return None
+            usable, _ = self._check_markdown(text_markdown)
+            if not usable:
+                return _ATTEMPT_FAILED
+            doc["text_markdown"] = text_markdown
+            doc["document_url"] = text_url
+            doc["_raw_content"] = body
+            doc["_content_extension"] = ".pdf"
+            return doc
 
+        soup = BeautifulSoup(body, "html.parser")
+        if await self._handle_maintenance(soup, doc):
+            return None
+        text_markdown = await self._extract_html_markdown(soup, doc)
+        usable, _ = self._check_markdown(text_markdown)
+        if not usable:
+            return _ATTEMPT_FAILED
+        doc["text_markdown"] = text_markdown
+        doc["document_url"] = html_doc_url
+        doc["_raw_content"] = body
+        doc["_content_extension"] = ".html"
+        return doc
+
+    async def _try_raw_pdf_path(
+        self,
+        doc: dict,
+        body: bytes,
+        filename: str | None,
+        content_type: str,
+        fallback_url: str,
+    ) -> dict | None:
+        """Attempts 3b+4 (PDF): direct PDF conversion then diary fallback."""
+        text_markdown = await self._get_markdown(
+            stream=BytesIO(body),
+            filename=filename or doc.get("file_name") or "document.pdf",
+        )
+        usable, reason = self._check_markdown(text_markdown)
+        if usable:
             doc["text_markdown"] = text_markdown
             doc["document_url"] = fallback_url
             doc["_raw_content"] = body
             doc["_content_extension"] = detect_extension(content_type, filename)
             return doc
+
+        diary_fallback = await self._fetch_diary_pdf_fallback(doc)
+        if diary_fallback is not None:
+            text_markdown, raw_content, content_ext, diary_url = diary_fallback
+            doc["text_markdown"] = text_markdown
+            doc["document_url"] = diary_url
+            doc["_raw_content"] = raw_content
+            doc["_content_extension"] = content_ext
+            return doc
+
+        await self._save_doc_error(
+            title=doc.get("title", "Unknown"),
+            year=doc.get("year", ""),
+            situation=doc.get("situation", ""),
+            norm_type=doc.get("type", ""),
+            html_link=fallback_url,
+            error_message=f"Could not extract valid markdown from PDF: {reason}",
+        )
+        return None
+
+    async def _try_raw_html_path(
+        self,
+        doc: dict,
+        body: bytes,
+        filename: str | None,
+        content_type: str,
+        fallback_url: str,
+    ) -> dict | None:
+        """Attempts 3–5 (HTML): HTML extraction, diary PDF, generic markdown."""
+        soup = BeautifulSoup(body, "html.parser")
+        if await self._handle_maintenance(soup, doc):
+            return None
+
+        text_markdown = await self._extract_html_markdown(soup, doc)
+        usable, reason = self._check_markdown(text_markdown)
+        if usable:
+            doc["text_markdown"] = text_markdown
+            doc["document_url"] = fallback_url
+            doc["_raw_content"] = body
+            doc["_content_extension"] = ".html"
+            return doc
+
+        # Attempt 4 (HTML): diary PDF slice
+        diary_fallback = await self._fetch_diary_pdf_fallback(doc)
+        if diary_fallback is not None:
+            text_markdown, raw_content, content_ext, diary_url = diary_fallback
+            doc["text_markdown"] = text_markdown
+            doc["document_url"] = diary_url
+            doc["_raw_content"] = raw_content
+            doc["_content_extension"] = content_ext
+            return doc
+
+        # Attempt 5: generic markdown from full HTML page
+        text_markdown = await self._get_markdown(
+            stream=BytesIO(body),
+            filename=filename or doc.get("file_name") or "document.html",
+        )
+        usable, reason = self._check_markdown(text_markdown)
+        if not usable:
+            await self._save_doc_error(
+                title=doc.get("title", "Unknown"),
+                year=doc.get("year", ""),
+                situation=doc.get("situation", ""),
+                norm_type=doc.get("type", ""),
+                html_link=fallback_url,
+                error_message=f"Could not extract valid markdown: {reason}",
+            )
+            return None
+
+        doc["text_markdown"] = text_markdown
+        doc["document_url"] = fallback_url
+        doc["_raw_content"] = body
+        doc["_content_extension"] = detect_extension(content_type, filename)
+        return doc
+
+    async def _get_doc_data(self, doc_info: dict) -> ScrapedDocument | None:
+        """Fetch a single norm, preferring the download URL for HTML documents.
+
+        Attempt order for **HTML** files (``download_url`` available, not PDF):
+          1. Fetch ``download_url`` (``/Norma/{ch_norma}/{file_name}``)
+          2. Fallback: text endpoint (``TextoArquivoNorma.aspx?id_file=…``)
+          3. Fallback: ``/arquivo`` endpoint
+          4. Diary PDF slice
+          5. Generic markitdown from ``/arquivo`` body
+
+        For **PDF** files (``file_name`` ends with ``.pdf``):
+          Attempt 1 is skipped; starts from the text endpoint.
+        """
+        resolved = self._resolve_doc_urls(doc_info)
+        if resolved is None:
+            return None
+        doc, title, fallback_url, text_url, download_url, pdf_file, file_id = resolved
+
+        try:
+            result = await self._try_download_url_path(doc, download_url, pdf_file)
+            if result is not _ATTEMPT_FAILED:
+                return result
+
+            html_doc_url = download_url or text_url
+            result = await self._try_text_endpoint(
+                doc, text_url, html_doc_url, pdf_file, file_id
+            )
+            if result is not _ATTEMPT_FAILED:
+                return result
+
+            # Attempts 3–5: raw /arquivo endpoint
+            fetch_result = await self.request_service.fetch_bytes(fallback_url)
+            if not fetch_result:
+                raise RuntimeError(f"No response for {fallback_url}")
+
+            body, resp = fetch_result
+            filename, content_type = self.request_service.detect_content_info(resp)
+
+            if is_pdf(body, content_type):
+                return await self._try_raw_pdf_path(
+                    doc, body, filename, content_type, fallback_url
+                )
+            return await self._try_raw_html_path(
+                doc, body, filename, content_type, fallback_url
+            )
         except Exception as exc:
             logger.error(f"Error getting document data for {fallback_url}: {exc}")
             await self._save_doc_error(
