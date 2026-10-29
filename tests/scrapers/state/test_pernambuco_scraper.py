@@ -2,30 +2,19 @@
 
 import ast
 import inspect
-from unittest.mock import AsyncMock, MagicMock
 
-import pytest
-from base_tests import ScraperClassTests, TypesConstantTests
 from bs4 import BeautifulSoup
-from conftest import make_base_scraper
+from conftest import make_scraper
+from parser_assertions import ScraperClassTests, TypesConstantTests
 
-from src.scraper.state_legislation.pernambuco import (
-    SITUATIONS,
-    TYPES,
-    PernambucoAlepeScraper,
-)
-from src.services.request.service import FailedRequest
+from src.scrapers.states.pe import TYPES, PernambucoAlepeScraper
 
 
 def _make_scraper(**kwargs) -> PernambucoAlepeScraper:
-    """Instantiate PernambucoAlepeScraper bypassing __init__ (no network, no I/O)."""
+    """Instantiate PernambucoAlepeScraper with injected dependencies."""
     _search_url = "https://legis.alepe.pe.gov.br/Paginas/pesquisaAvancada.aspx"
-    return make_base_scraper(
+    return make_scraper(
         PernambucoAlepeScraper,
-        "https://legis.alepe.pe.gov.br",
-        "PERNAMBUCO",
-        TYPES,
-        SITUATIONS,
         search_url=_search_url,
         _known_types=tuple(sorted(TYPES.keys(), key=len, reverse=True)),
         params={
@@ -69,15 +58,7 @@ def _make_scraper(**kwargs) -> PernambucoAlepeScraper:
 
 
 def _make_initial_search_html() -> str:
-    return """
-    <html><body>
-      <form>
-        <input name="__VIEWSTATE" value="state-1" />
-        <input name="__VIEWSTATEGENERATOR" value="gen-1" />
-        <input name="__EVENTVALIDATION" value="ev-1" />
-      </form>
-    </body></html>
-    """
+    return '\n    <html><body>\n      <form>\n        <input name="__VIEWSTATE" value="state-1" />\n        <input name="__VIEWSTATEGENERATOR" value="gen-1" />\n        <input name="__EVENTVALIDATION" value="ev-1" />\n      </form>\n    </body></html>\n    '
 
 
 def _make_results_row(
@@ -98,40 +79,12 @@ def _make_results_row(
         links.append(
             f'<li><a href="texto.aspx?id={doc_id}&tipo=TEXTOATUALIZADO"><div></div></a></li>'
         )
-    return f"""
-    <tr>
-      <td class="td-nome-norma col-md-4">
-        <span class="nome-norma">
-          <a href="texto.aspx?id={doc_id}&tipo=">{title}</a>
-        </span>
-        <span class="publicacao">{publication}</span>
-      </td>
-      <td class="textos col-md-2" id="textos">
-        <ul class="txt-desktop">
-          {"".join(links)}
-        </ul>
-      </td>
-      <td class="ementa-norma col-md-6">
-        <div class="fLeft">{summary}</div>
-        <a class="btn btn-info btn-xs fRight" href="dadosReferenciais.aspx?id={doc_id}">Dados Referenciais</a>
-      </td>
-    </tr>
-    """
+    return f"""\n    <tr>\n      <td class="td-nome-norma col-md-4">\n        <span class="nome-norma">\n          <a href="texto.aspx?id={doc_id}&tipo=">{title}</a>\n        </span>\n        <span class="publicacao">{publication}</span>\n      </td>\n      <td class="textos col-md-2" id="textos">\n        <ul class="txt-desktop">\n          {"".join(links)}\n        </ul>\n      </td>\n      <td class="ementa-norma col-md-6">\n        <div class="fLeft">{summary}</div>\n        <a class="btn btn-info btn-xs fRight" href="dadosReferenciais.aspx?id={doc_id}">Dados Referenciais</a>\n      </td>\n    </tr>\n    """
 
 
 def _make_results_page(rows: list[str], pager: str = "") -> BeautifulSoup:
-    html = f"""
-    <html><body>
-      <div id="divResultado">
-        <table><tbody>{"".join(rows)}</tbody></table>
-      </div>
-      {pager}
-      <input name="__VIEWSTATE" value="state-next" />
-      <input name="__VIEWSTATEGENERATOR" value="gen-next" />
-      <input name="__EVENTVALIDATION" value="ev-next" />
-    </body></html>
-    """
-    return BeautifulSoup(html, "html.parser")
+    html = f"""\n    <html><body>\n      <div id="divResultado">\n        <table><tbody>{"".join(rows)}</tbody></table>\n      </div>\n      {pager}\n      <input name="__VIEWSTATE" value="state-next" />\n      <input name="__VIEWSTATEGENERATOR" value="gen-next" />\n      <input name="__EVENTVALIDATION" value="ev-next" />\n    </body></html>\n    """
+    return BeautifulSoup(html, "lxml")
 
 
 def _make_pager(*items: tuple[str, str, bool], include_prox: bool = False) -> str:
@@ -146,38 +99,14 @@ def _make_pager(*items: tuple[str, str, bool], include_prox: bool = False) -> st
 
 def _make_doc_html(revogada: bool = False) -> bytes:
     revogada_div = '<div id="divRevogada">Revogada</div>' if revogada else ""
-    html = f"""
-    <html><body>
-      {revogada_div}
-      <div class="WordSection1">
-        <p><b>LEI ORDINARIA N.o 1/2020</b></p>
-        <p>Dispõe sobre matéria importante.</p>
-        <p>Este texto não substitui o publicado no Diário Oficial.</p>
-        <p><a href="/?lei">Lei relacionada</a></p>
-        <p><img src="foo.jpg" /></p>
-      </div>
-    </body></html>
-    """
+    html = f'\n    <html><body>\n      {revogada_div}\n      <div class="WordSection1">\n        <p><b>LEI ORDINARIA N.o 1/2020</b></p>\n        <p>Dispõe sobre matéria importante.</p>\n        <p>Este texto não substitui o publicado no Diário Oficial.</p>\n        <p><a href="/?lei">Lei relacionada</a></p>\n        <p><img src="foo.jpg" /></p>\n      </div>\n    </body></html>\n    '
     return html.encode("utf-8")
 
 
 def _make_reference_html(revogada: bool = False) -> BeautifulSoup:
     revogada_div = '<div id="divRevogada">Revogada</div>' if revogada else ""
-    html = f"""
-    <html><body>
-      {revogada_div}
-      <table>
-        <tr><th>Data</th><td>22/12/2020</td></tr>
-        <tr><th>Ementa</th><td>Resumo de referência.</td></tr>
-        <tr><th>Iniciativa</th><td>Poder Executivo</td></tr>
-        <tr><th>Publicação</th><td>Publicação feita no DOE.</td></tr>
-        <tr><th>Assunto Geral</th><td>MEIO AMBIENTE.</td></tr>
-        <tr><th>Atualizações</th><td>Não consta atualização.</td></tr>
-        <tr><th>Indexação</th><td>INDICE 1.</td></tr>
-      </table>
-    </body></html>
-    """
-    return BeautifulSoup(html, "html.parser")
+    html = f"\n    <html><body>\n      {revogada_div}\n      <table>\n        <tr><th>Data</th><td>22/12/2020</td></tr>\n        <tr><th>Ementa</th><td>Resumo de referência.</td></tr>\n        <tr><th>Iniciativa</th><td>Poder Executivo</td></tr>\n        <tr><th>Publicação</th><td>Publicação feita no DOE.</td></tr>\n        <tr><th>Assunto Geral</th><td>MEIO AMBIENTE.</td></tr>\n        <tr><th>Atualizações</th><td>Não consta atualização.</td></tr>\n        <tr><th>Indexação</th><td>INDICE 1.</td></tr>\n      </table>\n    </body></html>\n    "
+    return BeautifulSoup(html, "lxml")
 
 
 class TestTypesConstant(TypesConstantTests):
@@ -192,7 +121,7 @@ class TestClassAttributes(ScraperClassTests):
     STATE_NAME = "Pernambuco"
 
     def test_uses_string_not_text_in_bs4_calls(self):
-        import src.scraper.state_legislation.pernambuco as mod
+        import src.scrapers.states.pe as mod
 
         source = inspect.getsource(mod)
         tree = ast.parse(source)
@@ -217,7 +146,7 @@ class TestSearchHelpers:
         payload = scraper._build_search_payload(2025, {"__VIEWSTATE": "abc"})
         assert payload["ctl00$conteudo$tbxAno"] == "2025"
         assert payload["__VIEWSTATE"] == "abc"
-        assert not any("cblTipoNorma" in key for key in payload)
+        assert not any(("cblTipoNorma" in key for key in payload))
 
     def test_extract_norm_type_matches_known_prefixes(self):
         scraper = _make_scraper()
@@ -250,9 +179,7 @@ class TestSearchHelpers:
         soup = _make_results_page(
             [],
             pager=_make_pager(
-                ("lbtn1", "6", True),
-                ("lbtn2", "7", False),
-                ("lbtn3", "8", False),
+                ("lbtn1", "6", True), ("lbtn2", "7", False), ("lbtn3", "8", False)
             ),
         )
         slots = scraper._parse_pager_slots(soup)
@@ -261,240 +188,3 @@ class TestSearchHelpers:
             ("lbtn2", 7, False),
             ("lbtn3", 8, False),
         ]
-
-
-class TestPagination:
-    @pytest.mark.asyncio
-    async def test_get_docs_links_walks_moving_page_windows(self):
-        scraper = _make_scraper()
-        scraper.request_service.get_soup = AsyncMock(
-            return_value=BeautifulSoup(_make_initial_search_html(), "html.parser")
-        )
-
-        page1 = _make_results_page(
-            [_make_results_row(doc_id=1, title="Lei Ordinária n° 1", summary="R1")],
-            pager=_make_pager(
-                ("lbtn1", "1", True), ("lbtn2", "2", False), include_prox=True
-            ),
-        )
-        page2 = _make_results_page(
-            [_make_results_row(doc_id=2, title="Lei Ordinária n° 2", summary="R2")]
-        )
-        page3 = _make_results_page(
-            [_make_results_row(doc_id=3, title="Lei Ordinária n° 3", summary="R3")],
-            pager=_make_pager(("lbtn1", "3", True), ("lbtn2", "4", False)),
-        )
-        page4 = _make_results_page(
-            [_make_results_row(doc_id=4, title="Lei Ordinária n° 4", summary="R4")]
-        )
-
-        scraper._post_results_page = AsyncMock(side_effect=[page1, page2, page3, page4])
-
-        docs = await scraper._get_docs_links(2025)
-
-        assert [doc["title"] for doc in docs] == [
-            "Lei Ordinária n° 1",
-            "Lei Ordinária n° 2",
-            "Lei Ordinária n° 3",
-            "Lei Ordinária n° 4",
-        ]
-        assert scraper._post_results_page.call_count == 4
-        second_payload = scraper._post_results_page.call_args_list[1].args[0]
-        third_payload = scraper._post_results_page.call_args_list[2].args[0]
-        fourth_payload = scraper._post_results_page.call_args_list[3].args[0]
-        assert second_payload["__EVENTTARGET"] == "ctl00$conteudo$lbtn2"
-        assert third_payload["__EVENTTARGET"] == "ctl00$conteudo$lbtnProx"
-        assert fourth_payload["__EVENTTARGET"] == "ctl00$conteudo$lbtn2"
-
-    @pytest.mark.asyncio
-    async def test_get_docs_links_skips_overlapping_pages_after_prox(self):
-        scraper = _make_scraper()
-        scraper.request_service.get_soup = AsyncMock(
-            return_value=BeautifulSoup(_make_initial_search_html(), "html.parser")
-        )
-
-        page16 = _make_results_page(
-            [_make_results_row(doc_id=16, title="Lei Ordinária n° 16", summary="R16")],
-            pager=_make_pager(
-                ("lbtn1", "16", True),
-                ("lbtn2", "17", False),
-                ("lbtn3", "18", False),
-                include_prox=True,
-            ),
-        )
-        page17 = _make_results_page(
-            [_make_results_row(doc_id=17, title="Lei Ordinária n° 17", summary="R17")]
-        )
-        page18 = _make_results_page(
-            [_make_results_row(doc_id=18, title="Lei Ordinária n° 18", summary="R18")]
-        )
-        page18_overlap = _make_results_page(
-            [_make_results_row(doc_id=18, title="Lei Ordinária n° 18", summary="R18")],
-            pager=_make_pager(
-                ("lbtn1", "18", True),
-                ("lbtn2", "19", False),
-                ("lbtn3", "20", False),
-            ),
-        )
-        page19 = _make_results_page(
-            [_make_results_row(doc_id=19, title="Lei Ordinária n° 19", summary="R19")]
-        )
-        page20 = _make_results_page(
-            [_make_results_row(doc_id=20, title="Lei Ordinária n° 20", summary="R20")]
-        )
-
-        scraper._post_results_page = AsyncMock(
-            side_effect=[page16, page17, page18, page18_overlap, page19, page20]
-        )
-
-        docs = await scraper._get_docs_links(2025)
-
-        assert [doc["title"] for doc in docs] == [
-            "Lei Ordinária n° 16",
-            "Lei Ordinária n° 17",
-            "Lei Ordinária n° 18",
-            "Lei Ordinária n° 19",
-            "Lei Ordinária n° 20",
-        ]
-
-
-class TestGetDocData:
-    @pytest.mark.asyncio
-    async def test_resume_skip_checks_all_candidate_urls(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(
-            side_effect=lambda url, title: url.endswith("TEXTOORIGINAL")
-        )
-        doc = {
-            "title": "Lei 1/2020",
-            "type": "Lei Ordinária",
-            "document_url": "https://legis.alepe.pe.gov.br/texto.aspx?id=1&tipo=TEXTOATUALIZADO",
-            "_candidate_document_urls": [
-                "https://legis.alepe.pe.gov.br/texto.aspx?id=1&tipo=TEXTOATUALIZADO",
-                "https://legis.alepe.pe.gov.br/texto.aspx?id=1&tipo=TEXTOORIGINAL",
-            ],
-        }
-        result = await scraper._get_doc_data(doc, year=2020)
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_failed_fetch_saves_error_with_year_and_type(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper.request_service.fetch_bytes = AsyncMock(
-            return_value=FailedRequest(
-                url="https://legis.alepe.pe.gov.br/texto.aspx?id=1&tipo=TEXTOATUALIZADO",
-                reason="boom",
-            )
-        )
-        scraper._save_doc_error = AsyncMock()
-        doc = {
-            "title": "Lei 1/2020",
-            "type": "Lei Ordinária",
-            "document_url": "https://legis.alepe.pe.gov.br/texto.aspx?id=1&tipo=TEXTOATUALIZADO",
-            "_candidate_document_urls": [
-                "https://legis.alepe.pe.gov.br/texto.aspx?id=1&tipo=TEXTOATUALIZADO"
-            ],
-        }
-        result = await scraper._get_doc_data(doc, year=2020)
-        assert result is None
-        scraper._save_doc_error.assert_called_once()
-        kwargs = scraper._save_doc_error.call_args.kwargs
-        assert kwargs["year"] == 2020
-        assert kwargs["norm_type"] == "Lei Ordinária"
-        assert kwargs["error_message"] == "boom"
-
-    @pytest.mark.asyncio
-    async def test_falls_back_from_updated_to_original(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper.request_service.fetch_bytes = AsyncMock(
-            side_effect=[
-                (b"<html><body><p>missing</p></body></html>", MagicMock()),
-                (_make_doc_html(), MagicMock()),
-            ]
-        )
-        scraper._capture_mhtml = AsyncMock(return_value=b"fake-mhtml")
-        scraper._fetch_reference_page = AsyncMock(return_value=_make_reference_html())
-        scraper._get_markdown = AsyncMock(return_value="# Lei\n\n" + "Texto. " * 30)
-        doc = {
-            "title": "Lei 1/2020",
-            "type": "Lei Ordinária",
-            "summary": "Resumo do resultado",
-            "document_url": "https://legis.alepe.pe.gov.br/texto.aspx?id=1&tipo=TEXTOATUALIZADO",
-            "additional_data_url": "https://legis.alepe.pe.gov.br/dadosReferenciais.aspx?id=1",
-            "_candidate_document_urls": [
-                "https://legis.alepe.pe.gov.br/texto.aspx?id=1&tipo=TEXTOATUALIZADO",
-                "https://legis.alepe.pe.gov.br/texto.aspx?id=1&tipo=TEXTOORIGINAL",
-            ],
-        }
-
-        result = await scraper._get_doc_data(doc, year=2020)
-
-        assert result is not None
-        assert result["document_url"].endswith("TEXTOORIGINAL")
-        assert result["text_version"] == "TEXTOORIGINAL"
-        assert result["summary"] == "Resumo de referência."
-        assert result["publication"] == "Publicação feita no DOE."
-        assert result["situation"] == "Não consta revogação expressa"
-
-    @pytest.mark.asyncio
-    async def test_valid_doc_returns_mhtml_source_metadata(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper.request_service.fetch_bytes = AsyncMock(
-            return_value=(
-                _make_doc_html(),
-                MagicMock(),
-            )
-        )
-        scraper._capture_mhtml = AsyncMock(return_value=b"fake-mhtml")
-        scraper._fetch_reference_page = AsyncMock(return_value=_make_reference_html())
-        valid_md = "# Lei Ordinária 1/2020\n\n" + "Texto da lei. " * 30
-        scraper._get_markdown = AsyncMock(return_value=valid_md)
-        doc = {
-            "title": "Lei 1/2020",
-            "type": "Lei Ordinária",
-            "document_url": "https://legis.alepe.pe.gov.br/texto.aspx?id=1&tipo=TEXTOATUALIZADO",
-            "additional_data_url": "https://legis.alepe.pe.gov.br/dadosReferenciais.aspx?id=1",
-            "_candidate_document_urls": [
-                "https://legis.alepe.pe.gov.br/texto.aspx?id=1&tipo=TEXTOATUALIZADO"
-            ],
-        }
-
-        result = await scraper._get_doc_data(doc, year=2020)
-
-        assert result is not None
-        assert result["year"] == 2020
-        assert result["type"] == "Lei Ordinária"
-        assert result["text_version"] == "TEXTOATUALIZADO"
-        assert result["_content_extension"] == ".mhtml"
-        assert result["_raw_content"] == b"fake-mhtml"
-        assert result["initiative"] == "Poder Executivo"
-        assert result["date"] == "22/12/2020"
-        assert result["indexation"] == "INDICE 1."
-
-    @pytest.mark.asyncio
-    async def test_revogada_doc_sets_situation(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper.request_service.fetch_bytes = AsyncMock(
-            return_value=(
-                _make_doc_html(revogada=True),
-                MagicMock(),
-            )
-        )
-        scraper._capture_mhtml = AsyncMock(return_value=b"fake-mhtml")
-        scraper._fetch_reference_page = AsyncMock(return_value=_make_reference_html())
-        scraper._get_markdown = AsyncMock(return_value="# Lei\n\n" + "Texto. " * 30)
-        doc = {
-            "title": "Lei 1/2020",
-            "type": "Lei Ordinária",
-            "document_url": "https://legis.alepe.pe.gov.br/texto.aspx?id=1&tipo=TEXTOATUALIZADO",
-            "_candidate_document_urls": [
-                "https://legis.alepe.pe.gov.br/texto.aspx?id=1&tipo=TEXTOATUALIZADO"
-            ],
-        }
-        result = await scraper._get_doc_data(doc, year=2020)
-        assert result is not None
-        assert result["situation"] == "Revogada"

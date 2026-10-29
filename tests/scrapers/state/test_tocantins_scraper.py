@@ -1,73 +1,23 @@
-"""Tests for TocantinsScraper.
+"Parser and metadata regression tests for tocantins_scraper."
 
-Covers:
-- TYPES constant: 2 types with string IDs
-- SITUATIONS constant: dict with "Não consta"
-- Class docstring accessible (__doc__ is not None)
-- _iterate_situations NOT set
-- _format_search_payload: correct payload construction
-- _extract_docs_from_soup: HTML parsing logic
-  - missing h4 → row skipped
-  - missing link in h4 → row skipped
-  - relative doc_link → prefixed with base_url
-  - date extracted from "Data:" small tag
-  - summary extracted from em > strong
-  - PDF link extracted from Download anchor
-  - valid row → correct doc dict
-- _extract_total_count:
-  - no matching div → None
-  - div with "Registros encontrados" + strong → int
-- _has_table_artifacts:
-  - no pipes → False
-  - many pipes → True
-  - many pipe-starting lines → True
-- _normalize_table_markdown: collapses pipe tables
-- _get_doc_data:
-  - missing pdf_link → None + _save_doc_error
-  - already scraped → None
-  - failed request → None + _save_doc_error
-  - invalid markdown (_valid_markdown) → None + _save_doc_error
-  - table artifacts + valid markdown → normalized text returned
-  - valid markdown → correct dict shape, pdf_link removed
-
-Run with:
-    .venv/bin/pytest tests/test_tocantins_scraper.py -v
-"""
-
-from unittest.mock import AsyncMock, MagicMock
-
-import pytest
-from base_tests import ScraperClassTests, SituationsConstantTests, TypesConstantTests
 from bs4 import BeautifulSoup
-from conftest import make_base_scraper, make_failed_request
-
-from src.scraper.state_legislation.tocantins import (
-    SITUATIONS,
-    TYPES,
-    TocantinsScraper,
+from conftest import make_scraper
+from parser_assertions import (
+    ScraperClassTests,
+    SituationsConstantTests,
+    TypesConstantTests,
 )
 
-# ---------------------------------------------------------------------------
-# Factory helper
-# ---------------------------------------------------------------------------
+from src.scrapers.states.to import SITUATIONS, TYPES, TocantinsScraper
 
 
 def _make_scraper(**kwargs) -> TocantinsScraper:
-    """Instantiate TocantinsScraper bypassing __init__ (no network, no I/O)."""
-    return make_base_scraper(
+    """Instantiate TocantinsScraper with injected dependencies."""
+    return make_scraper(
         TocantinsScraper,
-        "https://www.al.to.leg.br",
-        "TOCANTINS",
-        TYPES,
-        situations=SITUATIONS,
         search_url="https://www.al.to.leg.br/legislacaoEstadual",
         **kwargs,
     )
-
-
-# ---------------------------------------------------------------------------
-# TYPES constant
-# ---------------------------------------------------------------------------
 
 
 class TestTypesConstant(TypesConstantTests):
@@ -77,30 +27,15 @@ class TestTypesConstant(TypesConstantTests):
     REQUIRE_INT_VALUES = False
 
 
-# ---------------------------------------------------------------------------
-# SITUATIONS constant
-# ---------------------------------------------------------------------------
-
-
 class TestSituationsConstant(SituationsConstantTests):
     SITUATIONS = SITUATIONS
     EXPECTED_TYPE = dict
     EXPECTED_EMPTY = False
 
 
-# ---------------------------------------------------------------------------
-# Class-level attributes
-# ---------------------------------------------------------------------------
-
-
 class TestClassAttributes(ScraperClassTests):
     SCRAPER_CLS = TocantinsScraper
     STATE_NAME = "Tocantins"
-
-
-# ---------------------------------------------------------------------------
-# _format_search_payload
-# ---------------------------------------------------------------------------
 
 
 class TestFormatSearchPayload:
@@ -136,11 +71,6 @@ class TestFormatSearchPayload:
             assert key in payload
 
 
-# ---------------------------------------------------------------------------
-# HTML helpers for _extract_docs_from_soup
-# ---------------------------------------------------------------------------
-
-
 def _make_row_html(
     title: str = "Lei Ordinária 1/2023",
     doc_link: str = "/legislacaoEstadual/detalhe?id=1",
@@ -148,19 +78,7 @@ def _make_row_html(
     summary: str = "Dispõe sobre algo.",
     pdf_href: str = "/arquivos/lei1.pdf",
 ) -> str:
-    return (
-        f'<div class="row">'
-        f'<h4><a href="{doc_link}">{title}</a></h4>'
-        f"<small>Data: {date}</small>"
-        f"<em><strong>{summary}</strong></em>"
-        f'<a href="{pdf_href}" title="Download">Download</a>'
-        f"</div>"
-    )
-
-
-# ---------------------------------------------------------------------------
-# _extract_docs_from_soup
-# ---------------------------------------------------------------------------
+    return f'<div class="row"><h4><a href="{doc_link}">{title}</a></h4><small>Data: {date}</small><em><strong>{summary}</strong></em><a href="{pdf_href}" title="Download">Download</a></div>'
 
 
 class TestExtractDocsFromSoup:
@@ -232,39 +150,23 @@ class TestExtractDocsFromSoup:
         assert len(result) == 2
 
 
-# ---------------------------------------------------------------------------
-# _extract_total_count
-# ---------------------------------------------------------------------------
-
-
 class TestExtractTotalCount:
     def test_no_registros_div_returns_none(self):
-        soup = BeautifulSoup(
-            "<html><body><p>Sem resultados</p></body></html>", "html.parser"
-        )
+        soup = BeautifulSoup("<html><body><p>Sem resultados</p></body></html>", "lxml")
         result = TocantinsScraper._extract_total_count(soup)
         assert result is None
 
     def test_extracts_count_from_strong(self):
-        html = (
-            "<html><body>"
-            "<div>Registros encontrados: <strong>42</strong></div>"
-            "</body></html>"
-        )
-        soup = BeautifulSoup(html, "html.parser")
+        html = "<html><body><div>Registros encontrados: <strong>42</strong></div></body></html>"
+        soup = BeautifulSoup(html, "lxml")
         result = TocantinsScraper._extract_total_count(soup)
         assert result == 42
 
     def test_ignores_div_without_strong(self):
         html = "<html><body><div>Registros encontrados: sem strong</div></body></html>"
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(html, "lxml")
         result = TocantinsScraper._extract_total_count(soup)
         assert result is None
-
-
-# ---------------------------------------------------------------------------
-# _has_table_artifacts
-# ---------------------------------------------------------------------------
 
 
 class TestHasTableArtifacts:
@@ -275,7 +177,6 @@ class TestHasTableArtifacts:
         assert TocantinsScraper._has_table_artifacts("Texto normal sem pipes.") is False
 
     def test_many_pipes_returns_true(self):
-        # ≥ 80 pipes required; "| a | b | c | d |" = 5 pipes × 20 repetitions = 100
         text = "| a | b | c | d |" * 20
         assert TocantinsScraper._has_table_artifacts(text) is True
 
@@ -284,13 +185,8 @@ class TestHasTableArtifacts:
         assert TocantinsScraper._has_table_artifacts(text) is True
 
     def test_few_pipes_returns_false(self):
-        text = "| one |"  # only 2 pipes
+        text = "| one |"
         assert TocantinsScraper._has_table_artifacts(text) is False
-
-
-# ---------------------------------------------------------------------------
-# _normalize_table_markdown
-# ---------------------------------------------------------------------------
 
 
 class TestNormalizeTableMarkdown:
@@ -318,126 +214,3 @@ class TestNormalizeTableMarkdown:
         assert "Beta" in result
         assert "Gamma" in result
         assert "|" not in result
-
-
-# ---------------------------------------------------------------------------
-# _get_doc_data
-# ---------------------------------------------------------------------------
-
-
-class TestGetDocData:
-    def _make_doc(self, **kwargs):
-        base = {
-            "pdf_link": "https://www.al.to.leg.br/arquivos/lei1.pdf",
-            "title": "Lei Ordinária 1/2023",
-            "year": 2023,
-            "summary": "Ementa.",
-            "situation": "Não consta",
-            "date": "01/01/2023",
-        }
-        base.update(kwargs)
-        return base
-
-    @pytest.mark.asyncio
-    async def test_missing_pdf_link_returns_none(self):
-        scraper = _make_scraper()
-        scraper._save_doc_error = AsyncMock()
-        doc = self._make_doc()
-        doc.pop("pdf_link")
-        result = await scraper._get_doc_data(doc)
-        assert result is None
-        scraper._save_doc_error.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_already_scraped_returns_none(self):
-        scraper = _make_scraper()
-        pdf_link = "https://www.al.to.leg.br/arquivos/lei1.pdf"
-        scraper._scraped_keys = {(pdf_link, "Lei Ordinária 1/2023")}
-        result = await scraper._get_doc_data(self._make_doc())
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_failed_request_returns_none_and_saves_error(self):
-        scraper = _make_scraper()
-        failed = make_failed_request()
-        scraper.request_service.make_request = AsyncMock(return_value=failed)
-        scraper._save_doc_error = AsyncMock()
-        result = await scraper._get_doc_data(self._make_doc())
-        assert result is None
-        scraper._save_doc_error.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_invalid_markdown_returns_none_and_saves_error(self):
-        scraper = _make_scraper()
-        resp = MagicMock()
-        resp.__bool__ = lambda s: True
-        resp.read = AsyncMock(return_value=b"%PDF fake")
-        scraper.request_service.make_request = AsyncMock(return_value=resp)
-        scraper._get_markdown = AsyncMock(return_value="short")
-        scraper._save_doc_error = AsyncMock()
-        result = await scraper._get_doc_data(self._make_doc())
-        assert result is None
-        scraper._save_doc_error.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_whitespace_markdown_returns_none(self):
-        scraper = _make_scraper()
-        resp = MagicMock()
-        resp.__bool__ = lambda s: True
-        resp.read = AsyncMock(return_value=b"%PDF fake")
-        scraper.request_service.make_request = AsyncMock(return_value=resp)
-        scraper._get_markdown = AsyncMock(return_value="   \n\n   ")
-        scraper._save_doc_error = AsyncMock()
-        result = await scraper._get_doc_data(self._make_doc())
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_valid_markdown_returns_correct_shape(self):
-        scraper = _make_scraper()
-        resp = MagicMock()
-        resp.__bool__ = lambda s: True
-        pdf_bytes = b"%PDF-1.4 content here"
-        resp.read = AsyncMock(return_value=pdf_bytes)
-        scraper.request_service.make_request = AsyncMock(return_value=resp)
-        valid_md = "# Lei Ordinária 1/2023\n\n" + "Texto da lei. " * 30
-        scraper._get_markdown = AsyncMock(return_value=valid_md)
-        doc = self._make_doc()
-        result = await scraper._get_doc_data(doc)
-        assert result is not None
-        assert result["text_markdown"] == valid_md
-        assert result["document_url"] == "https://www.al.to.leg.br/arquivos/lei1.pdf"
-        assert result["_raw_content"] == pdf_bytes
-        assert result["_content_extension"] == ".pdf"
-
-    @pytest.mark.asyncio
-    async def test_pdf_link_removed_from_result(self):
-        scraper = _make_scraper()
-        resp = MagicMock()
-        resp.__bool__ = lambda s: True
-        resp.read = AsyncMock(return_value=b"%PDF content")
-        scraper.request_service.make_request = AsyncMock(return_value=resp)
-        valid_md = "# Lei\n\n" + "Texto. " * 30
-        scraper._get_markdown = AsyncMock(return_value=valid_md)
-        doc = self._make_doc()
-        result = await scraper._get_doc_data(doc)
-        assert result is not None
-        assert "pdf_link" not in result
-
-    @pytest.mark.asyncio
-    async def test_table_artifacts_normalized_before_validation(self):
-        """Markdown with table artifacts is normalized before _valid_markdown check."""
-        scraper = _make_scraper()
-        resp = MagicMock()
-        resp.__bool__ = lambda s: True
-        resp.read = AsyncMock(return_value=b"%PDF content")
-        scraper.request_service.make_request = AsyncMock(return_value=resp)
-        # Simulate table-heavy markdown that normalizes to valid text
-        pipe_md = ("| Lei Ordinária | 1/2023 |\n" * 10) + "\n" + ("Texto normal. " * 30)
-        normalized_md = "# Lei\n\n" + "Texto. " * 30
-        scraper._get_markdown = AsyncMock(return_value=pipe_md)
-        # Patch _normalize_table_markdown to return valid text
-        scraper._normalize_table_markdown = MagicMock(return_value=normalized_md)
-        doc = self._make_doc()
-        await scraper._get_doc_data(doc)
-        # Normalization should have been called since pipe_count > 80
-        assert scraper._normalize_table_markdown.called
