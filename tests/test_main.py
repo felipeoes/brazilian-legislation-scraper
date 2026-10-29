@@ -1,127 +1,72 @@
-"""Tests for main CLI scraper selection helpers."""
+from dataclasses import replace
+from unittest.mock import AsyncMock
 
-import importlib
-from pathlib import Path
+import pytest
 
-import src.config as config_module
-from main import _get_scraper_names, build_scraper_configs
-from src.scraper.conama.scrape import ConamaScraper
-from src.scraper.state_legislation import AlagoasSefazScraper, LegislaGoias
-from src.services.ocr.config import LLMConfig
+import main
+from src.core.scraper import BaseScraper
+from src.registry import SCRAPERS, ScraperSpec
 
 
-class TestScraperCliNames:
-    def test_log_dir_reads_env_value(self, monkeypatch):
-        with monkeypatch.context() as context:
-            context.setenv("LOG_DIR", "logs/legislation")
-            context.delenv("ERROR_LOG_DIR", raising=False)
+def test_selection_aliases_and_unknown_names():
+    assert main.select_scrapers(["PB"])[0].cls.name == "PARAIBA"
+    assert len(main.select_scrapers(["Conama", "CONAMASCRAPER"])) == 1
+    with pytest.raises(ValueError, match="Unknown"):
+        main.select_scrapers(["misspelled"])
+    assert len(SCRAPERS) == 30
 
-            importlib.reload(config_module)
 
-            assert config_module.LOG_DIR == Path("logs/legislation")
+@pytest.mark.parametrize("argv", [[], ["run"], ["run", "--all", "-s", "AC"]])
+def test_cli_requires_explicit_selection(argv):
+    with pytest.raises(SystemExit) as exc:
+        main.parse_args(argv)
+    assert exc.value.code == 2
 
-        importlib.reload(config_module)
 
-    def test_short_name_defaults_from_scraper_class(self):
-        configs = build_scraper_configs(None)
-        cfg = next(c for c in configs if c.scraper is ConamaScraper)
+@pytest.mark.parametrize("failed", [False, True])
+async def test_exit_code_reflects_scraper_failure(monkeypatch, failed):
+    monkeypatch.setattr(main, "LLM_MODEL", "")
+    monkeypatch.setattr(main, "run_scraper", AsyncMock(return_value=not failed))
+    assert await main.main(["run", "-s", "AC"]) == int(failed)
 
-        assert cfg.name == "Conama"
-        assert _get_scraper_names(cfg) == {"conama", "conamascraper"}
 
-    def test_scrapers_without_suffix_keep_class_name(self):
-        configs = build_scraper_configs(None)
-        cfg = next(c for c in configs if c.scraper is LegislaGoias)
+async def test_cleanup_failure_sets_exit_one(tmp_path, monkeypatch):
+    class BrokenCleanup(BaseScraper):
+        name = "BROKEN"
+        base_url = "https://example.org"
 
-        assert cfg.name == "LegislaGoias"
-        assert _get_scraper_names(cfg) == {"legislagoias", "goias", "go"}
+        async def list_documents(self, year):
+            if False:
+                yield {}
 
-    def test_build_configs_assigns_names_to_all_scrapers(self):
-        configs = build_scraper_configs(None)
+        async def __aexit__(self, *exc):
+            await super().__aexit__(*exc)
+            raise RuntimeError("cleanup failed")
 
-        assert configs
-        assert all(cfg.name for cfg in configs)
+    monkeypatch.setattr(main, "LLM_MODEL", "")
+    monkeypatch.setattr(
+        main,
+        "SCRAPERS",
+        [ScraperSpec(BrokenCleanup, ("bad",), range(2024, 2025), save_dir=tmp_path)],
+    )
+    monkeypatch.setattr("src.core.scraper.LOG_DIR", tmp_path)
+    assert await main.main(["run", "-s", "bad"]) == 1
 
-    def test_short_name_selection_matches_conama(self):
-        configs = build_scraper_configs(None, run_names={"conama"})
 
-        enabled = [cfg.scraper.__name__ for cfg in configs if cfg.run]
-        assert enabled == ["ConamaScraper"]
+async def test_import_and_export_cli(tmp_path, monkeypatch):
+    import json
 
-    def test_class_name_selection_still_matches_conama(self):
-        configs = build_scraper_configs(None, run_names={"conamascraper"})
+    from test_store import document
 
-        enabled = [cfg.scraper.__name__ for cfg in configs if cfg.run]
-        assert enabled == ["ConamaScraper"]
-
-    def test_case_insensitive_selection_matches_goias(self):
-        configs = build_scraper_configs(None, run_names={"legislagoias"})
-
-        enabled = [cfg.scraper.__name__ for cfg in configs if cfg.run]
-        assert enabled == ["LegislaGoias"]
-
-    def test_state_alias_goias_matches_goias_scraper(self):
-        configs = build_scraper_configs(None, run_names={"goias"})
-
-        enabled = [cfg.scraper.__name__ for cfg in configs if cfg.run]
-        assert enabled == ["LegislaGoias"]
-
-    def test_state_alias_alagoas_matches_alagoas_scraper(self):
-        configs = build_scraper_configs(None, run_names={"alagoas"})
-
-        enabled = [cfg.scraper.__name__ for cfg in configs if cfg.run]
-        assert enabled == ["AlagoasSefazScraper"]
-
-    def test_state_alias_case_insensitive(self):
-        configs = build_scraper_configs(None, run_names={"alagoas"})
-        cfg = next(c for c in configs if c.scraper is AlagoasSefazScraper)
-
-        assert cfg.run is True
-
-    def test_all_state_scrapers_have_aliases(self):
-        configs = build_scraper_configs(None)
-        federal_scrapers = {"CamaraDepScraper", "ConamaScraper", "ICMBioScraper"}
-
-        state_configs = [
-            cfg for cfg in configs if cfg.scraper.__name__ not in federal_scrapers
-        ]
-        assert all(cfg.aliases for cfg in state_configs), (
-            "All state scrapers must declare at least one alias. "
-            f"Missing: {[cfg.scraper.__name__ for cfg in state_configs if not cfg.aliases]}"
-        )
-
-    def test_build_llm_config_infers_snowflake_when_provider_unset(self, monkeypatch):
-        captured_snowflake_kwargs = {}
-
-        class DummySnowflakeClient:
-            def __init__(self, **kwargs):
-                captured_snowflake_kwargs.update(kwargs)
-                self.account = kwargs["account"]
-
-        monkeypatch.delenv("LLM_PROVIDER", raising=False)
-        monkeypatch.setenv("LLM_API_KEY", "test-token")
-        monkeypatch.setenv(
-            "PROVIDER_BASE_URL",
-            "https://account.snowflakecomputing.com/api/v2/statements/",
-        )
-        monkeypatch.setenv("LLM_MODEL", "claude-sonnet")
-        monkeypatch.setenv("SNOWFLAKE_ACCOUNT", "account")
-        monkeypatch.setenv("SNOWFLAKE_USER", "user")
-        monkeypatch.setenv("SNOWFLAKE_DATABASE", "database")
-        monkeypatch.setenv("SNOWFLAKE_SCHEMA", "PUBLIC")
-        monkeypatch.setenv("SNOWFLAKE_STAGE", "stage")
-        monkeypatch.setattr(
-            "src.services.ocr.clients.SnowflakeClient", DummySnowflakeClient
-        )
-
-        config = LLMConfig.from_env()
-
-        assert config is not None
-        assert captured_snowflake_kwargs == {
-            "account": "account",
-            "user": "user",
-            "token": "test-token",
-            "database": "database",
-            "schema": "PUBLIC",
-            "stage": "stage",
-        }
+    spec = replace(SCRAPERS[3], save_dir=tmp_path)
+    source = spec.database.parent / "2024/data.json"
+    source.parent.mkdir(parents=True)
+    source.write_text(json.dumps([document().model_dump()]))
+    monkeypatch.setattr(main, "SCRAPERS", [spec])
+    assert await main.main(["import-json", "-s", "AC"]) == 0
+    out = tmp_path / "export"
+    assert await main.main(["export", "-s", "AC", "--out", str(out)]) == 0
+    assert (
+        json.loads((out / "2024/data.jsonl").read_text())["title"] == document().title
+    )
+    assert source.exists()

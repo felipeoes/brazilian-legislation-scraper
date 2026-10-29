@@ -1,34 +1,27 @@
 """Centralized configuration from environment variables."""
 
-from __future__ import annotations
-
 import os
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 load_dotenv()
-
-LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "")
-PROVIDER_BASE_URL = os.environ.get("PROVIDER_BASE_URL", "")
-
+LLM_PDF_INPUT = os.environ.get("LLM_PDF_INPUT", "false").lower() in {"1", "true", "yes"}
+LLM_BATCH_SIZE = int(os.environ.get("LLM_BATCH_SIZE", "5"))
+LLM_CONCURRENCY = int(os.environ.get("LLM_CONCURRENCY", "8"))
 SAVE_DIR = Path(os.environ.get("SAVE_DIR", "outputs/legislation"))
-
 _raw_state_dir = os.environ.get("STATE_LEGISLATION_SAVE_DIR")
 STATE_LEGISLATION_SAVE_DIR: Path | None = (
     Path(_raw_state_dir) if _raw_state_dir else None
 )
-
 _raw_specific_dir = os.environ.get("SPECIFIC_LEGISLATION_SAVE_DIR")
 SPECIFIC_LEGISLATION_SAVE_DIR: Path | None = (
     Path(_raw_specific_dir) if _raw_specific_dir else None
 )
-
 LOG_DIR = Path(
     os.environ.get("LOG_DIR", os.environ.get("ERROR_LOG_DIR", "logs/legislation"))
 )
-
 PROXY_FILE_PATH = os.environ.get("PROXY_FILE_PATH")
 PROXY_ENDPOINT = os.environ.get("PROXY_ENDPOINT")
 

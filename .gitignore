@@ -179,3 +179,4 @@ proxies.txt
 
 # AI-RELATED
 .claude/
+.gemini/

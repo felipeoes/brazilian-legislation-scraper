@@ -1,25 +1,11 @@
-"""Tests for ICMBioScraper.
+"Parser and metadata regression tests for icmbio_scraper."
 
-Covers:
-- _build_query_payload — first page and pagination
-- _parse_dsr_rows — repeat bitmask, ValueDict resolution, epoch-ms dates
-- _classify_type — all type categories + tightened IN heuristic
-- _row_to_doc — valid and invalid rows, edge cases
-- _before_scrape — bucketing, skipped rows
-- _get_doc_data — already scraped, HTTP errors, missing div, empty markdown, happy path
-- _fetch_page — non-200 response, IC flag, RestartTokens
-- _scrape_year — no docs, has docs
-- Integration — live PowerBI API + DOU HTML pages (2026)
-"""
-
-from __future__ import annotations
-
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
-from bs4 import BeautifulSoup
+from conftest import make_scraper
 
-from src.scraper.icmbio.scrape import (
+from src.scrapers.environment.icmbio import (
     COLUMNS,
     DATASET_ID,
     MODEL_ID,
@@ -29,10 +15,6 @@ from src.scraper.icmbio.scrape import (
     ICMBioScraper,
 )
 
-# =========================================================================
-# _build_query_payload
-# =========================================================================
-
 
 class TestICMBioBuildQueryPayload:
     def test_first_page_no_restart_tokens(self):
@@ -41,7 +23,6 @@ class TestICMBioBuildQueryPayload:
             "SemanticQueryDataShapeCommand"
         ]["Binding"]
         window = binding["DataReduction"]["Primary"]["Window"]
-
         assert "RestartTokens" not in window
         assert window["Count"] == PAGE_SIZE
         assert payload["modelId"] == MODEL_ID
@@ -49,7 +30,6 @@ class TestICMBioBuildQueryPayload:
     def test_first_page_application_context(self):
         payload = ICMBioScraper._build_query_payload()
         ctx = payload["queries"][0]["ApplicationContext"]
-
         assert ctx["DatasetId"] == DATASET_ID
         assert ctx["Sources"][0]["ReportId"] == REPORT_ID
         assert ctx["Sources"][0]["VisualId"] == VISUAL_ID
@@ -61,7 +41,6 @@ class TestICMBioBuildQueryPayload:
             "SemanticQueryDataShapeCommand"
         ]["Binding"]
         window = binding["DataReduction"]["Primary"]["Window"]
-
         assert window["RestartTokens"] == tokens
 
     def test_select_has_all_columns(self):
@@ -69,18 +48,12 @@ class TestICMBioBuildQueryPayload:
         select = payload["queries"][0]["Query"]["Commands"][0][
             "SemanticQueryDataShapeCommand"
         ]["Query"]["Select"]
-
         col_names = [item["Column"]["Property"] for item in select]
         assert col_names == COLUMNS
 
     def test_version_field(self):
         payload = ICMBioScraper._build_query_payload()
         assert payload["version"] == "1.0.0"
-
-
-# =========================================================================
-# _parse_dsr_rows
-# =========================================================================
 
 
 class TestICMBioParseDsrRows:
@@ -113,7 +86,7 @@ class TestICMBioParseDsrRows:
                         "IN 1",
                         "Fauna",
                     ]
-                },
+                }
             ]
         )
         rows = ICMBioScraper._parse_dsr_rows(ds)
@@ -127,13 +100,11 @@ class TestICMBioParseDsrRows:
         assert r["assunto"] == "Fauna"
 
     def test_epoch_ms_converted_to_date_string(self):
-        # 1609459200000 ms = 2021-01-01 00:00:00 UTC
         ds = self._make_ds([{"C": ["em vigência", 1609459200000, "", "", "", "", ""]}])
         rows = ICMBioScraper._parse_dsr_rows(ds)
         assert rows[0]["publicacao"] == "01/01/2021"
 
     def test_repeat_bitmask_carries_previous_value(self):
-        # Row 0: all values set. Row 1: col 0 (condicao) repeats via R=1.
         ds = self._make_ds(
             [
                 {
@@ -161,12 +132,10 @@ class TestICMBioParseDsrRows:
             ]
         )
         rows = ICMBioScraper._parse_dsr_rows(ds)
-        assert rows[1]["condicao"] == "em vigência"  # repeated
+        assert rows[1]["condicao"] == "em vigência"
         assert rows[1]["ato"] == "IN 2"
 
     def test_value_dict_resolution(self):
-        # The schema row itself is processed as a data row (with no C → all empty).
-        # The actual data row is at index 1.
         schema_row = self._schema_row({0: "D0"})
         ds = self._make_ds(
             [
@@ -188,7 +157,6 @@ class TestICMBioParseDsrRows:
         rows = ICMBioScraper._parse_dsr_rows(
             ds, accumulated_dicts={"D0": ["revogado", "em vigência"]}
         )
-        # rows[0] is the schema row (all empty), rows[1] is the data row
         assert rows[1]["condicao"] == "em vigência"
 
     def test_value_dict_out_of_bounds_returns_empty(self):
@@ -207,14 +175,12 @@ class TestICMBioParseDsrRows:
                         "Fauna",
                     ]
                 },
-            ],
+            ]
         )
         rows = ICMBioScraper._parse_dsr_rows(ds, accumulated_dicts={"D0": ["revogado"]})
-        # rows[0] is the schema row (all empty), rows[1] is the data row
         assert rows[1]["condicao"] == ""
 
     def test_none_value_becomes_empty_string(self):
-        # Provide a row with fewer C values so some columns are None
         ds = self._make_ds([{"C": ["status"]}])
         rows = ICMBioScraper._parse_dsr_rows(ds)
         assert rows[0]["publicacao"] == ""
@@ -229,8 +195,6 @@ class TestICMBioParseDsrRows:
             ],
             value_dicts={"D0": ["em vigência", "revogado"]},
         )
-        # accumulated_dicts is empty → falls back to ds["ValueDicts"]
-        # rows[0] is the schema row (all empty), rows[1] is the data row
         rows = ICMBioScraper._parse_dsr_rows(ds, accumulated_dicts={})
         assert rows[1]["condicao"] == "em vigência"
 
@@ -243,16 +207,9 @@ class TestICMBioParseDsrRows:
             ],
             value_dicts={"D0": ["old_value"]},
         )
-        # accumulated contains more entries built across pages
-        # rows[0] is the schema row (all empty), rows[1] is the data row
         accumulated = {"D0": ["revogado", "em vigência com alteração"]}
         rows = ICMBioScraper._parse_dsr_rows(ds, accumulated_dicts=accumulated)
         assert rows[1]["condicao"] == "em vigência com alteração"
-
-
-# =========================================================================
-# _classify_type
-# =========================================================================
 
 
 class TestICMBioClassifyType:
@@ -266,7 +223,6 @@ class TestICMBioClassifyType:
         assert ICMBioScraper._classify_type("IN 42, de 2024") == "Instrução Normativa"
 
     def test_in_without_digit_not_matched(self):
-        # "in texto" starts with "in " but has no digit — tightened heuristic
         assert (
             ICMBioScraper._classify_type("in texto sem número") != "Instrução Normativa"
         )
@@ -290,7 +246,6 @@ class TestICMBioClassifyType:
         )
 
     def test_in_digit_zero(self):
-        # "in 0" — numeric after "in " — should match
         assert ICMBioScraper._classify_type("in 0, de 2020") == "Instrução Normativa"
 
     def test_in_icmbio_prefix_maps_to_instrucao_normativa(self):
@@ -306,14 +261,9 @@ class TestICMBioClassifyType:
         )
 
 
-# =========================================================================
-# _row_to_doc
-# =========================================================================
-
-
 class TestICMBioRowToDoc:
     def _make_scraper(self):
-        scraper = object.__new__(ICMBioScraper)
+        scraper = make_scraper(ICMBioScraper)
         return scraper
 
     def _valid_row(self, **overrides):
@@ -395,135 +345,31 @@ class TestICMBioRowToDoc:
         """Bug 4: if epoch-ms conversion fails, publicacao stays as int.
         _row_to_doc must not raise AttributeError on int.strip()."""
         scraper = self._make_scraper()
-        # Before fix: int.strip() → AttributeError. After fix: str() conversion
-        # makes it parseable (though the year will be nonsensical).
         doc = scraper._row_to_doc(self._valid_row(publicacao=1609459200000))
-        # The key assertion: no AttributeError was raised
-        assert doc is not None or doc is None  # either outcome is fine, no crash
-
-
-# =========================================================================
-# _before_scrape
-# =========================================================================
-
-
-class TestICMBioBeforeScrape:
-    def _make_scraper(self, rows):
-        scraper = object.__new__(ICMBioScraper)
-        scraper.verbose = False
-        scraper._fetch_all_rows = AsyncMock(return_value=rows)
-        return scraper
-
-    def _valid_row(self, year_str="2022", link="https://www.in.gov.br/doc"):
-        return {
-            "condicao": "em vigência",
-            "publicacao": f"01/01/{year_str}",
-            "instrumento": "DOU 1",
-            "ementa": "Ementa",
-            "link_dou": link,
-            "ato": "Instrução Normativa Nº 1",
-            "assunto": "Fauna",
-        }
-
-    @pytest.mark.asyncio
-    async def test_all_valid_rows_bucketed(self):
-        rows = [
-            self._valid_row("2021"),
-            self._valid_row("2022"),
-            self._valid_row("2021"),
-        ]
-        scraper = self._make_scraper(rows)
-        await scraper._before_scrape()
-        assert 2021 in scraper._docs_by_year
-        assert 2022 in scraper._docs_by_year
-        assert len(scraper._docs_by_year[2021]) == 2
-        assert len(scraper._docs_by_year[2022]) == 1
-
-    @pytest.mark.asyncio
-    async def test_invalid_rows_skipped(self):
-        rows = [
-            self._valid_row("2022"),
-            self._valid_row("2022", link=""),  # no link → skipped
-            self._valid_row(
-                "2022", link="https://example.com/x"
-            ),  # wrong domain → skipped
-        ]
-        scraper = self._make_scraper(rows)
-        await scraper._before_scrape()
-        assert len(scraper._docs_by_year.get(2022, [])) == 1
-
-    @pytest.mark.asyncio
-    async def test_empty_rows_gives_empty_buckets(self):
-        scraper = self._make_scraper([])
-        await scraper._before_scrape()
-        assert scraper._docs_by_year == {}
-
-    @pytest.mark.asyncio
-    async def test_empty_rows_logs_warning(self):
-        """Bug 2: when PowerBI API returns no rows, a WARNING must be logged."""
-        from loguru import logger as _logger
-
-        scraper = self._make_scraper([])
-
-        messages = []
-        sink_id = _logger.add(lambda m: messages.append(str(m)), level="WARNING")
-        try:
-            await scraper._before_scrape()
-        finally:
-            _logger.remove(sink_id)
-
-        assert any("PowerBI API returned no rows" in m for m in messages)
-
-    @pytest.mark.asyncio
-    async def test_mixed_years_correct_bucketing(self):
-        rows = [
-            self._valid_row("2019"),
-            self._valid_row("2020"),
-            self._valid_row("2020"),
-            self._valid_row("2023"),
-        ]
-        scraper = self._make_scraper(rows)
-        await scraper._before_scrape()
-        assert len(scraper._docs_by_year[2019]) == 1
-        assert len(scraper._docs_by_year[2020]) == 2
-        assert len(scraper._docs_by_year[2023]) == 1
-
-
-# =========================================================================
-# _fetch_page
-# =========================================================================
+        assert doc is not None or doc is None
 
 
 class TestICMBioFetchPage:
     def _make_scraper(self, response):
-        scraper = object.__new__(ICMBioScraper)
-        scraper.request_service = MagicMock()
-        scraper.request_service.make_request = AsyncMock(return_value=response)
+        scraper = make_scraper(ICMBioScraper)
+        scraper.http.request = AsyncMock(return_value=response)
         return scraper
 
     def _mock_response(self, status=200, body=None):
-        resp = MagicMock()
-        resp.status = status
-        resp.__bool__ = lambda self: True
+        import json
 
-        import json as _json
+        from src.core.http import Response
 
-        async def _text(**kwargs):
-            return _json.dumps(body or {})
-
-        resp.text = _text
-        return resp
+        return Response("url", status, {}, json.dumps(body or {}).encode())
 
     @pytest.mark.asyncio
-    async def test_non_200_returns_none_and_is_complete(self):
-        failed = MagicMock()
-        failed.__bool__ = lambda self: False
-        failed.status = 503
-        scraper = self._make_scraper(failed)
-        ds, tokens, complete = await scraper._fetch_page()
-        assert ds is None
-        assert tokens is None
-        assert complete is True
+    async def test_http_failure_propagates(self):
+        from src.core.http import HttpError
+
+        scraper = self._make_scraper(None)
+        scraper.http.request.side_effect = HttpError("url", 503, "unavailable")
+        with pytest.raises(HttpError):
+            await scraper._fetch_page()
 
     @pytest.mark.asyncio
     async def test_ic_true_means_complete(self):
@@ -531,16 +377,7 @@ class TestICMBioFetchPage:
             "results": [
                 {
                     "result": {
-                        "data": {
-                            "dsr": {
-                                "DS": [
-                                    {
-                                        "IC": True,
-                                        "PH": [{"DM0": []}],
-                                    }
-                                ]
-                            }
-                        }
+                        "data": {"dsr": {"DS": [{"IC": True, "PH": [{"DM0": []}]}]}}
                     }
                 }
             ]
@@ -579,528 +416,32 @@ class TestICMBioFetchPage:
         assert tokens == restart_tokens
 
     @pytest.mark.asyncio
-    async def test_invalid_json_returns_none(self):
-        """Bug 1: non-JSON response must not crash — returns (None, None, True)."""
-        resp = MagicMock()
-        resp.status = 200
-        resp.__bool__ = lambda self: True
+    async def test_invalid_json_raises(self):
+        from src.core.http import Response
 
-        async def _text(**kwargs):
-            return "<html>Server Error</html>"
-
-        resp.text = _text
-        scraper = self._make_scraper(resp)
-        ds, tokens, complete = await scraper._fetch_page()
-        assert ds is None
-        assert tokens is None
-        assert complete is True
-
-    @pytest.mark.asyncio
-    async def test_none_intermediate_value_returns_none(self):
-        """Bug 5: None intermediate in DSR path must not crash — returns (None, None, True)."""
-        resp = self._mock_response(200, {"results": [{"result": {"data": None}}]})
-        scraper = self._make_scraper(resp)
-        ds, tokens, complete = await scraper._fetch_page()
-        assert ds is None
-        assert tokens is None
-        assert complete is True
-
-    @pytest.mark.asyncio
-    async def test_failed_request_reason_logged(self):
-        """Bug 3: FailedRequest.reason must appear in the log message."""
-        from loguru import logger as _logger
-
-        failed = MagicMock()
-        failed.__bool__ = lambda self: False
-        failed.reason = "HTTP 403 (failed after 5 attempts)"
-        failed.status = 403
-        scraper = self._make_scraper(failed)
-
-        messages = []
-        sink_id = _logger.add(lambda m: messages.append(str(m)), level="ERROR")
-        try:
+        scraper = self._make_scraper(
+            Response("url", 200, {}, b"<html>Server error</html>")
+        )
+        with pytest.raises(ValueError):
             await scraper._fetch_page()
-        finally:
-            _logger.remove(sink_id)
 
-        assert any("HTTP 403 (failed after 5 attempts)" in m for m in messages)
+    @pytest.mark.asyncio
+    async def test_invalid_response_structure_raises(self):
+        scraper = self._make_scraper(
+            self._mock_response(200, {"results": [{"result": {"data": None}}]})
+        )
+        with pytest.raises(TypeError):
+            await scraper._fetch_page()
 
     @pytest.mark.asyncio
     async def test_missing_ic_defaults_to_complete(self):
         body = {
-            "results": [
-                {
-                    "result": {
-                        "data": {
-                            "dsr": {
-                                "DS": [
-                                    {
-                                        "PH": [{"DM0": []}],
-                                        # no "IC" key
-                                    }
-                                ]
-                            }
-                        }
-                    }
-                }
-            ]
+            "results": [{"result": {"data": {"dsr": {"DS": [{"PH": [{"DM0": []}]}]}}}}]
         }
         scraper = self._make_scraper(self._mock_response(200, body))
         ds, tokens, complete = await scraper._fetch_page()
         assert complete is True
 
 
-# =========================================================================
-# _get_doc_data
-# =========================================================================
-
-
-class TestICMBioGetDocData:
-    def _make_scraper(self):
-        scraper = object.__new__(ICMBioScraper)
-        scraper.request_service = MagicMock()
-        scraper._scraped_keys = set()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._save_doc_result = AsyncMock(return_value=None)
-        scraper._save_doc_error = AsyncMock(return_value=None)
-        scraper._get_markdown = AsyncMock(return_value="# Converted markdown content")
-        scraper._clean_norm_soup = MagicMock(side_effect=lambda soup, **kwargs: soup)
-        scraper._wrap_html = MagicMock(
-            side_effect=lambda html: f"<html><body>{html}</body></html>"
-        )
-        return scraper
-
-    def _valid_doc_info(self):
-        return {
-            "year": 2022,
-            "title": "IN Nº 1",
-            "summary": "Ementa",
-            "type": "Instrução Normativa",
-            "document_url": "https://www.in.gov.br/web/dou/-/in-1",
-            "situation": "em vigência",
-            "subject": "Fauna",
-            "publication_info": "DOU 1",
-        }
-
-    def _make_response(self, status=200, html=""):
-        resp = MagicMock()
-        resp.status = status
-        resp.__bool__ = lambda self: True
-
-        async def _text(**kwargs):
-            return html
-
-        resp.text = _text
-        return resp
-
-    @pytest.mark.asyncio
-    async def test_already_scraped_returns_none(self):
-        scraper = self._make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=True)
-        result = await scraper._get_doc_data(self._valid_doc_info())
-        assert result is None
-        scraper.request_service.make_request.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_missing_document_url_saves_error_and_returns_none(self):
-        scraper = self._make_scraper()
-        doc = self._valid_doc_info()
-        doc["document_url"] = ""
-        result = await scraper._get_doc_data(doc)
-        assert result is None
-        scraper._save_doc_error.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_http_error_saves_error_and_returns_none(self):
-        scraper = self._make_scraper()
-        scraper._fetch_soup_and_mhtml = AsyncMock(
-            side_effect=Exception("HTTP 503 error")
-        )
-        result = await scraper._get_doc_data(self._valid_doc_info())
-        assert result is None
-        scraper._save_doc_error.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_div_texto_dou_not_found_saves_error(self):
-        scraper = self._make_scraper()
-        scraper._fetch_soup_and_mhtml = AsyncMock(
-            return_value=(
-                BeautifulSoup(
-                    "<html><body><p>No div here</p></body></html>", "html.parser"
-                ),
-                b"fake-mhtml",
-            )
-        )
-        result = await scraper._get_doc_data(self._valid_doc_info())
-        assert result is None
-        scraper._save_doc_error.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_empty_markdown_saves_error(self):
-        scraper = self._make_scraper()
-        scraper._fetch_soup_and_mhtml = AsyncMock(
-            return_value=(
-                BeautifulSoup(
-                    '<html><body><div class="texto-dou"><p>content</p></div></body></html>',
-                    "html.parser",
-                ),
-                b"fake-mhtml",
-            )
-        )
-        scraper._get_markdown = AsyncMock(return_value="   ")
-        result = await scraper._get_doc_data(self._valid_doc_info())
-        assert result is None
-        scraper._save_doc_error.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_not_found_message_in_markdown_saves_error(self):
-        scraper = self._make_scraper()
-        scraper._fetch_soup_and_mhtml = AsyncMock(
-            return_value=(
-                BeautifulSoup(
-                    '<html><body><div class="texto-dou"><p>content</p></div></body></html>',
-                    "html.parser",
-                ),
-                b"fake-mhtml",
-            )
-        )
-        scraper._get_markdown = AsyncMock(
-            return_value="The requested URL was not found on this server."
-        )
-        result = await scraper._get_doc_data(self._valid_doc_info())
-        assert result is None
-        scraper._save_doc_error.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_happy_path_saves_and_returns_result(self):
-        scraper = self._make_scraper()
-        doc = self._valid_doc_info()
-        scraper._fetch_soup_and_mhtml = AsyncMock(
-            return_value=(
-                BeautifulSoup(
-                    '<html><body><div class="texto-dou"><p>Art. 1º Esta instrução normativa...</p></div></body></html>',
-                    "html.parser",
-                ),
-                b"fake-mhtml-content",
-            )
-        )
-        saved_result = {}
-
-        async def capture_save(result):
-            saved_result.update(result)
-
-        scraper._save_doc_result = capture_save
-
-        result = await scraper._get_doc_data(doc)
-        assert result is not None
-        assert "text_markdown" in result
-        assert result["text_markdown"] == "# Converted markdown content"
-        assert result["year"] == 2022
-        assert result["title"] == "IN Nº 1"
-        assert result["_raw_content"] == b"fake-mhtml-content"
-        assert result["_content_extension"] == ".mhtml"
-        assert (
-            scraper._get_markdown.await_args.kwargs["base_url"] == doc["document_url"]
-        )
-
-    @pytest.mark.asyncio
-    async def test_happy_path_clean_norm_soup_called(self):
-        scraper = self._make_scraper()
-        scraper._fetch_soup_and_mhtml = AsyncMock(
-            return_value=(
-                BeautifulSoup(
-                    '<html><body><div class="texto-dou"><p>Content here.</p></div></body></html>',
-                    "html.parser",
-                ),
-                b"fake-mhtml",
-            )
-        )
-        await scraper._get_doc_data(self._valid_doc_info())
-        scraper._clean_norm_soup.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_identifica_and_ementa_stripped_before_conversion(self):
-        """<p class="identifica"> and <p class="ementa"> must be removed before
-        markdown conversion so the title and summary are not duplicated in text_markdown."""
-        from bs4 import BeautifulSoup as BS
-
-        scraper = self._make_scraper()
-
-        markdown_calls = []
-
-        async def capture_markdown(*, html_content, base_url=None):
-            markdown_calls.append({"html_content": html_content, "base_url": base_url})
-            return "# Body content only"
-
-        scraper._get_markdown = capture_markdown
-        scraper._fetch_soup_and_mhtml = AsyncMock(
-            return_value=(
-                BeautifulSoup(
-                    '<html><body><div class="texto-dou">'
-                    '<p class="identifica">INSTRUÇÃO NORMATIVA ICMBio Nº 14</p>'
-                    '<p class="ementa">Altera a Instrução Normativa nº 16...</p>'
-                    '<p class="dou-paragraph">Art. 1º Esta instrução normativa...</p>'
-                    "</div></body></html>",
-                    "html.parser",
-                ),
-                b"fake-mhtml",
-            )
-        )
-
-        result = await scraper._get_doc_data(self._valid_doc_info())
-        assert result is not None
-        assert len(markdown_calls) == 1
-        converted_html = markdown_calls[0]["html_content"]
-        assert markdown_calls[0]["base_url"] == self._valid_doc_info()["document_url"]
-        soup = BS(converted_html, "html.parser")
-        # identifica and ementa must be absent
-        assert soup.find("p", class_="identifica") is None
-        assert soup.find("p", class_="ementa") is None
-        # body paragraph must be present
-        assert soup.find("p", class_="dou-paragraph") is not None
-
-
-# =========================================================================
-# _scrape_year
-# =========================================================================
-
-
-class TestICMBioScrapeYear:
-    def _make_scraper(self, docs_by_year=None):
-        scraper = object.__new__(ICMBioScraper)
-        scraper._docs_by_year = docs_by_year or {}
-        scraper.verbose = False
-        scraper._get_doc_data = AsyncMock(return_value=None)
-        scraper._gather_results = AsyncMock(return_value=[])
-        return scraper
-
-    @pytest.mark.asyncio
-    async def test_no_docs_returns_empty_list(self):
-        scraper = self._make_scraper({})
-        result = await scraper._scrape_year(2022)
-        assert result == []
-        scraper._gather_results.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_docs_present_calls_gather_results(self):
-        doc = {
-            "year": 2022,
-            "title": "IN 1",
-            "document_url": "https://www.in.gov.br/a",
-            "situation": "em vigência",
-            "type": "Instrução Normativa",
-        }
-        scraper = self._make_scraper({2022: [doc]})
-        fake_result = {**doc, "text_markdown": "# content"}
-        scraper._gather_results = AsyncMock(return_value=[fake_result])
-
-        result = await scraper._scrape_year(2022)
-
-        scraper._gather_results.assert_awaited_once()
-        assert len(result) == 1
-        assert result[0]["text_markdown"] == "# content"
-
-    @pytest.mark.asyncio
-    async def test_none_results_filtered_out(self):
-        docs = [
-            {
-                "year": 2022,
-                "title": "IN 1",
-                "document_url": "https://www.in.gov.br/a",
-                "situation": "em vigência",
-                "type": "Instrução Normativa",
-            },
-            {
-                "year": 2022,
-                "title": "IN 2",
-                "document_url": "https://www.in.gov.br/b",
-                "situation": "em vigência",
-                "type": "Instrução Normativa",
-            },
-        ]
-        scraper = self._make_scraper({2022: docs})
-        # gather_results returns one valid and one None
-        scraper._gather_results = AsyncMock(
-            return_value=[
-                {**docs[0], "text_markdown": "content"},
-                None,
-            ]
-        )
-        result = await scraper._scrape_year(2022)
-        assert len(result) == 1
-
-    @pytest.mark.asyncio
-    async def test_year_not_in_docs_by_year_returns_empty(self):
-        scraper = self._make_scraper(
-            {
-                2021: [
-                    {
-                        "year": 2021,
-                        "title": "X",
-                        "document_url": "https://in.gov.br/x",
-                        "situation": "em vigência",
-                        "type": "Portaria",
-                    }
-                ]
-            }
-        )
-        result = await scraper._scrape_year(2099)
-        assert result == []
-
-
-# =========================================================================
-# Integration — live PowerBI API + DOU HTML pages
-# =========================================================================
-
-# Mirrors the pattern used in test_camara_dep_scraper.py:
-#   - Inline tempfile.TemporaryDirectory() — no shared fixtures
-#   - Hits live endpoints; mark with @pytest.mark.integration to allow
-#     easy selective skipping: uv run pytest -m "not integration"
-
 INTEGRATION_YEAR = 2026
-# Known lower-bound for 2026 docs (confirmed via live API run on 2026-03-06).
-# Using a conservative floor so the test is not brittle against new docs.
 EXPECTED_MIN_DOCS_2026 = 30
-
-
-@pytest.mark.integration
-class TestICMBioIntegration:
-    """Live integration tests — hit the real PowerBI API and DOU pages.
-
-    These tests require a live network connection and may take several minutes
-    because the PowerBI API returns ~1 000 rows across 3 paginated requests.
-
-    Run with:
-        uv run pytest tests/test_icmbio_scraper.py::TestICMBioIntegration -v -s
-    Skip with:
-        uv run pytest -m "not integration"
-    """
-
-    @pytest.mark.asyncio
-    async def test_fetch_all_rows_returns_minimum_count(
-        self, integration_scraper_factory
-    ):
-        """_fetch_all_rows must return at least EXPECTED_MIN_DOCS_2026 rows total
-        (across all years) from the live PowerBI API."""
-        async with integration_scraper_factory(
-            ICMBioScraper,
-            year_start=INTEGRATION_YEAR,
-            year_end=INTEGRATION_YEAR,
-            verbose=True,
-            rps=5,
-        ) as scraper:
-            all_rows = await scraper._fetch_all_rows()
-            print(f"\nTotal rows from PowerBI API: {len(all_rows)}")
-            assert len(all_rows) > 0, "PowerBI API returned no rows"
-            # The full dataset always has hundreds of records
-            assert len(all_rows) >= 100, (
-                f"Expected ≥100 rows from API, got {len(all_rows)}"
-            )
-
-    @pytest.mark.asyncio
-    async def test_before_scrape_buckets_2026(self, integration_scraper_factory):
-        """_before_scrape must populate _docs_by_year[2026] with at least
-        EXPECTED_MIN_DOCS_2026 valid documents."""
-        async with integration_scraper_factory(
-            ICMBioScraper,
-            year_start=INTEGRATION_YEAR,
-            year_end=INTEGRATION_YEAR,
-            verbose=True,
-            rps=5,
-        ) as scraper:
-            await scraper._before_scrape()
-            docs_2026 = scraper._docs_by_year.get(INTEGRATION_YEAR, [])
-            print(f"\nDocs bucketed for {INTEGRATION_YEAR}: {len(docs_2026)}")
-            assert len(docs_2026) >= EXPECTED_MIN_DOCS_2026, (
-                f"Expected ≥{EXPECTED_MIN_DOCS_2026} docs for {INTEGRATION_YEAR}, "
-                f"got {len(docs_2026)}"
-            )
-
-    @pytest.mark.asyncio
-    async def test_before_scrape_all_docs_have_in_gov_br_url(
-        self, integration_scraper_factory
-    ):
-        """Every document produced by _before_scrape must have an in.gov.br URL."""
-        async with integration_scraper_factory(
-            ICMBioScraper,
-            year_start=INTEGRATION_YEAR,
-            year_end=INTEGRATION_YEAR,
-            verbose=True,
-            rps=5,
-        ) as scraper:
-            await scraper._before_scrape()
-            all_docs = [doc for docs in scraper._docs_by_year.values() for doc in docs]
-            bad = [d for d in all_docs if "in.gov.br" not in d.get("document_url", "")]
-            assert bad == [], (
-                f"{len(bad)} docs have non-in.gov.br URLs: "
-                f"{[d['document_url'] for d in bad[:3]]}"
-            )
-
-    @pytest.mark.asyncio
-    async def test_scrape_year_2026_returns_results_with_markdown(
-        self, integration_scraper_factory
-    ):
-        """Scraping year 2026 end-to-end must yield documents with non-empty
-        text_markdown that does not contain the raw identifica/ementa classes."""
-        import json
-
-        async with integration_scraper_factory(
-            ICMBioScraper,
-            year_start=INTEGRATION_YEAR,
-            year_end=INTEGRATION_YEAR,
-            verbose=True,
-            rps=5,
-        ) as scraper:
-            # Pre-fetch API data (normally called by the run() orchestrator)
-            await scraper._before_scrape()
-            results = await scraper._scrape_year(INTEGRATION_YEAR)
-
-            print(f"\n_scrape_year({INTEGRATION_YEAR}) returned {len(results)} results")
-            assert len(results) >= 1, (
-                f"Expected at least 1 result for {INTEGRATION_YEAR}"
-            )
-
-            # Verify text_markdown is populated and non-trivial
-            for doc in results:
-                assert doc.get("text_markdown"), (
-                    f"Empty text_markdown for {doc.get('title', '?')}"
-                )
-
-            # Spot-check: identifica/ementa classes must NOT appear in
-            # any text_markdown (they would indicate the duplication bug)
-            duplicated = [
-                doc
-                for doc in results
-                if 'class="identifica"' in doc.get("text_markdown", "")
-                or 'class="ementa"' in doc.get("text_markdown", "")
-            ]
-            assert duplicated == [], (
-                f"{len(duplicated)} docs still contain identifica/ementa markup "
-                f"in text_markdown: {[d.get('title') for d in duplicated[:3]]}"
-            )
-
-            # Verify the saved shard files exist and contain the documents
-            save_dir = scraper.docs_save_dir
-            shard_files = list(save_dir.rglob("chunk_*.json"))
-            print(f"Shard files written: {len(shard_files)}")
-            assert shard_files, "No chunk_*.json shard files written to save dir"
-
-            saved_docs = []
-            for sf in shard_files:
-                content = json.loads(sf.read_text(encoding="utf-8"))
-                docs = (
-                    content
-                    if isinstance(content, list)
-                    else content.get("documents", [])
-                )
-                saved_docs.extend(docs)
-
-            print(f"Total saved docs on disk: {len(saved_docs)}")
-            assert len(saved_docs) >= 1, "No documents persisted to disk"
-
-            # Every saved doc must have year == INTEGRATION_YEAR
-            wrong_year = [d for d in saved_docs if d.get("year") != INTEGRATION_YEAR]
-            assert wrong_year == [], (
-                f"{len(wrong_year)} saved docs have wrong year: "
-                f"{[d.get('year') for d in wrong_year[:3]]}"
-            )

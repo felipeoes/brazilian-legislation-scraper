@@ -1,404 +1,148 @@
-"""Main script to run all scrapers related to Brazilian legislation.
-
-Note: I'm not using https://leisestaduais.com.br because it's explicitly forbidden to scrape their data, vide https://leisestaduais.com.br/robots.txt
-"""
+"""Run scrapers and import/export their SQLite archives."""
 
 import argparse
 import asyncio
 import sys
-from dataclasses import dataclass, field
+from contextlib import AsyncExitStack
+from pathlib import Path
+
 from loguru import logger
-from src.scraper.base.scraper import BaseScraper
-from src.services.ocr.config import LLMConfig
-from src.scraper.federal_legislation.scrape import CamaraDepScraper
-from src.scraper.conama.scrape import ConamaScraper
-from src.scraper.icmbio.scrape import ICMBioScraper
-from src.scraper.state_legislation import (
-    AcreLegisScraper,
-    AlagoasSefazScraper,
-    LegislaAMScraper,
-    AmapaAlapScraper,
-    BahiaLegislaScraper,
-    CearaAleceScraper,
-    DFSinjScraper,
-    ESAlesScraper,
-    LegislaGoias,
-    MaranhaoAlemaScraper,
-    MSAlemsScraper,
-    MTAlmtScraper,
-    MGAlmgScraper,
-    ParaAlepaScraper,
-    ParaibaAlpbScraper,
-    ParanaCVScraper,
-    PernambucoAlepeScraper,
-    PiauiAlepiScraper,
-    RJAlerjScraper,
-    RNAlrnScraper,
-    RSAlrsScraper,
-    RondoniaCotelScraper,
-    RoraimaAlerScraper,
-    SantaCatarinaScraper,
-    SaoPauloAlespScraper,
-    SergipeLegsonScraper,
-    TocantinsScraper,
-)
+
 from src.config import (
-    SAVE_DIR,
-    SPECIFIC_LEGISLATION_SAVE_DIR,
+    LLM_BATCH_SIZE,
+    LLM_CONCURRENCY,
+    LLM_MODEL,
+    LLM_PDF_INPUT,
     build_proxy_config,
 )
+from src.core.browser import BrowserPool
+from src.core.http import HttpClient
+from src.core.ocr import OCR
+from src.core.proxy import ProxyService
+from src.core.store import Store
+from src.registry import SCRAPERS, ScraperSpec
 
 
-@dataclass
-class ScraperConfig:
-    """Configuration for a scraper instance."""
-
-    scraper: type[BaseScraper]
-    name: str | None = None
-    params: dict = field(default_factory=dict)
-    run: bool = False
-    needs_proxy: bool = False
-    aliases: list[str] = field(default_factory=list)
-
-
-def _get_scraper_names(cfg: ScraperConfig) -> set[str]:
-    """Return accepted CLI names for a scraper (class name, short name, and aliases)."""
-    names = {cfg.scraper.__name__.lower()}
-    if cfg.name:
-        names.add(cfg.name.lower())
-    for alias in cfg.aliases:
-        names.add(alias.lower())
-    return names
-
-
-def build_scraper_configs(
-    llm_config: LLMConfig | None,
-    *,
-    run_names: set[str] | None = None,
-    verbose: bool = False,
-    overwrite: bool = False,
-    year: int | None = None,
-) -> list[ScraperConfig]:
-    """Build the list of scraper configurations.
-
-    CLI flags are baked into each config at construction time so that no
-    post-construction mutation of ``params`` is required.
-    """
-    proxy_config = build_proxy_config()
-
-    cli_extras: dict = {}
-    if verbose:
-        cli_extras["verbose"] = True
-    if overwrite:
-        cli_extras["overwrite"] = True
-    if year is not None:
-        cli_extras["year_start"] = year
-        cli_extras["year_end"] = year
-
-    def _sc(
-        scraper: type[BaseScraper],
-        *,
-        needs_proxy: bool = False,
-        aliases: list[str] | None = None,
-        **params,
-    ) -> ScraperConfig:
-        merged = {**params, **cli_extras}
-        if needs_proxy and proxy_config:
-            merged.setdefault("proxy_config", proxy_config)
-        cfg = ScraperConfig(
-            scraper=scraper,
-            name=scraper.__name__.removesuffix("Scraper"),
-            params=merged,
-            needs_proxy=needs_proxy,
-            aliases=aliases or [],
-        )
-        if run_names is not None:
-            cfg.run = bool(_get_scraper_names(cfg) & run_names)
-        return cfg
-
-    return [
-        # --- Federal / environment ---
-        _sc(
-            CamaraDepScraper,
-            year_start=1808,
-            year_end=2026,
-            rps=100,
-        ),
-        _sc(
-            ConamaScraper,
-            year_start=1984,
-            docs_save_dir=SPECIFIC_LEGISLATION_SAVE_DIR or SAVE_DIR,
-            llm_config=llm_config,
-        ),
-        _sc(
-            ICMBioScraper,
-            year_start=2016,
-            docs_save_dir=SPECIFIC_LEGISLATION_SAVE_DIR or SAVE_DIR,
-            disable_cookies=True,
-        ),
-        # --- State scrapers ---
-        _sc(AcreLegisScraper, aliases=["Acre", "AC"], year_start=1963),
-        _sc(
-            AlagoasSefazScraper,
-            aliases=["Alagoas", "AL"],
-            year_start=1942,
-            llm_config=llm_config,
-        ),
-        _sc(
-            LegislaAMScraper,
-            aliases=["Amazonas", "AM"],
-            year_start=1956,
-            rps=50,
-        ),
-        _sc(AmapaAlapScraper, aliases=["Amapa", "AP"], year_start=1991),
-        _sc(
-            BahiaLegislaScraper, aliases=["Bahia", "BA"], year_start=1891, max_retries=7
-        ),
-        _sc(
-            CearaAleceScraper,
-            aliases=["Ceara", "CE"],
-            year_start=1968,
-            llm_config=llm_config,
-        ),
-        _sc(
-            DFSinjScraper,
-            aliases=["DF", "DistritoFederal"],
-            year_start=1922,
-            llm_config=llm_config,
-            rps=100,
-            max_workers=100,
-        ),
-        _sc(
-            ESAlesScraper,
-            aliases=["ES", "EspiritoSanto"],
-            year_start=1958,
-            llm_config=llm_config,
-            rps=50,
-        ),
-        _sc(
-            LegislaGoias,
-            aliases=["Goias", "GO"],
-            year_start=1887,
-            llm_config=llm_config,
-            rps=100,
-        ),
-        _sc(
-            MaranhaoAlemaScraper,
-            aliases=["Maranhao", "MA"],
-            year_start=1906,
-            llm_config=llm_config,
-        ),
-        _sc(MSAlemsScraper, aliases=["MS", "MatoGrossoDoSul"], year_start=1979),
-        _sc(
-            MTAlmtScraper,
-            aliases=["MT", "MatoGrosso"],
-            year_start=2017,
-            llm_config=llm_config,
-            rps=5,
-        ),
-        _sc(
-            MGAlmgScraper,
-            aliases=["MG", "MinasGerais"],
-            year_start=1831,
-            llm_config=llm_config,
-        ),
-        _sc(ParaAlepaScraper, aliases=["Para", "PA"], llm_config=llm_config, rps=5),
-        _sc(
-            ParaibaAlpbScraper,
-            aliases=["Paraiba", "PB"],
-            year_start=1924,
-            llm_config=llm_config,
-        ),
-        _sc(
-            ParanaCVScraper,
-            aliases=["Parana", "PR"],
-            year_start=2025,
-            max_workers=2,
-            max_retries=6,
-            rps=1,
-            needs_proxy=True,
-        ),
-        _sc(PernambucoAlepeScraper, aliases=["Pernambuco", "PE"], year_start=1835),
-        _sc(
-            PiauiAlepiScraper,
-            aliases=["Piaui", "PI"],
-            year_start=1922,
-            llm_config=llm_config,
-        ),
-        _sc(RJAlerjScraper, aliases=["RJ", "RioDeJaneiro"]),
-        _sc(
-            RNAlrnScraper,
-            aliases=["RN", "RioGrandeDoNorte"],
-            year_start=1971,
-            llm_config=llm_config,
-        ),
-        _sc(RSAlrsScraper, aliases=["RS", "RioGrandeDoSul"], llm_config=llm_config),
-        _sc(
-            RondoniaCotelScraper,
-            aliases=["Rondonia", "RO"],
-            year_start=1981,
-            llm_config=llm_config,
-        ),
-        _sc(
-            RoraimaAlerScraper,
-            aliases=["Roraima", "RR"],
-            year_start=1991,
-            llm_config=llm_config,
-        ),
-        _sc(SantaCatarinaScraper, aliases=["SC"], year_start=1946),
-        _sc(
-            SaoPauloAlespScraper,
-            aliases=["SaoPaulo", "SP"],
-            year_start=1835,
-            llm_config=llm_config,
-        ),
-        _sc(
-            SergipeLegsonScraper,
-            aliases=["Sergipe", "SE"],
-            year_start=1940,
-            llm_config=llm_config,
-        ),
-        _sc(TocantinsScraper, aliases=["TO"], year_start=1989, llm_config=llm_config),
-    ]
-
-
-def parse_args() -> argparse.Namespace:
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="Brazilian legislation scraper")
-    parser.add_argument(
-        "--scrapers",
-        "-s",
-        nargs="+",
-        help=(
-            "Names of scrapers to run. Accepts short names and class names "
-            "(e.g., MTAlmt Conama or MTAlmtScraper ConamaScraper). "
-            "If not specified, runs enabled scrapers in config."
-        ),
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("list", help="List scraper names and aliases")
+    run = commands.add_parser("run", help="Scrape legislation")
+    select = run.add_mutually_exclusive_group(required=True)
+    select.add_argument("-s", "--scrapers", nargs="+")
+    select.add_argument("--all", action="store_true")
+    run.add_argument("--year", type=int)
+    run.add_argument("--overwrite", action="store_true")
+    run.add_argument("-v", "--verbose", action="store_true")
+    export = commands.add_parser("export", help="Stream SQLite documents to JSON/JSONL")
+    export.add_argument("-s", "--scrapers", nargs="+", required=True)
+    export.add_argument("--format", choices=("jsonl", "json"), default="jsonl")
+    export.add_argument("--out", type=Path)
+    migration = commands.add_parser(
+        "import-json", help="Import data.json and JSON shards without deleting inputs"
     )
-    parser.add_argument(
-        "--list",
-        "-l",
-        action="store_true",
-        help="List all available scraper names and exit.",
-    )
-    parser.add_argument(
-        "--verbose",
-        "-v",
-        action="store_true",
-        help="Enable verbose logging for all scrapers.",
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Re-scrape all documents, ignoring resume/skip logic.",
-    )
-    parser.add_argument(
-        "--year",
-        "-y",
-        type=int,
-        help="Specific year to scrape. If provided, overrides year_start and year_end in scraper configs.",
-    )
-    return parser.parse_args()
+    migration.add_argument("-s", "--scrapers", nargs="+", required=True)
+    return parser.parse_args(argv)
 
 
-async def main():
-    args = parse_args()
+def select_scrapers(names: list[str] | None) -> list[ScraperSpec]:
+    if names is None:
+        return SCRAPERS
+    requested = {name.lower() for name in names}
+    unknown = requested - set().union(*(spec.names for spec in SCRAPERS))
+    if unknown:
+        raise ValueError(f"Unknown scrapers: {', '.join(sorted(unknown))}")
+    return [spec for spec in SCRAPERS if spec.names & requested]
 
-    # Configure loguru: WARNING+ by default, DEBUG+ with --verbose.
-    # loguru's default sink (stderr at DEBUG) must be removed first.
-    logger.remove()
-    log_level = "DEBUG" if args.verbose else "WARNING"
-    logger.add(sys.stderr, level=log_level)
 
-    running_scrapers: list[BaseScraper] = []
-    llm_config: LLMConfig | None = None
-
+async def run_scraper(
+    spec: ScraperSpec, args: argparse.Namespace, ocr: OCR | None
+) -> bool:
+    name = spec.cls.name
     try:
-        if args.list:
-            configs = build_scraper_configs(None)
-            for cfg in configs:
-                status = "ON" if cfg.run else "OFF"
-                display_name = cfg.name or cfg.scraper.__name__
-                aliases_str = f" [{', '.join(cfg.aliases)}]" if cfg.aliases else ""
-                if display_name == cfg.scraper.__name__:
-                    print(f"  [{status}] {display_name}{aliases_str}")
-                else:
-                    print(
-                        f"  [{status}] {display_name} ({cfg.scraper.__name__}){aliases_str}"
-                    )
-            return
-
-        llm_config = LLMConfig.from_env()
-        run_names = {name.lower() for name in args.scrapers} if args.scrapers else None
-        configs = build_scraper_configs(
-            llm_config,
-            run_names=run_names,
-            verbose=args.verbose,
+        proxy_config = build_proxy_config() if spec.needs_proxy else None
+        http = HttpClient(
+            rps=spec.rps,
+            max_retries=spec.max_retries,
+            disable_cookies=spec.disable_cookies,
+            proxy_service=ProxyService(proxy_config) if proxy_config else None,
+        )
+        years = range(args.year, args.year + 1) if args.year is not None else spec.years
+        scraper = spec.cls(
+            store=Store(spec.database),
+            http=http,
+            ocr=ocr if spec.needs_ocr else None,
+            browser=BrowserPool(spec.browser_pages, limiter=http.limiter),
+            years=years,
+            workers=spec.workers,
             overwrite=args.overwrite,
-            year=args.year,
         )
-
-        enabled_configs = [cfg for cfg in configs if cfg.run]
-        if not enabled_configs:
-            logger.warning("No scrapers enabled. Use --scrapers or enable in config.")
-            return
-
-        print(f"Running {len(enabled_configs)} scrapers in parallel...")
-
-        async def run_scraper(cfg: ScraperConfig):
-            """Run a single scraper and handle its lifecycle."""
-            scraper_instance = None
-            scraper_name = cfg.scraper.__name__
-            try:
-                scraper_instance = cfg.scraper(**cfg.params)
-                running_scrapers.append(scraper_instance)
-                count = await scraper_instance.scrape()
-                with logger.contextualize(scraper=scraper_instance.name):
-                    logger.info(f"{scraper_name} completed: {count} items")
-                print(f"✓ {scraper_name} completed: {count} items")
-                return scraper_name, count, None
-            except Exception as e:
-                if scraper_instance:
-                    with logger.contextualize(scraper=scraper_instance.name):
-                        logger.error(f"{scraper_name} failed: {e}")
-                print(f"✗ {scraper_name} failed: {e}")
-                return scraper_name, 0, str(e)
-            finally:
-                if scraper_instance:
-                    try:
-                        await scraper_instance.cleanup()
-                    except Exception as cleanup_err:
-                        logger.error(f"Cleanup error for {scraper_name}: {cleanup_err}")
-
-        results = await asyncio.gather(
-            *[run_scraper(cfg) for cfg in enabled_configs],
-            return_exceptions=True,
+        async with scraper:
+            result = await scraper.run()
+            total = sum(row["documents"] for row in await scraper.store.summary())
+        print(
+            f"{name}: {result.docs} saved, {result.skipped} skipped, {result.errors} errors; {total} total"
         )
+        return result.errors == 0
+    except Exception:
+        logger.exception(f"{name} failed")
+        return False
 
-        print("=" * 60)
-        print("Scraping Summary:")
-        for result in results:
-            if isinstance(result, BaseException):
-                print(f"  ERROR: {result}")
-            else:
-                name, count, error = result
-                if error:
-                    print(f"  ✗ {name}: FAILED ({error})")
-                else:
-                    print(f"  ✓ {name}: {count} documents")
-        print("=" * 60)
 
-    except KeyboardInterrupt:
-        logger.warning("KeyboardInterrupt: Exiting...")
-    finally:
-        if llm_config:
+async def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    logger.remove()
+    logger.add(
+        sys.stderr, level="DEBUG" if getattr(args, "verbose", False) else "WARNING"
+    )
+    if args.command == "list":
+        for spec in SCRAPERS:
+            print(
+                f"{spec.cls.__name__.removesuffix('Scraper')} [{', '.join(spec.aliases)}] {spec.years.start}–{spec.years.stop - 1}"
+            )
+        return 0
+    try:
+        specs = select_scrapers(None if getattr(args, "all", False) else args.scrapers)
+        if args.command == "run":
+            async with AsyncExitStack() as stack:
+                ocr = None
+                if LLM_MODEL and any(spec.needs_ocr for spec in specs):
+                    ocr = OCR(
+                        LLM_MODEL,
+                        batch_size=LLM_BATCH_SIZE,
+                        concurrency=LLM_CONCURRENCY,
+                        pdf_input=LLM_PDF_INPUT,
+                    )
+                    await stack.enter_async_context(ocr.agent)
+                results = await asyncio.gather(
+                    *(run_scraper(spec, args, ocr) for spec in specs)
+                )
+            return 0 if all(results) else 1
+        failed = False
+        for spec in specs:
             try:
-                await llm_config.cleanup()
-            except Exception as cleanup_err:
-                logger.error(f"LLM client cleanup error: {cleanup_err}")
-
-    logger.info("Exiting...")
+                if args.command == "export" and not spec.database.exists():
+                    raise FileNotFoundError(spec.database)
+                async with Store(spec.database) as store:
+                    if args.command == "import-json":
+                        count = await store.import_json(spec.database.parent)
+                    else:
+                        out = args.out or spec.database.parent / "export"
+                        if args.out and len(specs) > 1:
+                            out /= spec.cls.name
+                        count = await store.export(out, args.format)
+                print(f"{spec.cls.name}: {count} documents {args.command}")
+            except Exception:
+                logger.exception(f"{spec.cls.name}: {args.command} failed")
+                failed = True
+        return int(failed)
+    except Exception:
+        logger.exception("Command failed")
+        return 1
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        sys.exit(asyncio.run(main()))
+    except KeyboardInterrupt:
+        sys.exit(130)

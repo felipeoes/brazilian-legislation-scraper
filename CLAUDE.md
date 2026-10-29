@@ -1,112 +1,61 @@
-# CLAUDE.md
+# Repository development guide
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+## Commands
 
-## Build & Run
-
-```bash
-uv sync                              # install deps
-uv sync --group dev                  # install dev deps
-uv run playwright install chromium   # install browser (needed by 3 state scrapers)
-
-uv run main.py                       # run enabled scrapers
-uv run main.py --scrapers AcreLegis Conama  # run specific scrapers by short name or class name
-uv run main.py --list                # list all scrapers and their on/off status
-uv run main.py --verbose             # show all info/debug logs (default shows only warnings + tqdm bars)
-uv run main.py --overwrite           # ignore resume logic, re-scrape everything
-```
-
-## Lint & Format
+Python 3.14+. Install with `uv sync --group dev` and `uv run playwright install chromium`.
 
 ```bash
-uv run ruff check --fix src/ main.py
-uv run ruff format src/ main.py
-uv run pre-commit run --all-files     # trailing-whitespace, end-of-file-fixer, ruff, pytest
+uv run main.py list
+uv run main.py run -s Acre Conama --year 2024
+uv run main.py run --all
+uv run main.py export -s Acre --format jsonl --out exports/acre
+uv run main.py import-json -s Acre
+uv run ruff check --fix src main.py tests
+uv run ruff format src main.py tests
+uv run pytest tests -m "not integration" -n 4
+uv run pytest tests -m integration
+uv run pre-commit run --all-files
 ```
 
-```bash
-uv run pytest tests/                          # run all tests (including integration)
-uv run pytest tests/test_core.py             # run a single test file
-uv run pytest tests/ -m "not integration"    # skip live-network tests
-uv run pytest tests/ -m integration          # run only integration tests (requires network)
-```
-
-Tests use `pytest-asyncio` with `asyncio_mode = auto`. Integration tests are marked `@pytest.mark.integration` and make real network requests — deselect them in CI with `-m "not integration"`. Per-scraper tests (`tests/test_<state>_scraper.py`) instantiate scrapers via `object.__new__` to avoid triggering I/O in `__init__`. Pre-commit runs only non-integration tests (`-m "not integration"`) on every commit.
+`run` requires `-s` or `--all`. It supports `--year`, `--overwrite`, and `--verbose`. Any scraper or cleanup failure returns exit 1. Pre-commit excludes integration tests and uses a 60-second test timeout.
 
 ## Architecture
 
-### Class Hierarchy
+- `src/registry.py`: `ScraperSpec` entries for 30 scrapers, aliases, date ranges, rates, workers, OCR/proxy settings, and storage roots.
+- `src/core/document.py`: Pydantic `Document`; required metadata and validated Markdown, excluded raw bytes, extra source fields allowed. No dictionary accessor shims.
+- `src/core/store.py`: SQLite per scraper; atomic document transactions, indexed resume keys and summaries, errors and runs, streaming JSON/JSONL export. Raw files are content-addressed and atomically replaced. Database operations run in threads under one async lock.
+- `src/core/scraper.py`: `BaseScraper` implements bounded queue workers and owns save/resume/error handling. `async with scraper` owns resource cleanup through `AsyncExitStack`. Years run sequentially; a failed year does not abort later years. Yearless sources enumerate once. Resume uses original listing URL/title globally, including documents filed under another year.
+- `src/core/sapl.py`: shared SAPL logic for Paraíba, Piauí, and Roraima.
+- `src/core/http.py`: `HttpClient.request()` returns a fully buffered `Response` (`content`, `text`, `json()`, `soup()`, `filename`, `content_type`). HTTP failures raise `HttpError`; never test responses for truthiness. Reads happen inside the tenacity retry loop.
+- `src/core/browser.py`: one lazy bounded `BrowserPool` per scraper, shared HTTP navigation limiter, no overflow pages. Use `async with browser.page()` and `browser.goto()`, or `browser.snapshot()` for soup plus MHTML.
+- `src/core/ocr.py`: one shared PydanticAI `OCR`, global batch semaphore, per-model/per-run usage, all-or-nothing document conversion when a batch fails. Blank successful batches are permitted.
+- `src/core/convert.py`: explicit-dependency functions for HTML/PDF conversion and cleaning. PDF chain: pymupdf4llm → PyMuPDF plain text → optional OCR. PDF CPU work runs in threads.
+- `src/core/images.py`: concurrent image fetching and base64 inlining; `src/core/proxy.py`: proxy rotation.
+- `src/scrapers/states/<uf>.py`, `federal/camara.py`, `environment/{conama,icmbio}.py`: source-specific extraction.
 
+## Scraper contract
+
+Constructors only set attributes; inject `store`, `http`, `years`, optional `ocr`/`browser`, `workers`, and `overwrite`. Implement:
+
+```python
+async def list_documents(self, year: int | None) -> AsyncIterator[dict]: ...
+async def fetch(self, ref: dict) -> Document | list[Document] | None: ...
 ```
-BrowserMixin                         # src/scraper/base/browser_mixin.py — Playwright page pool, MHTML capture
-PaginationMixin                      # src/scraper/base/pagination.py — _gather_results, _process_documents, _fetch_all_pages
 
-BaseScraper(BrowserMixin, PaginationMixin)  # src/scraper/base/scraper.py — async HTTP, PDF/OCR, markdown, save/resume
-  └─ StateScraper                    # same file — sets STATE_LEGISLATION_SAVE_DIR default
-       ├─ SAPLBaseScraper            # src/scraper/base/sapl_scraper.py — for SAPL REST API sites (Paraíba, Piauí, Roraima)
-       └─ (27 state scrapers)       # src/scraper/state_legislation/<state>.py
-  └─ CamaraDepScraper               # federal
-  └─ ConamaScraper, ICMBioScraper   # environment regulatory bodies
-```
+Listing refs contain stable `document_url` and `title`, plus year/type/situation and source-specific fields needed by fetch. Build `Document` only in fetch. The base persists results and records exceptions; an empty fetch result is an error. Use `setup()` for initialization requiring I/O. Use `download`, `markdown`, `fetch_pdf`, and `paginate` helpers where they fit. Keep session/JSF/ASP.NET pagination sequential.
 
-All scrapers inherit from `BaseScraper`. State scrapers go through `StateScraper`. States using the SAPL REST API extend `SAPLBaseScraper`.
+## Style and tests
 
-Supporting modules in `src/scraper/base/`:
-- **`content_utils.py`** — content-detection and markdown-cleaning helpers (`is_pdf`, `clean_markdown`, `clean_norm_soup`, `detect_extension`, etc.). Re-exported from `converter.py` for backward compatibility.
-- **`summary_utils.py`** — run-summary and LLM-usage formatting functions (`merge_context`, `flatten_results`, `_build_run_summary`, etc.). Re-exported from `scraper.py` for backward compatibility.
+Annotate all signatures, use built-in generics and `X | Y`, and format with Ruff. Python 3.14 defers annotations; future annotation imports are unnecessary. No inline lint suppressions without a concrete reason. Centralize project environment settings in `src/config.py`; provider credentials use PydanticAI's standard environment variables.
 
-### Services (composed into BaseScraper)
+Do not swallow errors or implement scraper retry loops. Let HTTP/browser retries handle transport failures. Reject malformed listing responses instead of treating them as empty years. Optional source alternatives may catch specific failures, but a document with no valid alternative must fail visibly.
 
-- **RequestService** (`src/services/request/service.py`) — `aiohttp` with per-scraper `RateLimiter`, retries via `tenacity`, optional proxy rotation. On failure, `make_request` / `get_soup` return a **falsy** `FailedRequest` sentinel (with `.url`, `.status`, `.reason`) instead of `None` — always use `if not resp:` (not `is None`) to check for errors.
-- **LLMOCRService** (`src/services/ocr/llm.py`) — renders PDF pages to PNG via PyMuPDF, sends to LLM vision model. Provider clients live in `src/services/ocr/clients/` and implement the `LLMClient` protocol (`src/services/ocr/protocol.py`): `OpenAIClient`, `BedrockClient`, `SnowflakeClient`.
-- **BrowserService** (`src/services/browser/playwright.py`) — Playwright page pool for JS-rendered sites. Used by Maranhão, Paraná, and Pernambuco. Browser lifecycle and MHTML capture methods live in `BrowserMixin` (`src/scraper/base/browser_mixin.py`).
-- **ProxyService** (`src/services/proxy/service.py`) — proxy rotation from file or HTTP endpoint.
-- **FileSaver** (`src/database/saver.py`) — async JSON persistence via `aiofiles`. Saves documents grouped by year into `data.json` files with document-level resume support. MHTML capture is injected via `mhtml_capture_fn` callback (not owned).
+Preserve images: keep `embed_images=True` for PDF conversion, inline HTML images before html-to-markdown, and retain base64 Markdown images during cleaning. Use BeautifulSoup's `lxml` parser.
 
-### Concurrency Model
+Tests construct scrapers normally with fakes (`tests/conftest.py`); no `object.__new__`. Async pytest mode is automatic. Mark every live-network test `integration`. Add focused regression tests for parsing, fetch metadata, failure propagation, resume, and bounded resources. Avoid running full archives during unit tests.
 
-- **Years** — scraped **sequentially** (one year completes before next).
-- **Types/Situations within a year** — scraped **concurrently** via `asyncio.gather()`.
-- **Pages and documents** — scraped **concurrently** via `_gather_results()` (wraps `asyncio.gather` with error filtering and progress bars).
-- **Rate limiting** — each scraper has its own `RateLimiter` for HTTP (via `rps` param). All scrapers share a single `RateLimiter` for LLM API calls.
-- **CPU-bound work** (PDF rendering) — offloaded via `asyncio.to_thread()` / `run_in_thread()`.
+## Configuration and data
 
-### Adding a New State Scraper
+See `.env.example` and README. `LLM_MODEL` accepts PydanticAI model strings or a comma-separated fallback list; `LLM_PDF_INPUT`, `LLM_BATCH_SIZE`, and `LLM_CONCURRENCY` control OCR. Standard provider credentials include `OPENAI_API_KEY`, `OPENAI_BASE_URL`, AWS settings, `ANTHROPIC_API_KEY`, and `GOOGLE_API_KEY`.
 
-1. Create `src/scraper/state_legislation/<state>.py`.
-2. Subclass `StateScraper` (or `SAPLBaseScraper` for SAPL API sites).
-3. Define module-level `TYPES` dict/list and `SITUATIONS` list.
-4. Implement `_format_search_url()`, `_get_docs_links()`, `_get_doc_data()`, and `_scrape_type()`.
-5. Export the class from `src/scraper/state_legislation/__init__.py`.
-6. Add a `ScraperConfig` entry in `main.py` → `build_scraper_configs()`.
-
-### Image Preservation
-
-Images are preserved as base64 data URIs in the final markdown output:
-
-- **PDFs**: `pymupdf4llm.to_markdown(doc, embed_images=True)` embeds images natively as `![](data:image/png;base64,...)`.
-- **HTML**: `<img>` sources are fetched concurrently, converted to base64 data URIs via `inline_images_in_html()` (`src/utils/image_inliner.py`), then the inlined HTML is converted to markdown with `html-to-markdown`.
-- **HTML→Markdown**: All HTML-to-markdown conversion uses the `html-to-markdown` library (not markitdown, which truncates base64 data).
-- `clean_norm_soup()` defaults to `remove_images=False` — images are kept unless explicitly removed.
-- `clean_markdown()` uses a negative lookbehind regex to preserve `![alt](data:...)` image syntax while stripping regular links.
-
-### Key Patterns
-
-- Use `_process_documents()` (from `PaginationMixin` in `pagination.py`) to run `_get_doc_data` → `_with_save` → `_gather_results` in one call (replaces 5-line boilerplate). For scrapers passing extra kwargs to `_get_doc_data`, use `doc_data_kwargs` or `doc_data_fn`.
-- Use `_save_doc_result()` to persist documents immediately (supports raw file saving + `data.json` append).
-- Use `_save_doc_error()` to log document-level failures.
-- Use `_is_already_scraped()` for resume support — checks `(document_url, title)` keys loaded by `_load_scraped_keys()`.
-- Use `_get_markdown()` for flexible content-to-markdown conversion (accepts url, response, stream, or html_content). Pass `base_url` for correct relative image URL resolution.
-- Use `_download_and_convert()` when you also need the raw bytes (e.g., for saving source PDFs).
-- Content-detection helpers (`is_pdf`, `clean_markdown`, `clean_norm_soup`, etc.) live in `content_utils.py`; `converter.py` re-exports them for backward compatibility.
-- Summary/reporting helpers (`merge_context`, `flatten_results`, `_build_run_summary`, etc.) live in `summary_utils.py`; `scraper.py` re-exports them for backward compatibility.
-- LLM configuration uses the `LLMConfig` dataclass (`src/services/ocr/config.py`), passed directly to `BaseScraper` and `LLMOCRService`.
-- Environment variables are centralized in `src/config.py` — import `SAVE_DIR`, `STATE_LEGISLATION_SAVE_DIR`, `LOG_DIR`, etc. from there.
-- The LLM OCR prompt is in Portuguese and defined as the module-level constant `DEFAULT_LLM_PROMPT` in `src/scraper/base/scraper.py`. Override `llm_prompt` only if a scraper needs different extraction instructions.
-- `RateLimiter` (`src/utils/concurrency.py`) wraps PyrateLimiter with `Rate(1, interval)` (not `Rate(rps, Duration.SECOND)`) to enforce strict even spacing with no burst. This prevents bursty traffic that triggers rate limiting on target servers.
-
-## Environment
-
-Python >= 3.12, managed with `uv`. Config via `.env` (copy `.env.example`). Key variables: `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_MODEL`, `PROVIDER_BASE_URL`, `SAVE_DIR`, `STATE_LEGISLATION_SAVE_DIR`, `LOG_DIR`.
-
-LLM providers: `openai` (OpenAI-compatible API, default), `bedrock` (AWS Bedrock Converse), `snowflake` (Snowflake Cortex).
+Archives live at `<save_dir>/<NAME>/documents.db`. `import-json` validates `YEAR/data.json` and shards without deleting inputs and preserves raw file paths. `export` streams files to per-year directories. `--overwrite` deletes only selected years and their raw artifacts. Summary queries must never load document bodies.

@@ -1,235 +1,107 @@
 # Brazilian Legislation Scraper
 
-Web scraper for legal documents regarding Brazilian legislation — federal, state, and regulatory bodies (CONAMA, ICMBio).
+Async scrapers for Brazilian federal legislation, all 27 state jurisdictions, CONAMA, and ICMBio. Documents are validated, stored in SQLite, and exported as JSON or JSONL. PDFs and HTML become Markdown with embedded images; scanned documents can use LLM OCR.
 
-> **Note:** This project does **not** scrape [leisestaduais.com.br](https://leisestaduais.com.br) as it is explicitly forbidden by their `robots.txt`.
+This project does not scrape leisestaduais.com.br.
 
-## Features
+## Install
 
-- **27 state scrapers** — covering all Brazilian states with dedicated scrapers for each state legislature website
-- **Federal legislation** — scrapes Câmara dos Deputados
-- **Environment regulatory bodies** — CONAMA and ICMBio scrapers
-- **Async concurrency** — built on `asyncio` + `aiohttp` for non-blocking I/O with independent per-scraper rate limiting for HTTP and shared rate limiting for LLM API calls
-- **LLM providers** — supports OpenAI-compatible APIs and AWS Bedrock Converse for OCR
-- **PDF & image extraction** — converts PDFs to Markdown with embedded images (base64), optional LLM-powered OCR for scanned documents, and inline image preservation for HTML sources
-- **Playwright support** — async Chromium automation for JavaScript-rendered pages (3 state scrapers)
-- **Proxy rotation** — optional proxy support from a file or HTTP endpoint
-- **SAPL integration** — dedicated base class for state legislatures using the SAPL REST API
-- **Structured output** — saves scraped data as JSON files grouped by year via `FileSaver`
-- **CLI interface** — select scrapers by name, list available scrapers
-
-## Requirements
-
-- Python >= 3.12
-- [uv](https://docs.astral.sh/uv/) package manager
-- Playwright Chromium browser (`uv run playwright install chromium`)
-
-## Installation
-
-1. Install `uv` if you don't have it:
-   ```bash
-   pip install uv
-   ```
-
-2. Install project dependencies:
-   ```bash
-   uv sync
-   ```
-
-3. Install Playwright browsers:
-   ```bash
-   uv run playwright install chromium
-   ```
-
-4. Set up environment variables:
-   ```bash
-   cp .env.example .env
-   # Edit .env with your values
-   ```
-
-## Configuration
-
-Copy `.env.example` to `.env` and configure the following variables:
-
-| Variable | Description | Default |
-|---|---|---|
-| `LLM_PROVIDER` | LLM provider to use (`openai` or `bedrock`) | `openai` |
-| `LLM_API_KEY` | API key for the LLM provider (used for OCR on image-based PDFs) | — |
-| `LLM_MODEL` | Model name (e.g. `gpt-4o`); comma-separated for multiple models | — |
-| `PROVIDER_BASE_URL` | LLM provider base URL | `https://openrouter.ai/api/v1` |
-| `SAVE_DIR` | Base directory for scraped JSON output | `outputs/legislation` |
-| `STATE_LEGISLATION_SAVE_DIR` | Directory for state legislation documents | — |
-| `SPECIFIC_LEGISLATION_SAVE_DIR` | Directory for CONAMA/ICMBio documents | — |
-| `LOG_DIR` | Directory for per-scraper runtime logs and error logs | `logs/legislation` |
-| `PROXY_FILE_PATH` | Path to a file containing proxy URLs (one per line) | — |
-| `PROXY_ENDPOINT` | HTTP endpoint that returns proxy URLs | — |
-
-## Usage
-
-### Run all enabled scrapers
-
-```bash
-uv run main.py
-```
-
-By default, only scrapers with `run=True` in their config will execute. Edit `main.py` → `build_scraper_configs()` to toggle which scrapers are enabled.
-
-### Verbose logging
-
-```bash
-# Default: Shows only warnings, errors, and progress bars
-uv run main.py
-
-# Verbose mode: Shows all info logs including debug messages
-uv run main.py --verbose
-```
-
-When `--verbose` is not specified, scrapers only log warnings, errors, and show tqdm progress bars in the terminal. With `--verbose`, all debug and info messages are displayed in the terminal.
-
-Each scraper also writes a debug-level runtime log to `LOG_DIR/<SCRAPER>/runtime.log` on every run. Structured document error JSON files are saved in the same scraper log directory.
-
-### Run specific scrapers by name
-
-```bash
-uv run main.py --scrapers MTAlmt Conama SaoPauloAlesp
-```
-
-### Overwrite previously scraped data
-
-```bash
-uv run main.py --overwrite
-```
-
-By default, scrapers resume from where they left off using document-level `(document_url, title)` keys. The `--overwrite` flag disables this resume logic and re-scrapes everything.
-
-### List all available scrapers
-
-```bash
-uv run main.py --list
-```
-
-## Project Structure
-
-```
-├── main.py                          # Entry point & CLI (asyncio.run)
-├── pyproject.toml                   # Project config & dependencies
-├── .env.example                     # Environment variable template
-├── src/
-│   ├── database/
-│   │   └── saver.py                 # FileSaver — async JSON persistence (aiofiles) with document-level resume
-│   ├── scraper/
-│   │   ├── base/
-│   │   │   ├── scraper.py           # BaseScraper & StateScraper — async HTTP, PDF/OCR, markdown, save/resume
-│   │   │   ├── sapl_scraper.py      # SAPLBaseScraper — base for SAPL REST API sites (Paraíba, Piauí, Roraima)
-│   │   │   └── concurrency.py       # RateLimiter, bounded_gather(), run_in_thread()
-│   │   ├── federal_legislation/
-│   │   │   └── scrape.py            # CamaraDepScraper
-│   │   ├── conama/
-│   │   │   └── scrape.py            # ConamaScraper
-│   │   ├── icmbio/
-│   │   │   └── scrape.py            # ICMBioScraper
-│   │   └── state_legislation/       # 27 state-specific scrapers
-│   │       ├── acre.py
-│   │       ├── alagoas.py
-│   │       ├── ...
-│   │       └── tocantins.py
-│   ├── services/
-│   │   ├── browser/
-│   │   │   └── playwright.py        # BrowserService — Playwright page pool
-│   │   ├── ocr/
-│   │   │   ├── llm.py               # LLMOCRService — PDF/image-to-Markdown via LLM vision
-│   │   │   └── bedrock.py           # BedrockClient — AWS Bedrock Converse API adapter
-│   │   ├── proxy/
-│   │   │   └── service.py           # ProxyService — proxy rotation from file or endpoint
-│   │   └── request/
-│   │       └── service.py           # RequestService — async HTTP with rate limiting & retries
-│   └── utils/
-│       ├── __init__.py              # clean_md_tag() — strips markdown code block wrappers
-│       └── image_inliner.py         # inline_images_in_html() — async base64 image inlining
-```
-
-## Architecture
-
-The project uses an **async-first** concurrency model with optimized parallelism:
-
-### Concurrency Levels
-- **Years** — scraped **sequentially** (one year completes before next starts)
-  - Prevents resource exhaustion with many years
-  - Better progress visibility and logging
-  - Each year's data completes fully before moving to next
-- **Types/Situations** — scraped **concurrently** within each year via `asyncio.gather()`
-  - All document types for a year scrape in parallel
-  - Nested situation+type combinations run concurrently
-  - Significantly faster when a year has many types
-- **Pages** — scraped **concurrently** via `asyncio.gather()`
-- **Documents** — scraped **concurrently** via `asyncio.gather()`
-
-### Rate Limiting
-- **HTTP requests** — each scraper has its own `RateLimiter` (via `RequestService`), configured independently with its `rps` parameter. Scrapers targeting different websites do not interfere with each other.
-- **LLM requests** — all scrapers share a single `RateLimiter` instance for LLM API calls, since they all query the same LLM endpoint. This prevents exceeding the provider's rate limit when multiple scrapers run in parallel.
-
-### Technology Stack
-- **HTTP I/O** — `aiohttp.ClientSession` for non-blocking requests with per-scraper sliding-window rate limiting
-- **HTML→Markdown** — `html-to-markdown` for HTML content conversion with full base64 image preservation; `pymupdf4llm` for PDF-to-markdown with embedded images
-- **LLM OCR** — vision model-based PDF/image extraction via OpenAI-compatible API or AWS Bedrock Converse API
-- **File I/O** — `aiofiles` for non-blocking JSON writes
-- **Browser automation** (3 scrapers) — Playwright async API (natively async, no thread wrappers)
-- **CPU-bound work** (PDF/image conversion) — offloaded via `asyncio.to_thread()`
-- **Retries** — `tenacity` for async retry logic with exponential backoff
-- **Proxy support** — optional proxy rotation from a file or HTTP endpoint
-
-## Development
-
-Install dev dependencies:
+Requires Python 3.14 or newer and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync --group dev
+uv run playwright install chromium
+cp .env.example .env
 ```
 
-Lint and format:
+Chromium is launched lazily for sites that require rendering or MHTML snapshots.
+
+## Usage
 
 ```bash
-uv run ruff check --fix src/ main.py
-uv run ruff format src/ main.py
+uv run main.py list
+uv run main.py run -s Acre Conama --year 2024
+uv run main.py run -s PB PI RR
+uv run main.py run --all
+uv run main.py run -s RS --year 2024 --overwrite
+uv run main.py run -s Pernambuco --year 2024 --verbose
+uv run main.py export -s Acre --format jsonl --out exports/acre
+uv run main.py export -s Acre --format json
+uv run main.py import-json -s Acre
 ```
 
-Run tests:
+Names, class names, and the aliases shown by `list` are case insensitive. Omit `--year` to scrape the registered date range. A run returns exit code 1 if any listing, document, or cleanup fails; errors are recorded in SQLite. With no command, the CLI prints usage and exits 2.
 
-```bash
-# Fast tests (recommended for development) - skips slow integration tests
-uv run pytest -m "not integration"
+Resume checks use the original listing URL and title, even when the fetched document has a different URL or publication year. `--overwrite` removes stored documents and raw files for the selected years before scraping them again. Acre, Amapá, Rio de Janeiro, and ICMBio enumerate their yearless listings once and filter by each document's year. Other sources scrape years sequentially. Constitutions retain their promulgation year.
 
-# Parallel execution (faster on multi-core systems)
-uv run pytest -n auto -m "not integration"
+## Configuration
 
-# Run all tests (including slow integration tests)
-uv run pytest tests/
+All project settings are read in `src/config.py`, including `.env`.
 
-# Run a single test file
-uv run pytest tests/test_core.py
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `SAVE_DIR` | Root of scraper archives | `outputs/legislation` |
+| `STATE_LEGISLATION_SAVE_DIR` | Optional state archive root | `SAVE_DIR` |
+| `SPECIFIC_LEGISLATION_SAVE_DIR` | Optional CONAMA/ICMBio archive root | `SAVE_DIR` |
+| `LOG_DIR` | Per-scraper runtime logs | `logs/legislation` |
+| `LLM_MODEL` | PydanticAI model string, or comma-separated fallback models | Empty: OCR disabled |
+| `LLM_PDF_INPUT` | Send PDF chunks instead of rendered PNG pages | `false` |
+| `LLM_BATCH_SIZE` | Pages per OCR request | `5` |
+| `LLM_CONCURRENCY` | Maximum concurrent OCR batches across all scrapers | `8` |
+| `PROXY_FILE_PATH` | Optional newline-separated or JSON proxy list | Empty |
+| `PROXY_ENDPOINT` | Optional proxy-list endpoint | Empty |
 
-# Run only integration tests (requires network and credentials)
-uv run pytest tests/ -m integration
+For example, set `LLM_MODEL=openai:gpt-4.1-mini` and `OPENAI_API_KEY`. OpenAI-compatible services also use `OPENAI_BASE_URL`. Other model strings use their standard provider credentials, such as `AWS_*`, `AWS_BEARER_TOKEN_BEDROCK`, `ANTHROPIC_API_KEY`, or `GOOGLE_API_KEY`. Installed PydanticAI provider extras cover OpenAI, Bedrock, Anthropic, and Google. Model selection and whether PDF input is supported depend on the provider.
 
-# Run tests with timing information
-uv run pytest --durations=10
+One OCR agent and semaphore are shared across the run. A failed OCR batch rejects the whole document; successful blank batches are allowed. Usage per model is stored in `runs.llm_usage`.
+
+## Storage and export
+
+Each scraper writes `<archive root>/<SCRAPER>/documents.db` with `documents`, `errors`, and `runs` tables. SQLite uses WAL and atomic transactions. Raw artifacts live under `YEAR/docs/` with fixed-length content-addressed filenames and are written by atomic replacement. An interrupted database write can leave an unreferenced raw file; it cannot replace a previous document's raw content.
+
+`export` streams records to `YEAR/data.jsonl` or `YEAR/data.json`. It includes document metadata, `text_markdown`, source-specific extra fields, and `file_path`; raw bytes and internal resume keys are excluded. The default export directory is `<archive root>/<SCRAPER>/export`. With multiple scrapers and `--out`, each scraper gets a separate subdirectory.
+
+`import-json` reads `YEAR/data.json` and `YEAR/shards/*.json` from the selected scraper's archive directory. It validates each record, preserves existing `file_path` values, and never deletes its inputs. Invalid files fail loudly; records committed before the failure remain available, and rerunning safely replaces duplicate keys.
+
+## Architecture
+
+```text
+main.py                      CLI and shared OCR lifecycle
+src/config.py                Environment settings
+src/registry.py              30 scraper registrations and runtime defaults
+src/core/document.py         Validated Document model and listing metadata type
+src/core/store.py            SQLite, resume keys, errors, summaries, import/export
+src/core/http.py             Buffered responses, rate limiting, retries
+src/core/browser.py          Lazy, bounded Playwright page pool
+src/core/ocr.py               Shared PydanticAI OCR
+src/core/convert.py           HTML/PDF conversion and content helpers
+src/core/scraper.py           Bounded listing → fetch → save pipeline
+src/core/sapl.py              Shared SAPL API scraper
+src/core/images.py           Image inlining
+src/core/proxy.py            Proxy rotation
+src/scrapers/states/<uf>.py   State-specific listing and document extraction
+src/scrapers/federal/         Câmara dos Deputados
+src/scrapers/environment/     CONAMA and ICMBio
 ```
 
-**Test Performance**: The test suite has been optimized for speed:
-- **Fast tests**: ~12 seconds (98.3% faster than before)
-- **Integration tests**: Include live network calls and may take several minutes
-- **Parallel execution**: Use `-n auto` for multi-core speedup
+Scrapers implement `list_documents(year)` as an async generator of lightweight metadata, and `fetch(ref)` returning a `Document`. Constructors only accept dependencies and set attributes. The base run loop owns persistence, error reporting, and resume; fetch workers never collect whole archives in memory. Each year has a queue capped at twice the worker count. Stateful pagination remains sequential; stateless page requests use bounded batches. HTTP requests and browser navigation share the scraper's rate limiter. Browser pools never exceed their configured page limit.
 
-Integration tests make real network requests to live legislative websites. They require internet access and (for Snowflake tests) valid credentials in `.env`. Use `-m "not integration"` for fast offline or CI runs.
+Digital PDFs use pymupdf4llm, then PyMuPDF plain text, then optional OCR. CPU-heavy PDF work runs in threads. HTML uses the lxml parser and html-to-markdown, with image sources inlined as base64 data URIs.
 
-Run pre-commit hooks on all files:
+## Development
 
 ```bash
+uv run ruff check src main.py tests
+uv run ruff format src main.py tests
+uv run pytest tests -m "not integration" -n 4
+uv run pytest tests -m integration
 uv run pre-commit run --all-files
 ```
 
-Pre-commit runs trailing-whitespace, end-of-file, large-file checks, ruff linting/formatting, and the full pytest suite (including integration tests) on every commit.
+Pre-commit runs whitespace, large-file, Ruff, and offline pytest checks with a 60-second per-test timeout. Integration tests make real network requests and may require Chromium. Unit tests inject buffered responses and fake browser/OCR dependencies through normal constructors.
+
+To add a scraper, subclass `BaseScraper` or `SAPLBaseScraper`, implement listing and fetch, and register a `ScraperSpec`. Keep persistence in the base class. Add parser fixtures and a fetch test that returns a validated `Document`.
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+See [LICENSE](LICENSE).
