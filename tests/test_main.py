@@ -31,6 +31,8 @@ def test_parana_stays_under_its_block_and_lists_without_session_state():
     # In one session, a year listing after another type's listing can come back empty
     # ("Nenhum registro encontrado"); without cookies every request starts fresh.
     assert parana.disable_cookies
+    # With proxies each IP gets its own 0.3 rps, so 20 proxies need ~20 in flight.
+    assert parana.workers >= 20
 
 
 @pytest.mark.parametrize("argv", [[], ["run"], ["run", "--all", "-s", "AC"]])

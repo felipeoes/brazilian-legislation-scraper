@@ -147,6 +147,8 @@ class ParanaCVScraper(BaseScraper):
             },
             # A year of resoluções (15k rows) takes the server ~2 minutes.
             timeout=600,
+            # 13 MB is too much for a proxy; 7 listings a year fit the direct IP's budget.
+            use_proxy=False,
         )
         soup = response.soup()
         total = self._total(soup)

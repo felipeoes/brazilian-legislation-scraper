@@ -1,8 +1,10 @@
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import aiohttp
 import pytest
+from aiohttp_socks import ProxyConnectionError
 
 from src.core.browser import BrowserPool
 from src.core.http import HttpClient, HttpError, Response
@@ -203,3 +205,108 @@ async def test_cancelled_page_wait_does_not_create_overflow():
         pass
     assert context.new_page.await_count == 1
     await pool.close()
+
+
+def _proxy_service(tmp_path, *proxies: str):
+    from src.core.proxy import ProxyService
+
+    path = tmp_path / "proxies.txt"
+    path.write_text("\n".join(proxies))
+    return ProxyService({"file_path": str(path)})
+
+
+def _session(status: int = 200, error: Exception | None = None) -> MagicMock:
+    response = MagicMock(status=status, reason="r", url="url", headers={})
+    response.read = AsyncMock(return_value=b"ok")
+    context = MagicMock()
+    context.__aenter__ = AsyncMock(side_effect=error, return_value=response)
+    context.__aexit__ = AsyncMock(return_value=False)
+    session = MagicMock()
+    session.request.return_value = context
+    return session
+
+
+async def test_proxies_rotate_and_failed_ones_rest_before_returning(tmp_path):
+    service = _proxy_service(tmp_path, "http://a:1", "socks5://b:2", "c:3")
+    assert [await service.get_proxy() for _ in range(4)] == [
+        "http://a:1",
+        "socks5://b:2",
+        "http://c:3",
+        "http://a:1",
+    ]
+    service.suspend("socks5://b:2", 0.1, "timeout")
+    assert {await service.get_proxy() for _ in range(4)} == {"http://a:1", "http://c:3"}
+    service.suspend("http://a:1", 60, "HTTP 403")
+    service.suspend("http://c:3", 60, "HTTP 403")
+    # With every proxy resting, requests go direct.
+    assert await service.get_proxy() is None
+    # Free proxies flap: a failed one comes back once its rest ends.
+    await asyncio.sleep(0.15)
+    assert await service.get_proxy() == "socks5://b:2"
+
+
+async def test_each_proxy_has_its_own_rate_limit(tmp_path):
+    """Paraná limits each IP; N proxies at 0.3 rps each fetch N times faster."""
+    http = HttpClient(
+        rps=1, proxy_service=_proxy_service(tmp_path, "http://a:1", "http://b:2")
+    )
+    http._ensure_session = AsyncMock(return_value=_session())
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    await asyncio.gather(http.request("u1"), http.request("u2"))
+    assert loop.time() - start < 0.5
+    assert [c.args[0] for c in http._ensure_session.await_args_list] == [
+        "http://a:1",
+        "http://b:2",
+    ]
+
+
+@pytest.mark.parametrize(
+    "failing",
+    [
+        _session(status=403),
+        _session(error=ProxyConnectionError(111, "refused")),
+        # Seen live: a proxy that hangs up mid SOCKS handshake.
+        _session(error=asyncio.IncompleteReadError(b"", 2)),
+    ],
+    ids=["blocked", "dead", "hung-up"],
+)
+async def test_failed_proxy_rests_and_the_retry_uses_the_next(
+    tmp_path, monkeypatch, failing
+):
+    from tenacity import wait_none
+
+    import src.core.http as module
+
+    monkeypatch.setattr(module, "wait_exponential", lambda **kw: wait_none())
+    service = _proxy_service(tmp_path, "http://a:1", "http://b:2")
+    http = HttpClient(rps=1000, max_retries=2, pause_on_403=600, proxy_service=service)
+    sessions = {"http://a:1": failing, "http://b:2": _session(), None: _session()}
+    http._ensure_session = AsyncMock(side_effect=lambda proxy: sessions[proxy])
+    assert (await http.request("url")).content == b"ok"
+    assert {await service.get_proxy() for _ in range(3)} == {"http://b:2"}
+    # A 403 rests the proxy through the site's block; other failures more briefly.
+    assert service._resting["http://a:1"] - time.monotonic() > 100
+    # A proxy's block is not the client's: direct requests carry on without a pause.
+    await asyncio.wait_for(http.request("url", use_proxy=False), 1)
+
+
+async def test_direct_requests_skip_the_proxies(tmp_path):
+    http = HttpClient(rps=1000, proxy_service=_proxy_service(tmp_path, "http://a:1"))
+    http._ensure_session = AsyncMock(return_value=_session())
+    await http.request("url", use_proxy=False)
+    assert http._ensure_session.await_args.args == (None,)
+
+
+async def test_proxied_connections_verify_certificates(monkeypatch):
+    """Free proxies are untrusted; without verification one could rewrite documents."""
+    import ssl
+
+    import src.core.http as module
+
+    from_url = MagicMock(side_effect=lambda url, **kw: aiohttp.TCPConnector())
+    monkeypatch.setattr(module.ProxyConnector, "from_url", from_url)
+    http = HttpClient(verify_ssl=False)
+    await http._ensure_session("socks5://a:1")
+    assert from_url.call_args.kwargs["ssl"].verify_mode == ssl.CERT_REQUIRED
+    await http.close()

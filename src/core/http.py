@@ -30,6 +30,10 @@ from tenacity import (
 from src.core.proxy import ProxyService
 
 
+# How long a proxy that failed to connect or answer sits out before another try.
+_PROXY_REST = 5 * 60
+
+
 class RateLimiter:
     def __init__(self, requests_per_second: float) -> None:
         if requests_per_second <= 0:
@@ -130,8 +134,11 @@ class HttpClient:
             raise ValueError("max_retries must be positive")
         self.max_retries = max_retries
         self.limiter = RateLimiter(rps)
-        # For sites whose 403 blocks the whole client for a while: every request waits
-        # this many seconds instead of failing against the block.
+        # Sites limit each IP, so every proxy gets its own budget.
+        self._proxy_limiters: dict[str, RateLimiter] = {}
+        # For sites whose 403 blocks the whole client for a while: every direct request
+        # waits this many seconds instead of failing against the block. A blocked proxy
+        # rests that long instead.
         self.pause_on_403 = pause_on_403
         self._resume_at = 0.0
         self.proxy_service = proxy_service
@@ -159,7 +166,8 @@ class HttpClient:
             )
             if session is None or session.closed:
                 connector = (
-                    ProxyConnector.from_url(proxy, ssl=self._ssl_ctx)
+                    # Proxies are untrusted: always verify, so none can alter a page.
+                    ProxyConnector.from_url(proxy, ssl=ssl.create_default_context())
                     if proxy
                     else aiohttp.TCPConnector(ssl=self._ssl_ctx)
                 )
@@ -183,6 +191,7 @@ class HttpClient:
         *,
         ok_statuses: tuple[int, ...] = (),
         timeout: float = 120,
+        use_proxy: bool = True,
         **kwargs: Any,
     ) -> Response:
         async for attempt in AsyncRetrying(
@@ -194,14 +203,23 @@ class HttpClient:
             with attempt:
                 self.stats["requests"] += 1
                 self.stats["retries"] += attempt.retry_state.attempt_number > 1
-                await self.limiter.acquire()
-                # Checked after the limiter: a block may begin while this request waits.
-                while (pause := self._resume_at - time.monotonic()) > 0:
-                    await asyncio.sleep(pause)
-                    await self.limiter.acquire()
                 proxy = (
-                    await self.proxy_service.get_proxy() if self.proxy_service else None
+                    await self.proxy_service.get_proxy()
+                    if self.proxy_service and use_proxy
+                    else None
                 )
+                if proxy:
+                    if proxy not in self._proxy_limiters:
+                        self._proxy_limiters[proxy] = RateLimiter(
+                            self.limiter.requests_per_second
+                        )
+                    await self._proxy_limiters[proxy].acquire()
+                else:
+                    await self.limiter.acquire()
+                    # Checked after the limiter: a block may begin while this waits.
+                    while (pause := self._resume_at - time.monotonic()) > 0:
+                        await asyncio.sleep(pause)
+                        await self.limiter.acquire()
                 session = await self._ensure_session(proxy)
                 try:
                     request_timeout = aiohttp.ClientTimeout(
@@ -215,6 +233,11 @@ class HttpClient:
                             and response.status not in ok_statuses
                         ):
                             if response.status == 403 and self.pause_on_403:
+                                if proxy:
+                                    self.proxy_service.suspend(
+                                        proxy, self.pause_on_403, "HTTP 403"
+                                    )
+                                    raise _RetryableError(url, 403, "proxy blocked")
                                 logger.warning(
                                     f"HTTP 403 from {url}; pausing requests for {self.pause_on_403:.0f}s"
                                 )
@@ -240,12 +263,17 @@ class HttpClient:
                         )
                 except (
                     aiohttp.ClientError,
+                    asyncio.IncompleteReadError,
                     TimeoutError,
                     ConnectionError,
                     ProxyError,
                     ProxyConnectionError,
                     ProxyTimeoutError,
                 ) as exc:
+                    if proxy:
+                        self.proxy_service.suspend(
+                            proxy, _PROXY_REST, type(exc).__name__
+                        )
                     raise _RetryableError(url, None, str(exc)) from exc
         raise AssertionError("Retry loop did not execute")
 

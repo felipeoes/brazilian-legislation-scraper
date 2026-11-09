@@ -1,6 +1,5 @@
 import asyncio
 import json
-import random
 import time
 from pathlib import Path
 
@@ -17,6 +16,10 @@ def _parse_proxy_list(content: str) -> list[str]:
     except ValueError, TypeError:
         pass
     return [p.strip() for p in content.splitlines() if p.strip()]
+
+
+def _with_scheme(proxy: str) -> str:
+    return proxy if "://" in proxy else f"http://{proxy}"
 
 
 class ProxyService:
@@ -37,6 +40,9 @@ class ProxyService:
         self._last_loaded = 0.0
         self._load_lock = asyncio.Lock()
         self._session: aiohttp.ClientSession | None = None
+        # Failed proxies rest until this time.monotonic(); free proxies flap.
+        self._resting: dict[str, float] = {}
+        self._turn = 0
 
     async def _load_proxies(self) -> None:
         """Internal method to load proxies from the configured source(s).
@@ -103,19 +109,29 @@ class ProxyService:
             self._last_loaded = current_time
 
     async def get_proxy(self) -> str | None:
-        """
-        Get a random proxy from the loaded list.
+        """Next live proxy in turn (e.g. 'http://ip:port'), or None when none is left.
 
-        Returns:
-            A string formatted proxy (e.g. 'http://ip:port') or None if not available.
+        Round robin spreads requests evenly, so per-proxy rate limits never leave
+        workers queued on one proxy while others idle.
         """
         await self._load_proxies()
-        if not self.proxies:
+        now = time.monotonic()
+        live = [
+            p for p in map(_with_scheme, self.proxies) if self._resting.get(p, 0) <= now
+        ]
+        if not live:
             return None
-        proxy = random.choice(self.proxies)
-        if "://" not in proxy:
-            proxy = f"http://{proxy}"
-        return proxy
+        self._turn += 1
+        return live[(self._turn - 1) % len(live)]
+
+    def suspend(self, proxy: str, seconds: float, reason: str) -> None:
+        """Take a failed or blocked proxy out of rotation for a while."""
+        now = time.monotonic()
+        self._resting[proxy] = now + seconds
+        left = sum(self._resting.get(_with_scheme(p), 0) <= now for p in self.proxies)
+        logger.warning(
+            f"Proxy failed ({reason}); resting it {seconds / 60:.0f} min, {left} in rotation"
+        )
 
     async def cleanup(self) -> None:
         """Close the reusable HTTP session used for endpoint reloads."""

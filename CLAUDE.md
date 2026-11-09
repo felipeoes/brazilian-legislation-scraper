@@ -31,7 +31,7 @@ uv run pre-commit run --all-files
 - `src/core/browser.py`: one lazy bounded `BrowserPool` per scraper, shared HTTP navigation limiter, no overflow pages. Use `async with browser.page()` and `browser.goto()`, or `browser.snapshot()` for soup plus MHTML.
 - `src/core/ocr.py`: one PydanticAI `OCR` per scraper process, batch semaphore, per-model/per-run usage, all-or-nothing document conversion when a batch fails. Blank successful batches are permitted.
 - `src/core/convert.py`: explicit-dependency functions for HTML/PDF conversion and cleaning. PDF chain: pymupdf4llm → PyMuPDF plain text → optional OCR, which also replaces unreadable text layers (`readable_text`). PDF text extraction runs in a process pool (`_in_process`, `PDF_WORKERS`) because pymupdf4llm holds the GIL; worker functions must not log. Unit tests run it inline (`tests/conftest.py`). DOCX converts through mammoth to HTML; legacy OLE2 `.doc` fails explicitly. `sniff_extension` trusts content over file names.
-- `src/core/images.py`: concurrent image fetching and base64 inlining; `src/core/proxy.py`: proxy rotation.
+- `src/core/images.py`: concurrent image fetching and base64 inlining; `src/core/proxy.py`: round-robin proxy rotation, used only by specs with `needs_proxy` (Paraná). Each proxy gets its own `rps` limiter and verified TLS; a proxy that answers 403 rests for `pause_on_403`, one that fails to connect or answer rests 5 minutes, and with none left requests go direct. `request(use_proxy=False)` forces the direct IP.
 - `src/scrapers/states/<uf>.py`, `federal/camara.py`, `environment/{conama,icmbio}.py`: source-specific extraction.
 
 ## Scraper contract

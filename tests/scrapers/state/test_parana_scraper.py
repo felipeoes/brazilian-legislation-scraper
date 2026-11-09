@@ -179,6 +179,8 @@ class TestListType:
         assert call.kwargs["data"]["codOrgaoUnidade"] == ""
         # The site needs ~2 minutes to list a year of resoluções.
         assert call.kwargs["timeout"] >= 300
+        # 13 MB in one response is too much for a proxy; listings use the direct IP.
+        assert call.kwargs["use_proxy"] is False
 
     async def test_repeated_rows_are_listed_once(self):
         """The site repeats a few rows and counts them (2025 Decretos: 3,860 rows, 3,858 acts)."""

@@ -126,15 +126,20 @@ SCRAPERS = [
         2025,
         # The site allows ~20 requests per rolling minute per IP; beyond that it answers
         # 403 and blocks the client for a fixed 21-30 min. 0.3 rps (18/min) stays under
-        # it (180 requests tested clean), and a block pauses every request through it.
+        # it (180 requests tested clean), and a block pauses every direct request
+        # through it. With PROXY_FILE_PATH set, each proxy gets its own 0.3 rps and a
+        # blocked or failing one rests, so load on the site is proxies x 0.3 rps.
         rps=0.3,
         pause_on_403=35 * 60,
         # In one session, a year listing after another type's listing can come back
         # empty; without cookies every request starts a fresh session.
         disable_cookies=True,
-        workers=2,
+        # 20 free proxies at 0.3 rps each need ~64 in flight (pages take ~10 s through
+        # them; 32 workers reached half the rate). Without proxies they just queue.
+        workers=64,
         needs_proxy=True,
-        max_retries=2,
+        # A retry after a proxy failure goes through the next proxy.
+        max_retries=4,
     ),
     state(PernambucoAlepeScraper, ("Pernambuco", "PE"), 1835),
     state(PiauiAlepiScraper, ("Piaui", "PI"), 1922, needs_ocr=True),
