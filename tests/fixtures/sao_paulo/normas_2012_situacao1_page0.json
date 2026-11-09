@@ -1,0 +1,97 @@
+{
+ "pageable": {
+  "pageNumber": 0,
+  "pageSize": 500,
+  "sort": {
+   "unsorted": true,
+   "sorted": false,
+   "empty": true
+  },
+  "offset": 0,
+  "unpaged": false,
+  "paged": true
+ },
+ "totalElements": 1528,
+ "totalPages": 4,
+ "last": true,
+ "numberOfElements": 4,
+ "size": 500,
+ "number": 0,
+ "sort": {
+  "unsorted": true,
+  "sorted": false,
+  "empty": true
+ },
+ "first": true,
+ "empty": false,
+ "content": [
+  {
+   "idNorma": "169098",
+   "tipo": "Lei",
+   "nuNorma": "14924",
+   "data": "28/12/2012",
+   "dataPublicacao": "29/12/2012",
+   "cadernoPublicacaoDO": "DOE-I",
+   "paginaPublicacaoDO": 3,
+   "nomeNorma": "Lei nº 14.924, de 28/12/2012",
+   "idTipo": "9",
+   "dsEmenta": "Dispõe sobre o subsídio do Governador, do Vice-Governador e dos  Secretários de Estado para o exercício de 2013",
+   "dsComplementoNorma": " ",
+   "tpPromulgacao": "E",
+   "urlTextoAtualizado": null,
+   "urlIntegraListaPesquisa": "https://www.al.sp.gov.br/repositorio/legislacao/lei/2012/lei-14924-28.12.2012.html",
+   "urlPublicacaoDO": "http://dobuscadireta.imprensaoficial.com.br/default.aspx?DataPublicacao=20121229&Caderno=DOE-I&NumeroPagina=3"
+  },
+  {
+   "idNorma": "169110",
+   "tipo": "Ato do Presidente",
+   "nuNorma": "83",
+   "data": "20/12/2012",
+   "dataPublicacao": "29/12/2012",
+   "cadernoPublicacaoDO": "Legislativo",
+   "paginaPublicacaoDO": 1,
+   "nomeNorma": "Ato do Presidente nº 83, de 20/12/2012",
+   "idTipo": "22",
+   "dsEmenta": "Convoca suplente para tomar posse como Deputado titular à ALESP",
+   "dsComplementoNorma": " ",
+   "tpPromulgacao": "L",
+   "urlTextoAtualizado": null,
+   "urlIntegraListaPesquisa": "https://www.al.sp.gov.br/repositorio/legislacao/ato.do.presidente/2012/ato.do.presidente-83-20.12.2012.html",
+   "urlPublicacaoDO": "http://dobuscadireta.imprensaoficial.com.br/default.aspx?DataPublicacao=20121229&Caderno=Legislativo&NumeroPagina=1"
+  },
+  {
+   "idNorma": "169053",
+   "tipo": "Decreto",
+   "nuNorma": "58791",
+   "data": "21/12/2012",
+   "dataPublicacao": "22/12/2012",
+   "cadernoPublicacaoDO": "DOE-I",
+   "paginaPublicacaoDO": 3,
+   "nomeNorma": "Decreto nº 58.791, de 21/12/2012",
+   "idTipo": "3",
+   "dsEmenta": "Aprova e fixa os valores a serem cobrados pelo uso dos recursos hídricos de domínio de Estado de São Paulo na Unidade de Gerenciamento de Recursos Hídricos Mogi-Guaçu ",
+   "dsComplementoNorma": " ",
+   "tpPromulgacao": "E",
+   "urlTextoAtualizado": null,
+   "urlIntegraListaPesquisa": "https://www.al.sp.gov.br/repositorio/legislacao/decreto/2012/decreto-58791-21.12.2012.pdf",
+   "urlPublicacaoDO": "http://dobuscadireta.imprensaoficial.com.br/default.aspx?DataPublicacao=20121222&Caderno=DOE-I&NumeroPagina=3"
+  },
+  {
+   "idNorma": "169099",
+   "tipo": "Lei",
+   "nuNorma": "14925",
+   "data": "28/12/2012",
+   "dataPublicacao": "29/12/2012",
+   "cadernoPublicacaoDO": "DOE - Poder Executivo - Suplemento - 1",
+   "paginaPublicacaoDO": 1,
+   "nomeNorma": "Lei nº 14.925, de 28/12/2012",
+   "idTipo": "9",
+   "dsEmenta": "Orça a receita e fixa a despesa para o exercício de 2013",
+   "dsComplementoNorma": " ",
+   "tpPromulgacao": "E",
+   "urlTextoAtualizado": null,
+   "urlIntegraListaPesquisa": null,
+   "urlPublicacaoDO": "http://dobuscadireta.imprensaoficial.com.br/default.aspx?DataPublicacao=20121229&Caderno=DOE - Poder Executivo - Suplemento - 1&NumeroPagina=1"
+  }
+ ]
+}

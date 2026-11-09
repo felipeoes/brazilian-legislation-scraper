@@ -1,0 +1,221 @@
+import json
+import sqlite3
+import tracemalloc
+
+import pytest
+
+from src.core.document import Document
+from src.core.store import Store
+
+
+def document(**kwargs) -> Document:
+    return Document(
+        **{
+            "year": 2024,
+            "title": "Lei 1",
+            "type": "Lei",
+            "situation": "Vigente",
+            "document_url": "https://example.org/1",
+            "text_markdown": "Art. 1º Esta lei estabelece as disposições para a administração pública.",
+            **kwargs,
+        }
+    )
+
+
+async def test_long_titles_and_stable_listing_identity(tmp_path):
+    async with Store(tmp_path / "documents.db") as store:
+        for suffix in ("one", "two"):
+            await store.save(
+                document(title="a" * 300 + suffix, raw=suffix.encode(), raw_ext=".pdf"),
+                ref_url="listing",
+                ref_title=suffix,
+            )
+        assert await store.keys() == {("listing", "one"), ("listing", "two")}
+        assert len(list((tmp_path / "2024/docs").glob("*.pdf"))) == 2
+        for fmt in ("json", "jsonl"):
+            assert await store.export(tmp_path / "export", fmt) == 2
+            text = (tmp_path / f"export/2024/data.{fmt}").read_text()
+            rows = (
+                json.loads(text)
+                if fmt == "json"
+                else [json.loads(line) for line in text.splitlines()]
+            )
+            assert {row["document_url"] for row in rows} == {"https://example.org/1"}
+            assert all("raw" not in row for row in rows)
+
+
+async def test_underscore_listing_fields_are_not_stored(tmp_path):
+    async with Store(tmp_path / "documents.db") as store:
+        await store.save(document(_pdf_link="https://example.org/1.pdf", number="1"))
+        await store.export(tmp_path / "export")
+        row = json.loads((tmp_path / "export/2024/data.jsonl").read_text())
+        assert row["number"] == "1" and "_pdf_link" not in row
+
+
+async def test_failed_insert_preserves_existing_row_and_file(tmp_path):
+    async with Store(tmp_path / "documents.db") as store:
+        await store.save(document(raw=b"old", raw_ext=".pdf"))
+        store.connection.execute(
+            "CREATE TRIGGER fail BEFORE INSERT ON documents BEGIN SELECT RAISE(ABORT, 'crash'); END"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.save(document(raw=b"new", raw_ext=".pdf"))
+        row = store.connection.execute("SELECT file_path FROM documents").fetchone()
+        assert (tmp_path / row[0]).read_bytes() == b"old"
+        assert len(await store.keys()) == 1
+
+
+async def test_summary_does_not_load_bodies(tmp_path):
+    async with Store(tmp_path / "documents.db") as store:
+        body = "x" * (1024 * 1024)
+        for i in range(100):
+            await store.save(document(title=str(i), text_markdown=body))
+        tracemalloc.start()
+        summary = await store.summary()
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        assert summary[0]["documents"] == 100
+        assert peak < 1024 * 1024
+
+
+async def test_import_fails_loudly_without_deleting_inputs(tmp_path):
+    source = tmp_path / "2024/data.json"
+    source.parent.mkdir()
+    source.write_text("[broken")
+    async with Store(tmp_path / "documents.db") as store:
+        with pytest.raises(json.JSONDecodeError):
+            await store.import_json(tmp_path)
+        assert source.read_text() == "[broken"
+        source.write_text(json.dumps([document(file_path="old.pdf").model_dump()]))
+        assert await store.import_json(tmp_path) == (1, 0)
+        assert (
+            store.connection.execute("SELECT file_path FROM documents").fetchone()[0]
+            == "old.pdf"
+        )
+
+
+async def test_export_import_round_trip_keeps_listing_keys(tmp_path):
+    async with Store(tmp_path / "a/documents.db") as store:
+        await store.save(document(), ref_url="listing", ref_title="Listing title")
+        await store.export(tmp_path / "archive", "json")
+    async with Store(tmp_path / "b/documents.db") as store:
+        assert await store.import_json(tmp_path / "archive") == (1, 0)
+        assert await store.keys() == {("listing", "Listing title")}
+        extra = store.connection.execute("SELECT extra FROM documents").fetchone()[0]
+        assert json.loads(extra) == {}
+
+
+async def test_import_reads_legacy_envelope_and_records_invalid_rows(tmp_path):
+    source = tmp_path / "2024/data.json"
+    source.parent.mkdir()
+    rows = [document().model_dump(), {**document(title="Lei 2").model_dump()}]
+    rows[1]["situation"] = ""
+    source.write_text(json.dumps({"summary": {}, "documents": rows}))
+    async with Store(tmp_path / "documents.db") as store:
+        assert await store.import_json(tmp_path) == (1, 1)
+        assert len(await store.keys()) == 1
+        title, message = store.connection.execute(
+            "SELECT title, message FROM errors"
+        ).fetchone()
+        assert title == "Lei 2" and "situation" in message
+
+
+async def test_error_runs(tmp_path):
+    async with Store(tmp_path / "documents.db") as store:
+        run = await store.start_run("TEST")
+        await store.record_error(run_id=run, message="failed", year=2024)
+        await store.finish_run(run, 1, 1, {"test": {"requests": 1}})
+        assert store.connection.execute("SELECT errors FROM runs").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    "field", ["title", "type", "situation", "document_url", "text_markdown"]
+)
+def test_document_validates_required_text(field):
+    with pytest.raises(ValueError):
+        document(**{field: " "})
+
+
+async def test_cancelled_context_entry_closes_open_connection():
+    import asyncio
+
+    store = Store(":memory:")
+    original_open = store.open
+
+    async def interrupted_open():
+        await original_open()
+        raise asyncio.CancelledError
+
+    store.open = interrupted_open
+    with pytest.raises(asyncio.CancelledError):
+        async with store:
+            pass
+    assert store._connection is None
+
+
+def test_document_normalizes_title_whitespace_and_null_summary():
+    doc = document(title="Ato\n      n° 4.307/2012", summary=None)
+    assert doc.title == "Ato n° 4.307/2012" and doc.summary == ""
+
+
+async def test_import_normalizes_ref_title_like_listing_keys(tmp_path):
+    (tmp_path / "2024").mkdir()
+    row = document().model_dump() | {"ref_url": "listing", "ref_title": "Lei\n   1"}
+    (tmp_path / "2024/data.json").write_text(json.dumps([row]))
+    async with Store(tmp_path / "documents.db") as store:
+        assert await store.import_json(tmp_path) == (1, 0)
+        assert await store.keys() == {("listing", "Lei 1")}
+
+
+def _raw_files(root):
+    return sorted(p.read_bytes() for p in root.glob("*/docs/*") if p.is_file())
+
+
+async def test_raw_file_path_is_relative_so_archives_can_move(tmp_path):
+    async with Store(tmp_path / "documents.db") as store:
+        await store.save(document(raw=b"pdf", raw_ext=".pdf"))
+        (path,) = store.connection.execute("SELECT file_path FROM documents").fetchone()
+    assert path.startswith("2024/docs/") and path.endswith(".pdf")
+    assert (tmp_path / path).read_bytes() == b"pdf"
+
+
+async def test_replacing_a_document_removes_its_old_raw_file(tmp_path):
+    async with Store(tmp_path / "documents.db") as store:
+        await store.save(document(raw=b"old", raw_ext=".pdf"))
+        await store.save(document(raw=b"new", raw_ext=".html", year=2025))
+        await store.save(document(raw=b"other", raw_ext=".pdf"), ref_title="Lei 2")
+    assert _raw_files(tmp_path) == [b"new", b"other"]
+
+
+async def test_failed_insert_removes_the_new_orphan_raw_file(tmp_path):
+    async with Store(tmp_path / "documents.db") as store:
+        await store.save(document(raw=b"old", raw_ext=".pdf"))
+        store.connection.execute(
+            "CREATE TRIGGER fail BEFORE INSERT ON documents BEGIN SELECT RAISE(ABORT, 'crash'); END"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.save(document(raw=b"new", raw_ext=".pdf"))
+    assert _raw_files(tmp_path) == [b"old"]
+
+
+async def test_replace_never_deletes_files_the_store_did_not_write(tmp_path):
+    foreign = tmp_path / "2024" / "legacy.pdf"
+    foreign.parent.mkdir()
+    foreign.write_bytes(b"legacy")
+    async with Store(tmp_path / "documents.db") as store:
+        await store.save(document(), file_path=str(foreign))
+        await store.save(document(raw=b"new", raw_ext=".pdf"))
+    assert foreign.read_bytes() == b"legacy"
+
+
+async def test_runs_keep_stats_and_old_archives_gain_the_column(tmp_path):
+    db = tmp_path / "documents.db"
+    with sqlite3.connect(db) as old:
+        old.execute(
+            "CREATE TABLE runs (id INTEGER PRIMARY KEY, scraper TEXT NOT NULL, started_at TEXT, finished_at TEXT, docs INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0, llm_usage TEXT NOT NULL DEFAULT '{}')"
+        )
+    async with Store(db) as store:
+        run = await store.start_run("TEST")
+        await store.finish_run(run, 1, 0, {}, {"seconds": 2.5})
+        (stats,) = store.connection.execute("SELECT stats FROM runs").fetchone()
+    assert json.loads(stats) == {"seconds": 2.5}

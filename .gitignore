@@ -174,8 +174,11 @@ test.py
 error_log.json
 artifacts/
 test_data/
-scripts/
-proxies.txt
+scripts/*
+!scripts/check_proxies.py
+proxies*.txt
+/docs/
 
 # AI-RELATED
 .claude/
+.gemini/

@@ -1,0 +1,38 @@
+{
+ "success": true,
+ "statusCode": 200,
+ "message": "Atos listado(a)s com sucesso!",
+ "moreDetails": "",
+ "data": [
+  {
+   "id": 8364,
+   "isConsolidated": false,
+   "summary": "Reconhece de Utilidade Pública Estadual a ASSOCIAÇÃO COMUNITÁRIA BOM JESUS DOS NAVEGANTES, com sede e foro na Cidade de Barra dos Coqueiros - SE.",
+   "number": "7495",
+   "tags": [
+    {
+     "name": "Ato Original"
+    }
+   ],
+   "actType": "Lei Ordinária",
+   "publicationDate": "2012-12-28T00:00:00",
+   "createdAt": "2022-03-08T11:17:43",
+   "actDate": "2012-12-18T00:00:00"
+  },
+  {
+   "id": 8382,
+   "isConsolidated": false,
+   "summary": "Institui o Dia Estadual da Secretária e do Secretário no Estado de Sergipe.  ",
+   "number": "7393",
+   "tags": [
+    {
+     "name": "Ato Original"
+    }
+   ],
+   "actType": "Lei Ordinária",
+   "publicationDate": "2012-05-31T00:00:00",
+   "createdAt": "2022-03-08T11:18:05",
+   "actDate": "2012-05-30T00:00:00"
+  }
+ ]
+}

@@ -1,107 +1,43 @@
-"""Tests for ParanaCVScraper (Paraná Casa Civil).
-
-Covers:
-- TYPES constant: 7 types, integer IDs
-- SITUATIONS module-level dict preserved for downstream consumers
-- Class docstring accessible
-- _build_form_data: correct keys and year/type values
-- _search_url: correct construction with/without total_records
-- _parse_results_table: returns docs, skips rows with < 4 tds,
-  handles missing link_tag, handles missing table
-- _infer_situation: revogado/revogada → INVALID, others → VALID
-- _get_doc_data: resume skip, failed response → error + None,
-  missing form → error + None, invalid markdown → None,
-  valid doc returns correct shape with situation inferred
-
-Run with:
-    .venv/bin/pytest tests/test_parana_scraper.py -v
-"""
-
-from unittest.mock import AsyncMock, MagicMock
+"Parser and metadata regression tests for parana_scraper."
 
 import pytest
-from base_tests import ScraperClassTests, SituationsConstantTests, TypesConstantTests
 from bs4 import BeautifulSoup
-from conftest import assert_resume_skips, make_base_scraper
+from conftest import make_mock_response, make_scraper
+from parser_assertions import (
+    ScraperClassTests,
+    SituationsConstantTests,
+    TypesConstantTests,
+)
 
-from src.scraper.base.scraper import DEFAULT_INVALID_SITUATION, DEFAULT_VALID_SITUATION
-from src.scraper.state_legislation.parana import SITUATIONS, TYPES, ParanaCVScraper
-
-# ---------------------------------------------------------------------------
-# Factory helper
-# ---------------------------------------------------------------------------
+from src.core.scraper import DEFAULT_INVALID_SITUATION, DEFAULT_VALID_SITUATION
+from src.scrapers.states.pr import SITUATIONS, TYPES, ParanaCVScraper
 
 
 def _make_scraper(**kwargs) -> ParanaCVScraper:
-    """Instantiate ParanaCVScraper bypassing __init__ (no network, no I/O)."""
-    return make_base_scraper(
-        ParanaCVScraper,
-        "https://www.legislacao.pr.gov.br",
-        "PARANA",
-        TYPES,
-        SITUATIONS,
-        _base_form_data={
-            "pesquisou": "true",
-            "opcaoAno": "2",
-            "opcaoNro": "1",
-            "optPesquisa": "tm",
-            "tiposAtoStr": "",
-            "site": "1",
-            "codigoTipoAto": "",
-            "tipoOrdenacao": "",
-            "ordAsc": "false",
-            "optTexto": "2",
-            "texto": "",
-            "anoInicialAto": "",
-            "anoFinalAto": "",
-            "nroInicialAto": "",
-            "nroFinalAto": "",
-            "tipoAto": "",
-            "nroAto": "",
-            "anoAto": "",
-            "tema": "0",
-            "anoInicialAtoTema": "",
-            "anoFinalAtoTema": "",
-            "nroInicialAtoTema": "",
-            "nroFinalAtoTema": "",
-        },
-        **kwargs,
-    )
+    """Instantiate ParanaCVScraper with injected dependencies."""
+    return make_scraper(ParanaCVScraper, **kwargs)
 
 
-def _make_results_html(count: int = 2, revogado: bool = False) -> str:
-    revogado_text = " Revogado pelo Decreto 999/2010" if revogado else ""
-    rows = ""
-    for i in range(1, count + 1):
-        rows += f"""
-        <tr class="list_cor_sim">
-          <td><a href="javascript:exibirAto('{100 + i}')">Lei {i}</a></td>
-          <td>Lei Estadual {i}/2020{revogado_text}</td>
-          <td>Dispõe sobre assunto {i}.</td>
-          <td>01/01/2020</td>
+def _make_results_html(codes: list[int], total: int | None = None) -> str:
+    """The unpaginated year listing (``listarAtosAno.do?action=listarAtos``)."""
+    rows = "".join(
+        f"""<tr class="list_cor_sim">
+          <td><a href="JavaScript:exibir('/legislacao/listarAtosAno.do?action=exibir&amp;codAto={code}&amp;indice=1&amp;totalRegistros={len(codes)}');"><img src="/legislacao/images/icon_exibir.png"/></a></td>
+          <td><div id="{code}_epigrafeAto">Lei {code} - 01 de janeiro de 2020</div></td>
+          <td><div id="{code}_descricaoItemAto">Dispõe sobre assunto {code}.</div></td>
+          <td><div id="{code}_dataPublicacao">01/01/2020</div></td>
         </tr>"""
-    return f"""<html><body>
-        <p>Página 1 de 1</p><p>Total de {count} registros</p>
-        <table id="list_tabela"><tbody>{rows}</tbody></table>
-    </body></html>"""
+        for code in codes
+    )
+    total = len(codes) if total is None else total
+    return f"""<html><body><div><i>{len(codes)} registro(s) listado(s)</i></div>
+        <table id="barra_paginacao"><tr><td>P&aacute;gina 1 de 1 : (Total de {total} registros)</td></tr></table>
+        <table id="list_tabela">{rows}</table></body></html>"""
 
 
 def _make_doc_html(revogado: bool = False) -> str:
     revogado_text = "Revogado pelo Decreto 999/2010" if revogado else ""
-    return f"""<html><body>
-        <form name="pesquisarAtoForm">
-          <div>
-            <p>LEI ESTADUAL N.º 1/2020</p>
-            <p>Dispõe sobre assunto importante.</p>
-            {revogado_text}
-          </div>
-        </form>
-    </body></html>"""
-
-
-# ---------------------------------------------------------------------------
-# TYPES and SITUATIONS constants
-# ---------------------------------------------------------------------------
+    return f'<html><body>\n        <form name="pesquisarAtoForm">\n          <div>\n            <p>LEI ESTADUAL N.º 1/2020</p>\n            <p>Dispõe sobre assunto importante.</p>\n            {revogado_text}\n          </div>\n        </form>\n    </body></html>'
 
 
 class TestTypesConstant(TypesConstantTests):
@@ -117,272 +53,168 @@ class TestSituationsConstant(SituationsConstantTests):
     EXPECTED_EMPTY = True
 
 
-# ---------------------------------------------------------------------------
-# Class-level attributes
-# ---------------------------------------------------------------------------
-
-
 class TestClassAttributes(ScraperClassTests):
     SCRAPER_CLS = ParanaCVScraper
     STATE_NAME = "Paraná"
 
 
-# ---------------------------------------------------------------------------
-# _build_form_data
-# ---------------------------------------------------------------------------
-
-
-class TestBuildFormData:
-    def test_sets_tipos_ato_str(self):
-        scraper = _make_scraper()
-        data = scraper._build_form_data(2020, 1)
-        assert data["tiposAtoStr"] == "1"
-
-    def test_sets_ano_inicial_ato_tema(self):
-        scraper = _make_scraper()
-        data = scraper._build_form_data(2020, 1)
-        assert data["anoInicialAtoTema"] == "2020"
-
-    def test_sets_ano_final_ato_tema(self):
-        scraper = _make_scraper()
-        data = scraper._build_form_data(2020, 1)
-        assert data["anoFinalAtoTema"] == "2020"
-
-    def test_no_mutation_of_base_form_data(self):
-        scraper = _make_scraper()
-        original = scraper._base_form_data.copy()
-        scraper._build_form_data(2020, 1)
-        assert scraper._base_form_data == original
-
-    def test_different_years_produce_different_data(self):
-        scraper = _make_scraper()
-        d1 = scraper._build_form_data(2020, 1)
-        d2 = scraper._build_form_data(2021, 1)
-        assert d1["anoInicialAtoTema"] != d2["anoInicialAtoTema"]
-
-
-# ---------------------------------------------------------------------------
-# _search_url
-# ---------------------------------------------------------------------------
-
-
-class TestSearchUrl:
-    def test_without_total_records(self):
-        scraper = _make_scraper()
-        url = scraper._search_url(page=1)
-        assert "indice=1" in url
-        assert "site=1" in url
-        assert "totalRegistros" not in url
-
-    def test_with_total_records(self):
-        scraper = _make_scraper()
-        url = scraper._search_url(page=2, total_records=50)
-        assert "indice=2" in url
-        assert "totalRegistros=50" in url
-
-    def test_contains_base_url(self):
-        scraper = _make_scraper()
-        url = scraper._search_url()
-        assert scraper.base_url in url
-
-
-# ---------------------------------------------------------------------------
-# _parse_results_table
-# ---------------------------------------------------------------------------
-
-
 class TestParseResultsTable:
     def test_happy_path_returns_docs(self):
-        soup = BeautifulSoup(_make_results_html(2), "html.parser")
+        soup = BeautifulSoup(_make_results_html([101, 102]), "lxml")
         docs = ParanaCVScraper._parse_results_table(soup)
+        assert docs[0] == {
+            "id": "101",
+            "title": "Lei 101 - 01 de janeiro de 2020",
+            "summary": "Dispõe sobre assunto 101.",
+            "date": "01/01/2020",
+        }
         assert len(docs) == 2
-        assert "id" in docs[0]
-        assert "title" in docs[0]
-        assert "summary" in docs[0]
-        assert "date" in docs[0]
 
     def test_missing_table_returns_empty(self):
-        soup = BeautifulSoup("<html><body><p>Nothing</p></body></html>", "html.parser")
+        soup = BeautifulSoup("<html><body><p>Nothing</p></body></html>", "lxml")
         docs = ParanaCVScraper._parse_results_table(soup)
         assert docs == []
 
-    def test_extracts_cod_ato_from_href(self):
-        soup = BeautifulSoup(_make_results_html(1), "html.parser")
-        docs = ParanaCVScraper._parse_results_table(soup)
-        assert docs[0]["id"] == "101"
-
     def test_skips_rows_without_link(self):
-        html = """<html><body>
-            <table id="list_tabela"><tbody>
-              <tr class="list_cor_sim">
-                <td>No link here</td>
-                <td>Title</td><td>Summary</td><td>01/01/2020</td>
-              </tr>
-            </tbody></table>
-        </body></html>"""
-        soup = BeautifulSoup(html, "html.parser")
+        html = '<html><body>\n            <table id="list_tabela"><tbody>\n              <tr class="list_cor_sim">\n                <td>No link here</td>\n                <td>Title</td><td>Summary</td><td>01/01/2020</td>\n              </tr>\n            </tbody></table>\n        </body></html>'
+        soup = BeautifulSoup(html, "lxml")
         docs = ParanaCVScraper._parse_results_table(soup)
         assert docs == []
 
     def test_skips_rows_with_fewer_than_4_tds(self):
-        html = """<html><body>
-            <table id="list_tabela"><tbody>
-              <tr class="list_cor_sim">
-                <td><a href="javascript:exibirAto('99')">X</a></td>
-                <td>Title</td>
-              </tr>
-            </tbody></table>
-        </body></html>"""
-        soup = BeautifulSoup(html, "html.parser")
+        html = '<html><body>\n            <table id="list_tabela"><tbody>\n              <tr class="list_cor_sim">\n                <td><a href="JavaScript:exibir(\'/legislacao/listarAtosAno.do?action=exibir&amp;codAto=99\');">X</a></td>\n                <td>Title</td>\n              </tr>\n            </tbody></table>\n        </body></html>'
+        soup = BeautifulSoup(html, "lxml")
         docs = ParanaCVScraper._parse_results_table(soup)
         assert docs == []
 
 
-# ---------------------------------------------------------------------------
-# _infer_situation
-# ---------------------------------------------------------------------------
-
-
 class TestInferSituation:
     def test_revogado_pelo_returns_invalid(self):
-        html = "<html><body><p>Revogado pelo Decreto 999/2010.</p></body></html>"
-        soup = BeautifulSoup(html, "html.parser")
+        html = (
+            "<html><body><p>Situação: Revogado pelo Decreto 999/2010.</p></body></html>"
+        )
+        soup = BeautifulSoup(html, "lxml")
         assert ParanaCVScraper._infer_situation(soup) == DEFAULT_INVALID_SITUATION
 
     def test_revogada_pela_returns_invalid(self):
-        html = "<html><body><p>Revogada pela Lei 888/2008.</p></body></html>"
-        soup = BeautifulSoup(html, "html.parser")
+        html = "<html><body><p>Situação: Revogada pela Lei 888/2008.</p></body></html>"
+        soup = BeautifulSoup(html, "lxml")
         assert ParanaCVScraper._infer_situation(soup) == DEFAULT_INVALID_SITUATION
 
     def test_no_revogado_returns_valid(self):
         html = "<html><body><p>Dispõe sobre normas administrativas.</p></body></html>"
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(html, "lxml")
         assert ParanaCVScraper._infer_situation(soup) == DEFAULT_VALID_SITUATION
 
     def test_revogado_por_returns_invalid(self):
-        html = "<html><body><p>Revogado por norma posterior.</p></body></html>"
-        soup = BeautifulSoup(html, "html.parser")
+        html = (
+            "<html><body><p>Situação: Revogado por norma posterior.</p></body></html>"
+        )
+        soup = BeautifulSoup(html, "lxml")
         assert ParanaCVScraper._infer_situation(soup) == DEFAULT_INVALID_SITUATION
 
 
-# ---------------------------------------------------------------------------
-# _get_doc_data
-# ---------------------------------------------------------------------------
+class TestFetch:
+    REF = {
+        "id": "101",
+        "title": "Lei 1 - 01 de janeiro de 2020",
+        "year": 2020,
+        "type": "Lei",
+        "situation": DEFAULT_VALID_SITUATION,
+        "document_url": "https://www.legislacao.pr.gov.br/legislacao/pesquisarAto.do?action=exibir&codAto=101",
+    }
 
-
-class TestGetDocData:
-    @pytest.mark.asyncio
-    async def test_resume_skip_returns_none(self):
-        await assert_resume_skips(
-            _make_scraper(), {"id": "101", "title": "Lei 1/2020", "date": "01/01/2020"}
-        )
-
-    @pytest.mark.asyncio
-    async def test_failed_response_saves_error_and_returns_none(self):
+    async def test_fetches_over_http_and_stores_html_body(self):
+        """Chromium hangs on a never-finishing sub-resource; the HTML itself is complete."""
         scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._fetch_soup_and_mhtml = AsyncMock(side_effect=Exception("fetch failed"))
-        scraper._save_doc_error = AsyncMock()
-        doc = {"id": "101", "title": "Lei 1/2020", "date": "01/01/2020"}
-        result = await scraper._get_doc_data(doc)
-        assert result is None
-        scraper._save_doc_error.assert_called_once()
+        body = _make_doc_html()
+        scraper.http.request.side_effect = [make_mock_response(body)]
+        doc = await scraper.fetch(dict(self.REF))
+        assert doc.raw == body.encode()
+        assert doc.raw_ext == ".html"
+        assert "Dispõe sobre assunto importante" in doc.text_markdown
+        assert doc.situation == DEFAULT_VALID_SITUATION
+        scraper.browser.snapshot.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_missing_form_saves_error_and_returns_none(self):
+    async def test_revoked_situation(self):
         scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._fetch_soup_and_mhtml = AsyncMock(
-            return_value=(
-                BeautifulSoup(
-                    "<html><body><p>No form</p></body></html>", "html.parser"
-                ),
-                b"",
-            )
+        html = _make_doc_html().replace(
+            "<div>", "<div><p>Situação: Revogado pelo Decreto 999/2010</p>", 1
         )
-        scraper._save_doc_error = AsyncMock()
-        doc = {"id": "101", "title": "Lei 1/2020", "date": "01/01/2020"}
-        result = await scraper._get_doc_data(doc)
-        assert result is None
-        scraper._save_doc_error.assert_called_once()
+        scraper.http.request.side_effect = [make_mock_response(html)]
+        doc = await scraper.fetch(dict(self.REF))
+        assert doc.situation == DEFAULT_INVALID_SITUATION
 
-    @pytest.mark.asyncio
-    async def test_invalid_markdown_returns_none(self):
+    async def test_missing_form_raises(self):
         scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._fetch_soup_and_mhtml = AsyncMock(
-            return_value=(BeautifulSoup(_make_doc_html(), "html.parser"), b"")
-        )
-        scraper._get_markdown = AsyncMock(return_value="   ")
-        doc = {"id": "101", "title": "Lei 1/2020", "date": "01/01/2020"}
-        result = await scraper._get_doc_data(doc)
-        assert result is None
+        scraper.http.request.side_effect = [make_mock_response("<html></html>")]
+        with pytest.raises(ValueError, match="pesquisarAtoForm"):
+            await scraper.fetch(dict(self.REF))
 
-    @pytest.mark.asyncio
-    async def test_valid_doc_returns_correct_shape(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._fetch_soup_and_mhtml = AsyncMock(
-            return_value=(BeautifulSoup(_make_doc_html(), "html.parser"), b"fake-mhtml")
-        )
-        valid_md = "# Lei Estadual 1/2020\n\n" + "Texto da lei. " * 30
-        scraper._get_markdown = AsyncMock(return_value=valid_md)
-        doc = {
-            "id": "101",
-            "title": "Lei 1/2020",
-            "date": "01/01/2020",
-            "year": 2020,
-            "type": "Lei",
-        }
-        result = await scraper._get_doc_data(doc)
-        assert result is not None
-        assert "text_markdown" in result
-        assert "document_url" in result
-        assert result["_content_extension"] == ".mhtml"
-        assert result["_raw_content"] == b"fake-mhtml"
 
-    @pytest.mark.asyncio
-    async def test_valid_revogado_doc_infers_invalid_situation(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._fetch_soup_and_mhtml = AsyncMock(
-            return_value=(
-                BeautifulSoup(_make_doc_html(revogado=True), "html.parser"),
-                b"fake-mhtml",
-            )
-        )
-        valid_md = "# Lei\n\n" + "Revogado pelo Decreto 999. " * 20
-        scraper._get_markdown = AsyncMock(return_value=valid_md)
-        doc = {
-            "id": "101",
-            "title": "Lei 1/2020",
-            "date": "01/01/2020",
-            "year": 2020,
-            "type": "Lei",
-        }
-        result = await scraper._get_doc_data(doc)
-        assert result is not None
-        assert result["situation"] == DEFAULT_INVALID_SITUATION
+# Trimmed from live responses: an empty year, and the site's error page, which also
+# shows "Nenhum registro encontrado".
+_NO_RECORDS = """<script>var auxiliar = document.getElementById(globalAjaxDivName);</script>
+<br><div width="100%" align="center"><i>Nenhum registro encontrado.</i></div>"""
+_SITE_ERROR = """<script>globalAjaxMsgError += '<td class="msg_aviso">gov.pr.celepar.framework.exception.ApplicationException: Sistema temporariamente indisponível. Aguarde alguns instantes e tente novamente.</td>';</script>
+<br><div width="100%" align="center"><i>Nenhum registro encontrado.</i></div>"""
 
-    @pytest.mark.asyncio
-    async def test_valid_active_doc_infers_valid_situation(self):
+
+class TestListType:
+    async def test_lists_every_act_of_the_year_in_one_request(self):
         scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._fetch_soup_and_mhtml = AsyncMock(
-            return_value=(
-                BeautifulSoup(_make_doc_html(revogado=False), "html.parser"),
-                b"fake-mhtml",
-            )
+        scraper.http.request.side_effect = [
+            make_mock_response(_make_results_html([101, 102]))
+        ]
+        refs = [ref async for ref in scraper.list_type(2020, "Resolução", 13)]
+        assert [ref["id"] for ref in refs] == ["101", "102"]
+        assert refs[0]["document_url"] == (
+            "https://www.legislacao.pr.gov.br/legislacao/pesquisarAto.do?action=exibir&codAto=101"
         )
-        valid_md = "# Lei\n\n" + "Dispõe sobre normas. " * 30
-        scraper._get_markdown = AsyncMock(return_value=valid_md)
-        doc = {
-            "id": "101",
-            "title": "Lei 1/2020",
-            "date": "01/01/2020",
-            "year": 2020,
-            "type": "Lei",
-        }
-        result = await scraper._get_doc_data(doc)
-        assert result is not None
-        assert result["situation"] == DEFAULT_VALID_SITUATION
+        assert (refs[0]["year"], refs[0]["type"]) == (2020, "Resolução")
+        call = scraper.http.request.await_args
+        assert "action=listarAtos&anoAto=2020&isPaginado=false" in call.args[0]
+        # Every agency at once: resoluções and portarias come from ~200 of them.
+        assert call.kwargs["data"]["codTipoAto"] == "13"
+        assert call.kwargs["data"]["codOrgaoUnidade"] == ""
+        # The site needs ~2 minutes to list a year of resoluções.
+        assert call.kwargs["timeout"] >= 300
+        # 13 MB in one response is too much for a proxy; listings use the direct IP.
+        assert call.kwargs["use_proxy"] is False
+
+    async def test_repeated_rows_are_listed_once(self):
+        """The site repeats a few rows and counts them (2025 Decretos: 3,860 rows, 3,858 acts)."""
+        scraper = _make_scraper()
+        scraper.http.request.side_effect = [
+            make_mock_response(_make_results_html([101, 102, 101]))
+        ]
+        refs = [ref async for ref in scraper.list_type(2025, "Decreto", 11)]
+        assert [ref["id"] for ref in refs] == ["101", "102"]
+
+    async def test_fewer_rows_than_the_total_fail_visibly(self):
+        scraper = _make_scraper()
+        scraper.http.request.side_effect = [
+            make_mock_response(_make_results_html([101, 102], total=3))
+        ]
+        with pytest.raises(ValueError, match="listed 2 of 3"):
+            [ref async for ref in scraper.list_type(2025, "Lei", 1)]
+
+    async def test_no_results_page_yields_nothing(self):
+        scraper = _make_scraper()
+        scraper.http.request.side_effect = [make_mock_response(_NO_RECORDS)]
+        refs = [
+            ref async for ref in scraper.list_type(2025, "Constituição Estadual", 10)
+        ]
+        assert refs == []
+
+    async def test_site_error_is_not_an_empty_year(self):
+        scraper = _make_scraper()
+        scraper.http.request.side_effect = [make_mock_response(_SITE_ERROR)]
+        with pytest.raises(ValueError, match="temporariamente indisponível"):
+            [ref async for ref in scraper.list_type(2025, "Lei", 1)]
+
+    async def test_unrecognized_page_raises(self):
+        scraper = _make_scraper()
+        scraper.http.request.side_effect = [make_mock_response("<html></html>")]
+        with pytest.raises(ValueError, match="Unrecognized Paraná listing"):
+            [ref async for ref in scraper.list_type(2025, "Lei", 1)]

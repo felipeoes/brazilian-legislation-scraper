@@ -1,46 +1,21 @@
-"""Tests for ConamaScraper.
+"Parser and metadata regression tests for conama_scraper."
 
-Covers:
-- TYPES constant completeness and documentation-only role
-- _format_search_url: correct URL construction (no tipo param)
-- _clean_dou_html: chrome removal, single-pass merge, garbage/pattern checks
-- _clean_pdf_markdown: regex artefact removal without double _clean_markdown
-- _get_doc_data: early-exit on None aid, resume skip, failed request,
-  empty markdown, server-error string caught by _valid_markdown,
-  invalid markdown (too short), correct result dict shape with type field
-- _fetch_page_norms: happy-path and failure fallback
-- _scrape_year (integration): total count matches API, type field sourced
-  from nomeato, pagination guard, no tipo in requests
-
-Run with:
-    uv run pytest tests/test_conama_scraper.py -v
-"""
-
-import json
 import re
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
-from base_tests import TypesConstantTests
 from bs4 import BeautifulSoup
-from conftest import make_base_scraper, make_failed_request
+from conftest import make_scraper
+from parser_assertions import TypesConstantTests
 
-from src.scraper.conama.scrape import TYPES, ConamaScraper
-
-# ---------------------------------------------------------------------------
-# Factory helpers
-# ---------------------------------------------------------------------------
+from src.scrapers.environment.conama import TYPES, ConamaScraper
 
 
 def _make_scraper(**kwargs) -> ConamaScraper:
     """Instantiate ConamaScraper bypassing heavy __init__ (no network, no I/O)."""
-    return make_base_scraper(
+    return make_scraper(
         ConamaScraper,
-        "https://conama.mma.gov.br/",
-        "CONAMA",
-        TYPES,
         params={"option": "com_sisconama", "order": "asc", "limit": 100},
-        _situation_regex=re.compile(r"Revogad|Revogação", re.IGNORECASE),
+        _situation_regex=re.compile("Revogad|Revogação", re.IGNORECASE),
         **kwargs,
     )
 
@@ -85,11 +60,6 @@ def _sample_row(**overrides) -> dict:
     return base
 
 
-# ---------------------------------------------------------------------------
-# TYPES constant
-# ---------------------------------------------------------------------------
-
-
 class TestTypesConstant(TypesConstantTests):
     TYPES = TYPES
     EXPECTED_COUNT = 6
@@ -108,11 +78,6 @@ class TestTypesConstant(TypesConstantTests):
 
     def test_portaria_is_type_6(self):
         assert TYPES["Portaria"] == 6
-
-
-# ---------------------------------------------------------------------------
-# _format_search_url
-# ---------------------------------------------------------------------------
 
 
 class TestFormatSearchUrl:
@@ -152,14 +117,9 @@ class TestFormatSearchUrl:
         assert "offset=0" in url
 
 
-# ---------------------------------------------------------------------------
-# _clean_dou_html
-# ---------------------------------------------------------------------------
-
-
 class TestCleanDouHtml:
     def _soup(self, html: str) -> BeautifulSoup:
-        return BeautifulSoup(html, "html.parser")
+        return BeautifulSoup(html, "lxml")
 
     def test_removes_script_tags(self):
         scraper = _make_scraper()
@@ -190,10 +150,9 @@ class TestCleanDouHtml:
     def test_does_not_remove_long_element_containing_garbage_string(self):
         """Elements >300 chars containing garbage should NOT be removed."""
         scraper = _make_scraper()
-        long_text = "DOU - Imprensa Nacional " + ("texto legal " * 30)
+        long_text = "DOU - Imprensa Nacional " + "texto legal " * 30
         soup = self._soup(f"<html><body><p>{long_text}</p></body></html>")
         scraper._clean_dou_html(soup)
-        # The paragraph is too long (>300 chars), so it should survive
         assert "texto legal" in soup.get_text()
 
     def test_removes_publicado_em_pattern(self):
@@ -238,8 +197,7 @@ class TestCleanDouHtml:
     def test_removes_publicacao_dou_reference_element(self):
         scraper = _make_scraper()
         soup = self._soup(
-            "<html><body><p>Art. 1°</p><p>o publicado no Publicação DOU nº 063, "
-            "de 01/04/1996, pág. 5439</p></body></html>"
+            "<html><body><p>Art. 1°</p><p>o publicado no Publicação DOU nº 063, de 01/04/1996, pág. 5439</p></body></html>"
         )
         scraper._clean_dou_html(soup)
         assert "Publicação DOU" not in soup.get_text()
@@ -248,8 +206,7 @@ class TestCleanDouHtml:
     def test_removes_boletim_servico_reference_element(self):
         scraper = _make_scraper()
         soup = self._soup(
-            "<html><body><p>Art. 1°</p><p>Publicado no Boletim de Serviço nº 939, "
-            "de 23/11/84, do Ministério do Interior.</p></body></html>"
+            "<html><body><p>Art. 1°</p><p>Publicado no Boletim de Serviço nº 939, de 23/11/84, do Ministério do Interior.</p></body></html>"
         )
         scraper._clean_dou_html(soup)
         assert "Boletim de Serviço" not in soup.get_text()
@@ -269,7 +226,6 @@ class TestCleanDouHtml:
         )
         scraper._clean_dou_html(soup)
         assert soup.find("a") is None
-        # Text also gone because the element is removed, not unwrapped
         assert "link" not in soup.get_text()
 
     def test_returns_soup_for_chaining(self):
@@ -277,11 +233,6 @@ class TestCleanDouHtml:
         soup = self._soup("<html><body><p>texto</p></body></html>")
         result = scraper._clean_dou_html(soup)
         assert result is soup
-
-
-# ---------------------------------------------------------------------------
-# _clean_pdf_markdown
-# ---------------------------------------------------------------------------
 
 
 class TestCleanPdfMarkdown:
@@ -319,10 +270,7 @@ class TestCleanPdfMarkdown:
 
     def test_removes_publicacao_dou_suffix_on_same_block(self):
         scraper = _make_scraper()
-        text = (
-            "Art. 1° Conteúdo legal completo.\n\n"
-            "o publicado no Publicação DOU nº 063, de 01/04/1996, pág. 5439"
-        )
+        text = "Art. 1° Conteúdo legal completo.\n\no publicado no Publicação DOU nº 063, de 01/04/1996, pág. 5439"
         result = scraper._clean_pdf_markdown(text)
         assert "Publicação DOU" not in result
         assert "5439" not in result
@@ -330,10 +278,7 @@ class TestCleanPdfMarkdown:
 
     def test_removes_publicacao_dou_suffix_with_wrapped_page_number(self):
         scraper = _make_scraper()
-        text = (
-            "Art. 1° Conteúdo legal completo.\n\n"
-            "o publicado na Publicação DOU nº 012, de 11/12/1995, pág.\n\n20391"
-        )
+        text = "Art. 1° Conteúdo legal completo.\n\no publicado na Publicação DOU nº 012, de 11/12/1995, pág.\n\n20391"
         result = scraper._clean_pdf_markdown(text)
         assert "Publicação DOU" not in result
         assert "20391" not in result
@@ -341,21 +286,14 @@ class TestCleanPdfMarkdown:
 
     def test_removes_trailing_dou_suffix_without_publicacao_label(self):
         scraper = _make_scraper()
-        text = (
-            "Art. 3° Conteúdo legal completo.\n\n"
-            "_ o publicado no DOU, de 22 de novembro de 1985._"
-        )
+        text = "Art. 3° Conteúdo legal completo.\n\n_ o publicado no DOU, de 22 de novembro de 1985._"
         result = scraper._clean_pdf_markdown(text)
         assert "publicado no DOU" not in result
         assert result == "Art. 3° Conteúdo legal completo."
 
     def test_removes_pre_1990_imprensa_nacional_notice(self):
         scraper = _make_scraper()
-        text = (
-            "Art. 8° Conteúdo legal completo.\n\n"
-            "** http://portal.imprensanacional.gov.br/** **devido a data**\n"
-            "**de publicação ser anterior ao ano de 1990.**"
-        )
+        text = "Art. 8° Conteúdo legal completo.\n\n** http://portal.imprensanacional.gov.br/** **devido a data**\n**de publicação ser anterior ao ano de 1990.**"
         result = scraper._clean_pdf_markdown(text)
         assert "portal.imprensanacional.gov.br" not in result
         assert "anterior ao ano de 1990" not in result
@@ -363,23 +301,14 @@ class TestCleanPdfMarkdown:
 
     def test_removes_publication_block_before_following_notes(self):
         scraper = _make_scraper()
-        text = (
-            "Art. 4° Conteúdo legal completo.\n\n"
-            "_ o publicado no DOU, de 23 de novembro de 1984._\n\n"
-            "3\n4\n\n"
-            "Nota editorial."
-        )
+        text = "Art. 4° Conteúdo legal completo.\n\n_ o publicado no DOU, de 23 de novembro de 1984._\n\n3\n4\n\nNota editorial."
         result = scraper._clean_pdf_markdown(text)
         assert "publicado no DOU" not in result
         assert "Nota editorial." in result
 
     def test_removes_boletim_servico_footer_with_ministry(self):
         scraper = _make_scraper()
-        text = (
-            "Art. 5° Conteúdo legal completo.\n\n"
-            "o publicado no Boletim de Serviço nº 948, de 25/11/85, "
-            "do Ministério do Interior"
-        )
+        text = "Art. 5° Conteúdo legal completo.\n\no publicado no Boletim de Serviço nº 948, de 25/11/85, do Ministério do Interior"
         result = scraper._clean_pdf_markdown(text)
         assert "Boletim de Serviço" not in result
         assert "Ministério do Interior" not in result
@@ -387,23 +316,14 @@ class TestCleanPdfMarkdown:
 
     def test_removes_boletim_servico_footer_without_comma_after_number(self):
         scraper = _make_scraper()
-        text = (
-            "Art. 6° Conteúdo legal completo.\n\n"
-            "o publicado no Boletim de Serviço nº 921 de 20/7/84, "
-            "do Ministério do Interior"
-        )
+        text = "Art. 6° Conteúdo legal completo.\n\no publicado no Boletim de Serviço nº 921 de 20/7/84, do Ministério do Interior"
         result = scraper._clean_pdf_markdown(text)
         assert "Boletim de Serviço" not in result
         assert result == "Art. 6° Conteúdo legal completo."
 
     def test_removes_boletim_servico_mi_footer_with_numeric_markers(self):
         scraper = _make_scraper()
-        text = (
-            "Art. 7° Conteúdo legal completo.\n\n"
-            "o publicado no Boletim de Serviço/MI, de 1 de novembro de 1984.\n\n"
-            "1\n2\n\n"
-            "Nota editorial."
-        )
+        text = "Art. 7° Conteúdo legal completo.\n\no publicado no Boletim de Serviço/MI, de 1 de novembro de 1984.\n\n1\n2\n\nNota editorial."
         result = scraper._clean_pdf_markdown(text)
         assert "Boletim de Serviço/MI" not in result
         assert "\n\n1\n2\n\n" not in result
@@ -411,23 +331,10 @@ class TestCleanPdfMarkdown:
 
     def test_removes_local_file_footer_block(self):
         scraper = _make_scraper()
-        text = (
-            "Art. 8° Conteúdo legal completo.\n\n"
-            "file:///C:/Users/97785458120/Desktop/res1384.html 1/1"
-        )
+        text = "Art. 8° Conteúdo legal completo.\n\nfile:///C:/Users/97785458120/Desktop/res1384.html 1/1"
         result = scraper._clean_pdf_markdown(text)
         assert "file:///" not in result
         assert result == "Art. 8° Conteúdo legal completo."
-
-    def test_does_not_double_clean_markdown_links(self):
-        """_clean_pdf_markdown must NOT call _clean_markdown internally.
-        _get_markdown already applies _clean_markdown; a second call would be
-        redundant. We verify _clean_markdown is not invoked on the instance.
-        """
-        scraper = _make_scraper()
-        scraper._clean_markdown = MagicMock(side_effect=lambda t, **kw: t)
-        scraper._clean_pdf_markdown("some text")
-        scraper._clean_markdown.assert_not_called()
 
     def test_preserves_legal_content(self):
         scraper = _make_scraper()
@@ -438,542 +345,12 @@ class TestCleanPdfMarkdown:
 
     def test_preserves_inline_publicacao_dou_reference_in_body(self):
         scraper = _make_scraper()
-        text = (
-            "Art. 2° A nota registra que o publicado na Publicação DOU nº 012, "
-            "de 11/12/1995, pág. 20391 deve ser consultado em conjunto com o anexo."
-        )
+        text = "Art. 2° A nota registra que o publicado na Publicação DOU nº 012, de 11/12/1995, pág. 20391 deve ser consultado em conjunto com o anexo."
         result = scraper._clean_pdf_markdown(text)
         assert result == text
 
     def test_preserves_header_block_with_boletim_reference(self):
         scraper = _make_scraper()
-        text = (
-            "**RESOLUÇÃO CONAMA nº 11, de 26 de setembro de 1984**\n"
-            "Publicada no Boletim de Serviço/MI, de 1º de novembro de 1984"
-        )
+        text = "**RESOLUÇÃO CONAMA nº 11, de 26 de setembro de 1984**\nPublicada no Boletim de Serviço/MI, de 1º de novembro de 1984"
         result = scraper._clean_pdf_markdown(text)
         assert result == text
-
-
-# ---------------------------------------------------------------------------
-# _get_doc_data (unit — mocked network)
-# ---------------------------------------------------------------------------
-
-
-class TestGetDocData:
-    @pytest.mark.asyncio
-    async def test_returns_none_for_null_aid(self):
-        scraper = _make_scraper()
-        row = _sample_row(aid=None)
-        result = await scraper._get_doc_data(row)
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_null_aid_checked_before_resume(self):
-        """Resume check must not be called when aid is None (no URL to check)."""
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        row = _sample_row(aid=None)
-        await scraper._get_doc_data(row)
-        scraper._is_already_scraped.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_skips_already_scraped_document(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=True)
-        row = _sample_row()
-        result = await scraper._get_doc_data(row)
-        assert result is None
-        scraper.request_service.make_request.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_returns_none_on_failed_request(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._save_doc_error = AsyncMock()
-        failed = make_failed_request()
-        scraper.request_service.make_request = AsyncMock(return_value=failed)
-        result = await scraper._get_doc_data(_sample_row())
-        assert result is None
-        scraper._save_doc_error.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_returns_none_on_empty_markdown(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._save_doc_error = AsyncMock()
-        scraper.request_service.make_request = AsyncMock(
-            return_value=_make_http_response(b"%PDF-1.4 fake")
-        )
-        scraper._get_markdown = AsyncMock(return_value="")
-        result = await scraper._get_doc_data(_sample_row())
-        assert result is None
-        scraper._save_doc_error.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_returns_none_on_server_error_in_markdown(self):
-        """Server-error strings must be caught by _valid_markdown, not a separate check."""
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._save_doc_error = AsyncMock()
-        scraper.request_service.make_request = AsyncMock(
-            return_value=_make_http_response(b"%PDF-1.4 fake")
-        )
-        # Return a server-error string long enough to pass length check but caught by pattern
-        server_error = "failed to open stream: HTTP request failed! " * 5
-        scraper._get_markdown = AsyncMock(return_value=server_error)
-        scraper._clean_pdf_markdown = MagicMock(return_value=server_error)
-        result = await scraper._get_doc_data(_sample_row())
-        assert result is None
-        scraper._save_doc_error.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_returns_none_on_too_short_markdown(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._save_doc_error = AsyncMock()
-        scraper.request_service.make_request = AsyncMock(
-            return_value=_make_http_response(b"%PDF-1.4 fake")
-        )
-        scraper._get_markdown = AsyncMock(return_value="curto")
-        scraper._clean_pdf_markdown = MagicMock(return_value="curto")
-        result = await scraper._get_doc_data(_sample_row())
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_result_contains_type_from_nomeato(self):
-        """The 'type' key must be sourced from nomeato, not from the context."""
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._save_doc_error = AsyncMock()
-        long_md = "Art. 1° Esta resolução estabelece critérios ambientais. " * 10
-        scraper.request_service.make_request = AsyncMock(
-            return_value=_make_http_response(b"%PDF-1.4 fake")
-        )
-        scraper._get_markdown = AsyncMock(return_value=long_md)
-        scraper._clean_pdf_markdown = MagicMock(return_value=long_md)
-
-        row = _sample_row(nomeato="Moção", numero="003", ano=2000, aid=377)
-        result = await scraper._get_doc_data(row)
-
-        assert result is not None
-        assert result["type"] == "Moção"
-
-    @pytest.mark.asyncio
-    async def test_result_dict_has_required_keys(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._save_doc_error = AsyncMock()
-        long_md = "Art. 1° Conteúdo legal completo e detalhado. " * 10
-        scraper.request_service.make_request = AsyncMock(
-            return_value=_make_http_response(b"%PDF-1.4 fake")
-        )
-        scraper._get_markdown = AsyncMock(return_value=long_md)
-        scraper._clean_pdf_markdown = MagicMock(return_value=long_md)
-
-        result = await scraper._get_doc_data(_sample_row())
-
-        assert result is not None
-        required = {
-            "year",
-            "title",
-            "type",
-            "id",
-            "number",
-            "summary",
-            "situation",
-            "keyword",
-            "origin",
-            "text_markdown",
-            "document_url",
-            "_raw_content",
-            "_content_extension",
-        }
-        assert required.issubset(result.keys())
-
-    @pytest.mark.asyncio
-    async def test_revoked_status_sets_invalid_situation(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._save_doc_error = AsyncMock()
-        long_md = "Art. 1° Conteúdo legal revogado extenso. " * 10
-        scraper.request_service.make_request = AsyncMock(
-            return_value=_make_http_response(b"%PDF-1.4 fake")
-        )
-        scraper._get_markdown = AsyncMock(return_value=long_md)
-        scraper._clean_pdf_markdown = MagicMock(return_value=long_md)
-
-        from src.scraper.base.scraper import DEFAULT_INVALID_SITUATION
-
-        row = _sample_row(status="Revogada em 2005")
-        result = await scraper._get_doc_data(row)
-
-        assert result is not None
-        assert result["situation"] == DEFAULT_INVALID_SITUATION
-
-    @pytest.mark.asyncio
-    async def test_active_status_sets_valid_situation(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._save_doc_error = AsyncMock()
-        long_md = "Art. 1° Conteúdo legal vigente e extenso. " * 10
-        scraper.request_service.make_request = AsyncMock(
-            return_value=_make_http_response(b"%PDF-1.4 fake")
-        )
-        scraper._get_markdown = AsyncMock(return_value=long_md)
-        scraper._clean_pdf_markdown = MagicMock(return_value=long_md)
-
-        from src.scraper.base.scraper import DEFAULT_VALID_SITUATION
-
-        row = _sample_row(status="Vigente")
-        result = await scraper._get_doc_data(row)
-
-        assert result is not None
-        assert result["situation"] == DEFAULT_VALID_SITUATION
-
-    @pytest.mark.asyncio
-    async def test_html_content_type_path_raw_content_is_mhtml(self):
-        """On the HTML path, raw_content must be the MHTML bytes from browser capture."""
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._save_doc_error = AsyncMock()
-
-        original_body = (
-            b"<html><body><p>Art. 1 Conteudo legal extenso e valido.</p></body></html>"
-        )
-        scraper.request_service.make_request = AsyncMock(
-            return_value=_make_http_response(original_body, content_type="text/html")
-        )
-        soup = BeautifulSoup(original_body, "html.parser")
-        mhtml = b"MHTML content"
-        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, mhtml))
-        long_md = "Art. 1 Conteúdo legal extenso e válido. " * 10
-        scraper._get_markdown = AsyncMock(return_value=long_md)
-
-        result = await scraper._get_doc_data(_sample_row())
-
-        assert result is not None
-        assert result["_raw_content"] == mhtml
-        assert result["_content_extension"] == ".mhtml"
-
-    @pytest.mark.asyncio
-    async def test_pdf_content_type_path_sets_pdf_extension(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._save_doc_error = AsyncMock()
-        long_md = "Art. 1° Conteúdo PDF extenso e válido. " * 10
-        scraper.request_service.make_request = AsyncMock(
-            return_value=_make_http_response(
-                b"%PDF-1.4 fake", content_type="application/pdf"
-            )
-        )
-        scraper._get_markdown = AsyncMock(return_value=long_md)
-        scraper._clean_pdf_markdown = MagicMock(return_value=long_md)
-
-        result = await scraper._get_doc_data(_sample_row())
-
-        assert result is not None
-        assert result["_content_extension"] == ".pdf"
-
-    @pytest.mark.asyncio
-    async def test_document_url_contains_aid(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._save_doc_error = AsyncMock()
-        long_md = "Art. 1° Conteúdo legal. " * 15
-        scraper.request_service.make_request = AsyncMock(
-            return_value=_make_http_response(b"%PDF-1.4 fake")
-        )
-        scraper._get_markdown = AsyncMock(return_value=long_md)
-        scraper._clean_pdf_markdown = MagicMock(return_value=long_md)
-
-        row = _sample_row(aid=9999)
-        result = await scraper._get_doc_data(row)
-
-        assert result is not None
-        assert "id=9999" in result["document_url"]
-
-
-# ---------------------------------------------------------------------------
-# _fetch_page_norms (unit — mocked network)
-# ---------------------------------------------------------------------------
-
-
-class TestFetchPageNorms:
-    @pytest.mark.asyncio
-    async def test_returns_rows_on_success(self):
-        scraper = _make_scraper()
-        rows = [_sample_row(numero=str(i)) for i in range(5)]
-        scraper.request_service.make_request = AsyncMock(
-            return_value=_make_api_response(rows)
-        )
-        result = await scraper._fetch_page_norms(offset=100, year_str="2000")
-        assert result == rows
-
-    @pytest.mark.asyncio
-    async def test_returns_empty_on_failed_request(self):
-        scraper = _make_scraper()
-        failed = make_failed_request()
-        scraper.request_service.make_request = AsyncMock(return_value=failed)
-        result = await scraper._fetch_page_norms(offset=0, year_str="2000")
-        assert result == []
-
-    @pytest.mark.asyncio
-    async def test_returns_empty_on_malformed_json(self):
-        scraper = _make_scraper()
-        resp = MagicMock()
-        resp.__bool__ = lambda s: True
-        resp.json = AsyncMock(return_value={"unexpected": "shape"})
-        scraper.request_service.make_request = AsyncMock(return_value=resp)
-        result = await scraper._fetch_page_norms(offset=0, year_str="2000")
-        assert result == []
-
-    @pytest.mark.asyncio
-    async def test_url_passed_to_request_contains_offset_and_year(self):
-        scraper = _make_scraper()
-        rows = [_sample_row()]
-        scraper.request_service.make_request = AsyncMock(
-            return_value=_make_api_response(rows)
-        )
-        await scraper._fetch_page_norms(offset=200, year_str="1998")
-        call_url = scraper.request_service.make_request.call_args[0][0]
-        assert "offset=200" in call_url
-        assert "ano=1998" in call_url
-        assert "tipo" not in call_url
-
-
-# ---------------------------------------------------------------------------
-# _scrape_year (unit — mocked network)
-# ---------------------------------------------------------------------------
-
-
-class TestScrapeYearUnit:
-    @pytest.mark.asyncio
-    async def test_returns_empty_on_failed_first_request(self):
-        scraper = _make_scraper()
-        failed = make_failed_request()
-        scraper.request_service.make_request = AsyncMock(return_value=failed)
-        result = await scraper._scrape_year(2000)
-        assert result == []
-
-    @pytest.mark.asyncio
-    async def test_returns_empty_on_malformed_json(self):
-        scraper = _make_scraper()
-        resp = MagicMock()
-        resp.__bool__ = lambda s: True
-        resp.json = AsyncMock(return_value={"bad": "response"})
-        scraper.request_service.make_request = AsyncMock(return_value=resp)
-        result = await scraper._scrape_year(2000)
-        assert result == []
-
-    @pytest.mark.asyncio
-    async def test_no_pagination_when_total_fits_one_page(self):
-        """When total <= limit, _fetch_page_norms must not be called."""
-        scraper = _make_scraper()
-        rows = [_sample_row(numero=str(i), aid=i) for i in range(10)]
-        scraper.request_service.make_request = AsyncMock(
-            return_value=_make_api_response(rows, total=10)
-        )
-        scraper._process_documents = AsyncMock(return_value=[])
-        scraper._fetch_page_norms = AsyncMock(return_value=[])
-
-        await scraper._scrape_year(2000)
-
-        scraper._fetch_page_norms.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_pagination_triggered_when_total_exceeds_limit(self):
-        """When total > 100, additional pages must be fetched."""
-        scraper = _make_scraper()
-        rows = [_sample_row(numero=str(i), aid=i) for i in range(100)]
-        scraper.request_service.make_request = AsyncMock(
-            return_value=_make_api_response(rows, total=150)
-        )
-        scraper._fetch_page_norms = AsyncMock(
-            return_value=[_sample_row(numero="999", aid=999)]
-        )
-        scraper._process_documents = AsyncMock(return_value=[])
-
-        await scraper._scrape_year(2000)
-
-        scraper._fetch_page_norms.assert_awaited_once_with(100, "2000")
-
-    @pytest.mark.asyncio
-    async def test_process_documents_called_with_all_rows(self):
-        scraper = _make_scraper()
-        rows = [_sample_row(numero=str(i), aid=i) for i in range(5)]
-        scraper.request_service.make_request = AsyncMock(
-            return_value=_make_api_response(rows, total=5)
-        )
-        scraper._process_documents = AsyncMock(return_value=[])
-
-        await scraper._scrape_year(2000)
-
-        call_docs = scraper._process_documents.call_args[0][0]
-        assert len(call_docs) == 5
-
-    @pytest.mark.asyncio
-    async def test_single_request_made_per_year_when_no_pagination(self):
-        """Exactly one HTTP request for a year with total <= limit."""
-        scraper = _make_scraper()
-        rows = [_sample_row()]
-        scraper.request_service.make_request = AsyncMock(
-            return_value=_make_api_response(rows, total=1)
-        )
-        scraper._process_documents = AsyncMock(return_value=[])
-
-        await scraper._scrape_year(1984)
-
-        assert scraper.request_service.make_request.call_count == 1
-
-    @pytest.mark.asyncio
-    async def test_request_url_has_no_tipo_param(self):
-        scraper = _make_scraper()
-        scraper.request_service.make_request = AsyncMock(
-            return_value=_make_api_response([], total=0)
-        )
-        scraper._process_documents = AsyncMock(return_value=[])
-
-        await scraper._scrape_year(2005)
-
-        call_url = scraper.request_service.make_request.call_args[0][0]
-        assert "tipo" not in call_url
-
-
-# ---------------------------------------------------------------------------
-# Integration tests — live API
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.integration
-async def test_scrape_year_2000_count_matches_api(integration_scraper_factory):
-    """Total documents returned must match the API-reported total for year 2000."""
-    async with integration_scraper_factory(
-        ConamaScraper,
-        year_start=2000,
-        year_end=2000,
-        overwrite=True,
-        rps=10,
-    ) as scraper:
-        await scraper._load_scraped_keys(2000)
-
-        # Get expected total from the API directly
-        url = scraper._format_search_url(offset=0, year="2000")
-        resp = await scraper.request_service.make_request(url)
-        assert resp, "Could not reach CONAMA API"
-        payload = await resp.json(content_type=None)
-        api_total = payload["data"]["total"]
-        print(f"\nAPI reports {api_total} norms for year 2000")
-
-        results = await scraper._scrape_year(2000)
-        print(f"Scraper returned {len(results)} results")
-
-        # Allow a small tolerance for documents that fail (empty text, 404, etc.)
-        tolerance = max(2, int(api_total * 0.05))
-        assert len(results) >= api_total - tolerance, (
-            f"Expected ~{api_total} docs, got {len(results)} (tolerance={tolerance})"
-        )
-
-
-@pytest.mark.integration
-async def test_scrape_year_2000_type_field_from_nomeato(integration_scraper_factory):
-    """Every result must have a non-empty 'type' field sourced from nomeato."""
-    async with integration_scraper_factory(
-        ConamaScraper,
-        year_start=2000,
-        year_end=2000,
-        overwrite=True,
-        rps=10,
-    ) as scraper:
-        await scraper._load_scraped_keys(2000)
-        results = await scraper._scrape_year(2000)
-        assert results, "No results returned"
-
-        missing_type = [d for d in results if not d.get("type")]
-        assert missing_type == [], (
-            f"{len(missing_type)} docs missing type field: "
-            + ", ".join(d.get("title", "?") for d in missing_type[:3])
-        )
-
-        # Types must all be known CONAMA types
-        unknown_types = {d["type"] for d in results if d["type"] not in TYPES}
-        assert unknown_types == set(), f"Unknown types found: {unknown_types}"
-
-
-@pytest.mark.integration
-async def test_scrape_year_2000_no_tipo_in_requests(integration_scraper_factory):
-    """No request made during a full year scrape should contain 'tipo='."""
-    async with integration_scraper_factory(
-        ConamaScraper,
-        year_start=2000,
-        year_end=2000,
-        overwrite=True,
-        rps=10,
-    ) as scraper:
-        await scraper._load_scraped_keys(2000)
-
-        made_urls: list[str] = []
-        original_make_request = scraper.request_service.make_request
-
-        async def tracking_make_request(url, **kwargs):
-            made_urls.append(url)
-            return await original_make_request(url, **kwargs)
-
-        scraper.request_service.make_request = tracking_make_request
-        await scraper._scrape_year(2000)
-
-        listing_urls = [u for u in made_urls if "atosnormativos.getList" in u]
-        tipo_urls = [u for u in listing_urls if "tipo=" in u]
-        assert tipo_urls == [], f"Found listing requests with tipo= param: {tipo_urls}"
-
-
-@pytest.mark.integration
-async def test_scrape_year_2000_mixed_types_in_single_request(
-    integration_scraper_factory,
-):
-    """Year 2000 contains both Resolução and Moção — both must appear in one request."""
-    async with integration_scraper_factory(
-        ConamaScraper,
-        year_start=2000,
-        year_end=2000,
-        overwrite=True,
-        rps=10,
-    ) as scraper:
-        await scraper._load_scraped_keys(2000)
-        results = await scraper._scrape_year(2000)
-
-        types_found = {d["type"] for d in results}
-        assert "Resolução" in types_found, "Expected Resoluções in year 2000"
-        assert "Moção" in types_found, "Expected Moções in year 2000"
-
-
-@pytest.mark.integration
-async def test_scrape_year_2000_saved_docs_have_situation(integration_scraper_factory):
-    """Every saved document must have a non-empty situation field."""
-    async with integration_scraper_factory(
-        ConamaScraper,
-        year_start=2000,
-        year_end=2000,
-        overwrite=True,
-        rps=10,
-    ) as scraper:
-        await scraper._load_scraped_keys(2000)
-        results = await scraper._scrape_year(2000)
-        assert results, "No results returned"
-
-        # Check shard files written by FileSaver
-        save_dir = scraper.docs_save_dir
-        shard_files = list(save_dir.rglob("chunk_*.json"))
-        saved_docs = []
-        for sf in shard_files:
-            content = json.loads(sf.read_text(encoding="utf-8"))
-            docs = (
-                content if isinstance(content, list) else content.get("documents", [])
-            )
-            saved_docs.extend(docs)
-
-        missing_situation = [d for d in saved_docs if not d.get("situation")]
-        assert missing_situation == [], (
-            f"{len(missing_situation)} saved docs missing situation: "
-            + ", ".join(d.get("title", "?") for d in missing_situation[:3])
-        )

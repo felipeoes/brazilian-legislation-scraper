@@ -1,39 +1,19 @@
-"""Tests for SergipeLegsonScraper.
+"""Regression tests for the Sergipe LegisOn API scraper, built from trimmed live responses."""
 
-Covers:
-- TYPES constant: 4 types with integer IDs
-- SITUATIONS constant: merged dict with valid + invalid situations
-- Class docstring accessible (__doc__ is not None)
-- _iterate_situations NOT set
-- _format_search_payload: correct payload construction
-- _clean_legison_markdown: removes portal boilerplate
-- _extract_content_markdown: extracts text from content API response
-- _get_docs_links:
-  - failed request → []
-  - non-dict response → []
-  - no result key → []
-  - valid items → correct doc dict shapes
-  - situacao id mapping to situation string
-- _get_doc_data:
-  - missing doc_id → None + _save_doc_error
-  - failed content request → raises (retry propagates)
-  - already scraped → None
-  - content_markdown found via API → direct text return
-  - PDF fallback with invalid markdown → falls through to error
-  - PDF fallback with valid markdown → correct dict shape
-  - no content and no PDF → None + _save_doc_error
-
-Run with:
-    .venv/bin/pytest tests/test_sergipe_scraper.py -v
-"""
-
-from unittest.mock import AsyncMock, MagicMock
+import json
+from pathlib import Path
+from unittest.mock import AsyncMock
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
-from base_tests import ScraperClassTests, SituationsConstantTests, TypesConstantTests
-from conftest import make_base_scraper, make_failed_request
+from conftest import make_scraper
+from parser_assertions import ScraperClassTests
 
-from src.scraper.state_legislation.sergipe import (
+from src.core.document import Document
+from src.core.http import Response
+from src.core.scraper import DEFAULT_VALID_SITUATION
+from src.scrapers.states.se import (
+    API_URL,
     INVALID_SITUATIONS,
     SITUATIONS,
     TYPES,
@@ -41,68 +21,50 @@ from src.scraper.state_legislation.sergipe import (
     SergipeLegsonScraper,
 )
 
-# ---------------------------------------------------------------------------
-# Factory helper
-# ---------------------------------------------------------------------------
+FIXTURES = Path(__file__).parents[2] / "fixtures" / "sergipe"
+PDF_TEXT = "LEI COMPLEMENTAR Nº 222\n\nArt. 1º Fica alterado o § 4º do art. 17 da Lei Complementar nº 204."
+FOOTER = (
+    "\n\nEste texto não substitui o publicado no Diário Oficial do Estado\n\n5\n\n"
+    "Extraído do Portal de Legislação do Governo de Sergipe - LegisOn https://legislacao.se.gov.br/\n"
+)
 
 
-def _make_scraper(**kwargs) -> SergipeLegsonScraper:
-    """Instantiate SergipeLegsonScraper bypassing __init__ (no network, no I/O)."""
-    return make_base_scraper(
-        SergipeLegsonScraper,
-        "https://legison.pge.se.gov.br",
-        "SERGIPE",
-        TYPES,
-        situations=SITUATIONS,
-        search_url="https://legison.pge.se.gov.br/Public/Consulta",
-        doc_content_url="https://legison.pge.se.gov.br/Public/GetConteudoAto",
-        **kwargs,
+def _load(name: str) -> dict:
+    return json.loads((FIXTURES / name).read_text())
+
+
+def _response(payload: object, pagination: dict | None = None) -> Response:
+    headers = {"Content-Type": "application/json"}
+    if pagination is not None:
+        headers["x-pagination"] = json.dumps(pagination)
+    return Response(
+        "https://api.legislacao.se.gov.br/api/v1/public/acts",
+        200,
+        headers,
+        json.dumps(payload).encode(),
     )
 
 
-# ---------------------------------------------------------------------------
-# TYPES constant
-# ---------------------------------------------------------------------------
+def _listing_page(page: int, total_pages: int) -> Response:
+    payload = _load("acts_lei_ordinaria_2012_p1.json")
+    for act in payload["data"]:
+        act["id"] += page * 1000
+    return _response(payload, {"page": page, "totalPages": total_pages})
 
 
-class TestTypesConstant(TypesConstantTests):
-    TYPES = TYPES
-    EXPECTED_COUNT = 4
-    REQUIRED_KEYS = {
-        "Lei Ordinária",
-        "Lei Complementar",
-        "Decreto",
-        "Emenda Constitucional",
-    }
-    REQUIRE_INT_VALUES = True
+class TestConstants:
+    def test_types_are_api_ids(self):
+        assert TYPES == {
+            "Lei Ordinária": 3,
+            "Lei Complementar": 2,
+            "Decreto": 4,
+            "Emenda Constitucional": 8,
+        }
 
-
-# ---------------------------------------------------------------------------
-# SITUATIONS constants
-# ---------------------------------------------------------------------------
-
-
-class TestSituationsConstants(SituationsConstantTests):
-    SITUATIONS = SITUATIONS
-    EXPECTED_TYPE = dict
-    EXPECTED_EMPTY = False
-
-    def test_em_vigor_in_valid(self):
-        assert "Em Vigor" in VALID_SITUATIONS.values()
-
-    def test_revogado_in_invalid(self):
-        assert "Revogado" in INVALID_SITUATIONS.values()
-
-    def test_situations_merges_both(self):
-        for k, v in VALID_SITUATIONS.items():
-            assert SITUATIONS[k] == v
-        for k, v in INVALID_SITUATIONS.items():
-            assert SITUATIONS[k] == v
-
-
-# ---------------------------------------------------------------------------
-# Class-level attributes
-# ---------------------------------------------------------------------------
+    def test_situations(self):
+        assert VALID_SITUATIONS == {1: "Em Vigor"}
+        assert INVALID_SITUATIONS == {2: "Revogado", 3: "Declarado Inconstitucional"}
+        assert SITUATIONS == VALID_SITUATIONS | INVALID_SITUATIONS
 
 
 class TestClassAttributes(ScraperClassTests):
@@ -110,350 +72,169 @@ class TestClassAttributes(ScraperClassTests):
     STATE_NAME = "Sergipe"
 
 
-# ---------------------------------------------------------------------------
-# _format_search_payload
-# ---------------------------------------------------------------------------
+class TestListType:
+    async def test_paginates_and_builds_refs(self):
+        scraper = make_scraper(SergipeLegsonScraper)
+
+        async def request(url: str) -> Response:
+            return _listing_page(int(parse_qs(urlsplit(url).query)["Page"][0]), 3)
+
+        scraper.http.request = AsyncMock(side_effect=request)
+        refs = [ref async for ref in scraper.list_type(2012, "Lei Ordinária", 3)]
+
+        queries = [
+            parse_qs(urlsplit(c.args[0]).query)
+            for c in scraper.http.request.await_args_list
+        ]
+        assert sorted(q["Page"][0] for q in queries) == ["1", "2", "3"]
+        assert all(
+            q["Year"] == ["2012"] and q["TypeAct"] == ["3"] and q["Quantity"] == ["50"]
+            for q in queries
+        )
+        assert len(refs) == 6
+        assert refs[0] == {
+            "year": 2012,
+            "type": "Lei Ordinária",
+            "title": "Lei Ordinária 7495 de 2012",
+            "summary": "Reconhece de Utilidade Pública Estadual a ASSOCIAÇÃO COMUNITÁRIA BOM JESUS DOS NAVEGANTES, com sede e foro na Cidade de Barra dos Coqueiros - SE.",
+            "number": "7495",
+            "date": "2012-12-18",
+            "publication_date": "2012-12-28",
+            "document_url": f"{API_URL}/9364/act",
+        }
+
+    async def test_empty_type_yields_nothing(self):
+        scraper = make_scraper(SergipeLegsonScraper)
+        payload = {"success": True, "statusCode": 200, "data": []}
+        scraper.http.request = AsyncMock(
+            return_value=_response(payload, {"totalItens": 0, "totalPages": 0})
+        )
+        assert [
+            ref async for ref in scraper.list_type(2012, "Emenda Constitucional", 8)
+        ] == []
+        assert scraper.http.request.await_count == 1
+
+    @pytest.mark.parametrize(
+        ("payload", "pagination"),
+        [
+            ({"success": True, "data": []}, None),
+            ({"success": False, "statusCode": 500, "data": None}, {"totalPages": 0}),
+            ({"success": True, "data": {"id": 1}}, {"totalPages": 1}),
+            ([], {"totalPages": 1}),
+        ],
+    )
+    async def test_malformed_listing_raises(self, payload, pagination):
+        scraper = make_scraper(SergipeLegsonScraper)
+        scraper.http.request = AsyncMock(return_value=_response(payload, pagination))
+        with pytest.raises(ValueError, match="Malformed Sergipe listing"):
+            [ref async for ref in scraper.list_type(2012, "Lei Ordinária", 3)]
 
 
-class TestFormatSearchPayload:
-    def test_includes_type_id(self):
-        scraper = _make_scraper()
-        payload = scraper._format_search_payload(3, 2023)
-        assert payload["IdTipo"] == "3"
-
-    def test_includes_year(self):
-        scraper = _make_scraper()
-        payload = scraper._format_search_payload(3, 2023)
-        assert payload["ano"] == "2023"
-
-    def test_default_page_is_1(self):
-        scraper = _make_scraper()
-        payload = scraper._format_search_payload(3, 2023)
-        assert payload["Page"] == 1
-
-    def test_custom_page(self):
-        scraper = _make_scraper()
-        payload = scraper._format_search_payload(3, 2023, page=5)
-        assert payload["Page"] == 5
-
-    def test_required_keys_present(self):
-        scraper = _make_scraper()
-        payload = scraper._format_search_payload(3, 2023)
-        for key in ("Ementa", "IdTipo", "ano", "Page", "Order"):
-            assert key in payload
-
-
-# ---------------------------------------------------------------------------
-# _clean_legison_markdown
-# ---------------------------------------------------------------------------
-
-
-class TestCleanLegisonMarkdown:
-    def test_removes_portal_footer(self):
-        scraper = _make_scraper()
-        text = "Texto da lei.\n\nExtraído do Portal de Legislação do Governo de Sergipe - LegisOn https://legislacao.se.gov.br/\n"
-        result = scraper._clean_legison_markdown(text)
-        assert "LegisOn" not in result
-        assert "Texto da lei." in result
-
-    def test_removes_nao_substitui_disclaimer(self):
-        scraper = _make_scraper()
-        text = "Texto.\n\nEste texto não substitui o publicado no Diário Oficial do Estado."
-        result = scraper._clean_legison_markdown(text)
-        assert "não substitui" not in result
-
-    def test_collapses_multiple_newlines(self):
-        scraper = _make_scraper()
-        text = "Linha 1.\n\n\n\n\nLinha 2."
-        result = scraper._clean_legison_markdown(text)
-        assert "\n\n\n" not in result
-
-    def test_strips_result(self):
-        scraper = _make_scraper()
-        text = "  \n\nTexto.\n\n  "
-        result = scraper._clean_legison_markdown(text)
-        assert result == result.strip()
-
-
-# ---------------------------------------------------------------------------
-# _extract_content_markdown
-# ---------------------------------------------------------------------------
-
-
-class TestExtractContentMarkdown:
-    def test_no_content_key_returns_empty(self):
-        scraper = _make_scraper()
-        result = scraper._extract_content_markdown({})
-        assert result == ""
-
-    def test_non_list_content_returns_empty(self):
-        scraper = _make_scraper()
-        result = scraper._extract_content_markdown({"content": "not a list"})
-        assert result == ""
-
-    def test_extracts_text_from_conteudo(self):
-        scraper = _make_scraper()
-        data = {"content": [{"conteudo": "Texto da lei."}, {"conteudo": "Mais texto."}]}
-        result = scraper._extract_content_markdown(data)
-        assert "Texto da lei." in result
-        assert "Mais texto." in result
-
-    def test_skips_items_without_conteudo(self):
-        scraper = _make_scraper()
-        data = {"content": [{"other": "value"}, {"conteudo": "Texto válido."}]}
-        result = scraper._extract_content_markdown(data)
-        assert "Texto válido." in result
-
-    def test_empty_content_list_returns_empty(self):
-        scraper = _make_scraper()
-        result = scraper._extract_content_markdown({"content": []})
-        assert result == ""
-
-
-# ---------------------------------------------------------------------------
-# _get_docs_links
-# ---------------------------------------------------------------------------
-
-
-def _make_api_item(
-    doc_id: int = 1,
-    numero: str = "42",
-    tipo_descricao: str = "Lei Ordinária",
-    ementa: str = "Dispõe sobre algo.",
-    data_ato: str = "2023-06-01T00:00:00",
-    situacao_id: int = 1,
-) -> dict:
+def _ref(act_id: int) -> dict:
     return {
-        "id": doc_id,
-        "numero": numero,
-        "dataAto": data_ato,
-        "ementa": ementa,
-        "tipoAto": {"descricao": tipo_descricao},
-        "situacao": {"id": situacao_id},
+        "year": 2012,
+        "type": "Lei Complementar",
+        "title": "Lei Complementar 222 de 2012",
+        "summary": "listing summary",
+        "number": "222",
+        "date": "2012-05-31",
+        "publication_date": "2012-06-01",
+        "document_url": f"{API_URL}/{act_id}/act",
     }
 
 
-class TestGetDocsLinks:
-    @pytest.mark.asyncio
-    async def test_failed_request_returns_empty(self):
-        scraper = _make_scraper()
-        failed = make_failed_request()
-        scraper.request_service.make_request = AsyncMock(return_value=failed)
-        result = await scraper._get_docs_links(
-            {"IdTipo": "3", "ano": "2023", "Page": 1}
+class TestFetch:
+    async def test_prefers_consolidated_pdf_and_keeps_stable_url(self):
+        act = _load("act_263.json")
+        scraper = make_scraper(
+            SergipeLegsonScraper,
+            download=AsyncMock(return_value=(PDF_TEXT + FOOTER, b"%PDF-1.4", ".pdf")),
         )
-        assert result == []
+        scraper.http.request = AsyncMock(return_value=_response(act))
 
-    @pytest.mark.asyncio
-    async def test_no_result_key_returns_empty(self):
-        scraper = _make_scraper()
-        resp = MagicMock()
-        resp.__bool__ = lambda s: True
-        resp.json = AsyncMock(return_value={"count": 0})
-        scraper.request_service.make_request = AsyncMock(return_value=resp)
-        result = await scraper._get_docs_links(
-            {"IdTipo": "3", "ano": "2023", "Page": 1}
+        doc = await scraper.fetch(_ref(263))
+
+        scraper.http.request.assert_awaited_once_with(f"{API_URL}/263/act")
+        scraper.download.assert_awaited_once_with(
+            act["data"]["arquivoAtualizadoPdf"]["caminho"]
         )
-        assert result == []
-
-    @pytest.mark.asyncio
-    async def test_valid_item_has_expected_fields(self):
-        scraper = _make_scraper()
-        item = _make_api_item(doc_id=5, numero="42", tipo_descricao="Lei Ordinária")
-        resp = MagicMock()
-        resp.__bool__ = lambda s: True
-        resp.json = AsyncMock(return_value={"result": [item]})
-        scraper.request_service.make_request = AsyncMock(return_value=resp)
-        result = await scraper._get_docs_links(
-            {"IdTipo": "3", "ano": "2023", "Page": 1}
+        assert isinstance(doc, Document)
+        assert doc.document_url == f"{API_URL}/263/act"
+        assert doc.situation == "Em Vigor"
+        assert doc.summary.startswith(
+            "Altera o § 4º do art. 17 da Lei Complementar nº 204"
         )
-        assert len(result) == 1
-        doc = result[0]
-        assert doc["id"] == "5"
-        assert "Lei Ordinária" in doc["title"]
-        assert doc["summary"] == "Dispõe sobre algo."
-        assert "situation" in doc
-        assert doc["doc_id"] == 5
+        assert doc.text_markdown == PDF_TEXT
+        assert (doc.raw, doc.raw_ext) == (b"%PDF-1.4", ".pdf")
+        assert doc.model_dump()["number"] == "222"
 
-    @pytest.mark.asyncio
-    async def test_situacao_id_maps_to_em_vigor(self):
-        scraper = _make_scraper()
-        item = _make_api_item(situacao_id=1)  # id 1 → "Em Vigor"
-        resp = MagicMock()
-        resp.__bool__ = lambda s: True
-        resp.json = AsyncMock(return_value={"result": [item]})
-        scraper.request_service.make_request = AsyncMock(return_value=resp)
-        result = await scraper._get_docs_links(
-            {"IdTipo": "3", "ano": "2023", "Page": 1}
+    async def test_falls_back_to_original_pdf(self):
+        act = _load("act_460.json")
+        act["data"]["idSituacao"] = None
+        scraper = make_scraper(
+            SergipeLegsonScraper,
+            download=AsyncMock(return_value=(PDF_TEXT, b"%PDF-1.3", ".pdf")),
         )
-        assert result[0]["situation"] == "Em Vigor"
+        scraper.http.request = AsyncMock(return_value=_response(act))
 
-    @pytest.mark.asyncio
-    async def test_situacao_id_maps_to_revogado(self):
-        scraper = _make_scraper()
-        item = _make_api_item(situacao_id=2)  # id 2 → "Revogado"
-        resp = MagicMock()
-        resp.__bool__ = lambda s: True
-        resp.json = AsyncMock(return_value={"result": [item]})
-        scraper.request_service.make_request = AsyncMock(return_value=resp)
-        result = await scraper._get_docs_links(
-            {"IdTipo": "3", "ano": "2023", "Page": 1}
+        doc = await scraper.fetch(_ref(460))
+
+        scraper.download.assert_awaited_once_with(act["data"]["arquivo"]["caminho"])
+        assert doc.situation == DEFAULT_VALID_SITUATION
+
+    async def test_revoked_situation(self):
+        act = _load("act_460.json")
+        act["data"]["idSituacao"] = 2
+        scraper = make_scraper(
+            SergipeLegsonScraper,
+            download=AsyncMock(return_value=(PDF_TEXT, b"%PDF-1.3", ".pdf")),
         )
-        assert result[0]["situation"] == "Revogado"
+        scraper.http.request = AsyncMock(return_value=_response(act))
+        assert (await scraper.fetch(_ref(460))).situation == "Revogado"
 
-    @pytest.mark.asyncio
-    async def test_title_includes_year_from_date(self):
-        scraper = _make_scraper()
-        item = _make_api_item(
-            numero="10", tipo_descricao="Decreto", data_ato="2022-03-15T00:00:00"
+    async def test_act_without_file_raises(self):
+        act = _load("act_460.json")
+        act["data"]["arquivo"] = None
+        scraper = make_scraper(SergipeLegsonScraper)
+        scraper.http.request = AsyncMock(return_value=_response(act))
+        with pytest.raises(ValueError, match="no PDF"):
+            await scraper.fetch(_ref(460))
+
+
+class TestCleanLegisonMarkdown:
+    def test_removes_portal_footer_and_disclaimer(self):
+        scraper = make_scraper(SergipeLegsonScraper)
+        result = scraper._clean_legison_markdown(PDF_TEXT + FOOTER)
+        assert "LegisOn" not in result and "não substitui" not in result
+        assert result == PDF_TEXT
+
+    @pytest.mark.parametrize(
+        "footer",
+        [
+            "Extraído do Portal de Legislação do Governo de Sergipe - LegisOn https://legislacao.se.gov.b",
+            "Extraído do Portal de Legislação do Governo de Sergipe - LegisOn ",
+        ],
+    )
+    def test_removes_truncated_portal_footer(self, footer):
+        scraper = make_scraper(SergipeLegsonScraper)
+        assert (
+            scraper._clean_legison_markdown(f"{PDF_TEXT}\n\n{footer}\n\nArt. 4º")
+            == f"{PDF_TEXT}\n\nArt. 4º"
         )
-        resp = MagicMock()
-        resp.__bool__ = lambda s: True
-        resp.json = AsyncMock(return_value={"result": [item]})
-        scraper.request_service.make_request = AsyncMock(return_value=resp)
-        result = await scraper._get_docs_links(
-            {"IdTipo": "4", "ano": "2022", "Page": 1}
+
+    def test_collapses_multiple_newlines(self):
+        scraper = make_scraper(SergipeLegsonScraper)
+        assert (
+            scraper._clean_legison_markdown("Linha 1.\n\n\n\n\nLinha 2.")
+            == "Linha 1.\n\nLinha 2."
         )
-        assert "2022" in result[0]["title"]
-
-    @pytest.mark.asyncio
-    async def test_multiple_items_returned(self):
-        scraper = _make_scraper()
-        items = [_make_api_item(doc_id=i, numero=str(i)) for i in range(1, 4)]
-        resp = MagicMock()
-        resp.__bool__ = lambda s: True
-        resp.json = AsyncMock(return_value={"result": items})
-        scraper.request_service.make_request = AsyncMock(return_value=resp)
-        result = await scraper._get_docs_links(
-            {"IdTipo": "3", "ano": "2023", "Page": 1}
-        )
-        assert len(result) == 3
 
 
-# ---------------------------------------------------------------------------
-# _get_doc_data
-# ---------------------------------------------------------------------------
-
-
-class TestGetDocData:
-    def _make_doc(self, **kwargs):
-        base = {
-            "doc_id": 42,
-            "id": "42",
-            "title": "Lei Ordinária 42 de 2023",
-            "year": 2023,
-            "type": "Lei Ordinária",
-            "summary": "Ementa.",
-            "situation": "Em Vigor",
-            "date": "2023-01-01T00:00:00",
-        }
-        base.update(kwargs)
-        return base
-
-    @pytest.mark.asyncio
-    async def test_missing_doc_id_returns_none(self):
-        scraper = _make_scraper()
-        scraper._save_doc_error = AsyncMock()
-        doc = self._make_doc()
-        doc.pop("doc_id")
-        result = await scraper._get_doc_data(doc)
-        assert result is None
-        scraper._save_doc_error.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_already_scraped_returns_none(self):
-        scraper = _make_scraper()
-        content_url = "https://legison.pge.se.gov.br/Public/GetConteudoAto?atosIds=42"
-        scraper._scraped_keys = {(content_url, "Lei Ordinária 42 de 2023")}
-        resp = MagicMock()
-        resp.__bool__ = lambda s: True
-        resp.status = 200
-        resp.json = AsyncMock(return_value={"content": [], "files": []})
-        scraper.request_service.make_request = AsyncMock(return_value=resp)
-        result = await scraper._get_doc_data(self._make_doc())
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_api_content_markdown_returned_directly(self):
-        """When content API returns direct text, use it without PDF fallback."""
-        scraper = _make_scraper()
-        resp = MagicMock()
-        resp.__bool__ = lambda s: True
-        resp.status = 200
-        long_text = "Texto da lei. " * 40
-        resp.json = AsyncMock(
-            return_value={"content": [{"conteudo": long_text}], "files": []}
-        )
-        scraper.request_service.make_request = AsyncMock(return_value=resp)
-        doc = self._make_doc()
-        result = await scraper._get_doc_data(doc)
-        assert result is not None
-        assert "text_markdown" in result
-        assert result["_content_extension"] == ".txt"
-
-    @pytest.mark.asyncio
-    async def test_pdf_fallback_valid_markdown_returned(self):
-        """When API text is empty but PDF succeeds with valid markdown."""
-        scraper = _make_scraper()
-        content_resp = MagicMock()
-        content_resp.__bool__ = lambda s: True
-        content_resp.status = 200
-        content_resp.json = AsyncMock(
-            return_value={
-                "content": [],
-                "files": [{"caminhoPDF": "lei42.pdf"}],
-            }
-        )
-        pdf_resp = MagicMock()
-        pdf_resp.__bool__ = lambda s: True
-        pdf_resp.read = AsyncMock(return_value=b"%PDF content")
-        scraper.request_service.make_request = AsyncMock(
-            side_effect=[content_resp, pdf_resp]
-        )
-        valid_md = "# Lei 42/2023\n\n" + "Texto da lei. " * 30
-        scraper._get_markdown = AsyncMock(return_value=valid_md)
-        doc = self._make_doc()
-        result = await scraper._get_doc_data(doc)
-        assert result is not None
-        assert result["_content_extension"] == ".pdf"
-
-    @pytest.mark.asyncio
-    async def test_pdf_fallback_invalid_markdown_saves_error(self):
-        """When PDF markdown is too short, falls through to error path."""
-        scraper = _make_scraper()
-        content_resp = MagicMock()
-        content_resp.__bool__ = lambda s: True
-        content_resp.status = 200
-        content_resp.json = AsyncMock(
-            return_value={
-                "content": [],
-                "files": [{"caminhoPDF": "lei42.pdf"}],
-            }
-        )
-        pdf_resp = MagicMock()
-        pdf_resp.__bool__ = lambda s: True
-        pdf_resp.read = AsyncMock(return_value=b"%PDF short")
-        scraper.request_service.make_request = AsyncMock(
-            side_effect=[content_resp, pdf_resp]
-        )
-        scraper._get_markdown = AsyncMock(return_value="short")
-        scraper._save_doc_error = AsyncMock()
-        doc = self._make_doc()
-        result = await scraper._get_doc_data(doc)
-        assert result is None
-        scraper._save_doc_error.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_no_content_no_pdf_saves_error(self):
-        """When there's no API content and no PDF file, error is saved."""
-        scraper = _make_scraper()
-        resp = MagicMock()
-        resp.__bool__ = lambda s: True
-        resp.status = 200
-        resp.json = AsyncMock(return_value={"content": [], "files": []})
-        scraper.request_service.make_request = AsyncMock(return_value=resp)
-        scraper._save_doc_error = AsyncMock()
-        doc = self._make_doc()
-        result = await scraper._get_doc_data(doc)
-        assert result is None
-        scraper._save_doc_error.assert_called_once()
+@pytest.mark.integration
+async def test_live_listing_and_fetch(integration_scraper_factory):
+    async with integration_scraper_factory(SergipeLegsonScraper, year=2012) as scraper:
+        refs = [ref async for ref in scraper.list_type(2012, "Lei Complementar", 2)]
+        assert len(refs) == 8
+        doc = await scraper.fetch(refs[0])
+        assert isinstance(doc, Document) and doc.raw_ext == ".pdf"
+        assert doc.document_url == refs[0]["document_url"]

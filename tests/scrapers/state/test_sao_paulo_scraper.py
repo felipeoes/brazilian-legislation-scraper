@@ -1,42 +1,19 @@
-"""Tests for SaoPauloAlespScraper.
+"""Regression tests for the São Paulo (ALESP) API scraper, built from captured responses."""
 
-Covers:
-- TYPES constant: 14 types present with correct IDs
-- SITUATIONS / VALID_SITUATIONS / INVALID_SITUATIONS module-level dicts preserved
-- Class docstring is accessible (__doc__ is not None)
-- _iterate_situations NOT set (single all-types/all-situations query per year)
-- _build_search_url: correct URL structure (year + page, idTipoSituacao=0, no idsTipoNorma)
-- _extract_result_counts: parses various formats; returns None on no match
-- _parse_docs_from_soup: extracts doc list from pre-fetched soup
-- _get_docs_links: happy-path returns docs, soup failure returns []
-- _infer_type: longest-match type inference from title
-- _get_norm_data: happy-path returns expected dict keys incl. situation; soup failure returns {}
-- _get_doc_data:
-    - resume skip returns None
-    - PDF path: valid → correct shape; invalid markdown → error + None
-    - iframe PDF path: valid markdown → correct shape; failed request → error + None
-    - HTML path: valid → correct shape; invalid markdown → error + None
-    - HTML path with image for Decisão da Mesa: appended markdown
-    - soup failure → error + None (not raise)
-- _scrape_year: no results, count=0, single-page, multi-page calls _process_documents
-
-Integration (live site):
-- test_build_search_url_returns_real_results
-- test_get_doc_data_html_returns_valid_markdown
-
-Run with:
-    .venv/bin/pytest tests/test_sao_paulo_scraper.py -v
-"""
-
-import tempfile
-from unittest.mock import AsyncMock, MagicMock
+import json
+from pathlib import Path
+from unittest.mock import AsyncMock
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
-from base_tests import ScraperClassTests, SituationsConstantTests, TypesConstantTests
-from bs4 import BeautifulSoup
-from conftest import make_base_scraper, make_failed_request
+from conftest import make_mock_json_response, make_mock_response, make_scraper
+from parser_assertions import (
+    ScraperClassTests,
+    SituationsConstantTests,
+    TypesConstantTests,
+)
 
-from src.scraper.state_legislation.sao_paulo import (
+from src.scrapers.states.sp import (
     INVALID_SITUATIONS,
     SITUATIONS,
     TYPES,
@@ -44,61 +21,28 @@ from src.scraper.state_legislation.sao_paulo import (
     SaoPauloAlespScraper,
 )
 
-# ---------------------------------------------------------------------------
-# Factory helper
-# ---------------------------------------------------------------------------
+FIXTURES = Path(__file__).parents[2] / "fixtures" / "sao_paulo"
+LISTING = json.loads(
+    (FIXTURES / "normas_2012_situacao1_page0.json").read_text(encoding="utf-8")
+)
 
 
-def _make_scraper(**kwargs) -> SaoPauloAlespScraper:
-    """Instantiate SaoPauloAlespScraper bypassing __init__ (no network, no I/O)."""
-    return make_base_scraper(
-        SaoPauloAlespScraper,
-        "https://www.al.sp.gov.br/norma/resultados",
-        "SAO_PAULO",
-        TYPES,
-        situations=SITUATIONS,
-        _page_size=500,
-        _site_base="https://www.al.sp.gov.br",
-        headers={"User-Agent": "test"},
-        **kwargs,
-    )
+def _empty_listing() -> dict:
+    return {**LISTING, "content": [], "totalElements": 0, "totalPages": 0}
 
 
-def _make_results_html(total: int = 3, pages: int = 1) -> str:
-    rows = ""
-    for i in range(1, total + 1):
-        rows += f"""
-        <tr>
-          <td>
-            <span>Lei {i:04d}/2020</span>
-            <a href="/norma/{i}" class="link_norma">link</a>
-            <a href="/norma/{i}/texto">texto</a>
-          </td>
-          <td><span>Ementa da Lei {i}</span></td>
-        </tr>"""
-    return f"""<html><body>
-        <b>Resultado: {total} normas em {pages}</b>
-        <table>{rows}</table>
-    </body></html>"""
+def _query(url: str) -> dict[str, str]:
+    return {key: values[0] for key, values in parse_qs(urlsplit(url).query).items()}
 
 
-def _make_no_results_html() -> str:
-    return "<html><body><div class='card cinza text-center'>Nenhuma norma encontrada como os parâmetros informados</div></body></html>"
-
-
-def _make_valid_md() -> str:
-    return "# Lei\n\nTexto da lei. " * 30
-
-
-# ---------------------------------------------------------------------------
-# TYPES / SITUATIONS constants
-# ---------------------------------------------------------------------------
+async def _refs(scraper: SaoPauloAlespScraper, year: int = 2012) -> list[dict]:
+    return [ref async for ref in scraper.list_documents(year)]
 
 
 class TestTypesConstant(TypesConstantTests):
     TYPES = TYPES
     EXPECTED_COUNT = 14
-    REQUIRED_KEYS = {"Decreto", "Lei", "Constituição Estadual"}
+    REQUIRED_KEYS = {"Decreto", "Lei", "Lei Complementar", "Constituição Estadual"}
     REQUIRE_INT_VALUES = True
 
 
@@ -108,571 +52,177 @@ class TestSituationsConstants(SituationsConstantTests):
     EXPECTED_EMPTY = False
 
     def test_situations_is_union(self):
-        assert len(SITUATIONS) == len(VALID_SITUATIONS) + len(INVALID_SITUATIONS)
-
-    def test_valid_situations_contains_sem_revogacao(self):
-        assert "Sem revogação expressa" in VALID_SITUATIONS
-
-    def test_invalid_situations_contains_revogada(self):
-        assert "Revogada" in INVALID_SITUATIONS
-
-    def test_all_values_are_integers(self):
-        for name, val in SITUATIONS.items():
-            assert isinstance(val, int), f"{name!r} should have int ID"
-
-
-# ---------------------------------------------------------------------------
-# Class-level attributes
-# ---------------------------------------------------------------------------
+        assert SITUATIONS == {**VALID_SITUATIONS, **INVALID_SITUATIONS}
+        assert VALID_SITUATIONS == {"Sem revogação expressa": 1}
+        assert INVALID_SITUATIONS["Revogada"] == 5
 
 
 class TestClassAttributes(ScraperClassTests):
     SCRAPER_CLS = SaoPauloAlespScraper
     STATE_NAME = "São Paulo"
 
-    def test_situations_non_empty_in_instance(self):
-        scraper = _make_scraper()
-        assert len(scraper.situations) > 0
 
+class TestListing:
+    async def test_lists_each_situation_and_every_page(self):
+        def respond(url: str) -> object:
+            query = _query(url)
+            if query["idsSituacao"] != "1":
+                return make_mock_json_response(_empty_listing())
+            return make_mock_json_response(
+                LISTING if query["page"] == "0" else {**LISTING, "content": []}
+            )
 
-# ---------------------------------------------------------------------------
-# _build_search_url
-# ---------------------------------------------------------------------------
+        scraper = make_scraper(SaoPauloAlespScraper)
+        scraper.http.request = AsyncMock(side_effect=respond)
+        refs = await _refs(scraper)
 
+        queries = [
+            _query(call.args[0]) for call in scraper.http.request.await_args_list
+        ]
+        # 6 situations; situation 1 has 1528 norms → 4 pages of 500.
+        assert len(queries) == 6 + 3
+        assert {q["idsSituacao"] for q in queries} == {str(i) for i in range(1, 7)}
+        assert sorted(q["page"] for q in queries if q["idsSituacao"] == "1") == [
+            "0",
+            "1",
+            "2",
+            "3",
+        ]
+        assert all(q["ano"] == "2012" and q["size"] == "500" for q in queries)
+        assert len(refs) == 4
 
-class TestBuildSearchUrl:
-    def test_contains_base_url(self):
-        scraper = _make_scraper()
-        url = scraper._build_search_url(2020)
-        assert "al.sp.gov.br/norma/resultados" in url
+    async def test_ref_carries_listing_metadata(self):
+        def respond(url: str) -> object:
+            query = _query(url)
+            if query["idsSituacao"] != "5":
+                return make_mock_json_response(_empty_listing())
+            return make_mock_json_response({**LISTING, "totalElements": 4})
 
-    def test_contains_year(self):
-        scraper = _make_scraper()
-        url = scraper._build_search_url(2020)
-        assert "ano=2020" in url
+        scraper = make_scraper(SaoPauloAlespScraper)
+        scraper.http.request = AsyncMock(side_effect=respond)
+        lei, _ato, decreto, no_text = await _refs(scraper)
 
-    def test_all_situations(self):
-        """idTipoSituacao=0 means all situations."""
-        scraper = _make_scraper()
-        url = scraper._build_search_url(2020)
-        assert "idTipoSituacao=0" in url
+        assert lei["year"] == 2012
+        assert lei["title"] == "Lei nº 14.924, de 28/12/2012"
+        assert lei["type"] == "Lei"
+        assert lei["situation"] == "Revogada"
+        assert lei["summary"].startswith("Dispõe sobre o subsídio do Governador")
+        assert lei["number"] == "14924"
+        assert lei["date"] == "28/12/2012"
+        assert lei["document_url"] == "https://www.al.sp.gov.br/norma/169098"
+        assert lei["text_url"].endswith("/lei/2012/lei-14924-28.12.2012.html")
+        assert decreto["type"] == "Decreto"
+        assert decreto["text_url"].endswith(".pdf")
+        assert no_text["text_url"] is None
 
-    def test_no_type_filter(self):
-        """No idsTipoNorma= selection param — _idsTipoNorma=1 is only the checkbox sentinel."""
-        scraper = _make_scraper()
-        url = scraper._build_search_url(2020)
-        # _idsTipoNorma=1 (checkbox sentinel) is present; idsTipoNorma=<id> (type selection) must not be
-        assert "_idsTipoNorma=1" in url
-        assert "&idsTipoNorma=" not in url
+    async def test_malformed_listing_raises(self):
+        scraper = make_scraper(SaoPauloAlespScraper)
+        for body in ({}, {"content": None, "totalElements": 1}, []):
+            scraper.http.request = AsyncMock(return_value=make_mock_json_response(body))
+            with pytest.raises(ValueError, match="Malformed"):
+                [ref async for ref in scraper._list_situation(2012, "Revogada", 5)]
 
-    def test_page_param(self):
-        scraper = _make_scraper()
-        url0 = scraper._build_search_url(2020, page=0)
-        url2 = scraper._build_search_url(2020, page=2)
-        assert "page=0" in url0
-        assert "page=2" in url2
-
-    def test_no_shared_state_mutation(self):
-        scraper = _make_scraper()
-        url1 = scraper._build_search_url(2020)
-        url2 = scraper._build_search_url(2019)
-        assert "ano=2020" in url1
-        assert "ano=2019" in url2
-
-
-# ---------------------------------------------------------------------------
-# _extract_result_counts
-# ---------------------------------------------------------------------------
-
-
-class TestExtractResultCounts:
-    def test_parses_standard_format(self):
-        html = "<html><body><b>Resultado: 42 normas em 1</b></body></html>"
-        soup = BeautifulSoup(html, "html.parser")
-        result = SaoPauloAlespScraper._extract_result_counts(soup)
-        assert result == (42, 1)
-
-    def test_parses_multipage(self):
-        html = "<html><body><b>Resultado: 1500 normas em 3</b></body></html>"
-        soup = BeautifulSoup(html, "html.parser")
-        result = SaoPauloAlespScraper._extract_result_counts(soup)
-        assert result == (1500, 3)
-
-    def test_returns_none_on_no_match(self):
-        html = "<html><body><b>No results here</b></body></html>"
-        soup = BeautifulSoup(html, "html.parser")
-        result = SaoPauloAlespScraper._extract_result_counts(soup)
-        assert result is None
-
-    def test_returns_none_on_empty_soup(self):
-        soup = BeautifulSoup("<html><body></body></html>", "html.parser")
-        result = SaoPauloAlespScraper._extract_result_counts(soup)
-        assert result is None
-
-
-# ---------------------------------------------------------------------------
-# _parse_docs_from_soup
-# ---------------------------------------------------------------------------
-
-
-class TestParseDocs:
-    def test_extracts_docs(self):
-        scraper = _make_scraper()
-        soup = BeautifulSoup(_make_results_html(3), "html.parser")
-        docs = scraper._parse_docs_from_soup(soup)
-        assert len(docs) == 3
-
-    def test_doc_has_required_keys(self):
-        scraper = _make_scraper()
-        soup = BeautifulSoup(_make_results_html(1), "html.parser")
-        docs = scraper._parse_docs_from_soup(soup)
-        assert "title" in docs[0]
-        assert "summary" in docs[0]
-        assert "html_link" in docs[0]
-        assert "norm_link" in docs[0]
-
-    def test_html_link_is_absolute(self):
-        scraper = _make_scraper()
-        soup = BeautifulSoup(_make_results_html(1), "html.parser")
-        docs = scraper._parse_docs_from_soup(soup)
-        assert docs[0]["html_link"].startswith("http")
-
-    def test_skips_mostrando_row(self):
-        html = """<html><body>
-            <table>
-                <tr><td>Mostrando 1-10 de 50</td><td></td></tr>
-                <tr>
-                    <td><span>Lei 001/2020</span>
-                        <a href="/norma/1" class="link_norma">link</a>
-                        <a href="/norma/1/texto">texto</a>
-                    </td>
-                    <td><span>Ementa</span></td>
-                </tr>
-            </table>
-        </body></html>"""
-        scraper = _make_scraper()
-        soup = BeautifulSoup(html, "html.parser")
-        docs = scraper._parse_docs_from_soup(soup)
-        assert len(docs) == 1
-
-    def test_empty_table_returns_empty(self):
-        scraper = _make_scraper()
-        soup = BeautifulSoup("<html><body><table></table></body></html>", "html.parser")
-        docs = scraper._parse_docs_from_soup(soup)
-        assert docs == []
-
-
-# ---------------------------------------------------------------------------
-# _get_docs_links
-# ---------------------------------------------------------------------------
-
-
-class TestGetDocsLinks:
-    @pytest.mark.asyncio
-    async def test_happy_path_returns_docs(self):
-        scraper = _make_scraper()
-        soup = BeautifulSoup(_make_results_html(3), "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
-        docs = await scraper._get_docs_links("http://example.com/normas?page=0")
-        assert len(docs) == 3
-
-    @pytest.mark.asyncio
-    async def test_soup_failure_returns_empty(self):
-        scraper = _make_scraper()
-        failed = make_failed_request()
-        scraper.request_service.get_soup = AsyncMock(return_value=failed)
-        docs = await scraper._get_docs_links("http://example.com/normas?page=0")
-        assert docs == []
-
-
-# ---------------------------------------------------------------------------
-# _infer_type
-# ---------------------------------------------------------------------------
-
-
-class TestInferType:
-    def test_lei_complementar_matched_before_lei(self):
-        """Longest match wins: 'Lei Complementar' before 'Lei'."""
-        result = SaoPauloAlespScraper._infer_type("Lei Complementar 42/2020")
-        assert result == "Lei Complementar"
-
-    def test_lei_matched(self):
-        result = SaoPauloAlespScraper._infer_type("Lei 9.394/1996")
-        assert result == "Lei"
-
-    def test_decreto_matched(self):
-        result = SaoPauloAlespScraper._infer_type("Decreto 64.921/2020")
-        assert result == "Decreto"
-
-    def test_decisao_da_mesa_matched(self):
-        result = SaoPauloAlespScraper._infer_type("Decisão da Mesa 1311/2005")
-        assert result == "Decisão da Mesa"
-
-    def test_unknown_falls_back_to_title_prefix(self):
-        result = SaoPauloAlespScraper._infer_type("Norma Desconhecida 1/2020")
-        assert result == "Norma Desconhecida"
-
-    def test_case_insensitive(self):
-        result = SaoPauloAlespScraper._infer_type("LEI 1/2020")
-        assert result == "Lei"
-
-
-# ---------------------------------------------------------------------------
-# _get_norm_data
-# ---------------------------------------------------------------------------
-
-
-class TestGetNormData:
-    @pytest.mark.asyncio
-    async def test_soup_failure_returns_empty_dict(self):
-        scraper = _make_scraper()
-        failed = make_failed_request()
-        scraper.request_service.get_soup = AsyncMock(return_value=failed)
-        result = await scraper._get_norm_data("http://example.com/norma/1")
-        assert result == {}
-
-    @pytest.mark.asyncio
-    async def test_happy_path_returns_expected_keys(self):
-        html = """<html><body>
-            <label>Promulgação</label><label>01/01/2020</label>
-            <label>Projeto</label><label>PL 001/2019</label>
-        </body></html>"""
-        scraper = _make_scraper()
-        soup = BeautifulSoup(html, "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
-        result = await scraper._get_norm_data("http://example.com/norma/1")
-        assert "promulgation" in result
-        assert "project" in result
-        assert "themes" in result
-        assert "keywords" in result
-        assert "situation" in result
-
-    @pytest.mark.asyncio
-    async def test_situation_extracted(self):
-        html = """<html><body>
-            <label>Situação</label><label>Sem revogação expressa</label>
-        </body></html>"""
-        scraper = _make_scraper()
-        soup = BeautifulSoup(html, "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
-        result = await scraper._get_norm_data("http://example.com/norma/1")
-        assert result["situation"] == "Sem revogação expressa"
-
-
-# ---------------------------------------------------------------------------
-# _get_doc_data
-# ---------------------------------------------------------------------------
-
-
-class TestGetDocData:
-    def _base_doc_info(self, suffix=".html"):
-        return {
-            "title": "Lei 001/2020",
-            "summary": "Dispõe sobre...",
-            "html_link": f"http://www.al.sp.gov.br/norma/1/texto{suffix}",
-            "norm_link": "http://www.al.sp.gov.br/norma/1",
-        }
-
-    @pytest.mark.asyncio
-    async def test_resume_skip_returns_none(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=True)
-        result = await scraper._get_doc_data(self._base_doc_info(), year=2020)
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_pdf_path_valid_markdown_returns_dict(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        valid_md = _make_valid_md()
-        scraper._download_and_convert = AsyncMock(
-            return_value=(valid_md, b"raw", ".pdf")
+    async def test_html_listing_response_raises(self):
+        scraper = make_scraper(SaoPauloAlespScraper)
+        scraper.http.request = AsyncMock(
+            return_value=make_mock_response("<html>erro</html>")
         )
-        scraper._get_norm_data = AsyncMock(return_value={})
-        result = await scraper._get_doc_data(self._base_doc_info(".pdf"), year=2020)
-        assert result is not None
-        assert result["text_markdown"] == valid_md.strip()
-        assert result["_content_extension"] == ".pdf"
+        with pytest.raises(json.JSONDecodeError):
+            [ref async for ref in scraper._list_situation(2012, "Revogada", 5)]
 
-    @pytest.mark.asyncio
-    async def test_pdf_path_invalid_markdown_returns_none(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._download_and_convert = AsyncMock(
-            return_value=("short", b"raw", ".pdf")
+    async def test_failed_situation_is_recorded_and_others_continue(self):
+        def respond(url: str) -> object:
+            if _query(url)["idsSituacao"] == "1":
+                return make_mock_json_response({})
+            return make_mock_json_response({**LISTING, "totalElements": 4})
+
+        scraper = make_scraper(SaoPauloAlespScraper)
+        scraper.http.request = AsyncMock(side_effect=respond)
+        scraper.error = AsyncMock()
+        refs = await _refs(scraper)
+
+        assert len(refs) == 4 * 5
+        scraper.error.assert_awaited_once()
+        assert scraper.error.await_args.args[0]["situation"] == "Sem revogação expressa"
+
+
+def _ref(**overrides: object) -> dict:
+    return {
+        "year": 2012,
+        "type": "Ato do Presidente",
+        "title": "Ato do Presidente nº 83, de 20/12/2012",
+        "summary": "Convoca suplente para tomar posse como Deputado titular",
+        "situation": "Sem revogação expressa",
+        "document_url": "https://www.al.sp.gov.br/norma/169110",
+        "text_url": "https://www.al.sp.gov.br/repositorio/legislacao/ato.do.presidente/2012/ato.do.presidente-83-20.12.2012.html",
+        **overrides,
+    }
+
+
+class TestFetch:
+    async def test_html_decodes_meta_charset_and_strips_site_header(self):
+        body = (FIXTURES / "ato.do.presidente-83-20.12.2012.html").read_bytes()
+        scraper = make_scraper(SaoPauloAlespScraper)
+        scraper.http.request = AsyncMock(return_value=make_mock_response(body))
+        doc = await scraper.fetch(_ref())
+
+        scraper.http.request.assert_awaited_once_with(_ref()["text_url"])
+        assert "DO ESTADO DE SÃO PAULO" in doc.text_markdown
+        assert "ORLANDO JOSÉ BOLÇONE" in doc.text_markdown
+        assert "LogoDECO" not in doc.text_markdown
+        assert doc.document_url == "https://www.al.sp.gov.br/norma/169110"
+        assert doc.text_url == _ref()["text_url"]
+        assert (doc.type, doc.situation) == (
+            "Ato do Presidente",
+            "Sem revogação expressa",
         )
-        scraper._save_doc_error = AsyncMock()
-        scraper._get_norm_data = AsyncMock(return_value={})
-        result = await scraper._get_doc_data(self._base_doc_info(".pdf"), year=2020)
-        assert result is None
-        scraper._save_doc_error.assert_called_once()
+        assert doc.raw == body
+        assert doc.raw_ext == ".html"
 
-    @pytest.mark.asyncio
-    async def test_html_path_valid_markdown_returns_dict(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._get_norm_data = AsyncMock(return_value={})
-        valid_md = _make_valid_md()
-        scraper._get_markdown = AsyncMock(return_value=valid_md)
-
-        html = "<html><body><p>Texto da lei.</p></body></html>"
-        soup = BeautifulSoup(html, "html.parser")
-        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
-
-        result = await scraper._get_doc_data(self._base_doc_info(), year=2020)
-        assert result is not None
-        assert result["text_markdown"] == valid_md.strip()
-        assert result["_content_extension"] == ".mhtml"
-
-    @pytest.mark.asyncio
-    async def test_html_path_invalid_markdown_returns_none(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._get_norm_data = AsyncMock(return_value={})
-        scraper._save_doc_error = AsyncMock()
-        scraper._get_markdown = AsyncMock(return_value="short")
-
-        html = "<html><body><p>Texto.</p></body></html>"
-        soup = BeautifulSoup(html, "html.parser")
-        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b""))
-
-        result = await scraper._get_doc_data(self._base_doc_info(), year=2020)
-        assert result is None
-        scraper._save_doc_error.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_iframe_pdf_path_valid_markdown(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._get_norm_data = AsyncMock(return_value={})
-        valid_md = _make_valid_md()
-        scraper._get_markdown = AsyncMock(return_value=valid_md)
-
-        html = """<html><body>
-            <div id="UpdatePanel1">
-                <iframe src="/pdf/lei001.pdf"></iframe>
-            </div>
-        </body></html>"""
-        soup = BeautifulSoup(html, "html.parser")
-        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
-
-        pdf_resp = MagicMock()
-        pdf_resp.__bool__ = lambda s: True
-        pdf_resp.read = AsyncMock(return_value=b"%PDF fake content")
-        scraper.request_service.make_request = AsyncMock(return_value=pdf_resp)
-
-        result = await scraper._get_doc_data(self._base_doc_info(), year=2020)
-        assert result is not None
-        assert result["_content_extension"] == ".pdf"
-        assert result["text_markdown"] == valid_md.strip()
-
-    @pytest.mark.asyncio
-    async def test_iframe_no_src_falls_through_to_html(self):
-        """panel_div exists but no iframe with src → falls through to HTML path."""
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._get_norm_data = AsyncMock(return_value={})
-        valid_md = _make_valid_md()
-        scraper._get_markdown = AsyncMock(return_value=valid_md)
-
-        html = """<html><body>
-            <div id="UpdatePanel1"><p>No iframe here</p></div>
-            <p>Texto da lei.</p>
-        </body></html>"""
-        soup = BeautifulSoup(html, "html.parser")
-        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
-
-        result = await scraper._get_doc_data(self._base_doc_info(), year=2020)
-        assert result is not None
-        assert result["_content_extension"] == ".mhtml"
-
-    @pytest.mark.asyncio
-    async def test_iframe_failed_request_returns_none_and_saves_error(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._get_norm_data = AsyncMock(return_value={})
-        scraper._save_doc_error = AsyncMock()
-
-        html = """<html><body>
-            <div id="UpdatePanel1">
-                <iframe src="/pdf/lei001.pdf"></iframe>
-            </div>
-        </body></html>"""
-        soup = BeautifulSoup(html, "html.parser")
-        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
-        failed = make_failed_request()
-        scraper.request_service.make_request = AsyncMock(return_value=failed)
-
-        result = await scraper._get_doc_data(self._base_doc_info(), year=2020)
-        assert result is None
-        scraper._save_doc_error.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_soup_failure_returns_none_and_saves_error(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._get_norm_data = AsyncMock(return_value={})
-        scraper._save_doc_error = AsyncMock()
-        scraper._fetch_soup_and_mhtml = AsyncMock(side_effect=Exception("fetch failed"))
-        result = await scraper._get_doc_data(self._base_doc_info(), year=2020)
-        assert result is None
-        scraper._save_doc_error.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_situation_populated_from_norm_data(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._get_norm_data = AsyncMock(
-            return_value={
-                "situation": "Revogada",
-                "promulgation": None,
-                "project": None,
-                "themes": None,
-                "keywords": None,
-            }
+    async def test_html_keeps_links_to_other_norms(self):
+        body = (FIXTURES / "lei-14924-28.12.2012.html").read_bytes()
+        scraper = make_scraper(SaoPauloAlespScraper)
+        scraper.http.request = AsyncMock(return_value=make_mock_response(body))
+        doc = await scraper.fetch(
+            _ref(type="Lei", text_url="https://example.org/lei-14924.html")
         )
-        valid_md = _make_valid_md()
-        scraper._get_markdown = AsyncMock(return_value=valid_md)
 
-        html = "<html><body><p>Texto da lei.</p></body></html>"
-        soup = BeautifulSoup(html, "html.parser")
-        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
+        assert "Ficha informativa" not in doc.text_markdown
+        assert "Assembleia Legislativa do Estado de São Paulo" not in doc.text_markdown
+        assert doc.text_markdown.startswith("# LEI Nº 14.924")  # no <head> front matter
+        assert "Lei complementar nº 802, de 7 de dezembro de 1995" in doc.text_markdown
 
-        result = await scraper._get_doc_data(self._base_doc_info(), year=2020)
-        assert result is not None
-        assert result["situation"] == "Revogada"
+    async def test_pdf_text_is_downloaded(self):
+        pdf_url = "https://www.al.sp.gov.br/repositorio/legislacao/decreto/2012/decreto-58791-21.12.2012.pdf"
+        markdown = "Texto do decreto convertido do PDF. " * 5
+        scraper = make_scraper(SaoPauloAlespScraper)
+        scraper.download = AsyncMock(return_value=(markdown, b"%PDF-1.5", ".pdf"))
+        doc = await scraper.fetch(_ref(type="Decreto", text_url=pdf_url))
 
-    @pytest.mark.asyncio
-    async def test_situation_defaults_to_nao_consta(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._get_norm_data = AsyncMock(return_value={})
-        valid_md = _make_valid_md()
-        scraper._get_markdown = AsyncMock(return_value=valid_md)
+        scraper.download.assert_awaited_once_with(pdf_url)
+        assert doc.text_markdown == markdown.strip()
+        assert (doc.raw, doc.raw_ext) == (b"%PDF-1.5", ".pdf")
+        assert doc.document_url == "https://www.al.sp.gov.br/norma/169110"
 
-        html = "<html><body><p>Texto da lei.</p></body></html>"
-        soup = BeautifulSoup(html, "html.parser")
-        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
-
-        result = await scraper._get_doc_data(self._base_doc_info(), year=2020)
-        assert result is not None
-        assert result["situation"] == "Não consta"
-
-    @pytest.mark.asyncio
-    async def test_norm_type_inferred_from_title(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._get_norm_data = AsyncMock(return_value={})
-        valid_md = _make_valid_md()
-        scraper._get_markdown = AsyncMock(return_value=valid_md)
-
-        html = "<html><body><p>Texto da lei complementar.</p></body></html>"
-        soup = BeautifulSoup(html, "html.parser")
-        scraper._fetch_soup_and_mhtml = AsyncMock(return_value=(soup, b"fake-mhtml"))
-
-        doc = {
-            "title": "Lei Complementar 42/2020",
-            "summary": "Dispõe sobre...",
-            "html_link": "http://www.al.sp.gov.br/norma/1/texto.html",
-            "norm_link": "http://www.al.sp.gov.br/norma/1",
-        }
-        result = await scraper._get_doc_data(doc, year=2020)
-        assert result is not None
-        assert result["type"] == "Lei Complementar"
-
-
-# ---------------------------------------------------------------------------
-# _scrape_year
-# ---------------------------------------------------------------------------
-
-
-class TestScrapeYear:
-    @pytest.mark.asyncio
-    async def test_soup_failure_returns_empty(self):
-        scraper = _make_scraper()
-        failed = make_failed_request()
-        scraper.request_service.get_soup = AsyncMock(return_value=failed)
-        results = await scraper._scrape_year(2020)
-        assert results == []
-
-    @pytest.mark.asyncio
-    async def test_no_results_text_returns_empty(self):
-        scraper = _make_scraper()
-        soup = BeautifulSoup(_make_no_results_html(), "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
-        results = await scraper._scrape_year(2020)
-        assert results == []
-
-    @pytest.mark.asyncio
-    async def test_zero_count_returns_empty(self):
-        scraper = _make_scraper()
-        html = "<html><body><b>Resultado: 0 normas em 0</b></body></html>"
-        soup = BeautifulSoup(html, "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
-        results = await scraper._scrape_year(2020)
-        assert results == []
-
-    @pytest.mark.asyncio
-    async def test_single_page_calls_process_documents(self):
-        scraper = _make_scraper()
-        soup = BeautifulSoup(_make_results_html(3, 1), "html.parser")
-        scraper.request_service.get_soup = AsyncMock(return_value=soup)
-        scraper._process_documents = AsyncMock(return_value=[{"title": "x"}])
-        results = await scraper._scrape_year(2020)
-        scraper._process_documents.assert_called_once()
-        assert results == [{"title": "x"}]
-
-    @pytest.mark.asyncio
-    async def test_multipage_fetches_extra_pages(self):
-        scraper = _make_scraper()
-        # page 0 soup has 3 pages
-        soup_p0 = BeautifulSoup(_make_results_html(3, 3), "html.parser")
-        soup_p1 = BeautifulSoup(_make_results_html(3, 3), "html.parser")
-        soup_p2 = BeautifulSoup(_make_results_html(3, 3), "html.parser")
-        scraper.request_service.get_soup = AsyncMock(
-            side_effect=[soup_p0, soup_p1, soup_p2]
-        )
-        scraper._gather_results = AsyncMock(
-            return_value=[[{"title": "x"}], [{"title": "y"}]]
-        )
-        scraper._process_documents = AsyncMock(return_value=[])
-        await scraper._scrape_year(2020)
-        # _gather_results should have been called with 2 tasks (pages 1 and 2)
-        scraper._gather_results.assert_called_once()
-        call_args = scraper._gather_results.call_args
-        tasks = call_args[0][0]
-        assert len(tasks) == 2
-
-
-# ---------------------------------------------------------------------------
-# Integration tests (live site)
-# ---------------------------------------------------------------------------
+    async def test_norm_without_text_fails_visibly(self):
+        scraper = make_scraper(SaoPauloAlespScraper)
+        with pytest.raises(ValueError, match="no text"):
+            await scraper.fetch(_ref(text_url=None))
 
 
 @pytest.mark.integration
-async def test_build_search_url_returns_real_results():
-    """São Paulo ALESP should return results for year 2020 with all situations."""
-    with tempfile.TemporaryDirectory() as tmp:
-        scraper = SaoPauloAlespScraper(docs_save_dir=tmp, verbose=False)
-        url = scraper._build_search_url(2020, page=0)
-        soup = await scraper.request_service.get_soup(url)
-        assert soup
-        counts = scraper._extract_result_counts(soup)
-        assert counts is not None
-        total, pages = counts
-        assert total > 0
+async def test_live_2012_listing_matches_type_counts():
+    from src.core.http import HttpClient
+    from src.core.store import Store
 
-
-@pytest.mark.integration
-async def test_get_doc_data_html_returns_valid_markdown():
-    """Fetching a real Lei from São Paulo should return non-empty markdown."""
-    with tempfile.TemporaryDirectory() as tmp:
-        scraper = SaoPauloAlespScraper(docs_save_dir=tmp, verbose=False)
-        url = scraper._build_search_url(2020, page=0)
-        docs = await scraper._get_docs_links(url)
-        assert len(docs) > 0
-        doc = docs[0]
-        result = await scraper._get_doc_data(doc, year=2020)
-        if result is not None:
-            assert "text_markdown" in result
-            assert len(result["text_markdown"]) > 50
+    async with SaoPauloAlespScraper(
+        store=Store(":memory:"), http=HttpClient(rps=2), years=range(2012, 2013)
+    ) as scraper:
+        refs = await _refs(scraper)
+        doc = await scraper.fetch(
+            next(r for r in refs if r["type"] == "Lei Complementar")
+        )
+    counts = {t: sum(r["type"] == t for r in refs) for t in ("Lei", "Decreto")}
+    assert len(refs) == 1656
+    assert counts == {"Lei": 239, "Decreto": 1103}
+    assert doc.raw_ext == ".html"

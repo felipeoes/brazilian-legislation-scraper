@@ -1,0 +1,46 @@
+{
+ "success": true,
+ "statusCode": 200,
+ "data": {
+  "id": 263,
+  "numero": "222",
+  "dataPublicacao": "2012-06-01T00:00:00",
+  "disponivel": true,
+  "usuarioCriador": "LegisOn Sistema",
+  "ementa": "Altera o § 4º do art. 17 da Lei Complementar nº 204, de 06 de julho de 2011; altera o art. 8º da Lei Complementar nº 203, de 06 de julho de 2011; revoga o art. 2º e altera o “caput” do art. 6º da Lei nº 6.864, de 21 de dezembro de 2009; e dá providências correlatas.",
+  "idTipoAto": 2,
+  "idIniciativa": 1,
+  "tags": [
+   {
+    "name": "Ato Original"
+   },
+   {
+    "name": "Ato Consolidado"
+   }
+  ],
+  "assinatura": false,
+  "dataRepublicacao": null,
+  "dataCadastro": "2023-11-16T10:16:22",
+  "dataAto": "2012-05-31T00:00:00",
+  "idSituacao": 1,
+  "atosTemas": null,
+  "atosOrgaos": null,
+  "arquivo": {
+   "caminho": "https://api.staging.pge.se.gov.br/minio/legisonprd/uploads/atos/263/MzEvMDUvMjAxMl8yMjI%3D.pdf?X-Amz-Signature=trimmed",
+   "dataCadastro": "2022-03-07T15:10:52",
+   "consolidado": true,
+   "original": false,
+   "nomeArquivo": "MzEvMDUvMjAxMl8yMjI=.pdf"
+  },
+  "arquivoAtualizadoPdf": {
+   "caminho": "https://api.staging.pge.se.gov.br/minio/legisonprd/uploads/atos/263/LC-222-2012-atualizado-LC-237-2014.pdf?X-Amz-Signature=trimmed",
+   "dataCadastro": "2023-06-16T09:11:54",
+   "consolidado": false,
+   "original": true,
+   "nomeArquivo": "LC-222-2012-atualizado-LC-237-2014.pdf"
+  },
+  "arquivoAtualizadoDocx": null
+ },
+ "message": "Ato obtido com sucesso.",
+ "moreDetails": null
+}
