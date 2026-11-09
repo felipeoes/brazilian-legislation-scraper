@@ -1,9 +1,10 @@
 """Bounded listing → fetch → save pipeline shared by every scraper."""
 
 import asyncio
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, ClassVar
 from urllib.parse import urljoin
 
@@ -11,8 +12,13 @@ from loguru import logger
 
 from src.config import LOG_DIR
 from src.core.browser import BrowserPool
-from src.core.convert import bytes_to_markdown, detect_extension, html_to_markdown
-from src.core.document import DocRef, Document
+from src.core.convert import (
+    bytes_to_markdown,
+    detect_extension,
+    html_to_markdown,
+    sniff_extension,
+)
+from src.core.document import DocRef, Document, clean_title
 from src.core.http import HttpClient
 from src.core.ocr import OCR, usage_scope
 from src.core.store import Store
@@ -26,6 +32,36 @@ class RunResult:
     docs: int = 0
     errors: int = 0
     skipped: int = 0
+    listed: int = 0
+    seconds: float = 0.0
+    listing_seconds: float = 0.0
+    fetch_seconds: list[float] = field(default_factory=list, repr=False)
+
+    def stats(self) -> dict:
+        """Performance summary stored with the run (see `main.py stats`)."""
+        times = sorted(self.fetch_seconds)
+
+        def quantile(q: float) -> float | None:
+            return (
+                round(times[min(len(times) - 1, int(len(times) * q))], 2)
+                if times
+                else None
+            )
+
+        return {
+            "seconds": round(self.seconds, 1),
+            "listing_seconds": round(self.listing_seconds, 1),
+            "listed": self.listed,
+            "docs": self.docs,
+            "errors": self.errors,
+            "skipped": self.skipped,
+            "docs_per_minute": round(self.docs * 60 / self.seconds, 1)
+            if self.seconds
+            else 0.0,
+            "fetch_p50": quantile(0.5),
+            "fetch_p95": quantile(0.95),
+            "fetch_max": quantile(1.0),
+        }
 
 
 class BaseScraper:
@@ -98,19 +134,23 @@ class BaseScraper:
 
     async def error(self, ref: DocRef, exc: Exception) -> None:
         self._result.errors += 1
+        message = str(exc)
+        if exc.__cause__ is not None:
+            message += f" (caused by {type(exc.__cause__).__name__}: {exc.__cause__})"
         await self.store.record_error(
             run_id=self._run_id,
-            message=str(exc),
+            message=message,
             year=ref.get("year"),
             type=ref.get("type", ""),
             situation=ref.get("situation", ""),
             title=ref.get("title", ""),
             url=ref.get("document_url", ""),
         )
-        logger.error(f"{self.name}: {ref.get('title', 'listing')}: {exc}")
+        logger.error(f"{self.name}: {ref.get('title', 'listing')}: {message}")
 
     async def run(self) -> RunResult:
         self._result = RunResult()
+        started = time.perf_counter()
         self._run_id = await self.store.start_run(self.name)
         scope = f"{self.name}:{self._run_id}"
         token = usage_scope.set(scope)
@@ -122,12 +162,21 @@ class BaseScraper:
             except Exception as exc:
                 await self.error({}, exc)
             finally:
+                self._result.seconds = time.perf_counter() - started
+                stats = {
+                    **self._result.stats(),
+                    "years": f"{self.years.start}-{self.years.stop - 1}",
+                    "workers": self.workers,
+                    "http": dict(self.http.stats),
+                    "browser_navigations": self.browser.navigations,
+                }
                 try:
                     await self.store.finish_run(
                         self._run_id,
                         self._result.docs,
                         self._result.errors,
                         self.ocr.usage_for(scope) if self.ocr else {},
+                        stats,
                     )
                 finally:
                     usage_scope.reset(token)
@@ -136,6 +185,7 @@ class BaseScraper:
     async def _scrape(self, keys: set[tuple[str, str]]) -> None:
         queue: asyncio.Queue[DocRef | None] = asyncio.Queue(maxsize=self.workers * 2)
         pending: set[tuple[str, str]] = set()
+        started = time.perf_counter()
 
         async def produce() -> None:
             # One queue for all years, so workers never wait at a year boundary.
@@ -149,26 +199,33 @@ class BaseScraper:
                             continue
                         if self.yearless and ref["year"] not in self.years:
                             continue
+                        ref["title"] = clean_title(ref["title"])
                         key = (ref["document_url"], ref["title"])
                         if key in keys or key in pending:
                             self._result.skipped += 1
                             continue
                         pending.add(key)
+                        self._result.listed += 1
                         await queue.put(ref)
                 except Exception as exc:
                     await self.error({"year": year}, exc)
+            self._result.listing_seconds = time.perf_counter() - started
             for _ in range(self.workers):
                 await queue.put(None)
 
         async def consume() -> None:
             while (ref := (await queue.get())) is not None:
                 key = (ref["document_url"], ref["title"])
+                fetch_started = time.perf_counter()
                 try:
                     doc = await self.fetch(dict(ref))
                     if doc is None:
                         raise ValueError("Fetch produced no document")
                     await self.store.save(doc, ref_url=key[0], ref_title=key[1])
                     self._result.docs += 1
+                    self._result.fetch_seconds.append(
+                        time.perf_counter() - fetch_started
+                    )
                     keys.add(key)
                     del doc
                 except Exception as exc:
@@ -212,12 +269,11 @@ class BaseScraper:
 
     async def download(self, url: str) -> tuple[str, bytes, str]:
         response = await self.http.request(url)
-        ext = detect_extension(response.content_type, response.filename)
-        if ext == ".pdf" or url.lower().endswith(".pdf"):
-            if not response.content.startswith(b"%PDF"):
-                raise ValueError(f"Expected PDF from {url}")
-        if response.content.startswith(b"%PDF"):
-            ext = ".pdf"
+        sniffed = sniff_extension(response.content)
+        declared = detect_extension(response.content_type, response.filename)
+        if (declared == ".pdf" or url.lower().endswith(".pdf")) and sniffed != ".pdf":
+            raise ValueError(f"Expected PDF from {url}")
+        ext = sniffed or declared
         markdown = await bytes_to_markdown(
             response.content,
             response.headers.get("Content-Type", response.content_type),
@@ -247,14 +303,15 @@ class BaseScraper:
         )
 
     async def fetch_html(
-        self, ref: DocRef, html: str, url: str, mhtml: bytes
+        self, ref: DocRef, html: str, url: str, raw: bytes, raw_ext: str = ".mhtml"
     ) -> Document:
+        """Build a Document from page HTML; raw is the browser MHTML or the HTTP body (".html")."""
         return Document(
             **{
                 **ref,
                 "document_url": url,
                 "text_markdown": await self.markdown(html=html, base_url=url),
-                "raw": mhtml,
-                "raw_ext": ".mhtml",
+                "raw": raw,
+                "raw_ext": raw_ext,
             }
         )

@@ -8,6 +8,11 @@ NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length
 type DocRef = dict[str, Any]
 
 
+def clean_title(text: str) -> str:
+    """Collapse source whitespace so titles, and the resume keys built from them, stay stable."""
+    return " ".join(text.split())
+
+
 class Document(BaseModel):
     model_config = ConfigDict(extra="allow", validate_assignment=True)
     year: int
@@ -19,6 +24,16 @@ class Document(BaseModel):
     summary: str = ""
     raw: bytes | None = Field(default=None, exclude=True)
     raw_ext: str | None = Field(default=None, exclude=True)
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str) -> str:
+        return clean_title(value)
+
+    @field_validator("summary", mode="before")
+    @classmethod
+    def validate_summary(cls, value: str | None) -> str:
+        return value or ""
 
     @field_validator("text_markdown")
     @classmethod

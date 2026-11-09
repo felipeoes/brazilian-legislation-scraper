@@ -218,3 +218,17 @@ class TestRemoveSummaryFromMarkdown:
         md = f"# Lei\n\n{summary}\n\nConteúdo\n\n{summary}"
         result = remove_summary_from_markdown(md, summary)
         assert result.count(summary) == 0
+
+
+class TestPrepareInlineHtml:
+    def test_uses_the_document_with_text_when_two_are_concatenated(self):
+        """Lei 17.604/2012: the API prepends an empty HTML shell to the real document."""
+        scraper = _make_scraper()
+        content = (
+            "<!DOCTYPE html><html><head><title>Lei</title></head><body>\n</body></html>"
+            "<html><head></head><body><p>Art. 1º Ficam reajustados os valores das"
+            " pensões especiais.</p></body></html>"
+        )
+        clean_html, pdf_link, redirect = scraper._prepare_inline_html(content)
+        assert "Ficam reajustados" in clean_html
+        assert (pdf_link, redirect) == ("", False)

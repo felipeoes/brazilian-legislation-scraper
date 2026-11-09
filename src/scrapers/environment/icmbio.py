@@ -2,6 +2,7 @@ import json
 import re
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
+from urllib.parse import urljoin
 
 from loguru import logger
 
@@ -32,6 +33,7 @@ TYPES = {
 }
 _IN_TITLE_RE = re.compile("^in(?:\\s+[a-zà-ÿ/.-]+)*\\s+\\d+", re.IGNORECASE)
 _PORTARIA_TITLE_RE = re.compile("^portari[ae]\\w*", re.IGNORECASE)
+_RE_EDITION_PREFIX = re.compile("^do\\d+[a-z]?-\\d{4}-\\d{2}-\\d{2}-")
 VALID_SITUATIONS = ["em vigência", "em vigência com alteração", "não consta"]
 INVALID_SITUATIONS = ["revogado", "vencido", "sem efeito"]
 SITUATIONS = {s: s for s in VALID_SITUATIONS + INVALID_SITUATIONS}
@@ -283,39 +285,49 @@ class ICMBioScraper(BaseScraper):
             "publication_info": row.get("instrumento", ""),
         }
 
-    async def fetch(self, doc_info: dict) -> Document | None:
-        """Fetch the DOU page HTML and convert to markdown."""
-        document_url = doc_info.get("document_url", "")
-        if not document_url:
-            raise ValueError("Invalid or missing document URL")
-        try:
-            soup, mhtml = await self.browser.snapshot(
-                document_url, wait_for_selector="div.texto-dou"
+    async def fetch(self, doc_info: dict) -> Document:
+        """Fetch the DOU act over HTTP and convert to markdown."""
+        url = doc_info["document_url"]
+        if "/visualiza/index.jsp" in url:
+            # Old DOU page links are a frameset around the PDF viewer servlet.
+            soup = (await self.http.request(url)).soup()
+            frame = soup.find("frame", attrs={"name": "visualizador"})
+            if frame is None or not frame.get("src"):
+                raise ValueError("DOU page viewer has no PDF frame")
+            url = urljoin(url, frame["src"])
+        if "/servlet/INPDFViewer" in url:
+            # The whole DOU journal page, which also holds neighbouring acts.
+            markdown, raw, ext = await self.download(url)
+            if ext != ".pdf":
+                raise ValueError(f"DOU PDF viewer returned {ext}, not a PDF")
+            return Document(
+                **{**doc_info, "document_url": url},
+                text_markdown=markdown,
+                raw=raw,
+                raw_ext=ext,
             )
-        except Exception as exc:
-            logger.warning(f"Failed to fetch {document_url}: {exc}")
-            raise ValueError(f"Failed to fetch page: {exc}")
-        text_div = soup.find("div", class_="texto-dou")
+        if "/materia/-/asset_publisher/" in url:
+            # Azion blocks this legacy path (403); the article slug resolves under /web/dou/-/.
+            slug = _RE_EDITION_PREFIX.sub("", url.rstrip("/").rsplit("/", 1)[-1])
+            url = f"https://www.in.gov.br/web/dou/-/{slug}"
+        response = await self.http.request(url)
+        text_div = response.soup().find("div", class_="texto-dou")
         if not text_div:
-            logger.warning(f"div.texto-dou not found at {document_url}")
             raise ValueError("Could not find div.texto-dou in page")
-        for p in text_div.find_all("p", class_="identifica"):
-            p.decompose()
-        for p in text_div.find_all("p", class_="ementa"):
+        for p in text_div.find_all("p", class_=["identifica", "ementa"]):
             p.decompose()
         text_div = clean_norm_soup(
             text_div, unwrap_links=True, remove_disclaimers=True, remove_empty_tags=True
         )
-        text_markdown = await self.markdown(html=str(text_div), base_url=document_url)
-        if not text_markdown or not text_markdown.strip():
-            logger.warning(f"Empty markdown from {document_url}")
-            raise ValueError("Empty markdown after HTML conversion")
+        text_markdown = await self.markdown(html=str(text_div), base_url=url)
         if "the requested url was not found" in text_markdown.lower():
             raise ValueError("Document URL returned 'not found' message")
-        result = Document(
-            **doc_info, text_markdown=text_markdown, raw=mhtml, raw_ext=".mhtml"
+        return Document(
+            **{**doc_info, "document_url": url},
+            text_markdown=text_markdown,
+            raw=response.content,
+            raw_ext=".html",
         )
-        return result
 
     async def list_documents(self, year: int | None) -> AsyncIterator[dict]:
         dictionaries: dict[str, list] = {}

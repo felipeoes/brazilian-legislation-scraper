@@ -2,8 +2,9 @@
 
 from unittest.mock import AsyncMock
 
+import fitz
 import pytest
-from conftest import make_scraper
+from conftest import make_mock_response, make_scraper
 
 from src.scrapers.environment.icmbio import (
     COLUMNS,
@@ -441,6 +442,107 @@ class TestICMBioFetchPage:
         scraper = self._make_scraper(self._mock_response(200, body))
         ds, tokens, complete = await scraper._fetch_page()
         assert complete is True
+
+
+def _ref(url: str) -> dict:
+    return {
+        "year": 2018,
+        "title": "Portaria 1039 de 29/11/2018",
+        "type": "Portaria",
+        "situation": "em vigência",
+        "document_url": url,
+    }
+
+
+_ARTICLE = (
+    '<html><body><div class="texto-dou"><p class="identifica">PORTARIA Nº 1.039</p>'
+    '<p class="ementa">Dispõe sobre algo.</p><p>Art. 1º Fica criado o conselho '
+    "consultivo da unidade de conservação federal.</p></div></body></html>"
+)
+
+
+def _pdf() -> bytes:
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_textbox(
+        fitz.Rect(72, 72, 520, 770),
+        "Art. 1º Fica aprovado o plano de manejo da unidade de conservação. " * 20,
+        fontsize=12,
+    )
+    content = doc.tobytes()
+    doc.close()
+    return content
+
+
+class TestICMBioFetch:
+    async def test_dou_article_over_http_stores_html(self):
+        scraper = make_scraper(ICMBioScraper)
+        url = "https://www.in.gov.br/web/dou/-/portaria-n-1-039-de-29-de-novembro-de-2018-1"
+        scraper.http.request.side_effect = [make_mock_response(_ARTICLE)]
+        doc = await scraper.fetch(_ref(url))
+        assert doc.raw == _ARTICLE.encode()
+        assert doc.raw_ext == ".html"
+        assert "conselho consultivo" in doc.text_markdown
+        assert "PORTARIA Nº 1.039" not in doc.text_markdown
+        scraper.browser.snapshot.assert_not_called()
+
+    async def test_legacy_asset_publisher_link_uses_article_slug(self):
+        """Azion blocks /materia/-/asset_publisher/ with 403; the same slug works under /web/dou/-/."""
+        scraper = make_scraper(ICMBioScraper)
+        scraper.http.request.side_effect = [make_mock_response(_ARTICLE)]
+        doc = await scraper.fetch(
+            _ref(
+                "https://www.in.gov.br/web/guest/materia/-/asset_publisher/Kujrw0TZC2Mb/content/id/47099695/do1-2018-10-25-portaria-conjunta-n-407-de-19-de-outubro-de-2018-47099425"
+            )
+        )
+        expected = "https://www.in.gov.br/web/dou/-/portaria-conjunta-n-407-de-19-de-outubro-de-2018-47099425"
+        assert scraper.http.request.call_args.args[0] == expected
+        assert doc.document_url == expected
+
+    async def test_old_page_viewer_follows_pdf_frame(self):
+        scraper = make_scraper(ICMBioScraper)
+        frameset = (
+            '<html><frameset><frame name="controlador" src="../visualiza/nav.jsp"/>'
+            '<frame name="visualizador" src="../../servlet/INPDFViewer?jornal=515&amp;'
+            'pagina=228&amp;data=30/11/2018&amp;captchafield=firstAccess"/></frameset></html>'
+        )
+        pdf = _pdf()
+        scraper.http.request.side_effect = [
+            make_mock_response(frameset),
+            make_mock_response(pdf, content_type="application/pdf"),
+        ]
+        doc = await scraper.fetch(
+            _ref(
+                "https://pesquisa.in.gov.br/imprensa/jsp/visualiza/index.jsp?data=30/11/2018&jornal=515&pagina=228"
+            )
+        )
+        pdf_url = "https://pesquisa.in.gov.br/imprensa/servlet/INPDFViewer?jornal=515&pagina=228&data=30/11/2018&captchafield=firstAccess"
+        assert scraper.http.request.call_args.args[0] == pdf_url
+        assert doc.document_url == pdf_url
+        assert (doc.raw, doc.raw_ext) == (pdf, ".pdf")
+        assert "plano de manejo" in doc.text_markdown
+
+    async def test_pdf_viewer_returning_html_raises(self):
+        scraper = make_scraper(ICMBioScraper)
+        scraper.http.request.side_effect = [
+            make_mock_response(
+                "<html><body>Digite o captcha para continuar o acesso ao documento solicitado.</body></html>"
+            )
+        ]
+        with pytest.raises(ValueError, match="PDF"):
+            await scraper.fetch(
+                _ref(
+                    "https://pesquisa.in.gov.br/imprensa/servlet/INPDFViewer?jornal=515&pagina=202&data=20/12/2018&captchafield=firstAccess"
+                )
+            )
+
+    async def test_page_without_dou_text_raises(self):
+        scraper = make_scraper(ICMBioScraper)
+        scraper.http.request.side_effect = [
+            make_mock_response("<html><body>Página</body></html>")
+        ]
+        with pytest.raises(ValueError, match="texto-dou"):
+            await scraper.fetch(_ref("https://www.in.gov.br/web/dou/-/x-1"))
 
 
 INTEGRATION_YEAR = 2026

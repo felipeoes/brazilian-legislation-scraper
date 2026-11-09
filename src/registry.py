@@ -123,14 +123,17 @@ SCRAPERS = [
         ParanaCVScraper,
         ("Parana", "PR"),
         2025,
-        rps=1,
+        # Above ~0.2 rps the site answers 403 and blocks the client for ~20 min;
+        # retrying during a block only extends it.
+        rps=0.2,
         workers=2,
         needs_proxy=True,
-        max_retries=6,
+        max_retries=2,
     ),
     state(PernambucoAlepeScraper, ("Pernambuco", "PE"), 1835),
     state(PiauiAlepiScraper, ("Piaui", "PI"), 1922, needs_ocr=True),
-    state(RJAlerjScraper, ("RJ", "RioDeJaneiro"), 1891),
+    # RJ documents use a 300 s timeout; 3 attempts caps one document at 15 min.
+    state(RJAlerjScraper, ("RJ", "RioDeJaneiro"), 1891, max_retries=3),
     state(RNAlrnScraper, ("RN", "RioGrandeDoNorte"), 1971, needs_ocr=True),
     state(RSAlrsScraper, ("RS", "RioGrandeDoSul"), 1830, needs_ocr=True),
     state(RondoniaCotelScraper, ("Rondonia", "RO"), 1981, needs_ocr=True),

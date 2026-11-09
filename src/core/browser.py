@@ -44,6 +44,7 @@ class BrowserPool:
         self._idle: list[Page] = []
         self._context = None
         self._stack = AsyncExitStack()
+        self.navigations = 0
 
     async def _initialize(self) -> None:
         if self._context is not None:
@@ -77,6 +78,7 @@ class BrowserPool:
 
     async def goto(self, page: Page, url: str, **kwargs: Any) -> None:
         await self.limiter.acquire()
+        self.navigations += 1
         response = await page.goto(url, **kwargs)
         if response is not None and response.status >= 400:
             raise RuntimeError(f"Browser HTTP {response.status}: {url}")

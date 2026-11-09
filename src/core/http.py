@@ -15,6 +15,7 @@ from aiohttp_socks import (
     ProxyTimeoutError,
 )
 from bs4 import BeautifulSoup
+from bs4.dammit import EncodingDetector
 from multidict import CIMultiDict
 from pyrate_limiter import Duration, InMemoryBucket, Limiter, Rate
 from tenacity import (
@@ -66,8 +67,32 @@ class Response:
         return message
 
     @property
+    def charset(self) -> str:
+        charset = (
+            self._message().get_content_charset()
+            or EncodingDetector.strip_byte_order_mark(self.content)[1]
+            # JSON may embed whole HTML documents; their <meta> doesn't describe the JSON.
+            or EncodingDetector.find_declared_encoding(
+                self.content, is_html="json" not in self.content_type
+            )
+        )
+        if not charset:
+            # Like browsers: UTF-8 when valid, else windows-1252. bs4's chardet guess
+            # varies per page (RS link pages came out windows-1250).
+            try:
+                self.content.decode("utf-8")
+                charset = "utf-8"
+            except UnicodeDecodeError:
+                charset = "cp1252"
+        charset = charset.lower()
+        # Browsers (WHATWG) decode these labels as windows-1252; Ceará relies on it.
+        if charset in {"iso-8859-1", "latin-1", "latin1", "us-ascii", "ascii"}:
+            return "cp1252"
+        return charset
+
+    @property
     def text(self) -> str:
-        charset = self._message().get_content_charset() or "utf-8"
+        charset = self.charset
         try:
             return self.content.decode(charset, errors="replace")
         except LookupError:
@@ -77,9 +102,7 @@ class Response:
         return json.loads(self.text)
 
     def soup(self) -> BeautifulSoup:
-        return BeautifulSoup(
-            self.content, "lxml", from_encoding=self._message().get_content_charset()
-        )
+        return BeautifulSoup(self.content, "lxml", from_encoding=self.charset)
 
     @property
     def content_type(self) -> str:
@@ -109,6 +132,9 @@ class HttpClient:
         if not verify_ssl:
             self._ssl_ctx.check_hostname = False
             self._ssl_ctx.verify_mode = ssl.CERT_NONE
+            # shortcut: legislabahia.ba.gov.br only offers TLS1.2 RSA key exchange, which
+            # OpenSSL's default security level rejects; revisit if Bahia upgrades TLS.
+            self._ssl_ctx.set_ciphers("DEFAULT@SECLEVEL=1")
         self.headers = {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
         }
@@ -117,6 +143,7 @@ class HttpClient:
         self._default_session: aiohttp.ClientSession | None = None
         self._proxy_sessions: dict[str, aiohttp.ClientSession] = {}
         self._session_lock = asyncio.Lock()
+        self.stats = {"requests": 0, "retries": 0, "bytes": 0}
 
     async def _ensure_session(self, proxy: str | None = None) -> aiohttp.ClientSession:
         async with self._session_lock:
@@ -158,6 +185,8 @@ class HttpClient:
             reraise=True,
         ):
             with attempt:
+                self.stats["requests"] += 1
+                self.stats["retries"] += attempt.retry_state.attempt_number > 1
                 await self.limiter.acquire()
                 proxy = (
                     await self.proxy_service.get_proxy() if self.proxy_service else None
@@ -186,6 +215,7 @@ class HttpClient:
                                 response.reason or "Request failed",
                             )
                         content = await response.read()
+                        self.stats["bytes"] += len(content)
                         return Response(
                             str(response.url),
                             response.status,

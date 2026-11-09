@@ -150,3 +150,26 @@ class TestGetDocsLinks:
         scraper = _make_scraper()
         docs = scraper._get_docs_links("<html><body></body></html>", "Lei")
         assert docs == []
+
+
+async def test_constitution_pdf_link_is_resolved_while_listing():
+    # Fetching the JSF constitution page during a search reset the shared
+    # session and broke the concurrent Lei search, so listing resolves it first.
+    from unittest.mock import AsyncMock
+
+    from conftest import make_mock_response
+
+    scraper = _make_scraper()
+    page = '<object class="view-pdf-constituicao" data="/ged/cons.pdf"></object>'
+    scraper.http.request = AsyncMock(return_value=make_mock_response(page))
+    (ref,) = [
+        ref
+        async for ref in scraper.list_type(
+            2024, "Constituição Estadual", TYPES["Constituição Estadual"]
+        )
+    ]
+    assert ref["_pdf_link"] == "https://legislacao.al.ma.leg.br/ged/cons.pdf"
+    scraper.fetch_pdf = AsyncMock(return_value="doc")
+    scraper.http.request.reset_mock()
+    assert await scraper.fetch(ref) == "doc"
+    scraper.http.request.assert_not_called()

@@ -15,6 +15,17 @@ from src.core.store import Store
 sys.path.insert(0, str(Path(__file__).parent))
 
 
+@pytest.fixture(autouse=True)
+def inline_pdf_work(monkeypatch):
+    """Unit tests convert PDFs inline so monkeypatches reach the conversion code."""
+    from src.core import convert
+
+    async def inline(function, *args):
+        return function(*args)
+
+    monkeypatch.setattr(convert, "_in_process", inline)
+
+
 def make_scraper(cls, **overrides):
     http = HttpClient(rps=1000, max_retries=1)
     http.request = AsyncMock(

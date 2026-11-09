@@ -130,7 +130,12 @@ class LegislaGoias(BaseScraper):
         if _REDIRECT_MARKER.lower() in soup.get_text(" ", strip=True).lower():
             return ("", "", True)
         pdf_link = self._extract_pdf_link(soup)
-        root = soup.body or soup
+        # Some API contents prepend an empty HTML shell; keep the body with the text.
+        root = max(
+            soup.find_all("body"),
+            key=lambda body: len(body.get_text(strip=True)),
+            default=soup,
+        )
         for tag_name in ["meta", "link", "title", "input", "label"]:
             for tag in root.find_all(tag_name):
                 tag.decompose()

@@ -5,7 +5,7 @@ import sys
 
 import pytest
 from bs4 import BeautifulSoup
-from conftest import make_scraper
+from conftest import make_mock_response, make_scraper
 from parser_assertions import (
     ScraperClassTests,
     SituationsConstantTests,
@@ -175,3 +175,44 @@ class TestGetDocDataStringKwarg:
             import re
 
             soup.find("td", string=re.compile("Links:"))
+
+
+class TestFetchHtmlNorm:
+    async def test_stores_http_body_instead_of_browser_mhtml(self):
+        scraper = _make_scraper()
+        meta = (
+            "<html><body><table>"
+            "<tr><td>Situação:</td><td>Vigente</td></tr>"
+            "<tr><td>Assunto:</td><td>Administração</td></tr>"
+            "<tr><td>Links:</td><td><a href='M0100099.asp?Hid_IdNorma=1'>Texto</a></td></tr>"
+            "</table></body></html>"
+        )
+        rows = "".join(f"<tr><td>cabeçalho {i}</td></tr>" for i in range(6))
+        text = (
+            f"<html><body><table><tbody>{rows}<tr><td>Art. 1º Fica instituído o "
+            "programa estadual de teste. Art. 2º Esta lei entra em vigor."
+            "</td></tr></tbody></table></body></html>"
+        )
+        scraper.http.request.side_effect = [
+            make_mock_response(meta),
+            make_mock_response(text),
+        ]
+        doc = await scraper.fetch(
+            {
+                "year": 2012,
+                "type": "Lei ordinária",
+                "title": "Lei ordinária 1 DE 01/01/2012",
+                "situation": "Não consta revogação expressa",
+                "_html_link": "https://www.al.rs.gov.br/legis/M010/M0100018.asp?Hid_IdNorma=1",
+                "document_url": "https://www.al.rs.gov.br/legis/M010/M0100018.asp?Hid_IdNorma=1",
+            }
+        )
+        assert doc.raw == text.encode()
+        assert doc.raw_ext == ".html"
+        assert (
+            doc.document_url
+            == "https://www.al.rs.gov.br/legis/M010/M0100099.asp?Hid_IdNorma=1"
+        )
+        assert "programa estadual de teste" in doc.text_markdown
+        assert doc.situation == "Vigente"
+        scraper.browser.snapshot.assert_not_called()

@@ -333,7 +333,11 @@ class MGAlmgScraper(BaseScraper):
     def _prepare_text_norma_html(
         self, text_norm_span: Tag, document_page_url: str
     ) -> tuple[str, str, list[str]]:
-        span_soup = BeautifulSoup(str(text_norm_span), "lxml")
+        # ALMG's page script collapses textNorma whitespace; without that, html-to-markdown
+        # glues words split across <p>s in rowspan tables ("doParaíso").
+        span_soup = BeautifulSoup(
+            re.sub("[ \t\r\n\f]+", " ", str(text_norm_span)), "lxml"
+        )
         clean_span = span_soup.find("span", class_="textNorma")
         if clean_span is None:
             clean_span = span_soup
@@ -405,7 +409,7 @@ class MGAlmgScraper(BaseScraper):
         self,
         text_norm_span: Tag,
         document_page_url: str,
-        page_mhtml: bytes | None,
+        page_raw: bytes | None,
         title: str,
         norm_type: str,
         data: dict,
@@ -442,8 +446,8 @@ class MGAlmgScraper(BaseScraper):
             year=year,
             text_markdown=text_markdown,
             document_url=document_page_url,
-            raw=page_mhtml,
-            raw_ext=".mhtml",
+            raw=page_raw,
+            raw_ext=".html",
         )
 
     async def fetch(self, doc_info: dict) -> Document | None:
@@ -477,7 +481,7 @@ class MGAlmgScraper(BaseScraper):
         (
             document_page_url,
             text_norm_span,
-            page_mhtml,
+            page_raw,
             error,
         ) = await self._resolve_mg_text_page(text_links, title)
         if text_norm_span is None:
@@ -487,7 +491,7 @@ class MGAlmgScraper(BaseScraper):
         return await self._convert_mg_content(
             text_norm_span,
             document_page_url,
-            page_mhtml,
+            page_raw,
             title,
             norm_type,
             data,
@@ -516,8 +520,8 @@ class MGAlmgScraper(BaseScraper):
     async def _try_fetch_text_norma(
         self, url: str, title: str
     ) -> tuple[Tag | None, bytes | None, str]:
-        soup, mhtml = await self.browser.snapshot(url)
-        span = soup.find("span", class_="textNorma")
+        response = await self.http.request(url)
+        span = response.soup().find("span", class_="textNorma")
         if span is not None:
-            return (span, mhtml, "")
+            return (span, response.content, "")
         return (None, None, "Could not find span.textNorma in document page")

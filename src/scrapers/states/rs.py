@@ -153,7 +153,8 @@ class RSAlrsScraper(BaseScraper):
         )
         if not html_link.startswith("http"):
             html_link = f"{self.base_url}/legis/M010/{html_link}"
-        soup = (await self.http.request(html_link)).soup()
+        response = await self.http.request(html_link)
+        soup = response.soup()
         if not soup:
             raise ValueError("Norm has no text content")
         soup_text = str(soup).lower()
@@ -175,13 +176,7 @@ class RSAlrsScraper(BaseScraper):
         document_url = pdf_link if pdf_link else html_link
         if html_string:
             text_markdown = await self.markdown(html=html_string)
-            try:
-                _, mhtml_bytes = await self.browser.snapshot(html_link)
-                raw = mhtml_bytes
-                content_ext = ".mhtml"
-            except Exception as exc:
-                logger.warning(f"MHTML capture failed for {html_link}: {exc}")
-                raise ValueError(f"MHTML capture failed: {exc}")
+            raw, content_ext = response.content, ".html"
         else:
             text_markdown, raw, content_ext = await self.download(pdf_link)
         text_markdown = self._clean_rs_markdown(text_markdown)

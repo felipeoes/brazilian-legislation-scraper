@@ -1,8 +1,10 @@
 "Parser and metadata regression tests for mato_grosso_scraper."
 
+from unittest.mock import AsyncMock
+
 import pytest
 from bs4 import BeautifulSoup
-from conftest import make_scraper
+from conftest import make_mock_response, make_scraper
 from parser_assertions import (
     ScraperClassTests,
     SituationsConstantTests,
@@ -285,3 +287,50 @@ class TestExtractDocsFromSoupNoneGuards:
         docs = scraper._extract_docs_from_soup(soup, is_historic=False)
         assert len(docs) == 1
         assert docs[0]["type"] == "Lei Ordinária"
+
+
+# Trimmed from a live compilado page: site header row, then <hr>, then the norm.
+_COMPILADO_HTML = """<html><body><turbo-frame id="norma-juridica-compilado-2018-05-30">
+<div class="row">
+<div class="col-12 col-md-6"><i class="bi bi-clock-fill"></i>
+<span class="ms-1">Horário de compilação: 03/07/2026 12:48</span></div>
+<div class="col-12 col-md-6"><nav><ul class="nav"><li><a class="btn" href="/gerar-pdf">PDF</a></li></ul></nav></div>
+</div>
+<hr class="mt-1"/>
+<div class="back-container-dispositivo" id="dispositivo-1"><div class="back-container-versao"><p>
+<span class="texto">RESOLUÇÃO Nº 5.473, DE 2018 - DOEAL/MT DE 19.06.18.</span></p></div></div>
+<div class="back-container-dispositivo" id="dispositivo-2"><p><b>Art.</b> 1º Fica concedido o Título de Cidadã Mato-grossense à Senhora Gessi Carmen Rostirolla.</p></div>
+</turbo-frame></body></html>"""
+
+
+class TestFetch:
+    async def test_builds_document_from_compilado_and_strips_site_header(self):
+        scraper = _make_scraper()
+        compilado = _COMPILADO_HTML.encode()
+        ficha = "<html><body><ul><li><strong>Situação:</strong> Vigente</li></ul></body></html>"
+
+        async def request(url, **_):
+            body = compilado if "/compilado?" in url else ficha
+            return make_mock_response(body)
+
+        scraper.http.request = AsyncMock(side_effect=request)
+        norm = (
+            "/norma-juridica/urn:lex:br;mato.grosso:estadual:resolucao:2018-05-30;5473"
+        )
+        doc = await scraper.fetch(
+            {
+                "year": 2018,
+                "type": "Resolução",
+                "title": "Resolução - 5473/2018",
+                "summary": "",
+                "situation": "Não consta revogação expressa",
+                "norm_link": norm,
+                "document_url": f"https://www.al.mt.gov.br{norm}",
+            }
+        )
+        assert doc.text_markdown.lstrip().startswith("RESOLUÇÃO Nº 5.473")
+        assert "Horário de compilação" not in doc.text_markdown
+        assert "---" not in doc.text_markdown
+        assert doc.situation == "Vigente"
+        assert doc.raw == compilado and doc.raw_ext == ".html"
+        assert scraper.http.request.await_count == 2

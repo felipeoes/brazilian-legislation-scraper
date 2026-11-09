@@ -14,7 +14,7 @@ uv run playwright install chromium
 cp .env.example .env
 ```
 
-Chromium is launched lazily for sites that require rendering or MHTML snapshots.
+Most sources are scraped over plain HTTP. Chromium is launched lazily, only by the few sources that still need a rendered page.
 
 ## Usage
 
@@ -23,6 +23,8 @@ uv run main.py list
 uv run main.py run -s Acre Conama --year 2024
 uv run main.py run -s PB PI RR
 uv run main.py run --all
+uv run main.py run --all --jobs 8
+uv run main.py stats
 uv run main.py run -s RS --year 2024 --overwrite
 uv run main.py run -s Pernambuco --year 2024 --verbose
 uv run main.py export -s Acre --format jsonl --out exports/acre
@@ -32,7 +34,11 @@ uv run main.py import-json -s Acre
 
 Names, class names, and the aliases shown by `list` are case insensitive. Omit `--year` to scrape the registered date range. A run returns exit code 1 if any listing, document, or cleanup fails; errors are recorded in SQLite. With no command, the CLI prints usage and exits 2.
 
-Resume checks use the original listing URL and title, even when the fetched document has a different URL or publication year. `--overwrite` re-scrapes the selected years and replaces each stored document as it is saved; nothing is deleted up front, so documents removed from the source stay in the archive. Acre, Amapá, Rio de Janeiro, and ICMBio enumerate their yearless listings once and filter by each document's year. Other sources list years in order through one shared worker queue. Constitutions retain their promulgation year.
+When several scrapers are selected, each runs in its own process, so CPU-heavy parsing in one source never stalls another. `--jobs` limits how many run at once (default: all selected, up to the CPU count). Each child has its own OCR limit (`LLM_CONCURRENCY`) and PDF worker pool. A single scraper runs in-process.
+
+`stats` prints a Markdown table of each archive's latest run. It covers wall time, listing time, documents per minute, fetch latency (p50/p95/max), HTTP requests, retries and megabytes, browser navigations, and LLM requests. The numbers come from `runs.stats`; [docs/performance-baseline.md](docs/performance-baseline.md) records a reference run.
+
+Resume checks use the original listing URL and title, even when the fetched document has a different URL or publication year. `--overwrite` re-scrapes the selected years and replaces each stored document as it is saved; nothing is deleted up front, so documents removed from the source stay in the archive. Acre, Rio de Janeiro, and ICMBio enumerate their yearless listings once and filter by each document's year. Amapá's eLegis filters by the year of the originating bill, so `--year Y` lists norms from bills filed in Y and files each under its publication year; `--all` covers every norm once. Other sources list years in order through one shared worker queue. Constitutions retain their promulgation year.
 
 ## Configuration
 
@@ -47,26 +53,27 @@ All project settings are read in `src/config.py`, including `.env`.
 | `LLM_MODEL` | PydanticAI model string, or comma-separated fallback models | Empty: OCR disabled |
 | `LLM_PDF_INPUT` | Send PDF chunks instead of rendered PNG pages | `false` |
 | `LLM_BATCH_SIZE` | Pages per OCR request | `5` |
-| `LLM_CONCURRENCY` | Maximum concurrent OCR batches across all scrapers | `8` |
+| `LLM_CONCURRENCY` | Maximum concurrent OCR batches per scraper process | `8` |
+| `PDF_WORKERS` | PDF text-extraction processes per scraper process (multi-scraper runs set it from `--jobs`) | `min(8, CPUs)` |
 | `PROXY_FILE_PATH` | Optional newline-separated or JSON proxy list | Empty |
 | `PROXY_ENDPOINT` | Optional proxy-list endpoint | Empty |
 
 For example, set `LLM_MODEL=openai:gpt-4.1-mini` and `OPENAI_API_KEY`. OpenAI-compatible services also use `OPENAI_BASE_URL`. Other model strings use their standard provider credentials, such as `AWS_*`, `AWS_BEARER_TOKEN_BEDROCK`, `ANTHROPIC_API_KEY`, or `GOOGLE_API_KEY`. Installed PydanticAI provider extras cover OpenAI, Bedrock, Anthropic, and Google. Model selection and whether PDF input is supported depend on the provider.
 
-One OCR agent and semaphore are shared across the run. A failed OCR batch rejects the whole document; successful blank batches are allowed. Usage per model is stored in `runs.llm_usage`.
+Each scraper process has one OCR agent and semaphore. A failed OCR batch rejects the whole document; successful blank batches are allowed. A PDF whose text layer is unreadable goes to OCR when a model is configured; without a model the noisy text is kept. Unreadable means mostly odd-shaped tokens and few common Portuguese words, as in old scans with a noisy OCR layer. On the 2012 archives this sends 13 of about 11,700 PDFs, 111 pages, to OCR. Usage per model is stored in `runs.llm_usage`.
 
 ## Storage and export
 
-Each scraper writes `<archive root>/<SCRAPER>/documents.db` with `documents`, `errors`, and `runs` tables. SQLite uses WAL and atomic transactions. Raw artifacts live under `YEAR/docs/` with fixed-length content-addressed filenames and are written by atomic replacement. An interrupted database write can leave an unreferenced raw file; it cannot replace a previous document's raw content.
+Each scraper writes `<archive root>/<SCRAPER>/documents.db` with `documents`, `errors`, and `runs` tables. SQLite uses WAL and atomic transactions. Raw artifacts live under `YEAR/docs/` with fixed-length content-addressed filenames and are written by atomic replacement. `file_path` is relative to the scraper's archive directory, so archives can be moved. Rows written by older versions may hold absolute paths. Replacing a document removes its previous raw file, and a failed write removes the file it just wrote. The store never deletes files it did not write, and an interrupted write never replaces a previous document's raw content.
 
 `export` streams records to `YEAR/data.jsonl` or `YEAR/data.json`. It includes document metadata, `text_markdown`, source-specific extra fields, `file_path`, and the resume key (`ref_url`, `ref_title`) so `import-json` can restore it; raw bytes and listing-only keys starting with `_` are excluded. The default export directory is `<archive root>/<SCRAPER>/export`. With multiple scrapers and `--out`, each scraper gets a separate subdirectory.
 
-`import-json` reads `YEAR/data.json` (a list, or the legacy `{"summary", "documents"}` file) and `YEAR/shards/*.json` from the selected scraper's archive directory. It validates each record, preserves existing `file_path` values, and never deletes its inputs. Invalid records are skipped, recorded in the `errors` table, and make the command exit 1; unreadable files fail loudly. Rerunning safely replaces duplicate keys. Legacy Câmara, DF, and Ceará archives were keyed by the fetched URL, not the listing URL that resume uses, so re-scrape those instead of importing them.
+`import-json` reads `YEAR/data.json` (a list, or the legacy `{"summary", "documents"}` file) and `YEAR/shards/*.json` from the selected scraper's archive directory. It validates each record, preserves existing `file_path` values, and never deletes its inputs. Invalid records are skipped, recorded in the `errors` table, and make the command exit 1; unreadable files fail loudly. Rerunning safely replaces duplicate keys. Legacy Câmara, DF, and Ceará archives were keyed by the fetched URL, not the listing URL that resume uses, so re-scrape those instead of importing them. The same applies to archives made before the Amapá, Pará, São Paulo, Sergipe, and Rio de Janeiro rewrites, whose sources or titles changed.
 
 ## Architecture
 
 ```text
-main.py                      CLI and shared OCR lifecycle
+main.py                      CLI, one process per scraper, run stats
 src/config.py                Environment settings
 src/registry.py              30 scraper registrations and runtime defaults
 src/core/document.py         Validated Document model and listing metadata type
@@ -86,7 +93,7 @@ src/scrapers/environment/     CONAMA and ICMBio
 
 Scrapers implement `list_type(year, name, value)` (called once per type, so one failing type doesn't stop the others) or override `list_documents(year)`, both async generators of lightweight metadata, and `fetch(ref)` returning a `Document`. Constructors only accept dependencies and set attributes. The base run loop owns persistence, error reporting, and resume; fetch workers never collect whole archives in memory. One queue capped at twice the worker count serves all years. Stateful pagination remains sequential; stateless page requests use bounded batches. HTTP requests and browser navigation share the scraper's rate limiter. Browser pools never exceed their configured page limit.
 
-Digital PDFs use pymupdf4llm, then PyMuPDF plain text, then optional OCR. CPU-heavy PDF work runs in threads. HTML uses the lxml parser and html-to-markdown, with image sources inlined as base64 data URIs.
+Digital PDFs use pymupdf4llm, then PyMuPDF plain text, then optional OCR. Text extraction runs in a pool of worker processes, because pymupdf4llm holds the GIL. A crashed worker fails only its own document. Word documents convert to HTML with mammoth. File types are detected from content (`%PDF`, DOCX zip, OLE2, HTML) before names or headers; legacy Word `.doc` files fail with a clear error, since no converter is bundled. HTML uses the lxml parser and html-to-markdown, with image sources inlined as base64 data URIs. Spacer images under 100 bytes are dropped. Responses decode as browsers do: the declared charset (header, BOM or `<meta>`), otherwise UTF-8 when valid and windows-1252 when not; ISO-8859-1 labels also mean windows-1252.
 
 ## Development
 

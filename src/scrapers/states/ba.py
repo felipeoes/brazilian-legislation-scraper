@@ -149,6 +149,11 @@ class BahiaLegislaScraper(BaseScraper):
     def _get_total_pages(self, soup: BeautifulSoup) -> int:
         pagination = soup.find("ul", class_="pagination js-pager__items")
         if not pagination:
+            # The view header reads "1 - 20 de 1138"; more results than rows needs a pager.
+            header = soup.find("div", class_="view-header")
+            total = re.search(r"de\s+(\d+)", header.get_text()) if header else None
+            if total and int(total.group(1)) > len(soup.select("tbody tr")):
+                raise ValueError("Listing has more results than rows but no pager")
             return 1
         last_page = 0
         for page_link in pagination.find_all("a", href=True):
@@ -168,11 +173,12 @@ class BahiaLegislaScraper(BaseScraper):
         """Get documents html links from a given search page."""
         if soup is None:
             soup = (await self.http.request(url)).soup()
-        if soup.find("td", class_="views-empty"):
+        empty = soup.find("td", class_="views-empty")
+        if empty and "Nenhum resultado encontrado" in empty.get_text():
             return []
         tbody = soup.find("tbody")
         if not tbody:
-            return []
+            raise ValueError(f"No results table at {url}")
         docs = []
         for item in tbody.find_all("tr"):
             tds = item.find_all("td")
@@ -190,6 +196,8 @@ class BahiaLegislaScraper(BaseScraper):
             if not title:
                 continue
             docs.append({"title": title, "type": norm_type, "_html_link": href})
+        if not docs:
+            raise ValueError(f"No document rows in results table at {url}")
         return docs
 
     async def fetch(self, doc_info: dict) -> Document | None:

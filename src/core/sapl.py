@@ -65,16 +65,8 @@ class SAPLBaseScraper(BaseScraper):
         "^(CONSTITUIÇÃO ESTADUAL|DECRETO LEGISLATIVO|DECRETO|EMENDA CONSTITUCIONAL|LEI COMPLEMENTAR|LEI DELEGADA|LEI|RESOLU[ÇC][AÃ]O)\\b",
         re.IGNORECASE,
     )
-    _EXTRA_DOC_START_PATTERNS: tuple[str, ...] = (
-        "governo do estado do piauí",
-        "secretaria de governo do estado do piauí",
-        "setor de protocolo alepi",
-        "expediente ",
-        "ofício pres. sgm",
-        "oficio pres. sgm",
-        "proposição ",
-        "proposicao ",
-    )
+    # Line starts that open a document appended after the law; site-specific (see Piauí).
+    _EXTRA_DOC_START_PATTERNS: tuple[str, ...] = ()
     _FOOTER_BLOCK_PATTERNS: tuple[str, ...] = (
         "a autenticidade do documento pode ser conferida",
         "a autenticidade deste documento pode ser conferida",
@@ -86,9 +78,14 @@ class SAPLBaseScraper(BaseScraper):
         "assinatura eletr",
     )
     _PROCESS_NUMBER_RE = re.compile("^\\d{5}\\.\\d{6,7}/\\d{4}[-.]\\d{2}$")
-    _SEI_PAGE_COUNTER_RE = re.compile("^\\d+\\s*/\\s*\\d+$")
+    _SEI_PAGE_COUNTER_RE = re.compile("^\\d{1,3}\\s*/\\s*\\d{1,3}$")
     _SEI_TIMESTAMP_RE = re.compile("^\\d{1,2}/\\d{1,2}/\\d{4},\\s*\\d{1,2}:\\d{2}$")
     _SEI_VERSION_RE = re.compile("^\\d[\\dv\\s]{6,}$", re.IGNORECASE)
+    _CLOSING_RE = re.compile("^(pal[áa]cio\\b|sala das sess)", re.IGNORECASE)
+    # A title deeper than this is a cross-reference or a reversed text layer, not the header.
+    _HEADER_MAX_WORDS = 60
+    _HEADER_MAX_SHARE = 0.15
+    _FOOTER_BLOCK_MAX_LINES = 6
 
     def _title_match_score(self, line: str, expected_title: str) -> int:
         """Score how well a line matches the expected document title."""
@@ -151,28 +148,24 @@ class SAPLBaseScraper(BaseScraper):
         )
 
     def _is_footer_block_line(self, compact: str, lower: str) -> bool:
-        """Return whether a line belongs to a SEI/authenticity footer block."""
+        """Return whether a line starts a SEI/authenticity footer block."""
         if not compact:
             return False
         if any((pattern in lower for pattern in self._FOOTER_BLOCK_PATTERNS)):
             return True
-        if lower.startswith("(assinatura") or lower.startswith("assinatura"):
+        if lower.startswith(("(assinatura", "assinatura", "sei/")):
             return True
-        if lower.startswith("sei/"):
-            return True
-        if lower.startswith("http") and "sei" in lower:
-            return True
-        if self._PROCESS_NUMBER_RE.match(compact):
-            return True
-        if self._SEI_PAGE_COUNTER_RE.match(compact):
-            return True
-        if self._SEI_TIMESTAMP_RE.match(compact):
-            return True
-        if self._SEI_VERSION_RE.match(compact) and "v" in lower:
-            return True
-        if lower.startswith("roraima, em "):
-            return True
-        return False
+        return lower.startswith("http") and "sei" in lower
+
+    def _is_footer_noise_line(self, compact: str, lower: str) -> bool:
+        """Return whether a single line is page/process/timestamp noise (dropped alone)."""
+        return bool(
+            self._PROCESS_NUMBER_RE.match(compact)
+            or self._SEI_PAGE_COUNTER_RE.match(compact)
+            or self._SEI_TIMESTAMP_RE.match(compact)
+            or (self._SEI_VERSION_RE.match(compact) and "v" in lower)
+            or lower.startswith("roraima, em ")
+        )
 
     def _format_search_url(
         self, norm_type_id: str | int, year: int, page: int = 1
@@ -295,6 +288,17 @@ class SAPLBaseScraper(BaseScraper):
             if self._SAPL_TITLE_RE.match(compact)
         ]
 
+    def _header_boundary(self, lines: list[str]) -> int:
+        """Index past which a title line can no longer be the start of the content."""
+        total = sum(len(line.split()) for line in lines)
+        allowed = max(self._HEADER_MAX_WORDS, total * self._HEADER_MAX_SHARE)
+        seen = 0
+        for idx, line in enumerate(lines):
+            if seen > allowed:
+                return idx
+            seen += len(line.split())
+        return len(lines)
+
     def _find_content_start(self, lines: list[str], expected_title: str | None) -> int:
         """Return the index of the first line of the actual norm content.
 
@@ -302,6 +306,7 @@ class SAPLBaseScraper(BaseScraper):
         falls back to the last numbered SAPL-title-RE candidate.  Returns 0 if
         no reliable start can be found.
         """
+        lines = lines[: self._header_boundary(lines)]
         normalized_expected = (
             normalize_title_text(expected_title) if expected_title else ""
         )
@@ -324,20 +329,28 @@ class SAPLBaseScraper(BaseScraper):
     def _filter_footer_blocks(
         self, line_tuples: list[tuple[str, str, str]]
     ) -> list[tuple[str, str, str]]:
-        """Remove footer-block lines (authentication blocks, stamps, etc.).
+        """Remove footer blocks and single noise lines without swallowing body or annex text.
 
-        Accepts (raw, compact, lower) tuples; returns tuples for kept lines.
+        A block is the footer line plus up to ``_FOOTER_BLOCK_MAX_LINES`` continuation
+        lines; it ends early at a blank line, a table row, or substantive legal text.
         """
         out: list[tuple[str, str, str]] = []
-        in_footer_block = False
+        remaining = 0
         for raw_line, compact, lower in line_tuples:
-            if in_footer_block:
-                if self._is_norm_content_line(compact, lower):
-                    in_footer_block = False
-                else:
-                    continue
             if self._is_footer_block_line(compact, lower):
-                in_footer_block = True
+                remaining = self._FOOTER_BLOCK_MAX_LINES
+                continue
+            if remaining:
+                if (
+                    not compact
+                    or compact.startswith("|")
+                    or self._is_norm_content_line(compact, lower)
+                ):
+                    remaining = 0
+                else:
+                    remaining -= 1
+                    continue
+            if self._is_footer_noise_line(compact, lower):
                 continue
             out.append((raw_line, compact, lower))
         return out
@@ -345,24 +358,20 @@ class SAPLBaseScraper(BaseScraper):
     def _truncate_extra_documents(
         self, line_tuples: list[tuple[str, str, str]]
     ) -> list[str]:
-        """Stop at the first line that looks like the start of a new document.
+        """Stop at an appended document (message, protocol stamp) after the law's closing formula.
 
         Accepts (raw, compact, lower) tuples; returns original raw lines.
         """
         out: list[str] = []
-        seen_norm_content = False
+        closed = False
         for raw_line, compact, lower in line_tuples:
-            if self._is_footer_block_line(compact, lower):
-                continue
-            if self._is_norm_content_line(compact, lower):
-                seen_norm_content = True
-            if seen_norm_content and any(
-                (
-                    lower.startswith(pattern)
-                    for pattern in self._EXTRA_DOC_START_PATTERNS
-                )
+            if self._is_footer_block_line(compact, lower) or self._is_footer_noise_line(
+                compact, lower
             ):
+                continue
+            if closed and lower.startswith(self._EXTRA_DOC_START_PATTERNS):
                 break
+            closed = closed or bool(self._CLOSING_RE.match(compact))
             out.append(raw_line)
         return out
 

@@ -456,11 +456,22 @@ class MaranhaoAlemaScraper(BaseScraper):
     ) -> AsyncIterator[dict]:
         if norm_type == "Constituição Estadual":
             if year == self.years.start:
+                # Resolve the PDF here: a JSF page GET during a later search
+                # resets the shared session and breaks that search.
+                url = urljoin(f"{self.base_url}/ged/", spec)
+                pdf = (
+                    (await self.http.request(url))
+                    .soup()
+                    .find("object", class_="view-pdf-constituicao")
+                )
+                if pdf is None or not pdf.get("data"):
+                    raise ValueError("Maranhão constitution has no PDF link")
                 yield {
                     "year": _CONSTITUTION_YEAR,
                     "type": norm_type,
                     "title": "Constituição Estadual do Maranhão",
-                    "document_url": urljoin(f"{self.base_url}/ged/", spec),
+                    "document_url": url,
+                    "_pdf_link": urljoin(self.base_url, pdf["data"]),
                     "situation": DEFAULT_VALID_SITUATION,
                     "constitution": True,
                 }
@@ -506,10 +517,4 @@ class MaranhaoAlemaScraper(BaseScraper):
                     }
 
     async def fetch(self, ref: dict) -> Document:
-        if ref.get("constitution"):
-            soup = (await self.http.request(ref["document_url"])).soup()
-            pdf = soup.find("object", class_="view-pdf-constituicao")
-            if pdf is None or not pdf.get("data"):
-                raise ValueError("Maranhão constitution has no PDF link")
-            ref = {**ref, "_pdf_link": urljoin(self.base_url, pdf["data"])}
         return await self.fetch_pdf(ref)

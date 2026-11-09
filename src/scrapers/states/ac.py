@@ -86,16 +86,13 @@ class AcreLegisScraper(BaseScraper):
         return str(html_tag)
 
     async def fetch(self, doc_info: dict) -> Document | None:
-        """Get document data from given html link"""
-        doc_html_link = doc_info["_html_link"]
-        try:
-            soup, mhtml = await self.browser.snapshot(
-                doc_html_link, wait_until="domcontentloaded"
-            )
-        except Exception as exc:
-            raise ValueError(f"Failed to fetch document page: {exc}")
-        html_string = self._clean_acre_html(soup)
-        return await self.fetch_html(doc_info, html_string, doc_html_link, mhtml)
+        """Get document data from the server-rendered law page."""
+        url = doc_info["document_url"]
+        response = await self.http.request(url)
+        html_string = self._clean_acre_html(response.soup())
+        return await self.fetch_html(
+            doc_info, html_string, url, response.content, raw_ext=".html"
+        )
 
     async def list_documents(self, year: int | None) -> AsyncIterator[dict]:
         soup = (await self.http.request(self._format_search_url(1))).soup()

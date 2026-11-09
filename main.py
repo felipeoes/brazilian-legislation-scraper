@@ -2,6 +2,8 @@
 
 import argparse
 import asyncio
+import json
+import os
 import sys
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -34,6 +36,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     run.add_argument("--year", type=int)
     run.add_argument("--overwrite", action="store_true")
     run.add_argument("-v", "--verbose", action="store_true")
+    run.add_argument(
+        "--jobs",
+        type=int,
+        help="Scraper processes at once when several are selected (default: all, up to CPU count)",
+    )
+    stats = commands.add_parser(
+        "stats", help="Markdown table of each archive's last run"
+    )
+    stats.add_argument("-s", "--scrapers", nargs="+")
     export = commands.add_parser("export", help="Stream SQLite documents to JSON/JSONL")
     export.add_argument("-s", "--scrapers", nargs="+", required=True)
     export.add_argument("--format", choices=("jsonl", "json"), default="jsonl")
@@ -89,6 +100,101 @@ async def run_scraper(
         return False
 
 
+async def run_in_processes(specs: list[ScraperSpec], args: argparse.Namespace) -> int:
+    """One process per scraper, so CPU-bound parsing in one never stalls the others."""
+    jobs = args.jobs or min(len(specs), os.cpu_count() or 1)
+    if jobs < 1:
+        raise ValueError("--jobs must be positive")
+    # LLM_CONCURRENCY applies per child: few sources need much OCR, and an even
+    # split left the one that does with a single batch.
+    env = {
+        **os.environ,
+        # PDF pools are 2x oversubscribed: most scrapers wait on the network.
+        "PDF_WORKERS": str(max(1, min(8, 2 * (os.cpu_count() or 1) // jobs))),
+    }
+    extra = [
+        *(("--year", str(args.year)) if args.year is not None else ()),
+        *(("--overwrite",) if args.overwrite else ()),
+        *(("--verbose",) if args.verbose else ()),
+    ]
+    gate = asyncio.Semaphore(jobs)
+
+    async def child(spec: ScraperSpec) -> int:
+        async with gate:
+            process = await asyncio.create_subprocess_exec(
+                sys.executable, __file__, "run", "-s", spec.cls.name, *extra, env=env
+            )
+            try:
+                return await process.wait()
+            finally:
+                if process.returncode is None:  # cancelled: don't leave orphans
+                    process.terminate()
+                    await process.wait()
+
+    async with asyncio.TaskGroup() as group:
+        tasks = [group.create_task(child(spec)) for spec in specs]
+    return int(any(task.result() for task in tasks))
+
+
+_STATS_COLUMNS = (
+    "Scraper",
+    "Years",
+    "Listed",
+    "Docs",
+    "Errors",
+    "Seconds",
+    "Listing s",
+    "Docs/min",
+    "Fetch p50 s",
+    "Fetch p95 s",
+    "Fetch max s",
+    "HTTP req",
+    "Retries",
+    "MB",
+    "Browser navs",
+    "LLM req",
+)
+
+
+async def print_stats(specs: list[ScraperSpec]) -> None:
+    print("| " + " | ".join(_STATS_COLUMNS) + " |")
+    print("|" + "---|" * len(_STATS_COLUMNS))
+    for spec in specs:
+        if not spec.database.exists():
+            continue
+        async with Store(spec.database) as store:
+            row = store.connection.execute(
+                "SELECT llm_usage, stats FROM runs WHERE finished_at IS NOT NULL ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            continue
+        stats = json.loads(row["stats"])
+        http = stats.get("http", {})
+        llm = sum(
+            usage.get("requests", 0) for usage in json.loads(row["llm_usage"]).values()
+        )
+        cells = [
+            spec.cls.name,
+            stats.get("years"),
+            stats.get("listed"),
+            stats.get("docs"),
+            stats.get("errors"),
+            stats.get("seconds"),
+            stats.get("listing_seconds"),
+            stats.get("docs_per_minute"),
+            stats.get("fetch_p50"),
+            stats.get("fetch_p95"),
+            stats.get("fetch_max"),
+            http.get("requests"),
+            http.get("retries"),
+            round(http["bytes"] / 2**20, 1) if "bytes" in http else None,
+            stats.get("browser_navigations"),
+            llm,
+        ]
+        cells[5:7] = [f"{v:.0f}" if v is not None else None for v in cells[5:7]]
+        print("| " + " | ".join("–" if c is None else str(c) for c in cells) + " |")
+
+
 async def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     logger.remove()
@@ -103,6 +209,11 @@ async def main(argv: list[str] | None = None) -> int:
         return 0
     try:
         specs = select_scrapers(None if getattr(args, "all", False) else args.scrapers)
+        if args.command == "stats":
+            await print_stats(specs)
+            return 0
+        if args.command == "run" and len(specs) > 1:
+            return await run_in_processes(specs, args)
         if args.command == "run":
             async with AsyncExitStack() as stack:
                 ocr = None
@@ -114,10 +225,8 @@ async def main(argv: list[str] | None = None) -> int:
                         pdf_input=LLM_PDF_INPUT,
                     )
                     await stack.enter_async_context(ocr.agent)
-                results = await asyncio.gather(
-                    *(run_scraper(spec, args, ocr) for spec in specs)
-                )
-            return 0 if all(results) else 1
+                ok = await run_scraper(specs[0], args, ocr)
+            return 0 if ok else 1
         failed = False
         for spec in specs:
             try:

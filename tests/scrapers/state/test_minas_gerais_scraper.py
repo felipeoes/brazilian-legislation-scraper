@@ -1,7 +1,9 @@
 """Tests for MGAlmgScraper."""
 
+from unittest.mock import AsyncMock
+
 from bs4 import BeautifulSoup
-from conftest import make_scraper
+from conftest import make_mock_response, make_scraper
 from parser_assertions import (
     ScraperClassTests,
     SituationsConstantTests,
@@ -243,3 +245,60 @@ class TestExtractTotalPages:
         scraper = _make_scraper()
         soup = BeautifulSoup("<html><body></body></html>", "lxml")
         assert scraper._extract_total_pages(soup) == 0
+
+
+async def test_fetch_reads_text_page_over_http():
+    scraper = _make_scraper()
+    detail = str(
+        _make_detail_soup(
+            text_links=[("Texto atualizado", "/legislacao-mineira/texto/LEI/1/2012/")]
+        )
+    )
+    text_body = str(_make_text_soup("Art. 1º Texto da lei mineira. " * 20)).encode()
+    text_url = "https://www.almg.gov.br/legislacao-mineira/texto/LEI/1/2012/"
+    pages = {
+        "https://www.almg.gov.br/legislacao-mineira/LEI/1/2012": make_mock_response(
+            detail
+        ),
+        text_url: make_mock_response(text_body),
+    }
+    scraper.http.request = AsyncMock(side_effect=lambda url, **_: pages[url])
+    doc = await scraper.fetch(
+        {
+            "year": 2012,
+            "type": "Lei",
+            "title": "Lei nº 1, de 01/01/2012",
+            "summary": "",
+            "situation": DEFAULT_VALID_SITUATION,
+            "document_url": "https://www.almg.gov.br/legislacao-mineira/LEI/1/2012",
+            "_html_link": "/legislacao-mineira/LEI/1/2012",
+        }
+    )
+    assert doc.document_url == text_url and "Texto da lei mineira" in doc.text_markdown
+    assert doc.raw == text_body and doc.raw_ext == ".html"
+
+
+async def test_source_line_breaks_do_not_glue_words():
+    """ALMG's page script collapses whitespace in textNorma; raw HTTP HTML must match."""
+    scraper = _make_scraper()
+    # Rowspan tables become list items, where a newline between <p>s glued words.
+    row = (
+        "<table><tr valign=top>\n   <td rowspan=2><p>AF/2º\n   NÍVEL/</p>\n   <p>SÃO</p></td>\n"
+        "   <td><p>3.\n   São Sebastião do</p>\n   <p>Paraíso</p>\n   </td>\n</tr>"
+        "<tr><td>x</td></tr></table>"
+    )
+    span = BeautifulSoup(
+        f'<span class="textNorma"><p>{"Art. 1º Texto da lei mineira. " * 20}</p>{row}</span>',
+        "lxml",
+    ).find("span")
+    doc = await scraper._convert_mg_content(
+        span,
+        "https://www.almg.gov.br/legislacao-mineira/texto/DEC/45993/2012/original",
+        b"raw",
+        "Decreto nº 45.993",
+        "Decreto",
+        {"title": "Decreto nº 45.993", "type": "Decreto", "situation": "Vigente"},
+        2012,
+    )
+    assert "São Sebastião do Paraíso" in doc.text_markdown
+    assert "doParaíso" not in doc.text_markdown

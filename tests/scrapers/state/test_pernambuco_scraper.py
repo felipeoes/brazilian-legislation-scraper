@@ -2,11 +2,13 @@
 
 import ast
 import inspect
+from unittest.mock import AsyncMock
 
 from bs4 import BeautifulSoup
-from conftest import make_scraper
+from conftest import make_mock_response, make_scraper
 from parser_assertions import ScraperClassTests, TypesConstantTests
 
+from src.core.http import HttpError
 from src.scrapers.states.pe import TYPES, PernambucoAlepeScraper
 
 
@@ -188,3 +190,38 @@ class TestSearchHelpers:
             ("lbtn2", 7, False),
             ("lbtn3", 8, False),
         ]
+
+
+async def test_fetch_stores_selected_text_page_as_html():
+    scraper = _make_scraper()
+    body = _make_doc_html().replace(
+        b"<p>Disp", "<p>Art. 1º Texto da lei pernambucana. ".encode() * 5 + b"<p>Disp"
+    )
+    text_url = "https://legis.alepe.pe.gov.br/texto.aspx?id=1&tipo=TEXTOATUALIZADO"
+    ref_url = "https://legis.alepe.pe.gov.br/dadosReferenciais.aspx?id=1"
+    pages = {
+        text_url: make_mock_response(body),
+        ref_url: make_mock_response(str(_make_reference_html())),
+    }
+
+    async def request(url, **_):
+        if url not in pages:  # inlined images
+            raise HttpError(url, 404, "Not Found")
+        return pages[url]
+
+    scraper.http.request = AsyncMock(side_effect=request)
+    doc = await scraper.fetch(
+        {
+            "year": 2020,
+            "type": "Lei Ordinária",
+            "title": "Lei Ordinária nº 1",
+            "summary": "",
+            "situation": "Não consta revogação expressa",
+            "document_url": text_url,
+            "additional_data_url": ref_url,
+            "_candidate_document_urls": [text_url],
+        }
+    )
+    assert "Texto da lei pernambucana" in doc.text_markdown
+    assert doc.text_version == "TEXTOATUALIZADO" and doc.subject == "MEIO AMBIENTE."
+    assert doc.raw == body and doc.raw_ext == ".html"

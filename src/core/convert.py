@@ -1,17 +1,24 @@
 """Content detection, cleaning, and conversion with explicit dependencies."""
 
 import asyncio
+import contextlib
+import io
 import re
 import string
+import zipfile
 from collections.abc import Awaitable, Callable
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
+from typing import Any
 
 import fitz
+import mammoth
 from bs4 import BeautifulSoup, Tag
-from html_to_markdown import ConversionOptions
+from html_to_markdown import ConversionOptions, PreprocessingOptions
 from html_to_markdown import convert as html_to_md
-from loguru import logger
 
+from src.config import PDF_WORKERS
 from src.core.http import HttpClient, Response
 from src.core.images import inline_images_in_html
 from src.core.ocr import OCR, clean_md_tag
@@ -164,8 +171,9 @@ def detect_extension(content_type: str, filename: str | None = None) -> str:
     """Determine file extension from content type or filename."""
     if filename:
         ext = Path(filename).suffix
-        if ext:
-            return ext
+        # Store rejects odd suffixes (".pdf?x=1", "."), so only trust plain ones.
+        if re.fullmatch("\\.[A-Za-z0-9]{1,8}", ext):
+            return ext.lower()
     ct = (content_type or "").lower()
     if "pdf" in ct:
         return ".pdf"
@@ -182,14 +190,40 @@ def detect_extension(content_type: str, filename: str | None = None) -> str:
     return ".bin"
 
 
+def sniff_extension(content: bytes) -> str | None:
+    """Extension from the bytes themselves; servers often mislabel files."""
+    if content.startswith(b"%PDF"):
+        return ".pdf"
+    if content.startswith(b"PK\x03\x04"):
+        try:
+            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                return ".docx" if "word/document.xml" in archive.namelist() else None
+        except zipfile.BadZipFile:
+            return None
+    if content.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):  # OLE2: Word 97 .doc
+        return ".doc"
+    if content[:1024].lstrip().lower().startswith((b"<!doctype html", b"<html")):
+        return ".html"
+    return None
+
+
 def wrap_html(content: str) -> str:
     """Wrap HTML fragment in ``<html><body>`` tags for conversion."""
     return f"<html><body>{content}</body></html>"
 
 
+_C1_RE = re.compile("[\x80-\x9f]")
+
+
+def _from_cp1252(match: re.Match[str]) -> str:
+    return bytes([ord(match.group())]).decode("cp1252", errors="ignore")
+
+
 def clean_markdown(text: str, replace: list[tuple[str, str]] | None = None) -> str:
     """Clean markdown text by removing links and applying custom replacements."""
     text = clean_md_tag(text)
+    # Sources that decode cp1252 as Latin-1 leave C1 controls for dashes and quotes.
+    text = _C1_RE.sub(_from_cp1252, text)
     text = re.sub("(?<!!)\\[([^\\]]*)\\]\\([^)]*\\)", "\\1", text)
     if replace:
         for find, replacement in replace:
@@ -350,17 +384,56 @@ async def html_to_markdown(
     result = await asyncio.to_thread(
         html_to_md,
         html,
-        ConversionOptions(heading_style="atx", strip_tags=["script", "style", "svg"]),
+        ConversionOptions(
+            heading_style="atx",
+            strip_tags=["script", "style", "svg"],
+            extract_metadata=False,
+            # ASP.NET/JSF/Domino pages wrap the whole law in a <form>.
+            preprocessing=PreprocessingOptions(remove_forms=False),
+            hidden_content="all",
+        ),
     )
-    return clean_markdown(result or "")
+    return clean_markdown(result.content or "")
 
 
 _WATERMARK_CHECK_RE = re.compile("(?:\\n[^\\n]{0,2}){15,}")
 _MD_BASE64_IMAGE_RE = re.compile("!\\[[^\\]]*\\]\\(data:image/[^)]+\\)")
+# pymupdf4llm names header cells it could not read "Col1", "Col2", ...
+_PLACEHOLDER_CELL_RE = re.compile("(?<=\\|)Col\\d+(?=\\|)")
+
+
+_WORD_SHAPE_RE = re.compile("^(?:[a-zà-ÿ]+|[A-ZÀ-Þ]+|[A-ZÀ-Þ][a-zà-ÿ]+)$")
+_LOWER_WORD_RE = re.compile("[a-zà-ÿ]+")
+_COMMON_WORDS = frozenset(
+    "de da do das dos que em no na nos nas para com por os as um uma ao aos se ou "
+    "lei art estado sua seu pelo pela este esta sobre mais não nao como ser sem entre "
+    "dia ano governo poder fica ficam artigo parágrafo inciso".split()
+)
+
+
+def readable_text(text: str) -> bool:
+    """False for noisy OCR layers: odd-shaped tokens and few Portuguese function words.
+
+    Calibrated on 2012 archives: flags 13 of ~450 PB/PI scans, no clean documents.
+    """
+    shaped = odd = 0
+    for raw in text.split():
+        token = raw.strip(".,;:()[]\"'“”‘’-–—ºª°§/")
+        if any(c.isalpha() for c in token):
+            if _WORD_SHAPE_RE.match(token):
+                shaped += 1
+            else:
+                odd += 1
+    words = [w for w in _LOWER_WORD_RE.findall(text.lower()) if len(w) >= 2]
+    if shaped + odd < 20 or not words:
+        return True
+    common = sum(w in _COMMON_WORDS for w in words) / len(words)
+    return shaped / (shaped + odd) >= 0.8 or common >= 0.3
 
 
 def _digital_pdf(data: bytes, image_size_limit: float) -> str:
-    import pymupdf4llm.helpers.pymupdf_rag
+    with contextlib.redirect_stdout(io.StringIO()):  # its import prints a layout nag
+        import pymupdf4llm.helpers.pymupdf_rag
 
     with fitz.open(stream=data, filetype="pdf") as doc:
         try:
@@ -376,32 +449,61 @@ def _digital_pdf(data: bytes, image_size_limit: float) -> str:
             )
 
 
-def _plain_pdf(data: bytes) -> str:
+def _pdf_text_layer(
+    data: bytes, image_size_limit: float, check_readable: bool
+) -> str | None:
+    """Best embedded text (pymupdf4llm, else plain); None means it needs OCR.
+
+    Runs in a worker process, so it must not log.
+    """
     with fitz.open(stream=data, filetype="pdf") as doc:
-        return "\n\n".join((page.get_text() for page in doc))
+        plain = "\n\n".join(page.get_text() for page in doc)
+        minimum = max(50, doc.page_count * 100)
+
+    def long_enough(text: str) -> bool:
+        check = _WATERMARK_CHECK_RE.sub("", _MD_BASE64_IMAGE_RE.sub("", text)).strip()
+        return valid_markdown(check, min_length=minimum)[0]
+
+    # Judge the plain layer: the gate was calibrated on it, and markdown table
+    # pipes would read as noise. Without OCR a noisy layer beats no document.
+    if check_readable and not readable_text(plain):
+        return None
+    scanned, confidence = is_pdf_scanned(data)
+    if not scanned and confidence >= 0.7:
+        try:
+            markdown = _digital_pdf(data, image_size_limit)
+        except Exception:  # pymupdf4llm fails on some layouts; plain text remains
+            markdown = ""
+        if long_enough(markdown):
+            return clean_markdown(_PLACEHOLDER_CELL_RE.sub("", markdown))
+    return clean_markdown(plain) if long_enough(plain) else None
+
+
+_pool: ProcessPoolExecutor | None = None
+
+
+async def _in_process[T](function: Callable[..., T], *args: Any) -> T:
+    """CPU-bound PDF work in worker processes: pymupdf4llm holds the GIL."""
+    global _pool
+    if _pool is None:
+        _pool = ProcessPoolExecutor(PDF_WORKERS)
+    pool = _pool
+    try:
+        return await asyncio.get_running_loop().run_in_executor(pool, function, *args)
+    except BrokenProcessPool:
+        # A crashed worker fails only its own document; later ones get a new pool.
+        if _pool is pool:
+            _pool = None
+            pool.shutdown(wait=False, cancel_futures=True)
+        raise
 
 
 async def pdf_to_markdown(
     data: bytes, ocr: OCR | None = None, *, image_size_limit: float = 0.1
 ) -> str:
-    scanned, confidence = await asyncio.to_thread(is_pdf_scanned, data)
-    count = await asyncio.to_thread(_pdf_page_count, data)
-    minimum = max(50, count * 100)
-
-    def usable(text: str) -> bool:
-        check = _WATERMARK_CHECK_RE.sub("", _MD_BASE64_IMAGE_RE.sub("", text)).strip()
-        return valid_markdown(check, min_length=minimum)[0]
-
-    if not scanned and confidence >= 0.7:
-        try:
-            markdown = await asyncio.to_thread(_digital_pdf, data, image_size_limit)
-            if usable(markdown):
-                return clean_markdown(markdown)
-        except Exception as exc:
-            logger.debug(f"PDF markdown extraction failed: {exc}")
-    plain = await asyncio.to_thread(_plain_pdf, data)
-    if usable(plain):
-        return clean_markdown(plain)
+    text = await _in_process(_pdf_text_layer, data, image_size_limit, ocr is not None)
+    if text is not None:
+        return text
     if ocr is not None:
         return clean_markdown(await ocr.pdf(data))
     raise ValueError("PDF needs OCR but no OCR model is configured")
@@ -422,6 +524,13 @@ async def bytes_to_markdown(
     async def fetch_image(image_url: str) -> bytes:
         return (await http.request(image_url)).content
 
+    sniffed = sniff_extension(data)
+    if sniffed == ".docx":
+        result = await asyncio.to_thread(mammoth.convert_to_html, io.BytesIO(data))
+        return await html_to_markdown(result.value, url, fetch_image)
+    if sniffed == ".doc":
+        # shortcut: no pure-Python Word 97 converter; add one if .doc norms become common.
+        raise ValueError(f"Legacy Word/Office (OLE2) file is not supported: {url}")
     response = Response(url, 200, {"Content-Type": content_type}, data)
     return await html_to_markdown(response.text, url, fetch_image)
 

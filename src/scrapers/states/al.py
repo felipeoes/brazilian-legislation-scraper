@@ -1,7 +1,6 @@
 import base64
 import re
 from collections.abc import AsyncIterator
-from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -10,7 +9,9 @@ from loguru import logger
 from src.core.convert import (
     bytes_to_markdown,
     calc_pages,
+    detect_extension,
     infer_type_by_prefix,
+    sniff_extension,
     valid_markdown,
 )
 from src.core.document import Document
@@ -114,12 +115,13 @@ class AlagoasSefazScraper(BaseScraper):
             response = await self.http.request(doc_link)
             data = response.json()
             full_filename = data["arquivo"]["nomeArquivo"]
-            ext = Path(full_filename).suffix.lower() or ".pdf"
+            pdf_bytes = base64.b64decode(data["arquivo"]["base64"])
+            # File names lie: some ".pdf" names hold Word documents.
+            ext = sniff_extension(pdf_bytes) or detect_extension("", full_filename)
             if not norm_type:
                 norm_type = self._infer_type_from_title(full_filename.replace("_", " "))
                 if norm_type:
                     title = f"{norm_type} {number} de {year}".strip()
-            pdf_bytes = base64.b64decode(data["arquivo"]["base64"])
             if year < 2000:
                 if self.ocr:
                     text_markdown = await self.ocr.pdf(pdf_bytes)

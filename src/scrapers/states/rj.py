@@ -20,11 +20,12 @@ from src.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
 
 TYPES = {
     "Constituição Estadual": "Constituição Estadual",
-    "Decreto": {"view_name": "DecretoInt", "page_id": 50},
-    "Emenda": {"view_name": "EmendaInt", "page_id": 51},
-    "LeiComp": {"view_name": "LeiCompInt", "page_id": 52},
-    "LeiOrd": {"view_name": "LeiOrdInt", "page_id": 53},
-    "Resolucao": {"view_name": "ResolucaoInt", "page_id": 54},
+    # ALERJ's DecretoInt view lists legislative decrees ("Texto do Decreto Legislativo").
+    "Decreto Legislativo": {"view_name": "DecretoInt", "page_id": 50},
+    "Emenda Constitucional": {"view_name": "EmendaInt", "page_id": 51},
+    "Lei Complementar": {"view_name": "LeiCompInt", "page_id": 52},
+    "Lei Ordinária": {"view_name": "LeiOrdInt", "page_id": 53},
+    "Resolução": {"view_name": "ResolucaoInt", "page_id": 54},
 }
 SITUATIONS = {}
 
@@ -133,6 +134,9 @@ class RJAlerjScraper(BaseScraper):
             div_to_remove.decompose()
         for div_to_remove in content_root.find_all("div", id="barraBotoes"):
             div_to_remove.decompose()
+        # Domino UI icons (twisties, spacers) sit on alerjln1, which refuses connections.
+        for icon in content_root.select('img[src*="/icons/"]'):
+            icon.decompose()
         strip_html_chrome(content_root)
         clean_norm_soup(content_root)
         for text_node in list(content_root.strings):
@@ -308,7 +312,7 @@ class RJAlerjScraper(BaseScraper):
             break
         return "\n".join(lines).strip()
 
-    async def fetch(self, doc_info: dict) -> Document | None:
+    async def fetch(self, doc_info: dict) -> Document:
         if doc_info.get("constitution"):
             return await self.fetch_constitution(doc_info)
         year = doc_info["year"]
@@ -316,10 +320,9 @@ class RJAlerjScraper(BaseScraper):
         document_url = doc_info.get("document_url") or doc_html_link.strip().replace(
             "?OpenDocument", ""
         )
-        try:
-            soup, mhtml = await self.browser.snapshot(doc_html_link)
-        except Exception as exc:
-            raise ValueError(f"Request failed: {exc}")
+        # The ASP wrapper renders the Domino page server-side; some take >2 minutes.
+        response = await self.http.request(doc_html_link, timeout=300)
+        soup = response.soup()
         status = soup.select_one("[class*=situacao], [id*=situacao], [class*=status]")
         situation = (
             "Revogada"
@@ -352,8 +355,8 @@ class RJAlerjScraper(BaseScraper):
             "situation": situation,
             "text_markdown": text_markdown,
             "document_url": document_url,
-            "raw": mhtml,
-            "raw_ext": ".mhtml",
+            "raw": response.content,
+            "raw_ext": ".html",
         }
         return Document(**result)
 

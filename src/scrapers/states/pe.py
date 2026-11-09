@@ -364,6 +364,7 @@ class PernambucoAlepeScraper(BaseScraper):
         additional_data_url = doc_info.get("additional_data_url", "")
         selected_url = ""
         selected_soup: BeautifulSoup | None = None
+        raw = b""
         text_markdown = ""
         last_failure_reason = "Failed to retrieve document page"
         for candidate_url in candidate_urls:
@@ -373,8 +374,7 @@ class PernambucoAlepeScraper(BaseScraper):
             if fetch_result.status == 404:
                 last_failure_reason = f"No document at {candidate_url}"
                 continue
-            body, _ = (fetch_result.content, fetch_result)
-            soup = BeautifulSoup(body, "lxml")
+            soup = fetch_result.soup()
             content_div = soup.find("div", class_="WordSection1")
             if not isinstance(content_div, Tag):
                 last_failure_reason = "Could not find WordSection1 in document page"
@@ -394,6 +394,7 @@ class PernambucoAlepeScraper(BaseScraper):
                 continue
             selected_url = candidate_url
             selected_soup = soup
+            raw = fetch_result.content
             text_markdown = candidate_markdown
             break
         if selected_soup is None or not selected_url:
@@ -403,11 +404,6 @@ class PernambucoAlepeScraper(BaseScraper):
             reference_page = await self._fetch_reference_page(
                 additional_data_url, title=title
             )
-        try:
-            mhtml = (await self.browser.snapshot(selected_url))[1]
-        except Exception as exc:
-            logger.warning(f"MHTML capture failed for {selected_url}: {exc}")
-            raise ValueError(f"MHTML capture failed: {exc}")
         result = {
             **doc_info,
             "year": year,
@@ -415,8 +411,8 @@ class PernambucoAlepeScraper(BaseScraper):
             "document_url": selected_url,
             "text_version": self._extract_text_version(selected_url) or "DEFAULT",
             "text_markdown": text_markdown,
-            "raw": mhtml,
-            "raw_ext": ".mhtml",
+            "raw": raw,
+            "raw_ext": ".html",
         }
         result.pop("_candidate_document_urls", None)
         additional_data = self._get_additional_data(

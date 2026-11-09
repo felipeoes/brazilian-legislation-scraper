@@ -98,10 +98,7 @@ async def test_failing_type_does_not_stop_other_types(alias):
         (
             SaoPauloAlespScraper,
             f"<p>{TEXT}</p>",
-            {
-                "_html_link": "https://example.org/law",
-                "norm_link": "https://example.org/details",
-            },
+            {"text_url": "https://example.org/law"},
         ),
         (ICMBioScraper, f'<div class="texto-dou"><p>{TEXT}</p></div>', {}),
     ],
@@ -305,9 +302,16 @@ async def test_api_fetch_contracts(alias):
             "estado_legislacao": {"nome": "Vigente"},
         }
     else:
-        ref["doc_id"] = 1
-        data = {"content": [{"conteudo": TEXT}]}
-    scraper.http.request = AsyncMock(return_value=make_mock_json_response(data))
+        data = {
+            "data": {
+                "arquivoAtualizadoPdf": None,
+                "arquivo": {"caminho": "https://example.org/act.pdf"},
+                "idSituacao": None,
+                "ementa": "Ementa",
+            }
+        }
+    pdf = make_mock_response(_make_digital_pdf(TEXT), content_type="application/pdf")
+    scraper.http.request = AsyncMock(side_effect=[make_mock_json_response(data), pdf])
     result = await scraper.fetch(ref)
     assert isinstance(result, Document) and result.raw
     assert result.year == 2024 and "Art." in result.text_markdown
@@ -345,11 +349,8 @@ async def test_rj_status_scoped_before_cleaning(status, expected):
     from src.scrapers.states.rj import RJAlerjScraper
 
     scraper = make_scraper(RJAlerjScraper)
-    soup = BeautifulSoup(
-        f'<div id="divConteudo">{status}<p>{TEXT}</p><p>Revogado apenas o artigo anterior.</p></div>',
-        "lxml",
-    )
-    scraper.browser.snapshot = AsyncMock(return_value=(soup, b"mhtml"))
+    html = f'<div id="divConteudo">{status}<p>{TEXT}</p><p>Revogado apenas o artigo anterior.</p></div>'
+    scraper.http.request.side_effect = [make_mock_response(html)]
     ref = {**document().model_dump(), "_html_link": "https://example.org/doc"}
     ref.pop("text_markdown")
     assert (await scraper.fetch(ref)).situation == expected

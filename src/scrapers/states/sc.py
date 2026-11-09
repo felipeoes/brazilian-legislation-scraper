@@ -17,10 +17,22 @@ from src.core.document import Document
 from src.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
 
 _RE_TYPE_FROM_TITLE = re.compile(
-    "^(LEI COMPLEMENTAR|LEI|DECRETO LEGISLATIVO|DECRETO-LEI|DECRETO|DEC-|EMENDA CONSTITUCIONAL|RESOLUÇÃO|RES-|PORTARIA|PRT-|INSTRUÇÃO NORMATIVA)",
+    "^(LEI COMPLEMENTAR|LEI|DECRETO LEGISLATIVO|DECRETO-LEI|DECRETO|EMENDA CONSTITUCIONAL|RESOLUÇÃO|PORTARIA|INSTRUÇÃO NORMATIVA)",
     re.IGNORECASE,
 )
-_ABBREV_TO_TYPE = {"DEC-": "Decreto", "RES-": "Resolução", "PRT-": "Portaria"}
+# Executive titles are "<CODE>-<number> <date>" (INT-000001); names confirmed from the
+# pages' TipoNorma meta ("Instrução Normativa - INT"). Never store the code as the type.
+_RE_CODE_TITLE = re.compile("^([A-Z]{2,4})-\\d+")
+_EXEC_CODES = {
+    "DEC": "Decreto",
+    "DEL": "Decreto-Lei",
+    "INT": "Instrução Normativa",
+    "MPV": "Medida Provisória",
+    "ONI": "Orientação Normativa",
+    "PRT": "Portaria",
+    "PRV": "Provimento",
+    "RES": "Resolução",
+}
 TYPES = {"Legislativo": "legislativo", "Executivo": "executivo"}
 SITUATIONS: list[str] = []
 
@@ -39,35 +51,46 @@ class SantaCatarinaScraper(BaseScraper):
     def _format_search_url(self, norm_type_id: str, year: int) -> str:
         return f"{self.base_url}/{norm_type_id}?ano={year}"
 
-    async def fetch(self, doc_info: dict) -> Document | None:
-        """Fetch document HTML and convert to markdown."""
-        document_url = doc_info.get("document_url", "")
-        title = doc_info.get("title", "")
-        if not document_url:
-            return None
-        try:
-            soup, mhtml = await self.browser.snapshot(document_url)
-        except Exception as exc:
-            raise ValueError(f"Failed to fetch document page: {exc}")
-        strip_html_chrome(soup)
-        html_content = str(soup)
-        normalized_title = " ".join(title.split())
-        norm_type = normalized_title
+    @staticmethod
+    def _infer_type(title: str) -> str:
+        if code := _RE_CODE_TITLE.match(title):
+            if code[1] not in _EXEC_CODES:
+                raise ValueError(f"Unknown SC act code {code[1]!r} in {title!r}")
+            return _EXEC_CODES[code[1]]
         m = _RE_TYPE_FROM_TITLE.match(title)
         if m:
-            matched = m.group(1)
-            norm_type = _ABBREV_TO_TYPE.get(matched.upper(), matched.title())
-        else:
-            prefix_match = re.match(
-                "(.+?)(?:\\s+(?:n[º°o]|n\\.|número)\\s*\\d|\\s+\\d)",
-                normalized_title,
-                re.IGNORECASE,
-            )
-            if prefix_match:
-                norm_type = prefix_match.group(1).strip()
-        doc_info["type"] = norm_type
+            return m.group(1).title()
+        prefix_match = re.match(
+            "(.+?)(?:\\s+(?:n[º°o]|n\\.|número)\\s*\\d|\\s+\\d)", title, re.IGNORECASE
+        )
+        return prefix_match.group(1).strip() if prefix_match else title
+
+    async def fetch(self, doc_info: dict) -> Document:
+        """Fetch the server-rendered document HTML and convert to markdown."""
+        if not doc_info.get("constitution"):
+            doc_info["type"] = self._infer_type(" ".join(doc_info["title"].split()))
+        document_url = doc_info["document_url"]
+        response = await self.http.request(document_url)
+        soup = response.soup()
+        strip_html_chrome(soup)
         doc_info["situation"] = "Não consta"
-        return await self.fetch_html(doc_info, html_content, document_url, mhtml)
+        return await self.fetch_html(
+            doc_info, str(soup), document_url, response.content, ".html"
+        )
+
+    async def list_documents(self, year: int | None) -> AsyncIterator[dict]:
+        # The constitution is only linked from every page's footer; list it once.
+        if year == self.years.start:
+            yield {
+                "year": 1989,
+                "type": "Constituição Estadual",
+                "title": "Constituição do Estado de Santa Catarina",
+                "document_url": f"{self.base_url}/ato-normativo/legislativo/52785",
+                "situation": DEFAULT_VALID_SITUATION,
+                "constitution": True,
+            }
+        async for ref in super().list_documents(year):
+            yield ref
 
     async def list_type(
         self, year: int, norm_type: str, path: str
@@ -80,7 +103,9 @@ class SantaCatarinaScraper(BaseScraper):
                     f"{self.base_url}/{path}?ano={year}&page={page}"
                 )
             ).soup()
-            links = soup.find_all("a", href=re.compile("/ato-normativo/"))
+            if "Resultados da Pesquisa" not in soup.get_text():
+                raise ValueError(f"Malformed SC listing page {page}")
+            links = soup.select('.card-title a[href*="/ato-normativo/"]')
             new_links = [link for link in links if link.get("href") not in seen]
             if not new_links:
                 break

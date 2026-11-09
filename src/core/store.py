@@ -12,7 +12,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from src.core.document import Document
+from src.core.document import Document, clean_title
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
@@ -32,9 +32,12 @@ CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY, scraper TEXT NOT NULL,
     started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     finished_at TEXT, docs INTEGER NOT NULL DEFAULT 0,
-    errors INTEGER NOT NULL DEFAULT 0, llm_usage TEXT NOT NULL DEFAULT '{}'
+    errors INTEGER NOT NULL DEFAULT 0, llm_usage TEXT NOT NULL DEFAULT '{}',
+    stats TEXT NOT NULL DEFAULT '{}'
 );
 """
+# Raw files this store wrote: <year>/docs/<sha256><ext>, relative to the archive.
+_OWNED_RAW_RE = re.compile("\\d+/docs/[0-9a-f]{64}\\.[a-zA-Z0-9]+")
 
 
 class Store:
@@ -65,6 +68,11 @@ class Store:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=NORMAL")
             connection.executescript(_SCHEMA)
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
+            if "stats" not in columns:  # archives created before run stats
+                connection.execute(
+                    "ALTER TABLE runs ADD COLUMN stats TEXT NOT NULL DEFAULT '{}'"
+                )
         except BaseException:
             connection.close()
             raise
@@ -100,25 +108,20 @@ class Store:
 
     def _insert(
         self, doc: Document, ref_url: str, ref_title: str, file_path: str | None
-    ) -> None:
+    ) -> str | None:
+        """Write the row (and raw file); returns the stored file_path."""
         if doc.raw is not None:
             if self.path == ":memory:":
                 raise ValueError("Raw files require a filesystem store")
-            ext = doc.raw_ext or ".bin"
-            if not re.fullmatch("\\.[a-zA-Z0-9]+", ext):
-                raise ValueError(f"Invalid raw extension: {ext!r}")
-            identity = json.dumps([ref_url, ref_title], ensure_ascii=False).encode()
-            # Keep the previous raw file intact if the SQL transaction fails.
-            digest = hashlib.sha256(identity + b"\x00" + doc.raw).hexdigest()
-            target = self.root / str(doc.year) / "docs" / f"{digest}{ext}"
+            file_path = self._raw_path(doc, ref_url, ref_title)
+            target = self.root / file_path
             target.parent.mkdir(parents=True, exist_ok=True)
-            temporary = target.with_suffix(ext + ".tmp")
+            temporary = target.with_name(target.name + ".tmp")
             try:
                 temporary.write_bytes(doc.raw)
                 os.replace(temporary, target)
             finally:
                 temporary.unlink(missing_ok=True)
-            file_path = str(target)
         data = doc.model_dump()
         # Keys starting with "_" are listing-only helpers, never archive data.
         extra = {
@@ -143,12 +146,53 @@ class Store:
                 json.dumps(extra, ensure_ascii=False),
             ),
         )
+        return file_path
+
+    @staticmethod
+    def _raw_path(doc: Document, ref_url: str, ref_title: str) -> str:
+        ext = doc.raw_ext or ".bin"
+        if not re.fullmatch("\\.[a-zA-Z0-9]+", ext):
+            raise ValueError(f"Invalid raw extension: {ext!r}")
+        identity = json.dumps([ref_url, ref_title], ensure_ascii=False).encode()
+        # Content-addressed, so a failed transaction never overwrites the old file.
+        digest = hashlib.sha256(identity + b"\x00" + doc.raw).hexdigest()
+        return f"{doc.year}/docs/{digest}{ext}"
+
+    def _owned_raw(self, file_path: str | None) -> Path | None:
+        """The raw file behind file_path, only if this store wrote it."""
+        if not file_path:
+            return None
+        path = Path(file_path)
+        if path.is_absolute():  # archives written before paths became relative
+            if not path.is_relative_to(self.root):
+                return None
+            file_path = path.relative_to(self.root).as_posix()
+        return self.root / file_path if _OWNED_RAW_RE.fullmatch(file_path) else None
 
     def _save(
         self, doc: Document, ref_url: str, ref_title: str, file_path: str | None
     ) -> None:
-        with self.connection:
-            self._insert(doc, ref_url, ref_title, file_path)
+        row = self.connection.execute(
+            "SELECT file_path FROM documents WHERE ref_url=? AND ref_title=?",
+            (ref_url, ref_title),
+        ).fetchone()
+        old = self._owned_raw(row[0]) if row else None
+        # Validates raw_ext before anything is written.
+        new = (
+            self.root / self._raw_path(doc, ref_url, ref_title)
+            if doc.raw is not None
+            else None
+        )
+        try:
+            with self.connection:
+                self._insert(doc, ref_url, ref_title, file_path)
+        except BaseException:
+            # Content-addressed: a path other than the old one is a fresh orphan.
+            if new is not None and new != old and self.path != ":memory:":
+                new.unlink(missing_ok=True)
+            raise
+        if old is not None and old != new:
+            old.unlink(missing_ok=True)
 
     async def save(
         self,
@@ -188,13 +232,18 @@ class Store:
         return await self._call(start)
 
     async def finish_run(
-        self, run_id: int, docs: int, errors: int, usage: dict
+        self,
+        run_id: int,
+        docs: int,
+        errors: int,
+        usage: dict,
+        stats: dict | None = None,
     ) -> None:
         def finish() -> None:
             with self.connection:
                 self.connection.execute(
-                    "UPDATE runs SET finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),\n                    docs=?, errors=?, llm_usage=? WHERE id=?",
-                    (docs, errors, json.dumps(usage), run_id),
+                    "UPDATE runs SET finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),\n                    docs=?, errors=?, llm_usage=?, stats=? WHERE id=?",
+                    (docs, errors, json.dumps(usage), json.dumps(stats or {}), run_id),
                 )
 
         await self._call(finish)
@@ -317,7 +366,7 @@ class Store:
                         self._insert(
                             doc,
                             ref_url or doc.document_url,
-                            ref_title or doc.title,
+                            clean_title(ref_title) if ref_title else doc.title,
                             row.get("file_path"),
                         )
                         imported += 1

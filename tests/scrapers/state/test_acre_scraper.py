@@ -1,10 +1,11 @@
 "Parser and metadata regression tests for acre_scraper."
 
 import re
+from unittest.mock import AsyncMock
 
 import pytest
 from bs4 import BeautifulSoup
-from conftest import make_scraper
+from conftest import make_mock_response, make_scraper
 from parser_assertions import TypesConstantTests
 
 from src.scrapers.states.ac import TYPES, AcreLegisScraper
@@ -212,3 +213,22 @@ class TestCleanAcreHtml:
             "\n" not in result.split("texto antes")[1].split("texto depois")[0].strip()
             or "https://example.com" in result
         )
+
+
+async def test_fetch_builds_document_from_http_body():
+    scraper = _make_scraper()
+    body = f'<html><body><div id="body-law"><p>{"Art. 1º Texto da lei. " * 5}</p></div></body></html>'.encode()
+    scraper.http.request = AsyncMock(return_value=make_mock_response(body))
+    url = "https://legis.ac.gov.br/detalhar/1"
+    ref = {
+        "year": 2012,
+        "type": "Lei Ordinária",
+        "title": "Lei nº 1",
+        "situation": "Não consta revogação expressa",
+        "document_url": url,
+        "_html_link": url,
+    }
+    doc = await scraper.fetch(ref)
+    scraper.http.request.assert_awaited_once_with(url)
+    assert "Art. 1º Texto da lei." in doc.text_markdown
+    assert doc.raw == body and doc.raw_ext == ".html"

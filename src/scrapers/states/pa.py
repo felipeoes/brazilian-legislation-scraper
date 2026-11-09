@@ -1,14 +1,15 @@
 import re
 from collections.abc import AsyncIterator
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urlencode, urljoin
 
 from bs4 import BeautifulSoup
 
-from src.core.convert import normalize_type
 from src.core.document import Document
 from src.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
 
+# Ids of the site's "Tipo de Norma" filter. tipo=12 ("Emendas Constitucionais
+# Federais") is left out on purpose: federal legislation has its own scraper.
 TYPES = {
     "Decreto Estadual": 2,
     "Decreto Legislativo": 1,
@@ -17,140 +18,97 @@ TYPES = {
     "Lei Ordinária": 3,
     "Resolução": 10,
 }
-SITUATIONS = {"Não consta": "Não consta"}
-_TYPE_NORMALIZE: dict[str, str] = {name.casefold(): name for name in TYPES}
-_TYPE_NORMALIZE.update(
-    {
-        "emendas constitucionais estaduais": "Emenda Constitucional",
-        "resoluções": "Resolução",
-    }
-)
-_FEDERAL_TYPES = {"emendas constitucionais federais"}
+_EMPTY_MESSAGE = "Nenhuma lei encontrada"
+_PAGE_RE = re.compile(r"[?&]p=(\d+)")
 
 
 class ParaAlepaScraper(BaseScraper):
-    """Webscraper for Para state legislation website (http://bancodeleis.alepa.pa.gov.br)
+    """Webscraper for Pará state legislation (https://bancodeleis.alepa.pa.gov.br)
 
     Year start (earliest on source): 1990
 
-    Optimization: a single POST with ``tipo=""`` fetches all document types
-    at once. The type is extracted per-document from the HTML response.
-
-    ``tipo=12`` ("Emendas Constitucionais Federais") exists on the server
-    but is intentionally excluded — federal legislation is handled by the
-    separate federal legislation scraper.
-
-    Example search request: http://bancodeleis.alepa.pa.gov.br/index.php
-
-    payload = {
-        numero:
-        anoLei: 2000
-        tipo:
-        pChave:
-        verifica: 1
-        button: Buscar
-    }
-
+    Listing is the server-rendered search, one query per year and type:
+    ``index.php?ano=2012&tipo=2&p=1``. Each page has 10 rows with number, type,
+    year, ementa and a PDF link; ``#result-count`` holds the total and
+    ``#paginacao`` links the last page. The JSON API (``api/leis.php``) is not
+    used because it returns at most 50 rows and has no paging.
     """
 
     types = TYPES
     situations = {}
     name = "PARA"
-    base_url = "http://bancodeleis.alepa.pa.gov.br"
+    base_url = "https://bancodeleis.alepa.pa.gov.br"
 
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self.regex_total_count = re.compile("Total de Registros:\\s+(\\d+)")
+    def _search_url(self, year: int, norm_type_id: int, page: int) -> str:
+        query = urlencode({"ano": year, "tipo": norm_type_id, "p": page})
+        return f"{self.base_url}/index.php?{query}"
 
-    def _normalize_type(self, raw_type: str) -> str | None:
-        """Normalize an HTML type label to the canonical TYPES name.
+    @staticmethod
+    def _total_pages(soup: BeautifulSoup) -> int:
+        pages = [
+            int(match.group(1))
+            for link in soup.select("#paginacao a[href]")
+            if (match := _PAGE_RE.search(str(link["href"])))
+        ]
+        if pages:
+            return max(pages)
+        count = soup.find(id="result-count")
+        rows = len(soup.select("#tbody-leis > tr"))
+        if count and int(count.get_text(strip=True).replace(".", "")) > rows:
+            raise ValueError("Listing has more than one page of results but no pager")
+        return 1
 
-        Returns ``None`` for federal types (to be filtered out).
-        Unknown types fall back to the raw string (future-proof).
-        """
-        cleaned = re.sub("\\s+", " ", raw_type or "").strip()
-        if not cleaned:
-            return ""
-        if cleaned.casefold() in _FEDERAL_TYPES:
-            return None
-        return normalize_type(raw_type, aliases=_TYPE_NORMALIZE, known_types=self.types)
-
-    def _build_params(self, year: int, norm_type_id: int | str = "") -> dict:
-        """Build a fresh params dict for a specific type/year query (no shared state)."""
-        return {
-            "numero": "",
-            "anoLei": year,
-            "tipo": norm_type_id,
-            "pChave": "",
-            "verifica": 1,
-            "button": "Buscar",
-        }
-
-    async def _get_docs_links(self, url: str, params: dict) -> list:
-        """Get documents html links from given page.
-
-        Extracts type and number per-document from the HTML. Federal types
-        are filtered out. Returns a list of dicts with keys ``title``,
-        ``summary``, ``_pdf_link``, ``type``, and ``norm_number``.
-        """
-        response = await self.http.request(url, method="POST", data=params)
-        soup = BeautifulSoup(response.content, "lxml")
-        total_count = self.regex_total_count.search(str(soup))
-        if total_count is None or int(total_count.group(1)) == 0:
+    def _parse_rows(self, soup: BeautifulSoup) -> list[dict]:
+        """Parse a listing page; raise unless it has rows or says it has none."""
+        count = soup.find(id="result-count")
+        tbody = soup.find(id="tbody-leis")
+        if count is None or tbody is None:
+            raise ValueError("Listing page has no result count or results table")
+        if int(count.get_text(strip=True).replace(".", "")) == 0:
+            if _EMPTY_MESSAGE not in tbody.get_text():
+                raise ValueError("Listing reports 0 results without the empty message")
             return []
         docs = []
-        table = soup.find_all("table")[-1]
-        items = table.find_all("tr")
-        for item in items:
-            tds = item.find_all("td")
-            if len(tds) == 2:
-                raw_type = ""
-                norm_number = ""
-                for strong in tds[0].find_all("strong"):
-                    label = strong.get_text(strip=True)
-                    value = ""
-                    if strong.next_sibling:
-                        value = str(strong.next_sibling).strip()
-                    if "Tipo da Lei:" in label:
-                        raw_type = value
-                    elif "Nº da Lei:" in label:
-                        norm_number = value
-                norm_type = self._normalize_type(raw_type)
-                if norm_type is None:
-                    continue
-                if not norm_number:
-                    first_strong = tds[0].find("strong")
-                    if first_strong and first_strong.next_sibling:
-                        norm_number = str(first_strong.next_sibling).strip()
-                title = (
-                    f"{norm_type} {norm_number}".strip() if norm_type else norm_number
+        for row in tbody.find_all("tr", recursive=False):
+            number = row.select_one("td.td-num")
+            year = row.select_one("td.td-num small")
+            ementa = row.select_one("td.td-ementa")
+            pdf = row.select_one("a.btn-pdf-t[href]")
+            if not (number and year and ementa and pdf):
+                raise ValueError(
+                    f"Malformed listing row: {row.get_text(' ', strip=True)}"
                 )
-                pdf_link = tds[1].find("a")
-                summary = pdf_link.text.strip()
-                pdf_link = pdf_link["href"]
-                docs.append(
-                    {
-                        "title": title,
-                        "summary": summary,
-                        "_pdf_link": pdf_link,
-                        "type": norm_type,
-                        "norm_number": norm_number,
-                    }
-                )
+            docs.append(
+                {
+                    "norm_number": number.find(string=True, recursive=False)
+                    .replace("Nº", "")
+                    .strip(),
+                    "year": int(year.get_text(strip=True)),
+                    "summary": ementa.get_text().strip(),
+                    "document_url": urljoin(self.base_url, str(pdf["href"])),
+                }
+            )
+        if not docs:
+            raise ValueError("Listing reports results but has no rows")
         return docs
 
-    async def fetch(self, doc_info: dict) -> Document | None:
-        """Get document data from given document dict."""
-        return await self.fetch_pdf(doc_info)
+    async def list_type(self, year: int, name: str, value: Any) -> AsyncIterator[dict]:
+        first = (await self.http.request(self._search_url(year, value, 1))).soup()
+        rows = self._parse_rows(first)
 
-    async def list_documents(self, year: int) -> AsyncIterator[dict]:
-        refs = await self._get_docs_links(
-            f"{self.base_url}/index.php", self._build_params(year)
-        )
-        for ref in refs:
+        async def fetch_page(page: int) -> list[dict]:
+            if page == 1:
+                return rows
+            url = self._search_url(year, value, page)
+            return self._parse_rows((await self.http.request(url)).soup())
+
+        async for ref in self.paginate(fetch_page, self._total_pages(first)):
             yield {
-                "year": year,
-                "situation": DEFAULT_VALID_SITUATION,
                 **ref,
-                "document_url": urljoin(self.base_url, ref["_pdf_link"]),
+                "title": f"{name} nº {ref['norm_number']}/{ref['year']}",
+                "type": name,
+                "situation": DEFAULT_VALID_SITUATION,
             }
+
+    async def fetch(self, ref: dict) -> Document:
+        return await self.fetch_pdf(ref)

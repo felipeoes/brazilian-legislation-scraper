@@ -1,7 +1,11 @@
 "Parser and metadata regression tests for parana_scraper."
 
+from math import ceil
+from urllib.parse import parse_qs, urlsplit
+
+import pytest
 from bs4 import BeautifulSoup
-from conftest import make_scraper
+from conftest import make_mock_response, make_scraper
 from parser_assertions import (
     ScraperClassTests,
     SituationsConstantTests,
@@ -182,3 +186,130 @@ class TestInferSituation:
         )
         soup = BeautifulSoup(html, "lxml")
         assert ParanaCVScraper._infer_situation(soup) == DEFAULT_INVALID_SITUATION
+
+
+class TestFetch:
+    REF = {
+        "id": "101",
+        "title": "Lei 1 - 01 de janeiro de 2020",
+        "year": 2020,
+        "type": "Lei",
+        "situation": DEFAULT_VALID_SITUATION,
+        "document_url": "https://www.legislacao.pr.gov.br/legislacao/pesquisarAto.do?action=exibir&codAto=101",
+    }
+
+    async def test_fetches_over_http_and_stores_html_body(self):
+        """Chromium hangs on a never-finishing sub-resource; the HTML itself is complete."""
+        scraper = _make_scraper()
+        body = _make_doc_html()
+        scraper.http.request.side_effect = [make_mock_response(body)]
+        doc = await scraper.fetch(dict(self.REF))
+        assert doc.raw == body.encode()
+        assert doc.raw_ext == ".html"
+        assert "Dispõe sobre assunto importante" in doc.text_markdown
+        assert doc.situation == DEFAULT_VALID_SITUATION
+        scraper.browser.snapshot.assert_not_called()
+
+    async def test_revoked_situation(self):
+        scraper = _make_scraper()
+        html = _make_doc_html().replace(
+            "<div>", "<div><p>Situação: Revogado pelo Decreto 999/2010</p>", 1
+        )
+        scraper.http.request.side_effect = [make_mock_response(html)]
+        doc = await scraper.fetch(dict(self.REF))
+        assert doc.situation == DEFAULT_INVALID_SITUATION
+
+    async def test_missing_form_raises(self):
+        scraper = _make_scraper()
+        scraper.http.request.side_effect = [make_mock_response("<html></html>")]
+        with pytest.raises(ValueError, match="pesquisarAtoForm"):
+            await scraper.fetch(dict(self.REF))
+
+
+class TestListType:
+    async def test_no_results_page_yields_nothing(self):
+        """The site reports zero hits only inside a script string, not in visible text."""
+        scraper = _make_scraper()
+        html = """<html><head><script>
+            globalMsgError += '<td class="msg_sucesso">Nenhum registro encontrado.</td>';
+        </script></head><body><form name="pesquisarAtoForm"></form></body></html>"""
+        scraper.http.request.side_effect = [make_mock_response(html)]
+        assert [ref async for ref in scraper.list_type(2025, "Lei", 1)] == []
+
+    async def test_unrecognized_page_raises(self):
+        scraper = _make_scraper()
+        scraper.http.request.side_effect = [make_mock_response("<html></html>")]
+        with pytest.raises(ValueError, match="pagination"):
+            [ref async for ref in scraper.list_type(2025, "Lei", 1)]
+
+    async def test_lists_results(self):
+        scraper = _make_scraper()
+        scraper.http.request.side_effect = [make_mock_response(_make_results_html(2))]
+        refs = [ref async for ref in scraper.list_type(2020, "Lei", 1)]
+        assert [ref["id"] for ref in refs] == ["101", "102"]
+        assert refs[0]["document_url"].endswith("codAto=101")
+
+
+_NO_RECORDS = "<html><script>m = 'Nenhum registro encontrado.';</script></html>"
+
+
+def _serve_acts(acts: list[tuple[str | None, int | None]]):
+    """Fake search form: 20 rows per page; like the live site, page 2+ repeats 4 rows
+    of the previous page (date ties are ordered per query), so plain paging skips acts.
+    A ``None`` code is counted in the total but never shown (Lei 22.530/2025 counts twice).
+    """
+
+    def serve(url: str, method: str, data: dict, timeout: float):
+        low, high = data["nroInicialAtoTema"], data["nroFinalAtoTema"]
+        hits = [
+            act
+            for act in acts
+            if not low or (act[1] is not None and int(low) <= act[1] <= int(high))
+        ]
+        if not hits:
+            return make_mock_response(_NO_RECORDS)
+        page = int(parse_qs(urlsplit(url).query)["indice"][0])
+        start = max(0, (page - 1) * 20 - 4)
+        shown = [act for act in hits if act[0] is not None]
+        rows = "".join(
+            f'<tr class="list_cor_sim"><td><a href="javascript:exibir(\'{code}\');">x</a></td>'
+            f"<td>{f'Lei {number} - 1 de janeiro de 2025' if number else 'Lei - sem número'}</td>"
+            "<td>Súmula.</td><td>01/01/2025</td></tr>"
+            for code, number in shown[start : start + 20]
+        )
+        return make_mock_response(
+            f"<html><body><p>Página {page} de {ceil(len(hits) / 20)}</p>"
+            f"<p>Total de {len(hits)} registros</p>"
+            f'<table id="list_tabela"><tbody>{rows}</tbody></table></body></html>'
+        )
+
+    return serve
+
+
+class TestListTypeSplitsByNumber:
+    ACTS = [(str(1000 + n), n) for n in range(101, 151)]
+
+    async def test_lists_every_act_once_despite_overlapping_pages(self):
+        scraper = _make_scraper()
+        scraper.http.request.side_effect = _serve_acts(self.ACTS)
+        refs = [ref async for ref in scraper.list_type(2025, "Lei", 1)]
+        assert sorted(ref["id"] for ref in refs) == sorted(
+            code for code, _ in self.ACTS
+        )
+
+    async def test_acts_without_number_fail_visibly(self):
+        scraper = _make_scraper()
+        # Only on a middle page, which number-range queries replace.
+        acts = [*self.ACTS[:30], ("9999", None), *self.ACTS[30:]]
+        scraper.http.request.side_effect = _serve_acts(acts)
+        refs = []
+        with pytest.raises(ValueError, match="1 Paraná acts have no number"):
+            async for ref in scraper.list_type(2025, "Lei", 1):
+                refs.append(ref)
+        assert len(refs) == 50
+
+    async def test_counted_but_hidden_act_is_not_an_error(self):
+        scraper = _make_scraper()
+        scraper.http.request.side_effect = _serve_acts([*self.ACTS, (None, 125)])
+        refs = [ref async for ref in scraper.list_type(2025, "Lei", 1)]
+        assert len(refs) == 50

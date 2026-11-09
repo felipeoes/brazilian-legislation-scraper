@@ -55,6 +55,9 @@ async def inline_images_in_html(
             return
         if not data:
             return
+        if len(data) < 100:  # 1x1 spacer GIFs/PNGs carry no content
+            img_tag.decompose()
+            return
         content_type = _guess_mime(full_url, data)
         b64 = base64.b64encode(data).decode("ascii")
         img_tag["src"] = f"data:{content_type};base64,{b64}"

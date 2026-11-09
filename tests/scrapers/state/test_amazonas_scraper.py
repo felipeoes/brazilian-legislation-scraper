@@ -1,15 +1,17 @@
 "Parser and metadata regression tests for amazonas_scraper."
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from bs4 import BeautifulSoup
-from conftest import make_scraper
+from conftest import make_mock_response, make_scraper
 from parser_assertions import (
     ScraperClassTests,
     SituationsConstantTests,
     TypesConstantTests,
 )
 
+from src.core.http import HttpError, Response
 from src.scrapers.states.am import SITUATIONS, TYPES, LegislaAMScraper
 
 
@@ -123,3 +125,45 @@ class TestGetNormText:
         soup = BeautifulSoup(html, "lxml")
         result = scraper._get_norm_text(soup)
         assert result.find("body") is not None
+
+
+def _listing_response(href: str = "/diario_am/12/2012/4/2403") -> Response:
+    html = f'<html><body><ul><li class="item-li"><h5>Lei nº 1</h5><p>Publicada em 04 de janeiro de 2012</p><a href="{href}">texto</a></li></ul></body></html>'
+    return make_mock_response(html)
+
+
+class TestListTypePagination:
+    async def test_404_after_last_page_ends_listing(self):
+        scraper = _make_scraper()
+        scraper.http.request = AsyncMock(
+            side_effect=[_listing_response(), HttpError("page2", 404, "Not Found")]
+        )
+        refs = [ref async for ref in scraper.list_type(2012, "Lei Ordinária", 12)]
+        assert [ref["title"] for ref in refs] == ["Lei nº 1"]
+        assert scraper.http.request.await_count == 2
+
+    async def test_404_on_first_page_is_an_error(self):
+        scraper = _make_scraper()
+        scraper.http.request = AsyncMock(
+            side_effect=HttpError("page1", 404, "Not Found")
+        )
+        with pytest.raises(HttpError):
+            [ref async for ref in scraper.list_type(2012, "Lei Ordinária", 12)]
+
+
+async def test_fetch_builds_document_from_http_body():
+    scraper = _make_scraper()
+    body = f'<html><body><div class="materia rounded"><p>{"Art. 1º Texto da lei. " * 5}</p></div></body></html>'.encode()
+    scraper.http.request = AsyncMock(return_value=make_mock_response(body))
+    ref = {
+        "year": 2012,
+        "type": "Lei Ordinária",
+        "title": "Lei nº 1",
+        "situation": "Não consta revogação expressa",
+        "document_url": "https://legisla.imprensaoficial.am.gov.br/diario_am/12/2012/4/2403",
+        "_html_link": "/diario_am/12/2012/4/2403",
+    }
+    doc = await scraper.fetch(ref)
+    scraper.http.request.assert_awaited_once_with(ref["document_url"])
+    assert "Art. 1º Texto da lei." in doc.text_markdown
+    assert doc.raw == body and doc.raw_ext == ".html"

@@ -235,13 +235,10 @@ class MTAlmtScraper(BaseScraper):
         compilado_url = (
             f"{norm_base_url}/compilado?exibirAnotacao=1&marcoHistorico={marco}"
         )
-        responses = await asyncio.gather(
+        ficha, compilado = await asyncio.gather(
             self.http.request(ficha_url), self.http.request(compilado_url)
         )
-        ficha_soup, compilado_soup = [response.soup() for response in responses]
-        if not ficha_soup:
-            logger.error(f"Error getting soup for {ficha_url}")
-            raise ValueError("Failed to get document page")
+        ficha_soup, compilado_soup = ficha.soup(), compilado.soup()
         author = ficha_soup.find("strong", string=re.compile("Autor:|Autores:"))
         if author:
             author = author.find_parent("li").text
@@ -269,24 +266,22 @@ class MTAlmtScraper(BaseScraper):
             situation = (
                 situation.find_parent("li").text.replace("Situação:", "").strip()
             )
-        if not compilado_soup:
-            raise ValueError("Failed to get compilado page")
         frame = compilado_soup.find("turbo-frame")
         if not frame:
             raise ValueError("turbo-frame not found in compilado page")
+        # Site header row ("Horário de compilação", PDF/share buttons) and its <hr>.
+        clock = frame.find(string=re.compile("Horário de compilação"))
+        header = clock.find_parent("div", class_="row") if clock else None
+        if header is not None:
+            if (rule := header.find_next_sibling("hr")) is not None:
+                rule.decompose()
+            header.decompose()
         strip_html_chrome(frame)
         html_str = str(frame)
         text_markdown = await self.markdown(html=html_str)
         valid, reason = valid_markdown(text_markdown)
         if not valid:
             raise ValueError(reason)
-        capture_url = doc_info.get("document_url", compilado_url)
-        try:
-            raw = (await self.browser.snapshot(capture_url))[1]
-            content_ext = ".mhtml"
-        except Exception as exc:
-            logger.warning(f"MHTML capture failed for {capture_url}: {exc}")
-            raise ValueError(f"MHTML capture failed: {exc}")
         doc_data = {
             **doc_info,
             "author": author if author else "",
@@ -296,8 +291,8 @@ class MTAlmtScraper(BaseScraper):
             "tags": tags if tags else "",
             "situation": situation if situation else doc_info.get("situation", ""),
             "text_markdown": text_markdown,
-            "raw": raw,
-            "raw_ext": content_ext,
+            "raw": compilado.content,
+            "raw_ext": ".html",
         }
         return Document(**doc_data)
 

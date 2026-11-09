@@ -5,7 +5,6 @@ from typing import Any
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, Tag
-from loguru import logger
 
 from src.core.convert import wrap_html
 from src.core.document import Document
@@ -215,17 +214,7 @@ class MSAlemsScraper(BaseScraper):
         if cached is not None:
             return cached
         cat_url = self._view_entries_url(type_path, start=1, count=200)
-        cat_resp = await self.http.request(cat_url)
-        cat_response = cat_resp
-        cat_xml = cat_response.text
-        try:
-            cat_root = ET.fromstring(cat_xml)
-        except ET.ParseError as exc:
-            logger.warning(
-                f"MSAlems | {type_name} | XML parse error on categories: {exc}"
-            )
-            self._type_year_index[type_name] = {}
-            return {}
+        cat_root = ET.fromstring((await self.http.request(cat_url)).text)
         year_index = self._build_type_year_index(cat_root)
         self._type_year_index[type_name] = year_index
         return year_index
@@ -244,14 +233,7 @@ class MSAlemsScraper(BaseScraper):
         docs_url = self._view_entries_url(
             type_path, start=expand_pos, count=doc_count + 1, expand=expand_pos
         )
-        docs_resp = await self.http.request(docs_url)
-        docs_response = docs_resp
-        docs_xml = docs_response.text
-        try:
-            docs_root = ET.fromstring(docs_xml)
-        except ET.ParseError as exc:
-            logger.warning(f"MSAlems | {type_name} | XML parse error on entries: {exc}")
-            return []
+        docs_root = ET.fromstring((await self.http.request(docs_url)).text)
         prefix = f"{expand_pos}."
         docs: list[dict] = []
         for entry in docs_root.findall("viewentry"):

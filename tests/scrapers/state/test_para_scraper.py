@@ -1,50 +1,31 @@
-"Parser and metadata regression tests for para_scraper."
+"""Regression tests for the Pará Banco de Leis scraper, built from trimmed live pages."""
 
-from conftest import make_scraper
-from parser_assertions import (
-    ScraperClassTests,
-    SituationsConstantTests,
-    TypesConstantTests,
-)
+from pathlib import Path
+from unittest.mock import AsyncMock
+from urllib.parse import parse_qs, urlsplit
 
-from src.scrapers.states.pa import (
-    _FEDERAL_TYPES,
-    _TYPE_NORMALIZE,
-    SITUATIONS,
-    TYPES,
-    ParaAlepaScraper,
-)
+import fitz
+import pytest
+from bs4 import BeautifulSoup
+from conftest import make_mock_response, make_scraper
+from parser_assertions import ScraperClassTests, TypesConstantTests
 
+from src.core.scraper import DEFAULT_VALID_SITUATION
+from src.scrapers.states.pa import TYPES, ParaAlepaScraper
 
-def _make_scraper(**kwargs) -> ParaAlepaScraper:
-    """Instantiate ParaAlepaScraper with injected dependencies."""
-    import re
-
-    return make_scraper(
-        ParaAlepaScraper,
-        regex_total_count=re.compile("Total de Registros:\\s+(\\d+)"),
-        **kwargs,
-    )
+FIXTURES = Path(__file__).parents[2] / "fixtures" / "para"
 
 
-def _make_listing_html(count: int = 3, doc_type: str = "Decreto Estadual") -> bytes:
-    """Build a minimal listing page with `count` document rows including type/number."""
-    rows = ""
-    for i in range(1, count + 1):
-        rows += f'\n        <tr>\n          <td>\n            <strong>Tipo da Lei:</strong> {doc_type}\n            <strong>Nº da Lei:</strong> 00{i} / 2000\n          </td>\n          <td><a href="/pdf/doc{i}.pdf">Ementa {i}</a></td>\n        </tr>'
-    return f"<html><body>\n        <p>Total de Registros: {count}</p>\n        <table><tr><td>header</td></tr>{rows}</table>\n    </body></html>".encode()
+def _html(name: str) -> str:
+    return (FIXTURES / name).read_text()
 
 
-def _make_mixed_listing_html() -> bytes:
-    """Build a listing page with multiple types including a federal type."""
-    rows = '\n    <tr>\n      <td>\n        <strong>Tipo da Lei:</strong> Decreto Estadual\n        <strong>Nº da Lei:</strong> 001 / 2020\n      </td>\n      <td><a href="/pdf/dec1.pdf">Ementa decreto</a></td>\n    </tr>\n    <tr>\n      <td>\n        <strong>Tipo da Lei:</strong> Resoluções\n        <strong>Nº da Lei:</strong> 010 / 2020\n      </td>\n      <td><a href="/pdf/res1.pdf">Ementa resolução</a></td>\n    </tr>\n    <tr>\n      <td>\n        <strong>Tipo da Lei:</strong> Emendas Constitucionais Federais\n        <strong>Nº da Lei:</strong> 100 / 2020\n      </td>\n      <td><a href="/pdf/fed1.pdf">Ementa federal</a></td>\n    </tr>\n    '
-    return f"<html><body>\n        <p>Total de Registros: 3</p>\n        <table><tr><td>header</td></tr>{rows}</table>\n    </body></html>".encode()
-
-
-def _make_empty_listing_html() -> bytes:
-    return (
-        b"<html><body><p>Total de Registros:                      0</p></body></html>"
-    )
+def _pdf(text: str) -> bytes:
+    doc = fitz.open()
+    doc.new_page().insert_textbox(fitz.Rect(72, 72, 520, 770), text, fontsize=12)
+    content = doc.tobytes()
+    doc.close()
+    return content
 
 
 class TestTypesConstant(TypesConstantTests):
@@ -53,108 +34,125 @@ class TestTypesConstant(TypesConstantTests):
     REQUIRED_KEYS = {"Decreto Estadual", "Lei Ordinária", "Lei Complementar"}
     REQUIRE_INT_VALUES = True
 
-    def test_decreto_estadual_id(self):
-        assert TYPES["Decreto Estadual"] == 2
-
-
-class TestSituationsConstant(SituationsConstantTests):
-    SITUATIONS = SITUATIONS
-    EXPECTED_TYPE = dict
-    EXPECTED_EMPTY = False
-
-    def test_nao_consta_key_present(self):
-        assert "Não consta" in SITUATIONS
+    def test_federal_amendments_excluded(self):
+        assert 12 not in TYPES.values()
 
 
 class TestClassAttributes(ScraperClassTests):
     SCRAPER_CLS = ParaAlepaScraper
-    STATE_NAME = "Para"
-
-    def test_situations_empty_in_instance(self):
-        scraper = _make_scraper()
-        assert scraper.situations == {}
+    STATE_NAME = "Pará"
 
 
-class TestNormalizeType:
-    def test_canonical_name_unchanged(self):
-        scraper = _make_scraper()
-        assert scraper._normalize_type("Decreto Estadual") == "Decreto Estadual"
-
-    def test_plural_resolucoes_normalized(self):
-        scraper = _make_scraper()
-        assert scraper._normalize_type("Resoluções") == "Resolução"
-
-    def test_emendas_estaduais_normalized(self):
-        scraper = _make_scraper()
-        assert (
-            scraper._normalize_type("Emendas Constitucionais Estaduais")
-            == "Emenda Constitucional"
+class TestParseRows:
+    def test_parses_real_listing_rows(self):
+        scraper = make_scraper(ParaAlepaScraper)
+        soup = BeautifulSoup(_html("listing_2012_decreto_estadual_p1.html"), "lxml")
+        rows = scraper._parse_rows(soup)
+        assert [row["norm_number"] for row in rows] == ["640", "639", "638"]
+        assert rows[0]["year"] == 2012
+        assert rows[0]["document_url"] == (
+            "https://bancodeleis.alepa.pa.gov.br/arquivos/lei640_2012_42751.pdf"
         )
+        assert rows[0]["summary"].startswith("D E C R E T O Nº 640")
+        assert "DOE Nº 32.307" in rows[0]["summary"]
 
-    def test_federal_type_returns_none(self):
-        scraper = _make_scraper()
-        assert scraper._normalize_type("Emendas Constitucionais Federais") is None
+    def test_total_pages_from_pagination(self):
+        soup = BeautifulSoup(_html("listing_2012_decreto_estadual_p1.html"), "lxml")
+        assert ParaAlepaScraper._total_pages(soup) == 20
 
-    def test_unknown_type_passthrough(self):
-        scraper = _make_scraper()
-        assert scraper._normalize_type("Tipo Desconhecido") == "Tipo Desconhecido"
+    def test_results_without_pager_raise(self):
+        soup = BeautifulSoup(_html("listing_2012_decreto_estadual_p1.html"), "lxml")
+        soup.find(id="paginacao").decompose()
+        with pytest.raises(ValueError, match="no pager"):
+            ParaAlepaScraper._total_pages(soup)
 
-    def test_empty_string_returns_empty(self):
-        scraper = _make_scraper()
-        assert scraper._normalize_type("") == ""
+    def test_explicit_empty_result(self):
+        scraper = make_scraper(ParaAlepaScraper)
+        soup = BeautifulSoup(_html("listing_empty.html"), "lxml")
+        assert scraper._parse_rows(soup) == []
+        assert ParaAlepaScraper._total_pages(soup) == 1
 
-    def test_none_returns_empty(self):
-        scraper = _make_scraper()
-        assert scraper._normalize_type(None) == ""
+    def test_zero_count_without_empty_message_raises(self):
+        scraper = make_scraper(ParaAlepaScraper)
+        html = _html("listing_empty.html").replace("Nenhuma lei encontrada", "Erro")
+        with pytest.raises(ValueError, match="empty message"):
+            scraper._parse_rows(BeautifulSoup(html, "lxml"))
 
-    def test_case_insensitive(self):
-        scraper = _make_scraper()
-        assert scraper._normalize_type("decreto estadual") == "Decreto Estadual"
+    def test_missing_results_table_raises(self):
+        scraper = make_scraper(ParaAlepaScraper)
+        soup = BeautifulSoup("<html><body><p>Manutenção</p></body></html>", "lxml")
+        with pytest.raises(ValueError, match="result count"):
+            scraper._parse_rows(soup)
 
-    def test_extra_whitespace_cleaned(self):
-        scraper = _make_scraper()
-        assert scraper._normalize_type("  Decreto   Estadual  ") == "Decreto Estadual"
-
-    def test_all_types_in_normalize_map(self):
-        for name in TYPES:
-            assert _TYPE_NORMALIZE.get(name.casefold()) == name
-
-    def test_federal_types_set(self):
-        assert "emendas constitucionais federais" in _FEDERAL_TYPES
+    def test_row_without_pdf_raises(self):
+        scraper = make_scraper(ParaAlepaScraper)
+        html = _html("listing_2012_decreto_estadual_p1.html").replace(
+            "btn-pdf-t", "btn-x"
+        )
+        with pytest.raises(ValueError, match="Malformed listing row"):
+            scraper._parse_rows(BeautifulSoup(html, "lxml"))
 
 
-class TestBuildParams:
-    def test_returns_correct_keys(self):
-        scraper = _make_scraper()
-        params = scraper._build_params(2000)
-        assert "anoLei" in params
-        assert "tipo" in params
-        assert "verifica" in params
-        assert "button" in params
+class TestListType:
+    async def test_fetches_every_page_for_year_and_type(self):
+        scraper = make_scraper(ParaAlepaScraper)
+        page = _html("listing_2012_decreto_estadual_p1.html")
+        scraper.http.request = AsyncMock(return_value=make_mock_response(page))
+        refs = [ref async for ref in scraper.list_type(2012, "Decreto Estadual", 2)]
+        queries = [
+            parse_qs(urlsplit(call.args[0]).query)
+            for call in scraper.http.request.await_args_list
+        ]
+        assert [q["p"] for q in queries] == [[str(p)] for p in range(1, 21)]
+        assert all(q["ano"] == ["2012"] and q["tipo"] == ["2"] for q in queries)
+        assert len(refs) == 60
+        assert refs[0]["title"] == "Decreto Estadual nº 640/2012"
+        assert refs[0]["type"] == "Decreto Estadual"
+        assert refs[0]["situation"] == DEFAULT_VALID_SITUATION
 
-    def test_default_tipo_is_empty(self):
-        scraper = _make_scraper()
-        params = scraper._build_params(2000)
-        assert params["tipo"] == ""
+    async def test_malformed_first_page_raises(self):
+        scraper = make_scraper(ParaAlepaScraper)
+        scraper.http.request = AsyncMock(
+            return_value=make_mock_response("<html><body></body></html>")
+        )
+        with pytest.raises(ValueError):
+            [ref async for ref in scraper.list_type(2012, "Lei Ordinária", 3)]
 
-    def test_year_set(self):
-        scraper = _make_scraper()
-        params = scraper._build_params(2000)
-        assert params["anoLei"] == 2000
 
-    def test_explicit_tipo(self):
-        scraper = _make_scraper()
-        params = scraper._build_params(2000, norm_type_id=2)
-        assert params["tipo"] == 2
+class TestFetch:
+    async def test_fetch_keeps_listing_metadata(self):
+        scraper = make_scraper(ParaAlepaScraper)
+        url = "https://bancodeleis.alepa.pa.gov.br/arquivos/lei640_2012_42751.pdf"
+        text = "DECRETO Nº 640, DE 26 DE DEZEMBRO DE 2012. Art. 1º Fica concedido desconto pela antecipação do pagamento do IPVA."
+        scraper.http.request = AsyncMock(
+            return_value=make_mock_response(_pdf(text), content_type="application/pdf")
+        )
+        doc = await scraper.fetch(
+            {
+                "title": "Decreto Estadual nº 640/2012",
+                "type": "Decreto Estadual",
+                "year": 2012,
+                "norm_number": "640",
+                "summary": "D E C R E T O Nº 640",
+                "situation": DEFAULT_VALID_SITUATION,
+                "document_url": url,
+            }
+        )
+        scraper.http.request.assert_awaited_once_with(url)
+        assert doc.document_url == url
+        assert doc.raw_ext == ".pdf"
+        assert doc.norm_number == "640"
+        assert "Art. 1º" in doc.text_markdown
 
-    def test_verifica_is_1(self):
-        scraper = _make_scraper()
-        params = scraper._build_params(2000)
-        assert params["verifica"] == 1
 
-    def test_no_shared_state_mutation(self):
-        scraper = _make_scraper()
-        p1 = scraper._build_params(2000, norm_type_id=2)
-        p2 = scraper._build_params(2001, norm_type_id=3)
-        assert p1["anoLei"] != p2["anoLei"]
-        assert p1["tipo"] != p2["tipo"]
+@pytest.mark.integration
+async def test_live_listing_2012_lei_complementar():
+    from src.core.http import HttpClient
+    from src.core.store import Store
+
+    async with ParaAlepaScraper(
+        store=Store(":memory:"), http=HttpClient(rps=2), years=range(2012, 2013)
+    ) as scraper:
+        refs = [ref async for ref in scraper.list_type(2012, "Lei Complementar", 4)]
+    assert len(refs) == 6
+    assert all(ref["document_url"].endswith(".pdf") for ref in refs)

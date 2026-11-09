@@ -1,7 +1,7 @@
 "Parser and metadata regression tests for rio_de_janeiro_scraper."
 
 from bs4 import BeautifulSoup
-from conftest import make_scraper
+from conftest import make_mock_response, make_scraper
 from parser_assertions import (
     ScraperClassTests,
     SituationsConstantTests,
@@ -24,8 +24,18 @@ def _make_scraper(**kwargs) -> RJAlerjScraper:
 class TestTypesConstant(TypesConstantTests):
     TYPES = TYPES
     EXPECTED_COUNT = 6
-    REQUIRED_KEYS = {"LeiOrd", "Decreto", "Constituição Estadual"}
+    REQUIRED_KEYS = {
+        "Constituição Estadual",
+        "Decreto Legislativo",
+        "Emenda Constitucional",
+        "Lei Complementar",
+        "Lei Ordinária",
+        "Resolução",
+    }
     REQUIRE_INT_VALUES = False
+
+    def test_keys_are_canonical_names_not_view_codes(self):
+        assert set(TYPES) == self.REQUIRED_KEYS
 
     def test_dict_types_have_view_name(self):
         for key, val in TYPES.items():
@@ -190,3 +200,82 @@ class TestCleanConstitutionSectionSoup:
         soup = BeautifulSoup(html, "lxml")
         scraper._clean_constitution_section_soup(soup)
         assert soup.find("div", id="barraBotoes") is None
+
+
+_ROW = '<tr><td><a data-role="/contlei.nsf/abc/def?OpenDocument" href="#">42</a></td><td>2023</td><td>Gov</td><td>Dispõe sobre algo.</td></tr>'
+
+
+class TestListType:
+    async def test_title_and_type_use_canonical_name(self):
+        scraper = _make_scraper()
+        scraper.http.request.side_effect = [
+            make_mock_response(f"<html><body><table>{_ROW}</table></body></html>")
+        ]
+        refs = [
+            ref
+            async for ref in scraper.list_type(
+                None, "Lei Ordinária", TYPES["Lei Ordinária"]
+            )
+        ]
+        assert [(r["title"], r["type"], r["year"]) for r in refs] == [
+            ("Lei Ordinária 42/2023", "Lei Ordinária", 2023)
+        ]
+        assert (
+            refs[0]["document_url"]
+            == "http://alerjln1.alerj.rj.gov.br/contlei.nsf/abc/def"
+        )
+
+
+class TestFetch:
+    async def test_fetches_over_http_and_stores_html_body(self):
+        scraper = _make_scraper()
+        body = (
+            '<html><body><div class="pagina_central"><div id="divConteudo">'
+            "<p>LEI Nº 42, DE 1º DE JANEIRO DE 2023</p>"
+            "<p>Art. 1º Fica instituído o programa estadual de teste no Rio de Janeiro.</p>"
+            "</div></div></body></html>"
+        )
+        scraper.http.request.side_effect = [make_mock_response(body)]
+        doc = await scraper.fetch(
+            {
+                "year": 2023,
+                "type": "Lei Ordinária",
+                "title": "Lei Ordinária 42/2023",
+                "date": "2023",
+                "summary": "Dispõe sobre algo.",
+                "situation": "Não consta revogação expressa",
+                "_html_link": "https://www3.alerj.rj.gov.br/lotus_notes/default.asp?id=53&url=x",
+                "document_url": "http://alerjln1.alerj.rj.gov.br/contlei.nsf/abc/def",
+            }
+        )
+        assert doc.raw == body.encode()
+        assert doc.raw_ext == ".html"
+        assert "programa estadual de teste" in doc.text_markdown
+        assert doc.document_url == "http://alerjln1.alerj.rj.gov.br/contlei.nsf/abc/def"
+        scraper.browser.snapshot.assert_not_called()
+
+    async def test_domino_icons_are_dropped_without_fetching(self):
+        """alerjln1 (the Domino host of spacer/twistie icons) refuses connections; fetching stalls on retries."""
+        scraper = _make_scraper()
+        body = (
+            '<html><body><div class="pagina_central"><div id="divConteudo">'
+            "<p>LEI Nº 42, DE 1º DE JANEIRO DE 2023</p>"
+            '<p><img src="http://alerjln1.alerj.rj.gov.br/icons/collapse.gif" alt="Hide details for Texto da Lei">'
+            '<img width="1" height="1" src="http://alerjln1.alerj.rj.gov.br/icons/ecblank.gif">'
+            "Art. 1º Fica instituído o programa estadual de teste no Rio de Janeiro.</p>"
+            "</div></div></body></html>"
+        )
+        scraper.http.request.side_effect = [make_mock_response(body)]
+        doc = await scraper.fetch(
+            {
+                "year": 2023,
+                "type": "Lei Ordinária",
+                "title": "Lei Ordinária 42/2023",
+                "date": "2023",
+                "situation": "Não consta revogação expressa",
+                "_html_link": "https://www3.alerj.rj.gov.br/lotus_notes/default.asp?id=53&url=x",
+                "document_url": "http://alerjln1.alerj.rj.gov.br/contlei.nsf/abc/def",
+            }
+        )
+        assert scraper.http.request.call_count == 1
+        assert "Hide details" not in doc.text_markdown

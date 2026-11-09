@@ -1,0 +1,37 @@
+{
+ "success": true,
+ "statusCode": 200,
+ "data": {
+  "id": 460,
+  "numero": "28335/A",
+  "dataPublicacao": "2012-02-03T00:00:00",
+  "disponivel": true,
+  "usuarioCriador": "LegisOn Sistema",
+  "ementa": "Decreta Luto Oficial pelo falecimento do Ex- Governador, JOÃO DE SEIXAS DORIÁ.",
+  "idTipoAto": 4,
+  "idIniciativa": 1,
+  "tags": [
+   {
+    "name": "Ato Original"
+   }
+  ],
+  "assinatura": false,
+  "dataRepublicacao": null,
+  "dataCadastro": "2022-03-07T15:26:06",
+  "dataAto": "2012-01-31T00:00:00",
+  "idSituacao": 1,
+  "atosTemas": null,
+  "atosOrgaos": null,
+  "arquivo": {
+   "caminho": "https://api.staging.pge.se.gov.br/minio/legisonprd/uploads/atos/460/MzEvMDEvMjAxMl8yOC4zMzUvQQ%3D%3D.pdf?X-Amz-Signature=trimmed",
+   "dataCadastro": "2022-03-07T15:26:06",
+   "consolidado": true,
+   "original": false,
+   "nomeArquivo": "MzEvMDEvMjAxMl8yOC4zMzUvQQ==.pdf"
+  },
+  "arquivoAtualizadoPdf": null,
+  "arquivoAtualizadoDocx": null
+ },
+ "message": "Ato obtido com sucesso.",
+ "moreDetails": null
+}

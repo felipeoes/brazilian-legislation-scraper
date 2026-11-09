@@ -10,6 +10,8 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "")
 LLM_PDF_INPUT = os.environ.get("LLM_PDF_INPUT", "false").lower() in {"1", "true", "yes"}
 LLM_BATCH_SIZE = int(os.environ.get("LLM_BATCH_SIZE", "5"))
 LLM_CONCURRENCY = int(os.environ.get("LLM_CONCURRENCY", "8"))
+# Worker processes for PDF text extraction, per scraper process.
+PDF_WORKERS = int(os.environ.get("PDF_WORKERS") or min(8, os.cpu_count() or 1))
 SAVE_DIR = Path(os.environ.get("SAVE_DIR", "outputs/legislation"))
 _raw_state_dir = os.environ.get("STATE_LEGISLATION_SAVE_DIR")
 STATE_LEGISLATION_SAVE_DIR: Path | None = (

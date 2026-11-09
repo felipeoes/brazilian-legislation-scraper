@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.14"
 resolution-markers = [
     "python_full_version >= '3.15' and sys_platform == 'win32'",
@@ -275,6 +275,15 @@ wheels = [
 ]
 
 [[package]]
+name = "cobble"
+version = "0.1.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/54/7a/a507c709be2c96e1bb6102eb7b7f4026c5e5e223ef7d745a17d239e9d844/cobble-0.1.4.tar.gz", hash = "sha256:de38be1539992c8a06e569630717c485a5f91be2192c461ea2b220607dfa78aa", size = 3805, upload-time = "2024-06-01T18:11:09.528Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d5/e1/3714a2f371985215c219c2a70953d38e3eed81ef165aed061d21de0e998b/cobble-0.1.4-py3-none-any.whl", hash = "sha256:36c91b1655e599fd428e2b95fdd5f0da1ca2e9f1abb0bc871dec21a0e78a2b44", size = 3984, upload-time = "2024-06-01T18:11:07.911Z" },
+]
+
+[[package]]
 name = "colorama"
 version = "0.4.6"
 source = { registry = "https://pypi.org/simple" }
@@ -519,13 +528,15 @@ wheels = [
 
 [[package]]
 name = "html-to-markdown"
-version = "2.28.2"
+version = "3.22.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/fe/bb/10587e46ad673c76faf5d02ec8fa6fe2fe4529239bfef3a678b2ba8b7f6b/html_to_markdown-2.28.2.tar.gz", hash = "sha256:d3bd995d5d77ff3536454155d5b35504f0272181526650f3e8aa8351d8fd23b0", size = 310235, upload-time = "2026-03-09T18:38:18.947Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b2/88/14ee6453b3168a017579244cdecbdab1d57d08f300a826eafe61da435520/html_to_markdown-3.22.0.tar.gz", hash = "sha256:f3167661bdab5c5769a3c38ac88c3a21d990595da9ca603d5bcf051c0bbbad7c", size = 6075665, upload-time = "2026-11-08T14:40:58.988Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/4d/7a/ce8efd40027860586c4039bbc22fb03d29e46dbf5917f6589d976e8a81a1/html_to_markdown-2.28.2-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:7bf29320dd50e69816b8a0bf6b4677e408262b6609612d639911d075c7834a74", size = 8880708, upload-time = "2026-03-09T18:38:11.222Z" },
-    { url = "https://files.pythonhosted.org/packages/4b/5f/c8ceb53ab4570fe974080999c739ca5d2d936877cb029b4c7325db9b13df/html_to_markdown-2.28.2-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:57d45dc680c81654181719cf05aa9ac3c33a074c7b7a823cae62ed14130096b8", size = 9689204, upload-time = "2026-03-09T18:38:13.558Z" },
-    { url = "https://files.pythonhosted.org/packages/ce/bd/c3ce18af6479735141a7e3e38ec6b4afdaad63f4a208f00e37801334d5e0/html_to_markdown-2.28.2-cp310-abi3-win_amd64.whl", hash = "sha256:67942aae9b1c5dd2442b9d7a45bccf2e8189c946c5ac3ec887934e9a3d465bb3", size = 9310129, upload-time = "2026-03-09T18:38:16.861Z" },
+    { url = "https://files.pythonhosted.org/packages/3d/86/1d74cabef5eb61230689d751c45b9cdf66160fecf62681771f4c3ec705cf/html_to_markdown-3.22.0-cp311-abi3-macosx_15_0_arm64.whl", hash = "sha256:6af717ec0a9e021f1af2b61d46a23e4655fb12d8e660f1d548b385258fb1e445", size = 8016093, upload-time = "2026-11-08T14:40:49.824Z" },
+    { url = "https://files.pythonhosted.org/packages/b1/9c/76f30c67f3cb1a065973b9d7c3d1256f381facc46138b3061718fb113c79/html_to_markdown-3.22.0-cp311-abi3-macosx_15_0_x86_64.whl", hash = "sha256:0e90cdc103d8018eb8e4563bcc9f46bd3be5b0dd93e51a6c592198f2b1edaade", size = 8495011, upload-time = "2026-11-08T14:40:51.956Z" },
+    { url = "https://files.pythonhosted.org/packages/80/83/2cd71f4449afb25246308fa188608c054ee3b1e8af5a0be19e96edcc63b9/html_to_markdown-3.22.0-cp311-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:47be76f44db8ecb49d5dbd9fede4b14b42c561c192d45d844e3210e287fd9761", size = 8251633, upload-time = "2026-11-08T14:40:53.901Z" },
+    { url = "https://files.pythonhosted.org/packages/e3/42/5d236462020ae2f2f43296263be075bf568ae08c498d6ec355a70cc244bf/html_to_markdown-3.22.0-cp311-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:951bf8285218a4c6b2f9f4e06f12577c2c0dae419f4eef0a8523b7dfca984a79", size = 8758809, upload-time = "2026-11-08T14:40:55.614Z" },
+    { url = "https://files.pythonhosted.org/packages/11/a9/46ba8d2170b0487a9baf2b572a79894d965d81a2a60ec9e5e86fe7e264b2/html_to_markdown-3.22.0-cp311-abi3-win_amd64.whl", hash = "sha256:7851b54354d644d8ee990e81f4bd67aab1a8f239aa32721008f8558a23584841", size = 8812737, upload-time = "2026-11-08T14:40:57.277Z" },
 ]
 
 [[package]]
@@ -704,6 +715,7 @@ dependencies = [
     { name = "html-to-markdown" },
     { name = "loguru" },
     { name = "lxml" },
+    { name = "mammoth" },
     { name = "playwright" },
     { name = "playwright-stealth" },
     { name = "pydantic-ai-slim", extra = ["anthropic", "bedrock", "google", "openai"] },
@@ -730,9 +742,10 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.13.3" },
     { name = "aiohttp-socks", specifier = ">=0.11.0" },
     { name = "beautifulsoup4", specifier = ">=4.13.4" },
-    { name = "html-to-markdown", specifier = ">=2.28.2" },
+    { name = "html-to-markdown", specifier = ">=3.22.0" },
     { name = "loguru", specifier = ">=0.7.3" },
     { name = "lxml", specifier = ">=6.0" },
+    { name = "mammoth", specifier = ">=1.13.0" },
     { name = "playwright", specifier = ">=1.58.0" },
     { name = "playwright-stealth", specifier = ">=2.0.2" },
     { name = "pydantic-ai-slim", extras = ["openai", "bedrock", "anthropic", "google"], specifier = ">=2.63" },
@@ -818,6 +831,18 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/0f/85/86766dfebfa87bea0ab78e9ff7a4b4b45225df4b4d3b8cc3c03c5cd68464/lxml-6.0.2-cp314-cp314t-win32.whl", hash = "sha256:da08e7bb297b04e893d91087df19638dc7a6bb858a954b0cc2b9f5053c922312", size = 3911420, upload-time = "2025-09-22T04:03:32.198Z" },
     { url = "https://files.pythonhosted.org/packages/fe/1a/b248b355834c8e32614650b8008c69ffeb0ceb149c793961dd8c0b991bb3/lxml-6.0.2-cp314-cp314t-win_amd64.whl", hash = "sha256:252a22982dca42f6155125ac76d3432e548a7625d56f5a273ee78a5057216eca", size = 4406837, upload-time = "2025-09-22T04:03:34.027Z" },
     { url = "https://files.pythonhosted.org/packages/92/aa/df863bcc39c5e0946263454aba394de8a9084dbaff8ad143846b0d844739/lxml-6.0.2-cp314-cp314t-win_arm64.whl", hash = "sha256:bb4c1847b303835d89d785a18801a883436cdfd5dc3d62947f9c49e24f0f5a2c", size = 3822205, upload-time = "2025-09-22T04:03:36.249Z" },
+]
+
+[[package]]
+name = "mammoth"
+version = "1.13.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cobble" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c3/a8/d6691d0b76cf55cf19851e9e189d0356526024d650c131a0969fcd76225d/mammoth-1.13.0.tar.gz", hash = "sha256:b359bee7bc00caba47dacc64286928133dd947917bab852eea01d0c8d8997296", size = 53987, upload-time = "2026-09-26T22:12:09.733Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/af/2a/47d72b27689f3c7cd1d270dd1d4699df2fe3b78b2f293b6b08f565548a45/mammoth-1.13.0-py2.py3-none-any.whl", hash = "sha256:dd7629fa9d0a5e82207b3f481a9dcb8308fb43f6206258e062f11121efba9991", size = 55228, upload-time = "2026-09-26T22:12:08.265Z" },
 ]
 
 [[package]]

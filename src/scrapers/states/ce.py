@@ -108,22 +108,19 @@ class CearaAleceScraper(BaseScraper):
             )
         visualizar_url = doc_info["document_url"].rstrip("/") + "/visualizar"
         doc_info["document_url"] = visualizar_url
-        try:
-            soup, mhtml = await self.browser.snapshot(visualizar_url)
-        except Exception as exc:
-            raise ValueError(f"Failed to fetch document page: {exc}")
+        response = await self.http.request(visualizar_url)
+        soup = response.soup()
         content = soup.find("div", class_="card-body") or soup.find("main") or soup
         clean_norm_soup(content, unwrap_links=False)
         remove_summary_element(content, doc_info.get("summary", ""))
         html_string = str(content)
-        text_markdown = await self.markdown(html=html_string)
+        text_markdown = await self.markdown(html=html_string, base_url=visualizar_url)
         valid, reason = valid_markdown(text_markdown)
         if not valid:
-            logger.error(f"Invalid markdown for {visualizar_url}: {reason}")
             raise ValueError(reason)
         doc_info["text_markdown"] = text_markdown
-        doc_info["raw"] = mhtml
-        doc_info["raw_ext"] = ".mhtml"
+        doc_info["raw"] = response.content
+        doc_info["raw_ext"] = ".html"
         return Document(**doc_info)
 
     async def _fetch_lei_ordinaria_years(self) -> list[int]:
@@ -242,13 +239,8 @@ class CearaAleceScraper(BaseScraper):
         doc_info = dict(doc_info)
         html_link = doc_info.pop("_html_link")
         url = self.construct_url(norm_type, html_link, year)
-        try:
-            soup, mhtml = await self.browser.snapshot(url)
-        except Exception as exc:
-            logger.error(
-                f"Error fetching document page: {url}. Year: {year}. HTML link: {html_link}"
-            )
-            raise ValueError(f"Failed to fetch document page: {exc}")
+        response = await self.http.request(url)
+        soup = response.soup()
         for a in soup.find_all("a"):
             if a.get_text(strip=True).upper() == "VOLTAR":
                 a.decompose()
@@ -269,7 +261,7 @@ class CearaAleceScraper(BaseScraper):
         html_string = str(content).strip()
         if "NÄO EXISTE LEI COM ESTE NÚMERO".lower() in html_string.lower():
             raise ValueError("Invalid document (NÄO EXISTE LEI COM ESTE NÚMERO)")
-        text_markdown = await self.markdown(html=html_string)
+        text_markdown = await self.markdown(html=html_string, base_url=url)
         valid, reason = valid_markdown(text_markdown)
         if not valid:
             pdf_md = await self._browser_pdf_to_markdown(url)
@@ -277,12 +269,11 @@ class CearaAleceScraper(BaseScraper):
                 text_markdown = pdf_md
                 valid, reason = valid_markdown(text_markdown)
         if not valid:
-            logger.error(f"Invalid markdown for {url} (year={year}): {reason}")
             raise ValueError(reason)
         doc_info["text_markdown"] = text_markdown
         doc_info["document_url"] = url
-        doc_info["raw"] = mhtml
-        doc_info["raw_ext"] = ".mhtml"
+        doc_info["raw"] = response.content
+        doc_info["raw_ext"] = ".html"
         return Document(**doc_info)
 
     async def list_documents(self, year: int) -> AsyncIterator[dict]:

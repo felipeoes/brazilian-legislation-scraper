@@ -1,6 +1,8 @@
 "Parser and metadata regression tests for bahia_scraper."
 
+from pathlib import Path
 from unittest.mock import AsyncMock
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from bs4 import BeautifulSoup
@@ -12,6 +14,12 @@ from parser_assertions import (
 )
 
 from src.scrapers.states.ba import SITUATIONS, TYPES, BahiaLegislaScraper
+
+FIXTURES = Path(__file__).parents[2] / "fixtures" / "bahia"
+
+
+def _html(name: str) -> str:
+    return (FIXTURES / name).read_text()
 
 
 def _make_scraper(**kwargs) -> BahiaLegislaScraper:
@@ -131,40 +139,112 @@ class TestGetDocsLinks:
         assert docs[1]["type"] == "Decreto"
 
     @pytest.mark.asyncio
-    async def test_empty_page_class_returns_empty(self):
+    async def test_real_empty_result_returns_empty(self):
         scraper = _make_scraper()
-        soup = BeautifulSoup(
-            '<html><body><td class="views-empty">Nenhum resultado encontrado</td></body></html>',
-            "lxml",
-        )
-        scraper.http.request = AsyncMock(return_value=make_mock_response(str(soup)))
-        docs = await scraper._get_docs_links("http://example.com")
-        assert docs == []
+        soup = BeautifulSoup(_html("listing_empty.html"), "lxml")
+        assert await scraper._get_docs_links("http://example.com", soup=soup) == []
+        assert scraper._get_total_pages(soup) == 1
 
     @pytest.mark.asyncio
-    async def test_no_tbody_returns_empty(self):
+    async def test_views_empty_without_message_raises(self):
+        scraper = _make_scraper()
+        html = _html("listing_empty.html").replace("Nenhum resultado encontrado", "")
+        with pytest.raises(ValueError, match="No document rows"):
+            await scraper._get_docs_links(
+                "http://example.com", soup=BeautifulSoup(html, "lxml")
+            )
+
+    @pytest.mark.asyncio
+    async def test_no_tbody_raises(self):
         scraper = _make_scraper()
         soup = BeautifulSoup("<html><body><div>nothing</div></body></html>", "lxml")
         scraper.http.request = AsyncMock(return_value=make_mock_response(str(soup)))
-        docs = await scraper._get_docs_links("http://example.com")
-        assert docs == []
+        with pytest.raises(ValueError, match="No results table"):
+            await scraper._get_docs_links("http://example.com")
 
     @pytest.mark.asyncio
-    async def test_row_with_wrong_column_count_is_skipped(self):
+    async def test_rows_without_documents_raise(self):
         scraper = _make_scraper()
         soup = BeautifulSoup(
             "<html><body><table><tbody><tr><td>only one</td></tr></tbody></table></body></html>",
             "lxml",
         )
         scraper.http.request = AsyncMock(return_value=make_mock_response(str(soup)))
-        docs = await scraper._get_docs_links("http://example.com")
-        assert docs == []
+        with pytest.raises(ValueError, match="No document rows"):
+            await scraper._get_docs_links("http://example.com")
 
     @pytest.mark.asyncio
     async def test_passed_soup_skips_fetch(self):
         scraper = _make_scraper()
-        scraper._fetch_soup_with_retry = AsyncMock()
         soup = _make_listing_soup([("/doc/1", "Lei 001", "Leis Ordinárias")])
         docs = await scraper._get_docs_links("http://example.com", soup=soup)
         assert len(docs) == 1
-        scraper._fetch_soup_with_retry.assert_not_called()
+        scraper.http.request.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_real_listing_rows(self):
+        scraper = _make_scraper()
+        soup = BeautifulSoup(_html("listing_2012_p0.html"), "lxml")
+        docs = await scraper._get_docs_links("http://example.com", soup=soup)
+        assert docs[0] == {
+            "title": "DECRETO SIMPLES DOE 29 e 30.12.2012",
+            "type": "Decreto Simples",
+            "_html_link": "/documentos/decreto-simples-doe-29-e-30122012",
+        }
+        assert len(docs) == 3
+
+
+class TestPagination:
+    def test_real_pager_gives_57_pages(self):
+        soup = BeautifulSoup(_html("listing_2012_p0.html"), "lxml")
+        assert _make_scraper()._get_total_pages(soup) == 57
+
+    def test_header_total_without_pager_raises(self):
+        soup = BeautifulSoup(_html("listing_2012_p0.html"), "lxml")
+        soup.find("ul", class_="pagination").decompose()
+        with pytest.raises(ValueError, match="no pager"):
+            _make_scraper()._get_total_pages(soup)
+
+    @pytest.mark.asyncio
+    async def test_list_documents_fetches_every_page(self):
+        scraper = _make_scraper()
+        page = make_mock_response(_html("listing_2012_p0.html"))
+        scraper.http.request = AsyncMock(return_value=page)
+        refs = [ref async for ref in scraper.list_documents(2012)]
+        pages = [
+            parse_qs(urlsplit(call.args[0]).query)["page"]
+            for call in scraper.http.request.await_args_list
+        ]
+        assert pages == [[str(p)] for p in range(57)]
+        assert len(refs) == 57 * 3
+        assert refs[0]["document_url"] == (
+            "https://www.legislabahia.ba.gov.br/documentos/decreto-simples-doe-29-e-30122012"
+        )
+
+
+class TestFetch:
+    @pytest.mark.asyncio
+    async def test_real_document_metadata(self):
+        scraper = _make_scraper()
+        body = (FIXTURES / "document_lei_12616_2012.html").read_bytes()
+        scraper.http.request = AsyncMock(return_value=make_mock_response(body))
+        doc = await scraper.fetch(
+            {
+                "title": "LEI Nº 12.616 DE 28 DE DEZEMBRO DE 2012",
+                "type": "Lei Ordinária",
+                "year": 2012,
+                "situation": "Não consta revogação expressa",
+                "_html_link": "/documentos/lei-no-12616-de-28-de-dezembro-de-2012",
+            }
+        )
+        assert doc.document_url == (
+            "https://www.legislabahia.ba.gov.br/documentos/lei-no-12616-de-28-de-dezembro-de-2012"
+        )
+        assert doc.type == "Lei Ordinária"
+        assert doc.norm_number == "12616"
+        assert doc.date == "sexta-feira, 28 de Dezembro de 2012"
+        assert doc.summary.startswith("Altera a Lei nº 11.371")
+        assert "Art. 1º - Fica revogado o § 1º" in doc.text_markdown
+        assert doc.summary not in doc.text_markdown
+        assert doc.raw_ext == ".html"
+        assert "_html_link" not in doc.model_dump()

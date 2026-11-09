@@ -6,6 +6,7 @@ from bs4 import BeautifulSoup
 
 from src.core.convert import clean_norm_soup
 from src.core.document import Document
+from src.core.http import HttpError
 from src.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
 
 _PT_MONTHS = {
@@ -119,14 +120,13 @@ class LegislaAMScraper(BaseScraper):
         doc_info = dict(doc_info)
         html_link = doc_info.pop("_html_link")
         url = urljoin(self.base_url, html_link)
-        try:
-            soup, mhtml = await self.browser.snapshot(url)
-        except Exception as exc:
-            raise ValueError(f"Failed to fetch page: {exc}")
-        html_content = self._get_norm_text(soup)
+        response = await self.http.request(url)
+        html_content = self._get_norm_text(response.soup())
         if html_content is None:
             raise ValueError("No norm text found in page")
-        return await self.fetch_html(doc_info, str(html_content), url, mhtml)
+        return await self.fetch_html(
+            doc_info, str(html_content), url, response.content, raw_ext=".html"
+        )
 
     async def list_type(
         self, year: int, norm_type: str, norm_type_id: str
@@ -145,9 +145,15 @@ class LegislaAMScraper(BaseScraper):
             return
         page = 1
         while True:
-            refs, reached_end = await self._get_docs_links(
-                self._format_search_url(norm_type_id, year, page)
-            )
+            try:
+                refs, reached_end = await self._get_docs_links(
+                    self._format_search_url(norm_type_id, year, page)
+                )
+            except HttpError as exc:
+                # The site answers 404 for the page after the last one.
+                if exc.status == 404 and page > 1:
+                    break
+                raise
             for ref in refs:
                 yield {
                     **ref,

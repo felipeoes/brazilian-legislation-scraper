@@ -152,3 +152,64 @@ async def test_yearless_row_without_year_is_an_error():
         )
         result = await scraper.run()
         assert result.docs == 1 and result.errors == 1
+
+
+async def test_listing_titles_are_whitespace_normalized_for_keys_and_documents():
+    class SpacedScraper(Scraper):
+        async def list_documents(self, year):
+            yield {
+                "year": year,
+                "document_url": "doc/1",
+                "title": "LEI N.º\n  15.215,\xa0\xa0 DE 05.09.12",
+            }
+
+        async def fetch(self, ref):
+            return document(title=ref["title"], year=ref["year"])
+
+    async with Store(":memory:") as store:
+        scraper = SpacedScraper(store=store, http=HttpClient(), years=range(2024, 2025))
+        assert (await scraper.run()).docs == 1
+        assert await store.keys() == {("doc/1", "LEI N.º 15.215, DE 05.09.12")}
+
+
+async def test_recorded_error_keeps_the_chained_cause():
+    class CauseScraper(Scraper):
+        async def list_documents(self, year):
+            yield {"year": year, "document_url": "doc/1", "title": "1"}
+
+        async def fetch(self, ref):
+            try:
+                raise TimeoutError("model timed out")
+            except TimeoutError as exc:
+                raise ValueError("PDF OCR failed") from exc
+
+    async with Store(":memory:") as store:
+        await CauseScraper(
+            store=store, http=HttpClient(), years=range(2024, 2025)
+        ).run()
+        (message,) = store.connection.execute("SELECT message FROM errors").fetchone()
+        assert message == "PDF OCR failed (caused by TimeoutError: model timed out)"
+
+
+async def test_run_records_performance_stats():
+    import json
+
+    class Flaky(Scraper):
+        async def fetch(self, ref):
+            if ref["title"] == "0":
+                raise ValueError("broken")
+            return await super().fetch(ref)
+
+    async with Store(":memory:") as store:
+        scraper = Flaky(
+            store=store, http=HttpClient(), years=range(2024, 2025), workers=3
+        )
+        result = await scraper.run()
+        (raw,) = store.connection.execute("SELECT stats FROM runs").fetchone()
+    stats = json.loads(raw)
+    assert result.listed == 30 and stats["listed"] == 30
+    assert (stats["docs"], stats["errors"], stats["workers"]) == (29, 1, 3)
+    assert 0 <= stats["listing_seconds"] <= stats["seconds"]
+    assert stats["fetch_p50"] <= stats["fetch_p95"] <= stats["fetch_max"]
+    assert stats["http"] == {"requests": 0, "retries": 0, "bytes": 0}
+    assert stats["browser_navigations"] == 0

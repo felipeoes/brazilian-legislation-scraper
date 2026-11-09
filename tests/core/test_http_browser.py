@@ -24,6 +24,50 @@ def test_response_encoding_filename_and_json():
     assert Response("url", 200, {}, b'{"n":1}').json() == {"n": 1}
 
 
+@pytest.mark.parametrize("label", ["iso-8859-1", "latin-1", "us-ascii"])
+def test_latin1_labels_decode_as_windows_1252_like_browsers(label):
+    # Ceará labels windows-1252 pages ISO-8859-1; \x96 is an en dash there.
+    response = Response(
+        "url", 200, {"content-type": f"text/html; charset={label}"}, b"Lei 1 \x96 Art."
+    )
+    assert response.text == "Lei 1 – Art."
+    assert response.soup().text == "Lei 1 – Art."
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        # RS link pages: no charset anywhere; chardet guessed windows-1250 ("Resoluçăo").
+        (
+            b"<html><a href='Resolu\xe7\xe3o 001.pdf'>Texto</a></html>",
+            "Resolução 001.pdf",
+        ),
+        (
+            "<html><a href='Resolução 001.pdf'>x</a></html>".encode(),
+            "Resolução 001.pdf",
+        ),
+        (
+            b'<html><head><meta charset="windows-1250"></head>'
+            b"<a href='Resolu\xe7\xe3o 001.pdf'>x</a></html>",
+            "Resoluçăo 001.pdf",
+        ),
+    ],
+    ids=["undeclared-latin", "undeclared-utf8", "meta-declared"],
+)
+@pytest.mark.parametrize("headers", [{"content-type": "text/html"}, {}])
+def test_undeclared_charset_decodes_like_browsers(body, expected, headers):
+    response = Response("url", 200, headers, body)
+    assert response.soup().a["href"] == expected
+    assert expected in response.text
+
+
+def test_json_ignores_meta_charset_inside_strings():
+    """Goiás embeds whole HTML documents (with <meta charset>) in UTF-8 JSON."""
+    payload = """{"conteudo": "<meta charset='windows-1252'>Resolução"}""".encode()
+    response = Response("url", 200, {"content-type": "application/json"}, payload)
+    assert response.json()["conteudo"].endswith("Resolução")
+
+
 @pytest.mark.parametrize("status", [400, 404, 503])
 async def test_http_errors_raise_after_retry_budget(status):
     http = HttpClient(max_retries=1)
@@ -62,6 +106,7 @@ async def test_body_read_is_inside_retry_and_response_is_released(monkeypatch):
     http._ensure_session = AsyncMock(return_value=session)
     assert (await http.request("url")).content == b"complete"
     assert context.__aexit__.await_count == 2
+    assert http.stats == {"requests": 2, "retries": 1, "bytes": 8}
 
 
 async def test_pool_never_exceeds_limit_and_replaces_closed_pages():

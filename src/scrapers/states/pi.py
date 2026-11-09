@@ -23,3 +23,14 @@ class PiauiAlepiScraper(SAPLBaseScraper):
     name = "PIAUI"
     types = TYPES
     base_url = "https://sapl.al.pi.leg.br"
+    # Piauí PDFs often append the governor's message and protocol stamps after the law.
+    _EXTRA_DOC_START_PATTERNS = (
+        "governo do estado do piauí",
+        "secretaria de governo do estado do piauí",
+        "setor de protocolo alepi",
+        "expediente ",
+        "ofício pres. sgm",
+        "oficio pres. sgm",
+        "proposição ",
+        "proposicao ",
+    )

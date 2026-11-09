@@ -1,16 +1,18 @@
 "Parser and metadata regression tests for ceara_scraper."
 
 from collections import defaultdict
+from unittest.mock import AsyncMock
 
 import pytest
 from bs4 import BeautifulSoup
-from conftest import make_scraper
+from conftest import make_mock_response, make_scraper
 from parser_assertions import (
     ScraperClassTests,
     SituationsConstantTests,
     TypesConstantTests,
 )
 
+from src.core.http import HttpError
 from src.scrapers.states.ce import SITUATIONS, TYPES, CearaAleceScraper
 
 
@@ -233,3 +235,61 @@ class TestGetDocsLinksMalformedRows:
             "Ato Normativo", "https://example.com", soup=soup
         )
         assert docs == []
+
+
+_TEXT = "Art. 1º O governador do estado decreta a presente lei. " * 5
+
+
+def _ref(**extra) -> dict:
+    return {
+        "year": 2012,
+        "title": "Lei Complementar nº 120",
+        "situation": "Não consta revogação expressa",
+        "summary": "",
+        **extra,
+    }
+
+
+class TestFetchOverHttp:
+    async def test_paginated_type_uses_visualizar_page(self):
+        scraper = _make_scraper()
+        body = f'<html><body><div class="card-body"><p>{_TEXT}</p></div></body></html>'.encode()
+        scraper.http.request = AsyncMock(return_value=make_mock_response(body))
+        doc = await scraper.fetch(
+            _ref(
+                type="Resolução",
+                document_url="https://www.al.ce.gov.br/legislativo/leis-e-normativos-internos/1205",
+            )
+        )
+        url = "https://www.al.ce.gov.br/legislativo/leis-e-normativos-internos/1205/visualizar"
+        scraper.http.request.assert_awaited_once_with(url)
+        assert doc.document_url == url and "Art. 1º" in doc.text_markdown
+        assert doc.raw == body and doc.raw_ext == ".html"
+
+    async def test_static_index_type_uses_word_page(self):
+        scraper = _make_scraper()
+        body = f'<html><body><div class="Section1"><p>{_TEXT}</p></div></body></html>'.encode()
+        scraper.http.request = AsyncMock(return_value=make_mock_response(body))
+        doc = await scraper.fetch(
+            _ref(
+                type="Lei Complementar",
+                document_url="https://www2.al.ce.gov.br/legislativo/ementario/lc120.htm",
+                _html_link="lc120.htm",
+            )
+        )
+        url = "https://www2.al.ce.gov.br/legislativo/ementario/lc120.htm"
+        scraper.http.request.assert_awaited_once_with(url)
+        assert doc.document_url == url and "Art. 1º" in doc.text_markdown
+        assert doc.raw == body and doc.raw_ext == ".html"
+
+    async def test_missing_static_page_fails_visibly(self):
+        scraper = _make_scraper()
+        scraper.http.request = AsyncMock(
+            side_effect=HttpError("dl508", 404, "Not Found")
+        )
+        with pytest.raises(HttpError):
+            await scraper.fetch(
+                _ref(
+                    type="Decreto Legislativo", document_url="x", _html_link="dl508.htm"
+                )
+            )

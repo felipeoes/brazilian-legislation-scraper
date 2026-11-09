@@ -1,9 +1,8 @@
 import re
 from collections.abc import AsyncIterator
-from urllib.parse import urlencode, urljoin
+from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
 from bs4 import BeautifulSoup
-from loguru import logger
 
 from src.core.document import Document
 from src.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
@@ -22,7 +21,7 @@ _TYPE_PATTERNS = [
     ("^lei\\s*ord(?:in[aá]ria)?\\b", "Lei Ordinária"),
     ("^lei\\s*comp(?:lementar)?\\b", "Lei Complementar"),
     ("^emenda\\b", "Emenda Constitucional"),
-    ("^constitui(?:c|ç)(?:a|ã)o\\b", "Constituição Estadual"),
+    ("^constitui(?:c|ç)(?:a|ã)o estadual\\b", "Constituição Estadual"),
     ("^resolu(?:c|ç)(?:a|ã)o\\b", "Resolução"),
 ]
 
@@ -65,6 +64,27 @@ class RNAlrnScraper(BaseScraper):
             return match.group(1).strip().title()
         return "Outro"
 
+    @classmethod
+    def _is_state_norm(cls, title: str) -> bool:
+        """State acts are numbered; federal acts and reference books are not."""
+        if cls._infer_norm_type(title) == "Constituição Estadual":
+            return True
+        return "federal" not in title.casefold() and bool(
+            re.search("\\bn[º°o]\\.?\\s*\\d", title, re.IGNORECASE)
+        )
+
+    @staticmethod
+    def _total_pages(soup: BeautifulSoup) -> int:
+        """Highest ``page=`` in the Laravel pagination nav; no nav means one page."""
+        nav = soup.find("nav", attrs={"aria-label": "Pagination Navigation"})
+        if nav is None:
+            return 1
+        return max(
+            int(page)
+            for link in nav.find_all("a", href=True)
+            for page in parse_qs(urlsplit(str(link["href"])).query).get("page", [])
+        )
+
     async def _get_docs_links(
         self, url: str, soup: BeautifulSoup | None = None
     ) -> list:
@@ -78,12 +98,8 @@ class RNAlrnScraper(BaseScraper):
         docs = []
         table = soup.find("table", class_="table table-sm table-striped")
         if not table:
-            logger.warning(f"No table found for url: {url}")
-            return []
-        items = table.find_all("tr")
-        if not items:
-            logger.warning(f"Empty table for url: {url}")
-        for item in items:
+            raise ValueError(f"No results table at {url}")
+        for item in table.find_all("tr"):
             tds = item.find_all("td")
             if len(tds) == 0:
                 continue
@@ -103,17 +119,15 @@ class RNAlrnScraper(BaseScraper):
 
     async def fetch(self, doc_info: dict) -> Document | None:
         """Get document data from given document dict."""
+        # Norms without a file link to the bare folder, which answers 403 on every retry.
+        if doc_info["_pdf_link"].rstrip("/").endswith("/storage/legislacao"):
+            raise ValueError("RN lists this norm without a file")
         return await self.fetch_pdf(doc_info)
 
     async def list_documents(self, year: int) -> AsyncIterator[dict]:
         url = self._format_search_url(year, 1)
         soup = (await self.http.request(url)).soup()
-        pagination = soup.find("ul", class_="pagination")
-        pages = (
-            int(pagination.find_all("li")[-2].find("a").text.strip())
-            if pagination
-            else 1
-        )
+        pages = self._total_pages(soup)
 
         async def fetch_page(page: int) -> list[dict]:
             return (
@@ -123,6 +137,8 @@ class RNAlrnScraper(BaseScraper):
             )
 
         async for ref in self.paginate(fetch_page, pages):
+            if not self._is_state_norm(ref["title"]):
+                continue
             yield {
                 "year": year,
                 "situation": DEFAULT_VALID_SITUATION,

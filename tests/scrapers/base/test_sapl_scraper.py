@@ -148,3 +148,46 @@ async def test_fetch_failure_names_each_variant_cause():
         await scraper.fetch(ref)
     assert "Expected PDF" in str(caught.value)
     assert "PDF OCR failed" in str(caught.value)
+
+
+BODY = "\n".join(
+    f"Art. {n}º Fica estabelecida a disposição número {n} desta norma estadual."
+    for n in range(1, 40)
+)
+
+
+class TestCleanSaplPdfMarkdownKeepsTheLaw:
+    """Regressions from the 2012 live run: 63 PB/PI/RR documents lost most of their text."""
+
+    def test_late_sentence_starting_with_lei_does_not_cut_the_body(self):
+        # The PDF text layer splits the title across lines, so only the late sentence looks numbered.
+        text = f"ESTADO DA PARAÍBA\nLEI N°\n9.725\n, DE\n29\nDE\nMAIO\nDE 2012\n{BODY}\nLei no prazo de 90 (noventa) dias.\nPALÁCIO DO GOVERNO"
+        cleaned = _make_scraper()._clean_sapl_pdf_markdown(
+            text, "Lei Ordinária nº 9.725, de 29 de maio de 2012"
+        )
+        assert "Art. 1º" in cleaned and "Art. 39º" in cleaned
+
+    def test_title_found_late_in_a_reversed_text_layer_keeps_everything(self):
+        text = f"{BODY}\nDECRETO LEGISLATIVO N° 337 DE 3 DE JULHO DE 2012\nASSEMBLEIA"
+        cleaned = _make_scraper()._clean_sapl_pdf_markdown(
+            text, "Decreto Legislativo nº 337, de 03 de julho de 2012"
+        )
+        assert "Art. 1º" in cleaned
+
+    def test_footer_block_does_not_swallow_annex_tables(self):
+        table = "\n".join(
+            f"| 4313/{n} | Cargo {n} | R$ 325,00 |" for n in range(10, 30)
+        )
+        text = f"LEI Nº 877\n{BODY}\nAssinatura eletrônica do Presidente\n{table}"
+        cleaned = _make_scraper()._clean_sapl_pdf_markdown(text, "Lei nº 877")
+        assert "Cargo 29" in cleaned and "Assinatura" not in cleaned
+
+    def test_extra_document_is_cut_only_after_the_closing_formula(self):
+        text = (
+            f"LEI Nº 9.884\n{BODY[:200]}\nexpediente normal na repartição fiscal, observado o § 2°\n"
+            f"{BODY[200:]}\nPALÁCIO DO GOVERNO DO ESTADO, em João Pessoa\nOfício Pres. SGM nº 12/2012\nSenhor Governador"
+        )
+        scraper = _make_scraper(_EXTRA_DOC_START_PATTERNS=("ofício pres. sgm",))
+        cleaned = scraper._clean_sapl_pdf_markdown(text, "Lei nº 9.884")
+        assert "Art. 39º" in cleaned and "expediente normal" in cleaned
+        assert "Senhor Governador" not in cleaned

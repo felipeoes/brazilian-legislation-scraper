@@ -61,9 +61,7 @@ async def test_failed_insert_preserves_existing_row_and_file(tmp_path):
         with pytest.raises(sqlite3.IntegrityError):
             await store.save(document(raw=b"new", raw_ext=".pdf"))
         row = store.connection.execute("SELECT file_path FROM documents").fetchone()
-        from pathlib import Path
-
-        assert Path(row[0]).read_bytes() == b"old"
+        assert (tmp_path / row[0]).read_bytes() == b"old"
         assert len(await store.keys()) == 1
 
 
@@ -153,3 +151,71 @@ async def test_cancelled_context_entry_closes_open_connection():
         async with store:
             pass
     assert store._connection is None
+
+
+def test_document_normalizes_title_whitespace_and_null_summary():
+    doc = document(title="Ato\n      n° 4.307/2012", summary=None)
+    assert doc.title == "Ato n° 4.307/2012" and doc.summary == ""
+
+
+async def test_import_normalizes_ref_title_like_listing_keys(tmp_path):
+    (tmp_path / "2024").mkdir()
+    row = document().model_dump() | {"ref_url": "listing", "ref_title": "Lei\n   1"}
+    (tmp_path / "2024/data.json").write_text(json.dumps([row]))
+    async with Store(tmp_path / "documents.db") as store:
+        assert await store.import_json(tmp_path) == (1, 0)
+        assert await store.keys() == {("listing", "Lei 1")}
+
+
+def _raw_files(root):
+    return sorted(p.read_bytes() for p in root.glob("*/docs/*") if p.is_file())
+
+
+async def test_raw_file_path_is_relative_so_archives_can_move(tmp_path):
+    async with Store(tmp_path / "documents.db") as store:
+        await store.save(document(raw=b"pdf", raw_ext=".pdf"))
+        (path,) = store.connection.execute("SELECT file_path FROM documents").fetchone()
+    assert path.startswith("2024/docs/") and path.endswith(".pdf")
+    assert (tmp_path / path).read_bytes() == b"pdf"
+
+
+async def test_replacing_a_document_removes_its_old_raw_file(tmp_path):
+    async with Store(tmp_path / "documents.db") as store:
+        await store.save(document(raw=b"old", raw_ext=".pdf"))
+        await store.save(document(raw=b"new", raw_ext=".html", year=2025))
+        await store.save(document(raw=b"other", raw_ext=".pdf"), ref_title="Lei 2")
+    assert _raw_files(tmp_path) == [b"new", b"other"]
+
+
+async def test_failed_insert_removes_the_new_orphan_raw_file(tmp_path):
+    async with Store(tmp_path / "documents.db") as store:
+        await store.save(document(raw=b"old", raw_ext=".pdf"))
+        store.connection.execute(
+            "CREATE TRIGGER fail BEFORE INSERT ON documents BEGIN SELECT RAISE(ABORT, 'crash'); END"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.save(document(raw=b"new", raw_ext=".pdf"))
+    assert _raw_files(tmp_path) == [b"old"]
+
+
+async def test_replace_never_deletes_files_the_store_did_not_write(tmp_path):
+    foreign = tmp_path / "2024" / "legacy.pdf"
+    foreign.parent.mkdir()
+    foreign.write_bytes(b"legacy")
+    async with Store(tmp_path / "documents.db") as store:
+        await store.save(document(), file_path=str(foreign))
+        await store.save(document(raw=b"new", raw_ext=".pdf"))
+    assert foreign.read_bytes() == b"legacy"
+
+
+async def test_runs_keep_stats_and_old_archives_gain_the_column(tmp_path):
+    db = tmp_path / "documents.db"
+    with sqlite3.connect(db) as old:
+        old.execute(
+            "CREATE TABLE runs (id INTEGER PRIMARY KEY, scraper TEXT NOT NULL, started_at TEXT, finished_at TEXT, docs INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0, llm_usage TEXT NOT NULL DEFAULT '{}')"
+        )
+    async with Store(db) as store:
+        run = await store.start_run("TEST")
+        await store.finish_run(run, 1, 0, {}, {"seconds": 2.5})
+        (stats,) = store.connection.execute("SELECT stats FROM runs").fetchone()
+    assert json.loads(stats) == {"seconds": 2.5}

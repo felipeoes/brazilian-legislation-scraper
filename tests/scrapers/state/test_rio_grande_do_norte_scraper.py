@@ -1,8 +1,12 @@
 "Parser and metadata regression tests for rio_grande_do_norte_scraper."
 
+from pathlib import Path
+from unittest.mock import AsyncMock
+from urllib.parse import parse_qs, urlsplit
+
 import pytest
 from bs4 import BeautifulSoup
-from conftest import make_scraper
+from conftest import make_mock_response, make_scraper
 from parser_assertions import (
     ScraperClassTests,
     SituationsConstantTests,
@@ -10,6 +14,12 @@ from parser_assertions import (
 )
 
 from src.scrapers.states.rn import SITUATIONS, TYPES, RNAlrnScraper
+
+FIXTURES = Path(__file__).parents[2] / "fixtures" / "rio_grande_do_norte"
+
+
+def _html(name: str) -> str:
+    return (FIXTURES / name).read_text()
 
 
 def _make_scraper(**kwargs) -> RNAlrnScraper:
@@ -69,6 +79,27 @@ class TestInferNormType:
             RNAlrnScraper._infer_norm_type("Lei Comp12,de 2024") == "Lei Complementar"
         )
 
+    def test_real_listing_titles(self):
+        assert (
+            RNAlrnScraper._infer_norm_type("Emenda Constitucional nº 08, de 20/11/2012")
+            == "Emenda Constitucional"
+        )
+        assert (
+            RNAlrnScraper._infer_norm_type("Lei Comp. nº 468, de 22/06/2012")
+            == "Lei Complementar"
+        )
+        assert (
+            RNAlrnScraper._infer_norm_type("RESOLUÇÃO Nº 212, DE 26 DE MARÇO DE 2026.")
+            == "Resolução"
+        )
+
+    def test_federal_constitution_is_not_state_constitution(self):
+        assert RNAlrnScraper._infer_norm_type("Constituição Federal") == "Outro"
+        assert (
+            RNAlrnScraper._infer_norm_type("Constituição Estadual")
+            == "Constituição Estadual"
+        )
+
     def test_unknown_prefix_falls_back_to_title_prefix(self):
         assert (
             RNAlrnScraper._infer_norm_type("Norma Especial99,de 2024")
@@ -89,12 +120,33 @@ def _make_row(title: str, year: int, pdf_href: str) -> str:
 
 class TestGetDocsLinks:
     @pytest.mark.asyncio
-    async def test_no_table_returns_empty(self):
-        """When the table element is not found, return [] instead of crashing."""
+    async def test_no_table_raises(self):
+        """A page without the results table is malformed, not an empty year."""
         scraper = _make_scraper()
         soup = BeautifulSoup("<html><body><p>Sem tabela</p></body></html>", "lxml")
-        result = await scraper._get_docs_links("http://example.com", soup=soup)
-        assert result == []
+        with pytest.raises(ValueError, match="No results table"):
+            await scraper._get_docs_links("http://example.com", soup=soup)
+
+    @pytest.mark.asyncio
+    async def test_real_empty_year_returns_empty(self):
+        scraper = _make_scraper()
+        soup = BeautifulSoup(_html("listing_empty.html"), "lxml")
+        assert await scraper._get_docs_links("http://example.com", soup=soup) == []
+        assert RNAlrnScraper._total_pages(soup) == 1
+
+    @pytest.mark.asyncio
+    async def test_real_listing_rows(self):
+        scraper = _make_scraper()
+        soup = BeautifulSoup(_html("listing_2012_p11.html"), "lxml")
+        docs = await scraper._get_docs_links("http://example.com", soup=soup)
+        assert [doc["title"] for doc in docs] == [
+            "Emenda Constitucional nº 08, de 20/11/2012",
+            "Constituição Federal",
+        ]
+        assert docs[0]["year"] == 2012
+        assert docs[0]["_pdf_link"] == (
+            "https://www.al.rn.leg.br/storage/legislacao//arq51adf4b5852de.pdf"
+        )
 
     @pytest.mark.asyncio
     async def test_empty_table_returns_empty(self):
@@ -133,3 +185,78 @@ class TestGetDocsLinks:
         soup = _make_table_soup(rows)
         result = await scraper._get_docs_links("http://example.com", soup=soup)
         assert len(result) == 2
+
+
+class TestPagination:
+    def test_total_pages_from_laravel_nav(self):
+        soup = BeautifulSoup(_html("listing_2012_p1.html"), "lxml")
+        assert RNAlrnScraper._total_pages(soup) == 12
+
+    @pytest.mark.asyncio
+    async def test_list_documents_fetches_every_page(self):
+        scraper = _make_scraper()
+        page = make_mock_response(_html("listing_2012_p1.html"))
+        scraper.http.request = AsyncMock(return_value=page)
+        refs = [ref async for ref in scraper.list_documents(2012)]
+        pages = [
+            parse_qs(urlsplit(call.args[0]).query)["page"]
+            for call in scraper.http.request.await_args_list
+        ]
+        assert pages == [[str(p)] for p in range(1, 13)]
+        assert len(refs) == 24
+        assert refs[0]["title"] == "Lei Ord. nº 9.687, de 17/12/2012"
+        assert refs[0]["type"] == "Lei Ordinária"
+        assert refs[0]["document_url"] == (
+            "https://www.al.rn.leg.br/storage/legislacao//arq511e38da7c92c.pdf"
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_live_2012_listing_has_every_page():
+    from src.core.http import HttpClient
+    from src.core.store import Store
+
+    async with RNAlrnScraper(
+        store=Store(":memory:"), http=HttpClient(rps=2), years=range(2012, 2013)
+    ) as scraper:
+        refs = [ref async for ref in scraper.list_documents(2012)]
+    assert len(refs) == 98  # 111 rows minus 13 federal/reference items
+    assert {"Lei Ordinária", "Lei Complementar", "Emenda Constitucional"} <= {
+        ref["type"] for ref in refs
+    }
+
+
+@pytest.mark.parametrize(
+    ("title", "state"),
+    [
+        ("Lei Ord. nº 9.687, de 17/12/2012", True),
+        ("Lei Comp. nº 470, de 29/03/2012", True),
+        ("Emenda Constitucional nº 08, de 20/11/2012", True),
+        ("Resolução nº 12, de 01/02/2012", True),
+        ("Constituição Estadual", True),
+        ("Constituição Federal", False),
+        ("Emendas da Constituição Federal", False),
+        ("Lei Federal nº 10.257 - Estatuto da Cidade", False),
+        ("Código Civil Brasileiro", False),
+        ("CLT - Consolidação das Leis de Trabalho", False),
+        ("Índice Temático da Constituição Estadual", False),
+    ],
+)
+def test_listing_keeps_only_state_norms(title, state):
+    # RN's year listing mixes in federal acts and reference books that 404.
+    assert RNAlrnScraper._is_state_norm(title) is state
+
+
+async def test_norm_without_file_fails_without_requesting():
+    """Lei 9.612/2012 links to the bare storage folder, which answers 403 after retries."""
+    scraper = _make_scraper()
+    ref = {
+        "title": "Lei Ord. nº 9.612, de 27/01/2012",
+        "year": 2012,
+        "_pdf_link": "https://www.al.rn.leg.br/storage/legislacao/",
+        "document_url": "https://www.al.rn.leg.br/storage/legislacao/",
+    }
+    with pytest.raises(ValueError, match="without a file"):
+        await scraper.fetch(ref)
+    scraper.http.request.assert_not_called()
