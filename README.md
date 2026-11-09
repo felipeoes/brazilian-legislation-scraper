@@ -36,7 +36,7 @@ Names, class names, and the aliases shown by `list` are case insensitive. Omit `
 
 When several scrapers are selected, each runs in its own process, so CPU-heavy parsing in one source never stalls another. `--jobs` limits how many run at once (default: all selected, up to the CPU count). Each child has its own OCR limit (`LLM_CONCURRENCY`) and PDF worker pool. A single scraper runs in-process.
 
-`stats` prints a Markdown table of each archive's latest run. It covers wall time, listing time, documents per minute, fetch latency (p50/p95/max), HTTP requests, retries and megabytes, browser navigations, and LLM requests. The numbers come from `runs.stats`; [docs/performance-baseline.md](docs/performance-baseline.md) records a reference run.
+`stats` prints a Markdown table of each archive's latest run. It covers wall time, listing time, documents per minute, fetch latency (p50/p95/max), HTTP requests, retries and megabytes, browser navigations, and LLM requests. The numbers come from `runs.stats`.
 
 Resume checks use the original listing URL and title, even when the fetched document has a different URL or publication year. `--overwrite` re-scrapes the selected years and replaces each stored document as it is saved; nothing is deleted up front, so documents removed from the source stay in the archive. Acre, Rio de Janeiro, and ICMBio enumerate their yearless listings once and filter by each document's year. Amapá's eLegis filters by the year of the originating bill, so `--year Y` lists norms from bills filed in Y and files each under its publication year; `--all` covers every norm once. Other sources list years in order through one shared worker queue. Constitutions retain their promulgation year.
 

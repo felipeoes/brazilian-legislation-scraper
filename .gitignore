@@ -176,6 +176,7 @@ artifacts/
 test_data/
 scripts/
 proxies.txt
+/docs/
 
 # AI-RELATED
 .claude/
