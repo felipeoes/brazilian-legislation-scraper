@@ -128,9 +128,13 @@ class ProxyService:
         """Take a failed or blocked proxy out of rotation for a while."""
         now = time.monotonic()
         self._resting[proxy] = now + seconds
-        left = sum(self._resting.get(_with_scheme(p), 0) <= now for p in self.proxies)
+        listed = [_with_scheme(p) for p in self.proxies]
+        left = sum(self._resting.get(p, 0) <= now for p in listed)
+        # Its position, not its address: shows whether failures cluster on a few.
+        number = listed.index(proxy) + 1 if proxy in listed else "?"
         logger.warning(
-            f"Proxy failed ({reason}); resting it {seconds / 60:.0f} min, {left} in rotation"
+            f"Proxy #{number} failed ({reason}); resting it {seconds / 60:.0f} min, "
+            f"{left} in rotation"
         )
 
     async def cleanup(self) -> None:

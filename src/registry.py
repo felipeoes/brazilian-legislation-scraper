@@ -129,6 +129,8 @@ SCRAPERS = [
         # it (180 requests tested clean), and a block pauses every direct request
         # through it. With PROXY_FILE_PATH set, each proxy gets its own 0.3 rps and a
         # blocked or failing one rests, so load on the site is proxies x 0.3 rps.
+        # shortcut: a direct 403 while every proxy rests holds the workers that fell
+        # back to direct for the whole pause, even after proxies return; seen 0 times.
         rps=0.3,
         pause_on_403=35 * 60,
         # In one session, a year listing after another type's listing can come back

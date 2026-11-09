@@ -55,7 +55,7 @@ All project settings are read in `src/config.py`, including `.env`.
 | `LLM_BATCH_SIZE` | Pages per OCR request | `5` |
 | `LLM_CONCURRENCY` | Maximum concurrent OCR batches per scraper process | `8` |
 | `PDF_WORKERS` | PDF text-extraction processes per scraper process (multi-scraper runs set it from `--jobs`) | `min(8, CPUs)` |
-| `PROXY_FILE_PATH` | Optional newline-separated proxy list (`scheme://host:port`), used by Paraná only. Each proxy gets Paraná's own rate (0.3 rps), so load is proxies × 0.3 rps; list only working proxies with distinct exit IPs | Empty |
+| `PROXY_FILE_PATH` | Optional newline-separated proxy list (`scheme://host:port`), used by Paraná only. Each proxy gets Paraná's own rate (0.3 rps), so load is proxies × 0.3 rps. Build it with `uv run scripts/check_proxies.py proxies.txt proxies.parana.txt --count 20`, which keeps working proxies with distinct exit IPs; the file is re-read every 60 s, so rerunning the script mid-run refreshes the pool | Empty |
 | `PROXY_ENDPOINT` | Optional proxy-list endpoint | Empty |
 
 For example, set `LLM_MODEL=openai:gpt-4.1-mini` and `OPENAI_API_KEY`. OpenAI-compatible services also use `OPENAI_BASE_URL`. Other model strings use their standard provider credentials, such as `AWS_*`, `AWS_BEARER_TOKEN_BEDROCK`, `ANTHROPIC_API_KEY`, or `GOOGLE_API_KEY`. Installed PydanticAI provider extras cover OpenAI, Bedrock, Anthropic, and Google. Model selection and whether PDF input is supported depend on the provider.
