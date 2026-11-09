@@ -75,6 +75,7 @@ async def run_scraper(
         http = HttpClient(
             rps=spec.rps,
             max_retries=spec.max_retries,
+            pause_on_403=spec.pause_on_403,
             disable_cookies=spec.disable_cookies,
             proxy_service=ProxyService(proxy_config) if proxy_config else None,
         )

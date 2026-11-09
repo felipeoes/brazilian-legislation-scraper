@@ -55,6 +55,7 @@ class ScraperSpec:
     browser_pages: int = 4
     save_dir: Path = SAVE_DIR
     max_retries: int = 6
+    pause_on_403: float = 0
     disable_cookies: bool = False
 
     @property
@@ -123,9 +124,14 @@ SCRAPERS = [
         ParanaCVScraper,
         ("Parana", "PR"),
         2025,
-        # Above ~0.2 rps the site answers 403 and blocks the client for ~20 min;
-        # retrying during a block only extends it.
-        rps=0.2,
+        # The site allows ~20 requests per rolling minute per IP; beyond that it answers
+        # 403 and blocks the client for a fixed 21-30 min. 0.3 rps (18/min) stays under
+        # it (180 requests tested clean), and a block pauses every request through it.
+        rps=0.3,
+        pause_on_403=35 * 60,
+        # In one session, a year listing after another type's listing can come back
+        # empty; without cookies every request starts a fresh session.
+        disable_cookies=True,
         workers=2,
         needs_proxy=True,
         max_retries=2,

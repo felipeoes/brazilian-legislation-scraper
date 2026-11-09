@@ -3,6 +3,7 @@
 import asyncio
 import json
 import ssl
+import time
 from dataclasses import dataclass
 from email.message import Message
 from typing import Any
@@ -16,6 +17,7 @@ from aiohttp_socks import (
 )
 from bs4 import BeautifulSoup
 from bs4.dammit import EncodingDetector
+from loguru import logger
 from multidict import CIMultiDict
 from pyrate_limiter import Duration, InMemoryBucket, Limiter, Rate
 from tenacity import (
@@ -122,11 +124,16 @@ class HttpClient:
         verify_ssl: bool = False,
         disable_cookies: bool = False,
         proxy_timeout: int = 15,
+        pause_on_403: float = 0,
     ) -> None:
         if max_retries < 1:
             raise ValueError("max_retries must be positive")
         self.max_retries = max_retries
         self.limiter = RateLimiter(rps)
+        # For sites whose 403 blocks the whole client for a while: every request waits
+        # this many seconds instead of failing against the block.
+        self.pause_on_403 = pause_on_403
+        self._resume_at = 0.0
         self.proxy_service = proxy_service
         self._ssl_ctx = ssl.create_default_context()
         if not verify_ssl:
@@ -188,6 +195,10 @@ class HttpClient:
                 self.stats["requests"] += 1
                 self.stats["retries"] += attempt.retry_state.attempt_number > 1
                 await self.limiter.acquire()
+                # Checked after the limiter: a block may begin while this request waits.
+                while (pause := self._resume_at - time.monotonic()) > 0:
+                    await asyncio.sleep(pause)
+                    await self.limiter.acquire()
                 proxy = (
                     await self.proxy_service.get_proxy() if self.proxy_service else None
                 )
@@ -203,6 +214,11 @@ class HttpClient:
                             response.status >= 400
                             and response.status not in ok_statuses
                         ):
+                            if response.status == 403 and self.pause_on_403:
+                                logger.warning(
+                                    f"HTTP 403 from {url}; pausing requests for {self.pause_on_403:.0f}s"
+                                )
+                                self._resume_at = time.monotonic() + self.pause_on_403
                             error_cls = (
                                 _RetryableError
                                 if response.status

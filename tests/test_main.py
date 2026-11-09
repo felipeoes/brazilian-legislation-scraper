@@ -24,6 +24,15 @@ def test_registry_years_and_bahia_rate():
     assert bahia.years.start == 1891 and bahia.years.stop == datetime.now().year + 1
 
 
+def test_parana_stays_under_its_block_and_lists_without_session_state():
+    parana = main.select_scrapers(["PR"])[0]
+    assert parana.rps * 60 < 20  # the site blocks a client above ~20 requests/minute
+    assert parana.pause_on_403 >= 30 * 60  # a block lasts 21-30 minutes
+    # In one session, a year listing after another type's listing can come back empty
+    # ("Nenhum registro encontrado"); without cookies every request starts fresh.
+    assert parana.disable_cookies
+
+
 @pytest.mark.parametrize("argv", [[], ["run"], ["run", "--all", "-s", "AC"]])
 def test_cli_requires_explicit_selection(argv):
     with pytest.raises(SystemExit) as exc:

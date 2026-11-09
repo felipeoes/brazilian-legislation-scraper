@@ -109,6 +109,41 @@ async def test_body_read_is_inside_retry_and_response_is_released(monkeypatch):
     assert http.stats == {"requests": 2, "retries": 1, "bytes": 8}
 
 
+async def test_block_pause_holds_every_request_until_it_ends(monkeypatch):
+    """Paraná answers 403 to a client that went too fast and blocks it for ~30 min."""
+    from tenacity import wait_none
+
+    import src.core.http as module
+
+    monkeypatch.setattr(module, "wait_exponential", lambda **kw: wait_none())
+    # 10 rps: the second request is still waiting on the limiter when the 403 lands.
+    http = HttpClient(rps=10, max_retries=2, pause_on_403=0.3)
+    sent: list[float] = []
+
+    def respond(method, url, **kwargs):
+        sent.append(asyncio.get_running_loop().time())
+        status = 403 if len(sent) == 1 else 200
+        response = MagicMock(status=status, reason="blocked", url=url, headers={})
+        response.read = AsyncMock(return_value=b"ok")
+
+        async def arrive() -> MagicMock:
+            await asyncio.sleep(0.05 if status == 403 else 0)
+            return response
+
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(side_effect=arrive)
+        context.__aexit__ = AsyncMock(return_value=False)
+        return context
+
+    session = MagicMock()
+    session.request.side_effect = respond
+    http._ensure_session = AsyncMock(return_value=session)
+
+    await asyncio.gather(http.request("blocked"), http.request("other"))
+    assert len(sent) == 3
+    assert min(sent[1:]) - sent[0] >= 0.3
+
+
 async def test_pool_never_exceeds_limit_and_replaces_closed_pages():
     pool = BrowserPool(max_pages=2, limiter=MagicMock())
     created = []
