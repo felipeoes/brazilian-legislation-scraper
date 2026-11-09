@@ -154,7 +154,6 @@ class DFSinjScraper(BaseScraper):
     types = TYPES
     situations = SITUATIONS
     base_url = "https://www.sinj.df.gov.br/sinj"
-    _iterate_situations = False
     _TEXT_ENDPOINT = "TextoArquivoNorma.aspx?id_file={id_file}"
     _RAW_ENDPOINT = "Norma/{ch_norma}/arquivo"
     _DETAILS_ENDPOINT = "DetalhesDeNorma.aspx?id_norma={ch_norma}"
@@ -663,11 +662,10 @@ class DFSinjScraper(BaseScraper):
             return (False, "contains site chrome")
         return (True, "")
 
-    async def _handle_maintenance(self, soup: BeautifulSoup, doc: dict) -> bool:
-        """Log a maintenance error and return True if *soup* is a maintenance page."""
-        if not self._is_maintenance_soup(soup):
-            return False
-        raise ValueError("Norm text is in maintenance on SINJ")
+    def _check_maintenance(self, soup: BeautifulSoup) -> None:
+        """Raise if *soup* is SINJ's maintenance page."""
+        if self._is_maintenance_soup(soup):
+            raise ValueError("Norm text is in maintenance on SINJ")
 
     def _resolve_doc_urls(
         self, doc_info: dict
@@ -710,8 +708,7 @@ class DFSinjScraper(BaseScraper):
             return _ATTEMPT_FAILED
         body, _resp = (result.content, result)
         soup = BeautifulSoup(body, "lxml")
-        if await self._handle_maintenance(soup, doc):
-            return None
+        self._check_maintenance(soup)
         text_markdown = await self._extract_html_markdown(soup, doc)
         usable, _ = self._check_markdown(text_markdown)
         if not usable:
@@ -753,8 +750,7 @@ class DFSinjScraper(BaseScraper):
             doc["raw_ext"] = ".pdf"
             return Document(**doc)
         soup = BeautifulSoup(body, "lxml")
-        if await self._handle_maintenance(soup, doc):
-            return None
+        self._check_maintenance(soup)
         text_markdown = await self._extract_html_markdown(soup, doc)
         usable, _ = self._check_markdown(text_markdown)
         if not usable:
@@ -804,8 +800,7 @@ class DFSinjScraper(BaseScraper):
     ) -> dict | None:
         """Attempts 3–5 (HTML): HTML extraction, diary PDF, generic markdown."""
         soup = BeautifulSoup(body, "lxml")
-        if await self._handle_maintenance(soup, doc):
-            return None
+        self._check_maintenance(soup)
         text_markdown = await self._extract_html_markdown(soup, doc)
         usable, reason = self._check_markdown(text_markdown)
         if usable:

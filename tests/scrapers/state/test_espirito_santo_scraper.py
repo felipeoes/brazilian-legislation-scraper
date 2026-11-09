@@ -160,6 +160,16 @@ class TestParseDocsFromSoup:
         docs = scraper._parse_docs_from_soup(soup)
         assert docs == []
 
+    def test_diary_and_non_pdf_digital_links_are_skipped_while_listing(self):
+        scraper = _make_scraper()
+        html = (
+            _make_listing_html(3)
+            .replace(b"/pdf/lei1.pdf", b"/DiariosPDF/2010/diario.pdf")
+            .replace(b"/pdf/lei2.pdf", b"/Processo2/Digital.aspx?arquivo=lei.doc")
+        )
+        docs = scraper._parse_docs_from_soup(BeautifulSoup(html, "lxml"))
+        assert [doc["doc_link"] for doc in docs] == ["/pdf/lei3.pdf"]
+
     def test_process_link_is_skipped(self):
         scraper = _make_scraper()
         html = b'<html><body>\n            <div class="kt-portlet__body">\n              <div class="kt-widget5__item">\n                <a class="kt-widget5__title">Lei Ordinaria\n001/2010</a>\n                <a class="kt-widget5__desc">Ementa</a>\n                <div class="kt-widget5__info">\n                  <span class="kt-font-info">01/01/2010</span>\n                  <span class="kt-font-info">Em Vigor</span>\n                </div>\n                <div class="kt-widget5__info"><span class="kt-font-info">Gov</span></div>\n                <a class="btn btn-sm btn-label-info btn-pill d-block" href="/processo.aspx?id=1">Process</a>\n              </div>\n            </div>\n        </body></html>'

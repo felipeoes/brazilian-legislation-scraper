@@ -4,7 +4,6 @@ Roraima uses SAPLBaseScraper with no overrides — all logic is inherited.
 Covers:
 - TYPES constant: 10 types with integer IDs
 - Class docstring accessible (__doc__ is not None)
-- _iterate_situations NOT set (SAPLBaseScraper passes situations={})
 - situations is empty dict
 - _format_search_url (inherited): correct SAPL API URL construction
 - _get_docs_links (inherited):

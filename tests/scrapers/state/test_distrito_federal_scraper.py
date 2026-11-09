@@ -116,7 +116,6 @@ class TestSituationsConstant(SituationsConstantTests):
 class TestClassAttributes(ScraperClassTests):
     SCRAPER_CLS = DFSinjScraper
     STATE_NAME = "Distrito Federal"
-    EXPECT_ITERATE_SITUATIONS = False
 
 
 class TestBuildPayload:

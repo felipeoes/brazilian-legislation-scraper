@@ -60,15 +60,6 @@ def is_pdf(body: bytes, content_type: str = "") -> bool:
     return "pdf" in content_type.lower() or body[:4] == b"%PDF"
 
 
-def _expects_pdf(ext: str, content_type: str = "", url: str = "") -> bool:
-    """Return True if the extension, content-type, or URL indicates PDF was expected."""
-    return (
-        ext.lower() == ".pdf"
-        or "pdf" in (content_type or "").lower()
-        or url.lower().endswith(".pdf")
-    )
-
-
 def _is_image_bytes(raw: bytes) -> bool:
     """Return True if *raw* starts with a known image-format magic sequence."""
     for magic in _IMAGE_MAGIC_BYTES:

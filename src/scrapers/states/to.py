@@ -107,7 +107,7 @@ class TocantinsScraper(BaseScraper):
                     "summary": summary,
                     "date": date_text,
                     "situation": VALID_SITUATIONS[0],
-                    "pdf_link": pdf_link,
+                    "_pdf_link": pdf_link,
                 }
                 docs.append(doc)
             except Exception as e:
@@ -190,7 +190,7 @@ class TocantinsScraper(BaseScraper):
 
     async def fetch(self, doc_info: dict) -> Document | None:
         """Get document data by downloading PDF and converting to markdown"""
-        pdf_link = doc_info.get("pdf_link")
+        pdf_link = doc_info.get("_pdf_link")
         title = doc_info.get("title", "")
         if not pdf_link:
             raise ValueError("Missing PDF link")
@@ -206,7 +206,6 @@ class TocantinsScraper(BaseScraper):
             valid, reason = valid_markdown(text_markdown)
             if not valid:
                 raise ValueError(f"Invalid markdown: {reason}")
-            doc_info.pop("pdf_link", None)
             doc_info.update(
                 {
                     "text_markdown": text_markdown,
@@ -228,20 +227,25 @@ class TocantinsScraper(BaseScraper):
                 "type": "Constituição Estadual",
                 "title": "Constituição Estadual de Tocantins",
                 "document_url": url,
-                "pdf_link": url,
+                "_pdf_link": url,
                 "situation": DEFAULT_VALID_SITUATION,
             }
-        for norm_type, norm_type_id in self.types.items():
-            pages = await self._get_total_pages(norm_type_id, year)
+        async for ref in super().list_documents(year):
+            yield ref
 
-            async def fetch_page(page: int) -> list[dict]:
-                return await self._get_docs_links_page(norm_type_id, year, page)
+    async def list_type(
+        self, year: int, norm_type: str, norm_type_id: str
+    ) -> AsyncIterator[dict]:
+        pages = await self._get_total_pages(norm_type_id, year)
 
-            async for ref in self.paginate(fetch_page, pages):
-                yield {
-                    "year": year,
-                    "type": norm_type,
-                    "situation": DEFAULT_VALID_SITUATION,
-                    **ref,
-                    "document_url": ref["pdf_link"],
-                }
+        async def fetch_page(page: int) -> list[dict]:
+            return await self._get_docs_links_page(norm_type_id, year, page)
+
+        async for ref in self.paginate(fetch_page, pages):
+            yield {
+                "year": year,
+                "type": norm_type,
+                "situation": DEFAULT_VALID_SITUATION,
+                **ref,
+                "document_url": ref["_pdf_link"],
+            }

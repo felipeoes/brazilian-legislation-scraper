@@ -5,11 +5,12 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import sqlite3
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+from pydantic import ValidationError
 
 from src.core.document import Document
 
@@ -119,10 +120,11 @@ class Store:
                 temporary.unlink(missing_ok=True)
             file_path = str(target)
         data = doc.model_dump()
+        # Keys starting with "_" are listing-only helpers, never archive data.
         extra = {
             key: value
             for key, value in data.items()
-            if key not in Document.model_fields
+            if key not in Document.model_fields and not key.startswith("_")
         }
         extra.pop("file_path", None)
         self.connection.execute(
@@ -147,18 +149,6 @@ class Store:
     ) -> None:
         with self.connection:
             self._insert(doc, ref_url, ref_title, file_path)
-
-    async def save_many(
-        self, docs: list[Document], *, ref_url: str, ref_title: str
-    ) -> None:
-        def save() -> None:
-            # Commit all outputs together so resume never skips a partial listing.
-            with self.connection:
-                for index, doc in enumerate(docs):
-                    title = ref_title if index == 0 else f"{ref_title} [{index}]"
-                    self._insert(doc, ref_url, title, None)
-
-        await self._call(save)
 
     async def save(
         self,
@@ -186,27 +176,6 @@ class Store:
             return {(row[0], row[1]) for row in rows}
 
         return await self._call(select)
-
-    async def has(self, url: str, title: str) -> bool:
-        return await self._call(
-            lambda: (
-                self.connection.execute(
-                    "SELECT 1 FROM documents WHERE ref_url=? AND ref_title=?",
-                    (url, title),
-                ).fetchone()
-                is not None
-            )
-        )
-
-    async def reset_year(self, year: int) -> None:
-        def reset() -> None:
-            with self.connection:
-                self.connection.execute("DELETE FROM documents WHERE year=?", (year,))
-            folder = self.root / str(year) / "docs"
-            if self.path != ":memory:" and folder.exists():
-                shutil.rmtree(folder)
-
-        await self._call(reset)
 
     async def start_run(self, scraper: str) -> int:
         def start() -> int:
@@ -287,8 +256,8 @@ class Store:
                         ):
                             data = dict(row)
                             extra = json.loads(data.pop("extra"))
-                            for key in ("ref_url", "ref_title", "scraped_at"):
-                                data.pop(key)
+                            # ref_url/ref_title stay: import needs them as resume keys.
+                            data.pop("scraped_at")
                             if fmt == "json" and (not first):
                                 output.write(",\n")
                             output.write(
@@ -307,26 +276,51 @@ class Store:
 
         return await self._call(export)
 
-    async def import_json(self, directory: str | Path) -> int:
-        def import_files() -> int:
-            count = 0
+    async def import_json(self, directory: str | Path) -> tuple[int, int]:
+        """Import JSON archives; returns (imported, rejected). Rejected rows go to errors."""
+
+        def import_files() -> tuple[int, int]:
+            imported = rejected = 0
             root = Path(directory)
             paths = sorted(root.glob("[0-9]*/data.json")) + sorted(
                 root.glob("[0-9]*/shards/*.json")
             )
             for path in paths:
                 rows = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(rows, dict):  # legacy saver: {"summary", "documents"}
+                    rows = rows.get("documents")
                 if not isinstance(rows, list):
-                    raise ValueError(f"Expected JSON array in {path}")
-                for row in rows:
-                    doc = Document.model_validate(row)
-                    self._save(
-                        doc,
-                        row.get("ref_url") or doc.document_url,
-                        row.get("ref_title") or doc.title,
-                        row.get("file_path"),
-                    )
-                    count += 1
-            return count
+                    raise ValueError(f"Expected a JSON array of documents in {path}")
+                with self.connection:
+                    for row in rows:
+                        row = dict(row)
+                        ref_url, ref_title = (
+                            row.pop("ref_url", None),
+                            row.pop("ref_title", None),
+                        )
+                        try:
+                            doc = Document.model_validate(row)
+                        except ValidationError as exc:
+                            rejected += 1
+                            self.connection.execute(
+                                "INSERT INTO errors(year, type, situation, title, url, message) VALUES (?, ?, ?, ?, ?, ?)",
+                                (
+                                    row.get("year"),
+                                    row.get("type"),
+                                    row.get("situation"),
+                                    row.get("title"),
+                                    row.get("document_url"),
+                                    f"import {path}: {exc}",
+                                ),
+                            )
+                            continue
+                        self._insert(
+                            doc,
+                            ref_url or doc.document_url,
+                            ref_title or doc.title,
+                            row.get("file_path"),
+                        )
+                        imported += 1
+            return imported, rejected
 
         return await self._call(import_files)

@@ -32,7 +32,6 @@ class AcreLegisScraper(BaseScraper):
     types = TYPES
     situations = SITUATIONS
     base_url = "https://legis.ac.gov.br/principal"
-    _mhtml_wait_until = "domcontentloaded"
 
     def _format_search_url(self, norm_type_id: str) -> str:
         """Format url for search request"""
@@ -40,7 +39,7 @@ class AcreLegisScraper(BaseScraper):
 
     async def _get_docs_links(self, soup: BeautifulSoup, norm_type_id: str) -> list:
         """Get documents html links from soup object.
-        Returns a list of dicts with keys 'title', 'year', 'summary' and 'html_link'
+        Returns a list of dicts with keys 'title', 'year', 'summary' and '_html_link'
         """
         trs = (
             soup.find("div", id=norm_type_id)
@@ -54,13 +53,13 @@ class AcreLegisScraper(BaseScraper):
             html_link = a["href"]
             summary = tr.find("td").find_next("td").text.strip()
             m = self.year_regex.search(title.split(",")[-1])
-            year = m.group() if m else "0000"
+            year = m.group() if m else None
             html_links.append(
                 {
                     "title": title,
                     "year": year,
                     "summary": summary,
-                    "html_link": html_link,
+                    "_html_link": html_link,
                 }
             )
         return html_links
@@ -88,7 +87,7 @@ class AcreLegisScraper(BaseScraper):
 
     async def fetch(self, doc_info: dict) -> Document | None:
         """Get document data from given html link"""
-        doc_html_link = doc_info["html_link"]
+        doc_html_link = doc_info["_html_link"]
         try:
             soup, mhtml = await self.browser.snapshot(
                 doc_html_link, wait_until="domcontentloaded"
@@ -96,8 +95,7 @@ class AcreLegisScraper(BaseScraper):
         except Exception as exc:
             raise ValueError(f"Failed to fetch document page: {exc}")
         html_string = self._clean_acre_html(soup)
-        doc_data = {k: v for k, v in doc_info.items() if k != "html_link"}
-        return await self.fetch_html(doc_data, html_string, doc_html_link, mhtml)
+        return await self.fetch_html(doc_info, html_string, doc_html_link, mhtml)
 
     async def list_documents(self, year: int | None) -> AsyncIterator[dict]:
         soup = (await self.http.request(self._format_search_url(1))).soup()
@@ -109,15 +107,15 @@ class AcreLegisScraper(BaseScraper):
                     "type": norm_type,
                     "title": norm_type,
                     "document_url": url,
-                    "html_link": url,
+                    "_html_link": url,
                     "situation": DEFAULT_VALID_SITUATION,
                 }
                 continue
             for ref in await self._get_docs_links(soup, norm_type_id):
                 yield {
                     **ref,
-                    "year": int(ref["year"]),
+                    "year": int(ref["year"]) if ref["year"] else None,
                     "type": norm_type,
                     "situation": DEFAULT_VALID_SITUATION,
-                    "document_url": urljoin(self.base_url, ref["html_link"]),
+                    "document_url": urljoin(self.base_url, ref["_html_link"]),
                 }

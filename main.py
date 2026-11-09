@@ -125,7 +125,12 @@ async def main(argv: list[str] | None = None) -> int:
                     raise FileNotFoundError(spec.database)
                 async with Store(spec.database) as store:
                     if args.command == "import-json":
-                        count = await store.import_json(spec.database.parent)
+                        count, rejected = await store.import_json(spec.database.parent)
+                        if rejected:
+                            failed = True
+                            print(
+                                f"{spec.cls.name}: {rejected} invalid rows rejected (see errors table)"
+                            )
                     else:
                         out = args.out or spec.database.parent / "export"
                         if args.out and len(specs) > 1:

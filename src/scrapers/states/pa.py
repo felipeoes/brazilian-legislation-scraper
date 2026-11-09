@@ -91,7 +91,7 @@ class ParaAlepaScraper(BaseScraper):
 
         Extracts type and number per-document from the HTML. Federal types
         are filtered out. Returns a list of dicts with keys ``title``,
-        ``summary``, ``pdf_link``, ``type``, and ``norm_number``.
+        ``summary``, ``_pdf_link``, ``type``, and ``norm_number``.
         """
         response = await self.http.request(url, method="POST", data=params)
         soup = BeautifulSoup(response.content, "lxml")
@@ -132,7 +132,7 @@ class ParaAlepaScraper(BaseScraper):
                     {
                         "title": title,
                         "summary": summary,
-                        "pdf_link": pdf_link,
+                        "_pdf_link": pdf_link,
                         "type": norm_type,
                         "norm_number": norm_number,
                     }
@@ -152,5 +152,5 @@ class ParaAlepaScraper(BaseScraper):
                 "year": year,
                 "situation": DEFAULT_VALID_SITUATION,
                 **ref,
-                "document_url": urljoin(self.base_url, ref["pdf_link"]),
+                "document_url": urljoin(self.base_url, ref["_pdf_link"]),
             }

@@ -83,9 +83,6 @@ class MSAlemsScraper(BaseScraper):
     def _doc_url(self, unid: str) -> str:
         return f"{self._nsf}/0/{unid}?OpenDocument"
 
-    def _type_items(self) -> list[tuple[str, str]]:
-        return list(self.types.items())
-
     @staticmethod
     def _entrydata_text(data: ET.Element) -> str:
         for tag_name in ("text", "number"):
@@ -269,14 +266,14 @@ class MSAlemsScraper(BaseScraper):
             if not title:
                 continue
             docs.append(
-                {"title": title, "summary": summary, "html_link": self._doc_url(unid)}
+                {"title": title, "summary": summary, "_html_link": self._doc_url(unid)}
             )
         return docs
 
     async def fetch(self, doc_info: dict) -> Document | None:
         """Fetch and convert an individual Domino document page to markdown."""
         doc_info = dict(doc_info)
-        url = doc_info.pop("html_link")
+        url = doc_info.pop("_html_link")
         result = await self.http.request(url)
         raw_body, response = (result.content, result)
         html = response.text
@@ -303,18 +300,17 @@ class MSAlemsScraper(BaseScraper):
             }
         )
 
-    async def list_documents(self, year: int) -> AsyncIterator[dict]:
-        for norm_type, path in self.types.items():
-            for ref in await self._get_type_year_docs(norm_type, path, year):
-                yield {
-                    "year": year,
-                    "type": norm_type,
-                    "situation": DEFAULT_VALID_SITUATION,
-                    **ref,
-                    "document_url": urljoin(self.base_url, ref["html_link"]),
-                }
+    async def list_type(
+        self, year: int, norm_type: str, path: str
+    ) -> AsyncIterator[dict]:
+        for ref in await self._get_type_year_docs(norm_type, path, year):
+            yield {
+                "year": year,
+                "type": norm_type,
+                "situation": DEFAULT_VALID_SITUATION,
+                **ref,
+                "document_url": urljoin(self.base_url, ref["_html_link"]),
+            }
 
     async def setup(self) -> None:
-        self._type_year_index = {}
-        for type_name, type_path in self._type_items():
-            await self._load_type_year_index(type_name, type_path)
+        self._type_year_index = {}  # filled lazily per type by list_type

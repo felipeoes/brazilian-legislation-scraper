@@ -121,7 +121,7 @@ class TestGetDocsLinks:
         doc = result[0]
         assert doc["title"] == "Lei Ordinária 42/2022"
         assert doc["year"] == 2022
-        assert doc["pdf_link"] == "/pdf/lei42.pdf"
+        assert doc["_pdf_link"] == "/pdf/lei42.pdf"
         assert "summary" in doc
 
     @pytest.mark.asyncio

@@ -251,11 +251,6 @@ class ConamaScraper(BaseScraper):
         doc_type = doc_info.get("nomeato", "")
         doc_year = doc_info.get("ano", "")
         title = f"{doc_type} CONAMA Nº {doc_number}/{doc_year}"
-        if doc_id is None:
-            logger.info(
-                f"Skipping {title} as it has no document ID attached (aid is null)."
-            )
-            return None
         doc_url = urllib.parse.urljoin(
             self.base_url, f"?option=com_sisconama&task=arquivo.download&id={doc_id}"
         )
@@ -342,6 +337,9 @@ class ConamaScraper(BaseScraper):
         async for ref in self.paginate(
             fetch_page, calc_pages(data["total"], limit) - 1, start=0
         ):
+            if ref.get("aid") is None:
+                logger.info(f"Skipping CONAMA {ref.get('numero')}/{year}: no file")
+                continue
             url = urllib.parse.urljoin(
                 self.base_url,
                 f"?option=com_sisconama&task=arquivo.download&id={ref.get('aid')}",

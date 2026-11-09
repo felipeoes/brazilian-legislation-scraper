@@ -101,12 +101,10 @@ class ScraperClassTests:
     Subclasses must set:
         SCRAPER_CLS              – the scraper class under test
         STATE_NAME               – substring expected in ``__doc__`` (case-insensitive)
-        EXPECT_ITERATE_SITUATIONS – expected value of ``_iterate_situations`` (default False)
     """
 
     SCRAPER_CLS = None
     STATE_NAME: str = ""
-    EXPECT_ITERATE_SITUATIONS: bool = False
 
     def test_docstring_is_accessible(self):
         assert self.SCRAPER_CLS.__doc__ is not None, "Missing class docstring"
@@ -114,12 +112,6 @@ class ScraperClassTests:
             assert self.STATE_NAME.lower() in self.SCRAPER_CLS.__doc__.lower(), (
                 f"Expected '{self.STATE_NAME}' in docstring"
             )
-
-    def test_iterate_situations(self):
-        actual = getattr(self.SCRAPER_CLS, "_iterate_situations", False)
-        assert actual == self.EXPECT_ITERATE_SITUATIONS, (
-            f"Expected _iterate_situations={self.EXPECT_ITERATE_SITUATIONS}, got {actual}"
-        )
 
 
 class FormatSearchUrlTests:

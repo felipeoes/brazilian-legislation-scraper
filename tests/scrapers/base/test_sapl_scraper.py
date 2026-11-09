@@ -1,5 +1,7 @@
 "Parser and metadata regression tests for sapl_scraper."
 
+from unittest.mock import AsyncMock
+
 import pytest
 from conftest import make_scraper
 
@@ -115,7 +117,7 @@ class TestGetDocsLinks:
         assert len(result) == 1
         assert result[0]["id"] == 10
         assert result[0]["type"] == scraper._resolve_type_name(1)
-        assert result[0]["pdf_link"] == item["texto_integral"]
+        assert result[0]["_pdf_link"] == item["texto_integral"]
         assert result[0]["title"] == "Lei Ordinária 1/2023"
 
     @pytest.mark.asyncio
@@ -133,3 +135,16 @@ class TestGetDocsLinks:
         data = {"results": [item]}
         result = await scraper._get_docs_links("https://api.example.com/", data=data)
         assert result[0]["situation"] == "Revogada"
+
+
+async def test_fetch_failure_names_each_variant_cause():
+    """The errors table must say why every attachment variant failed."""
+    scraper = _make_scraper(base_url="https://sapl.example.leg.br")
+    scraper.download = AsyncMock(
+        side_effect=[ValueError("Expected PDF"), ValueError("PDF OCR failed")]
+    )
+    ref = {"title": "Lei 1", "_pdf_link": "http://sapl.example.leg.br/media/lei.pdf"}
+    with pytest.raises(ValueError) as caught:
+        await scraper.fetch(ref)
+    assert "Expected PDF" in str(caught.value)
+    assert "PDF OCR failed" in str(caught.value)

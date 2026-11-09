@@ -144,7 +144,7 @@ class TestGetDocsLinks:
         assert docs[0]["project"] == "PL 001/2020"
         assert docs[0]["publication"] == "01/01/2020"
         assert docs[0]["summary"] == "Ementa do doc 1"
-        assert docs[0]["pdf_link"] == "https://legislacao.al.ma.leg.br/pdf/doc1.pdf"
+        assert docs[0]["_pdf_link"] == "https://legislacao.al.ma.leg.br/pdf/doc1.pdf"
 
     def test_empty_rows_return_empty_list(self):
         scraper = _make_scraper()

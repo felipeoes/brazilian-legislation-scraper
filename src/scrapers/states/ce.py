@@ -148,7 +148,7 @@ class CearaAleceScraper(BaseScraper):
         self, url: str, norm_type: str
     ) -> list:
         """Get documents html links from given page.
-        Returns a list of dicts with keys 'title', 'year', 'summary', 'html_link'
+        Returns a list of dicts with keys 'title', 'year', 'summary', '_html_link'
         """
         soup = (await self.http.request(url)).soup()
         if not soup:
@@ -196,7 +196,7 @@ class CearaAleceScraper(BaseScraper):
                     "title": title,
                     "year": year,
                     "summary": summary,
-                    "html_link": html_link,
+                    "_html_link": html_link,
                 }
             )
         return docs
@@ -240,7 +240,7 @@ class CearaAleceScraper(BaseScraper):
     ) -> dict | None:
         """Get document data from given document dict"""
         doc_info = dict(doc_info)
-        html_link = doc_info.pop("html_link")
+        html_link = doc_info.pop("_html_link")
         url = self.construct_url(norm_type, html_link, year)
         try:
             soup, mhtml = await self.browser.snapshot(url)
@@ -289,7 +289,7 @@ class CearaAleceScraper(BaseScraper):
         for norm_type, refs in self._prefetched_docs.get(year, {}).items():
             for ref in refs:
                 url = ref.get("document_url") or self.construct_url(
-                    norm_type, ref["html_link"], year
+                    norm_type, ref["_html_link"], year
                 )
                 yield {
                     **ref,
@@ -310,7 +310,7 @@ class CearaAleceScraper(BaseScraper):
                     "year": year,
                     "type": "Lei Ordinária",
                     "document_url": self.construct_url(
-                        "Lei Ordinária", ref["html_link"], year
+                        "Lei Ordinária", ref["_html_link"], year
                     ),
                     "situation": DEFAULT_VALID_SITUATION,
                 }

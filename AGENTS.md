@@ -21,10 +21,10 @@ uv run pre-commit run --all-files
 
 ## Architecture
 
-- `src/registry.py`: `ScraperSpec` entries for 30 scrapers, aliases, date ranges, rates, workers, OCR/proxy settings, and storage roots.
+- `src/registry.py`: `ScraperSpec` entries (`state()` for state scrapers) for 30 scrapers, aliases, start years, rates, workers, OCR/proxy settings, and storage roots.
 - `src/core/document.py`: Pydantic `Document`; required metadata and validated Markdown, excluded raw bytes, extra source fields allowed. No dictionary accessor shims.
 - `src/core/store.py`: SQLite per scraper; atomic document transactions, indexed resume keys and summaries, errors and runs, streaming JSON/JSONL export. Raw files are content-addressed and atomically replaced. Database operations run in threads under one async lock.
-- `src/core/scraper.py`: `BaseScraper` implements bounded queue workers and owns save/resume/error handling. `async with scraper` owns resource cleanup through `AsyncExitStack`. Years run sequentially; a failed year does not abort later years. Yearless sources enumerate once. Resume uses original listing URL/title globally, including documents filed under another year.
+- `src/core/scraper.py`: `BaseScraper` implements bounded queue workers and owns save/resume/error handling. `async with scraper` owns resource cleanup through `AsyncExitStack`. One bounded queue serves all years, so workers never wait at a year boundary. A failed year, type, or listing page is recorded and the rest continue. Yearless sources enumerate once. Resume uses original listing URL/title globally, including documents filed under another year.
 - `src/core/sapl.py`: shared SAPL logic for Paraíba, Piauí, and Roraima.
 - `src/core/http.py`: `HttpClient.request()` returns a fully buffered `Response` (`content`, `text`, `json()`, `soup()`, `filename`, `content_type`). HTTP failures raise `HttpError`; never test responses for truthiness. Reads happen inside the tenacity retry loop.
 - `src/core/browser.py`: one lazy bounded `BrowserPool` per scraper, shared HTTP navigation limiter, no overflow pages. Use `async with browser.page()` and `browser.goto()`, or `browser.snapshot()` for soup plus MHTML.
@@ -38,11 +38,12 @@ uv run pre-commit run --all-files
 Constructors only set attributes; inject `store`, `http`, `years`, optional `ocr`/`browser`, `workers`, and `overwrite`. Implement:
 
 ```python
-async def list_documents(self, year: int | None) -> AsyncIterator[dict]: ...
-async def fetch(self, ref: dict) -> Document | list[Document] | None: ...
+async def list_type(self, year: int | None, name: str, value: Any) -> AsyncIterator[dict]: ...  # once per `types` item
+async def list_documents(self, year: int | None) -> AsyncIterator[dict]: ...  # override instead when listing isn't per type
+async def fetch(self, ref: dict) -> Document: ...
 ```
 
-Listing refs contain stable `document_url` and `title`, plus year/type/situation and source-specific fields needed by fetch. Build `Document` only in fetch. The base persists results and records exceptions; an empty fetch result is an error. Use `setup()` for initialization requiring I/O. Use `download`, `markdown`, `fetch_pdf`, and `paginate` helpers where they fit. Keep session/JSF/ASP.NET pagination sequential.
+Listing refs contain stable `document_url` and `title`, plus year/type/situation and source-specific fields needed by fetch. Build `Document` only in fetch. The base persists results and records exceptions; a `None` fetch result is an error, so skip unwanted refs while listing. Ref keys starting with `_` (`_pdf_link`, `_html_link`) are listing-only and never stored. Use `setup()` for initialization requiring I/O. Use `download`, `markdown`, `fetch_pdf`, and `paginate` helpers where they fit. Keep session/JSF/ASP.NET pagination sequential.
 
 ## Style and tests
 
@@ -58,4 +59,4 @@ Tests construct scrapers normally with fakes (`tests/conftest.py`); no `object._
 
 See `.env.example` and README. `LLM_MODEL` accepts PydanticAI model strings or a comma-separated fallback list; `LLM_PDF_INPUT`, `LLM_BATCH_SIZE`, and `LLM_CONCURRENCY` control OCR. Standard provider credentials include `OPENAI_API_KEY`, `OPENAI_BASE_URL`, AWS settings, `ANTHROPIC_API_KEY`, and `GOOGLE_API_KEY`.
 
-Archives live at `<save_dir>/<NAME>/documents.db`. `import-json` validates `YEAR/data.json` and shards without deleting inputs and preserves raw file paths. `export` streams files to per-year directories. `--overwrite` deletes only selected years and their raw artifacts. Summary queries must never load document bodies.
+Archives live at `<save_dir>/<NAME>/documents.db`. `import-json` reads `YEAR/data.json` (a list or the legacy `{"summary", "documents"}` file) and shards without deleting inputs, preserves raw file paths, and records invalid rows in `errors` (exit 1). Exports keep `ref_url`/`ref_title` so re-imports resume correctly; legacy Camara, DF, and CE archives lack them, so re-scrape those instead of importing. `export` streams files to per-year directories. `--overwrite` re-scrapes without deleting anything; each save replaces the old row. Summary queries must never load document bodies.

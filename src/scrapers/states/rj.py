@@ -355,7 +355,6 @@ class RJAlerjScraper(BaseScraper):
             "raw": mhtml,
             "raw_ext": ".mhtml",
         }
-        result.pop("_html_link", None)
         return Document(**result)
 
     def _build_constitution_section_url(self, data_role: str) -> str:
@@ -392,36 +391,37 @@ class RJAlerjScraper(BaseScraper):
             return str(content_div)
         return None
 
-    async def list_documents(self, year: int | None) -> AsyncIterator[dict]:
-        yield {
-            "year": 1989,
-            "type": "Constituição Estadual",
-            "title": "Constituição Estadual do Rio de Janeiro",
-            "document_url": "http://www3.alerj.rj.gov.br/lotus_notes/default.asp?id=73&url=L2NvbnN0ZXN0Lm5zZi9JbmRpY2VJbnQ/T3BlbkZvcm0mU3RhcnQ9MSZDb3VudD0zMDA=",
-            "situation": DEFAULT_VALID_SITUATION,
-            "constitution": True,
-        }
-        for norm_type, spec in self.types.items():
-            if norm_type == "Constituição Estadual":
-                continue
-            start = 1
-            while True:
-                soup = (
-                    await self.http.request(self._format_search_url(spec, start))
-                ).soup()
-                refs, years = self._get_docs_html_links(
-                    norm_type, spec["page_id"], soup, None
-                )
-                for ref in refs:
-                    yield {
-                        **ref,
-                        "type": norm_type,
-                        "year": int(ref["date"]),
-                        "situation": DEFAULT_VALID_SITUATION,
-                    }
-                if not years or len(years) < self.params["Count"]:
-                    break
-                start += self.params["Count"]
+    async def list_type(
+        self, year: int | None, norm_type: str, spec: Any
+    ) -> AsyncIterator[dict]:
+        if norm_type == "Constituição Estadual":
+            yield {
+                "year": 1989,
+                "type": norm_type,
+                "title": "Constituição Estadual do Rio de Janeiro",
+                "document_url": "http://www3.alerj.rj.gov.br/lotus_notes/default.asp?id=73&url=L2NvbnN0ZXN0Lm5zZi9JbmRpY2VJbnQ/T3BlbkZvcm0mU3RhcnQ9MSZDb3VudD0zMDA=",
+                "situation": DEFAULT_VALID_SITUATION,
+                "constitution": True,
+            }
+            return
+        start = 1
+        while True:
+            soup = (
+                await self.http.request(self._format_search_url(spec, start))
+            ).soup()
+            refs, years = self._get_docs_html_links(
+                norm_type, spec["page_id"], soup, None
+            )
+            for ref in refs:
+                yield {
+                    **ref,
+                    "type": norm_type,
+                    "year": int(ref["date"]),
+                    "situation": DEFAULT_VALID_SITUATION,
+                }
+            if not years or len(years) < self.params["Count"]:
+                break
+            start += self.params["Count"]
 
     async def fetch_constitution(self, ref: dict) -> Document:
         soup = (await self.http.request(ref["document_url"])).soup()

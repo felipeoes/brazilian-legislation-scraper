@@ -120,13 +120,13 @@ class TestExtractDocsFromSoup:
         assert "15/06/2023" in doc["date"]
         assert doc["summary"] == "Dispõe sobre algo."
         assert doc["situation"] == "Não consta"
-        assert "pdf_link" in doc
+        assert "_pdf_link" in doc
 
     def test_relative_pdf_link_prefixed(self):
         scraper = _make_scraper()
         html = _make_row_html(pdf_href="/arquivos/lei1.pdf").encode("utf-8")
         result = scraper._extract_docs_from_soup(html)
-        assert result[0]["pdf_link"].startswith("https://www.al.to.leg.br")
+        assert result[0]["_pdf_link"].startswith("https://www.al.to.leg.br")
 
     def test_absolute_pdf_link_unchanged(self):
         scraper = _make_scraper()
@@ -134,7 +134,7 @@ class TestExtractDocsFromSoup:
             "utf-8"
         )
         result = scraper._extract_docs_from_soup(html)
-        assert result[0]["pdf_link"] == "https://cdn.example.com/lei1.pdf"
+        assert result[0]["_pdf_link"] == "https://cdn.example.com/lei1.pdf"
 
     def test_multiple_rows(self):
         scraper = _make_scraper()

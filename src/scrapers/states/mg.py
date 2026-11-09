@@ -205,7 +205,7 @@ class MGAlmgScraper(BaseScraper):
                 {
                     "title": title,
                     "summary": summary,
-                    "html_link": href,
+                    "_html_link": href,
                     "type": self._normalize_type(title, href),
                 }
             )
@@ -449,7 +449,7 @@ class MGAlmgScraper(BaseScraper):
     async def fetch(self, doc_info: dict) -> Document | None:
         """Get document data from a listing entry."""
         doc_info = dict(doc_info)
-        detail_link = doc_info.get("html_link", "")
+        detail_link = doc_info.get("_html_link", "")
         title = doc_info.get("title", "Unknown")
         detail_url = urljoin(self.base_url, detail_link)
         norm_type = doc_info.get("type", "")
@@ -510,7 +510,7 @@ class MGAlmgScraper(BaseScraper):
                 "year": year,
                 "situation": DEFAULT_VALID_SITUATION,
                 **ref,
-                "document_url": urljoin(self.base_url, ref["html_link"]),
+                "document_url": urljoin(self.base_url, ref["_html_link"]),
             }
 
     async def _try_fetch_text_norma(

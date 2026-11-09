@@ -13,7 +13,7 @@ pytestmark = pytest.mark.integration
 async def test_amazonas_listing(integration_scraper_factory):
     async with integration_scraper_factory(LegislaAMScraper, year=2022) as scraper:
         docs, _ = await scraper._get_docs_links(scraper._format_search_url(12, 2022, 1))
-        assert docs and docs[0]["html_link"]
+        assert docs and docs[0]["_html_link"]
 
 
 async def test_amazonas_fetch(integration_scraper_factory):

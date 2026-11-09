@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from src.config import (
     SAVE_DIR,
@@ -46,7 +47,7 @@ from src.scrapers.states.to import TocantinsScraper
 class ScraperSpec:
     cls: type[BaseScraper]
     aliases: tuple[str, ...]
-    years: range
+    start_year: int
     rps: float = 10
     workers: int = 16
     needs_proxy: bool = False
@@ -55,6 +56,10 @@ class ScraperSpec:
     save_dir: Path = SAVE_DIR
     max_retries: int = 6
     disable_cookies: bool = False
+
+    @property
+    def years(self) -> range:
+        return range(self.start_year, datetime.now().year + 1)
 
     @property
     def names(self) -> set[str]:
@@ -70,215 +75,68 @@ class ScraperSpec:
         return self.save_dir / self.cls.name / "documents.db"
 
 
+def state(*args: Any, **kwargs: Any) -> ScraperSpec:
+    return ScraperSpec(*args, save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR, **kwargs)
+
+
 SCRAPERS = [
-    ScraperSpec(CamaraDepScraper, (), range(1808, datetime.now().year + 1), rps=100),
+    ScraperSpec(CamaraDepScraper, (), 1808, rps=100),
     ScraperSpec(
         ConamaScraper,
         (),
-        range(1984, datetime.now().year + 1),
+        1984,
         needs_ocr=True,
         save_dir=SPECIFIC_LEGISLATION_SAVE_DIR or SAVE_DIR,
     ),
     ScraperSpec(
         ICMBioScraper,
         (),
-        range(2016, datetime.now().year + 1),
+        2016,
         disable_cookies=True,
         save_dir=SPECIFIC_LEGISLATION_SAVE_DIR or SAVE_DIR,
     ),
-    ScraperSpec(
-        AcreLegisScraper,
-        ("Acre", "AC"),
-        range(1963, datetime.now().year + 1),
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
-    ),
-    ScraperSpec(
-        AlagoasSefazScraper,
-        ("Alagoas", "AL"),
-        range(1942, datetime.now().year + 1),
-        needs_ocr=True,
-        rps=5,
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
-    ),
-    ScraperSpec(
-        LegislaAMScraper,
-        ("Amazonas", "AM"),
-        range(1956, datetime.now().year + 1),
-        rps=50,
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
-    ),
-    ScraperSpec(
-        AmapaAlapScraper,
-        ("Amapa", "AP"),
-        range(1991, datetime.now().year + 1),
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
-    ),
-    ScraperSpec(
-        BahiaLegislaScraper,
-        ("Bahia", "BA"),
-        range(1891, datetime.now().year + 1),
-        max_retries=7,
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
-    ),
-    ScraperSpec(
-        CearaAleceScraper,
-        ("Ceara", "CE"),
-        range(1968, datetime.now().year + 1),
-        needs_ocr=True,
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
-    ),
-    ScraperSpec(
+    state(AcreLegisScraper, ("Acre", "AC"), 1963),
+    state(AlagoasSefazScraper, ("Alagoas", "AL"), 1942, needs_ocr=True, rps=5),
+    state(LegislaAMScraper, ("Amazonas", "AM"), 1956, rps=50),
+    state(AmapaAlapScraper, ("Amapa", "AP"), 1991),
+    state(BahiaLegislaScraper, ("Bahia", "BA"), 1891, max_retries=7, rps=1),
+    state(CearaAleceScraper, ("Ceara", "CE"), 1968, needs_ocr=True),
+    state(
         DFSinjScraper,
         ("DF", "DistritoFederal"),
-        range(1922, datetime.now().year + 1),
+        1922,
         needs_ocr=True,
         rps=100,
         workers=100,
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
     ),
-    ScraperSpec(
-        ESAlesScraper,
-        ("ES", "EspiritoSanto"),
-        range(1958, datetime.now().year + 1),
-        needs_ocr=True,
-        rps=50,
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
+    state(ESAlesScraper, ("ES", "EspiritoSanto"), 1958, needs_ocr=True, rps=50),
+    state(LegislaGoias, ("Goias", "GO"), 1887, needs_ocr=True, rps=100),
+    state(MaranhaoAlemaScraper, ("Maranhao", "MA"), 1906, needs_ocr=True),
+    state(MSAlemsScraper, ("MS", "MatoGrossoDoSul"), 1979),
+    state(MTAlmtScraper, ("MT", "MatoGrosso"), 2017, needs_ocr=True, rps=5),
+    state(MGAlmgScraper, ("MG", "MinasGerais"), 1831, needs_ocr=True),
+    state(ParaAlepaScraper, ("Para", "PA"), 1990, needs_ocr=True, rps=5),
+    state(
+        ParaibaAlpbScraper, ("Paraiba", "PB"), 1924, needs_ocr=True, workers=2, rps=1
     ),
-    ScraperSpec(
-        LegislaGoias,
-        ("Goias", "GO"),
-        range(1887, datetime.now().year + 1),
-        needs_ocr=True,
-        rps=100,
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
-    ),
-    ScraperSpec(
-        MaranhaoAlemaScraper,
-        ("Maranhao", "MA"),
-        range(1906, datetime.now().year + 1),
-        needs_ocr=True,
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
-    ),
-    ScraperSpec(
-        MSAlemsScraper,
-        ("MS", "MatoGrossoDoSul"),
-        range(1979, datetime.now().year + 1),
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
-    ),
-    ScraperSpec(
-        MTAlmtScraper,
-        ("MT", "MatoGrosso"),
-        range(2017, datetime.now().year + 1),
-        needs_ocr=True,
-        rps=5,
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
-    ),
-    ScraperSpec(
-        MGAlmgScraper,
-        ("MG", "MinasGerais"),
-        range(1831, datetime.now().year + 1),
-        needs_ocr=True,
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
-    ),
-    ScraperSpec(
-        ParaAlepaScraper,
-        ("Para", "PA"),
-        range(1990, datetime.now().year + 1),
-        needs_ocr=True,
-        rps=5,
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
-    ),
-    ScraperSpec(
-        ParaibaAlpbScraper,
-        ("Paraiba", "PB"),
-        range(1924, datetime.now().year + 1),
-        needs_ocr=True,
-        workers=2,
-        rps=1,
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
-    ),
-    ScraperSpec(
+    state(
         ParanaCVScraper,
         ("Parana", "PR"),
-        range(2025, datetime.now().year + 1),
+        2025,
         rps=1,
         workers=2,
         needs_proxy=True,
         max_retries=6,
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
     ),
-    ScraperSpec(
-        PernambucoAlepeScraper,
-        ("Pernambuco", "PE"),
-        range(1835, datetime.now().year + 1),
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
-    ),
-    ScraperSpec(
-        PiauiAlepiScraper,
-        ("Piaui", "PI"),
-        range(1922, datetime.now().year + 1),
-        needs_ocr=True,
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
-    ),
-    ScraperSpec(
-        RJAlerjScraper,
-        ("RJ", "RioDeJaneiro"),
-        range(1891, datetime.now().year + 1),
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
-    ),
-    ScraperSpec(
-        RNAlrnScraper,
-        ("RN", "RioGrandeDoNorte"),
-        range(1971, datetime.now().year + 1),
-        needs_ocr=True,
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
-    ),
-    ScraperSpec(
-        RSAlrsScraper,
-        ("RS", "RioGrandeDoSul"),
-        range(1830, datetime.now().year + 1),
-        needs_ocr=True,
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
-    ),
-    ScraperSpec(
-        RondoniaCotelScraper,
-        ("Rondonia", "RO"),
-        range(1981, datetime.now().year + 1),
-        needs_ocr=True,
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
-    ),
-    ScraperSpec(
-        RoraimaAlerScraper,
-        ("Roraima", "RR"),
-        range(1991, datetime.now().year + 1),
-        needs_ocr=True,
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
-    ),
-    ScraperSpec(
-        SantaCatarinaScraper,
-        ("SC",),
-        range(1946, datetime.now().year + 1),
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
-    ),
-    ScraperSpec(
-        SaoPauloAlespScraper,
-        ("SaoPaulo", "SP"),
-        range(1835, datetime.now().year + 1),
-        needs_ocr=True,
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
-    ),
-    ScraperSpec(
-        SergipeLegsonScraper,
-        ("Sergipe", "SE"),
-        range(1940, datetime.now().year + 1),
-        needs_ocr=True,
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
-    ),
-    ScraperSpec(
-        TocantinsScraper,
-        ("TO",),
-        range(1989, datetime.now().year + 1),
-        needs_ocr=True,
-        save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR,
-    ),
+    state(PernambucoAlepeScraper, ("Pernambuco", "PE"), 1835),
+    state(PiauiAlepiScraper, ("Piaui", "PI"), 1922, needs_ocr=True),
+    state(RJAlerjScraper, ("RJ", "RioDeJaneiro"), 1891),
+    state(RNAlrnScraper, ("RN", "RioGrandeDoNorte"), 1971, needs_ocr=True),
+    state(RSAlrsScraper, ("RS", "RioGrandeDoSul"), 1830, needs_ocr=True),
+    state(RondoniaCotelScraper, ("Rondonia", "RO"), 1981, needs_ocr=True),
+    state(RoraimaAlerScraper, ("Roraima", "RR"), 1991, needs_ocr=True),
+    state(SantaCatarinaScraper, ("SC",), 1946),
+    state(SaoPauloAlespScraper, ("SaoPaulo", "SP"), 1835, needs_ocr=True),
+    state(SergipeLegsonScraper, ("Sergipe", "SE"), 1940, needs_ocr=True),
+    state(TocantinsScraper, ("TO",), 1989, needs_ocr=True),
 ]

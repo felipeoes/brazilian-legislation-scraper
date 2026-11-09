@@ -142,8 +142,6 @@ class AlagoasSefazScraper(BaseScraper):
         if not valid:
             raise ValueError(f"Invalid markdown: {reason}")
         text_markdown = _DISCLAIMER_LINE_RE.sub("", text_markdown).strip()
-        from src.core.document import Document
-
         return Document(
             year=year,
             id=doc_info["numeroDocumento"],

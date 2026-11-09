@@ -61,7 +61,7 @@ class RSAlrsScraper(BaseScraper):
         self, url: str, soup: BeautifulSoup | None = None
     ) -> list:
         """Get documents html links from given page.
-        Returns a list of dicts with keys 'type', 'title', 'date',  'summary', 'html_link'
+        Returns a list of dicts with keys 'type', 'title', 'date',  'summary', '_html_link'
         """
         if soup is None:
             soup = (await self.http.request(url)).soup()
@@ -89,7 +89,7 @@ class RSAlrsScraper(BaseScraper):
                     "title": title,
                     "date": date,
                     "summary": summary,
-                    "html_link": html_link,
+                    "_html_link": html_link,
                 }
             )
         return html_links
@@ -104,11 +104,12 @@ class RSAlrsScraper(BaseScraper):
           - bare line:            'http://www.al.rs.gov.br/legis'
           - with page number:     'http://www.al.rs.gov.br/legis  4'
           - inside a table row:   '| http://www.al.rs.gov.br/legis  | … | 3 |'
-        Matching the whole line (any leading chars, URL, any trailing chars)
-        covers all observed variants.
+        Dropping every line that contains the URL covers all observed variants.
+        A line filter, not a regex: base64 image lines are megabytes long and
+        ``[^\\n]*URL`` backtracks quadratically on them, freezing the event loop.
         """
-        return re.sub(
-            "\\n?[^\\n]*https?://www\\.al\\.rs\\.gov\\.br/legis[^\\n]*", "", text
+        return "\n".join(
+            line for line in text.split("\n") if "://www.al.rs.gov.br/legis" not in line
         ).strip()
 
     def _get_html_string(self, soup: BeautifulSoup) -> str:
@@ -130,7 +131,7 @@ class RSAlrsScraper(BaseScraper):
         if doc_info.get("constitution"):
             return await self.fetch_pdf(doc_info)
         doc_info = dict(doc_info)
-        html_link = doc_info.pop("html_link")
+        html_link = doc_info.pop("_html_link")
         soup = (await self.http.request(html_link)).soup()
         if not soup:
             logger.error(f"Error getting document data: {html_link}")
@@ -228,5 +229,5 @@ class RSAlrsScraper(BaseScraper):
                     "year": year,
                     "situation": DEFAULT_VALID_SITUATION,
                     **ref,
-                    "document_url": ref["html_link"],
+                    "document_url": ref["_html_link"],
                 }

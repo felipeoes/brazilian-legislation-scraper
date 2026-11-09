@@ -49,31 +49,47 @@ async def test_all_scrapers_record_listing_transport_failures(spec):
 
 
 @pytest.mark.parametrize(
+    "alias", ["MS", "PR", "SC", "RO", "SE", "TO", "MA", "AM", "RJ"]
+)
+async def test_failing_type_does_not_stop_other_types(alias):
+    spec = next(spec for spec in SCRAPERS if alias.lower() in spec.names)
+    scraper = make_scraper(spec.cls, years=range(2024, 2025), workers=1)
+    scraper.http.request = AsyncMock(
+        side_effect=HttpError("listing", 503, "unavailable")
+    )
+    scraper.fetch = AsyncMock(return_value=document())
+    async with scraper.store:
+        await scraper.run()
+        rows = scraper.store.connection.execute("SELECT type FROM errors")
+        assert len({row[0] for row in rows}) >= 2
+
+
+@pytest.mark.parametrize(
     ("cls", "html", "extra"),
     [
         (
             AcreLegisScraper,
             f'<div id="body-law"><p>{TEXT}</p></div>',
-            {"html_link": "https://example.org/law"},
+            {"_html_link": "https://example.org/law"},
         ),
         (
             LegislaAMScraper,
             f'<div class="materia rounded"><p>{TEXT}</p></div>',
-            {"html_link": "/law"},
+            {"_html_link": "/law"},
         ),
         (
             AmapaAlapScraper,
             f"<table><tr><td><p>{TEXT}</p></td></tr></table>",
-            {"html_link": "/law"},
+            {"_html_link": "/law"},
         ),
         (
             BahiaLegislaScraper,
             f'<div class="field--name-body"><p>{TEXT}</p></div>',
-            {"html_link": "/law"},
+            {"_html_link": "/law"},
         ),
         (CearaAleceScraper, f"<main><p>{TEXT}</p></main>", {"type": "Resolução"}),
         (ESAlesScraper, f"<p>{TEXT}</p>", {"doc_link": "/law", "norm_type": "Lei"}),
-        (MSAlemsScraper, f"<p>{TEXT}</p>", {"html_link": "https://example.org/law"}),
+        (MSAlemsScraper, f"<p>{TEXT}</p>", {"_html_link": "https://example.org/law"}),
         (
             ParanaCVScraper,
             f'<form name="pesquisarAtoForm"><p>{TEXT}</p></form>',
@@ -83,7 +99,7 @@ async def test_all_scrapers_record_listing_transport_failures(spec):
             SaoPauloAlespScraper,
             f"<p>{TEXT}</p>",
             {
-                "html_link": "https://example.org/law",
+                "_html_link": "https://example.org/law",
                 "norm_link": "https://example.org/details",
             },
         ),
@@ -165,6 +181,19 @@ async def test_conama_html_response_is_fetched_once():
     scraper.http.request.assert_awaited_once()
 
 
+async def test_conama_skips_rows_without_document_id_while_listing():
+    scraper = make_scraper(ConamaScraper)
+    rows = [
+        {"aid": None, "numero": "1", "nomeato": "Resolução"},
+        {"aid": 2, "numero": "2", "nomeato": "Resolução"},
+    ]
+    scraper.http.request = AsyncMock(
+        return_value=make_mock_json_response({"data": {"rows": rows, "total": 2}})
+    )
+    refs = [ref async for ref in scraper.list_documents(2024)]
+    assert [ref["aid"] for ref in refs] == [2]
+
+
 @pytest.mark.parametrize("status", ["", "<p>Situação: Vigente</p>"])
 def test_parana_article_revocation_does_not_revoke_document(status):
     soup = BeautifulSoup(
@@ -192,7 +221,7 @@ async def test_pdf_fetch_contracts(alias):
     scraper.http.request = AsyncMock(
         return_value=make_mock_response(pdf, content_type="application/pdf")
     )
-    ref = {**document().model_dump(), "pdf_link": "https://example.org/law.pdf"}
+    ref = {**document().model_dump(), "_pdf_link": "https://example.org/law.pdf"}
     ref.pop("text_markdown")
     result = await scraper.fetch(ref)
     assert isinstance(result, Document) and result.raw == pdf
@@ -206,7 +235,7 @@ async def test_pdf_fetch_contracts(alias):
         (
             "MG",
             f'<a href="/texto">Texto atualizado</a><span class="textNorma"><p>{TEXT}</p></span>',
-            {"html_link": "/details"},
+            {"_html_link": "/details"},
         ),
         ("MT", f"<turbo-frame><p>{TEXT}</p></turbo-frame>", {"norm_link": "/lei/1"}),
         (
@@ -300,7 +329,7 @@ async def test_rs_fetch_defaults_status_and_resolves_relative_pdf():
     )
     ref = {
         **document().model_dump(),
-        "html_link": "https://www.al.rs.gov.br/legis/M010/details.asp",
+        "_html_link": "https://www.al.rs.gov.br/legis/M010/details.asp",
     }
     ref.pop("text_markdown")
     result = await scraper.fetch(ref)

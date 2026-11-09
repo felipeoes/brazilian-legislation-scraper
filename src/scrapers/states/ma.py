@@ -399,7 +399,7 @@ class MaranhaoAlemaScraper(BaseScraper):
                     "publication": publication,
                     "project": project,
                     "summary": summary,
-                    "pdf_link": urljoin(
+                    "_pdf_link": urljoin(
                         self.base_url, self._string_attr(anchors[-1], "href")
                     ),
                 }
@@ -451,58 +451,59 @@ class MaranhaoAlemaScraper(BaseScraper):
             return (None, None, "", ())
         return (result_state, soup, subtype_field_name, subtype_values)
 
-    async def list_documents(self, year: int) -> AsyncIterator[dict]:
-        for norm_type, spec in self.types.items():
-            if norm_type == "Constituição Estadual":
-                if year == self.years.start:
-                    yield {
-                        "year": _CONSTITUTION_YEAR,
-                        "type": norm_type,
-                        "title": "Constituição Estadual do Maranhão",
-                        "document_url": urljoin(f"{self.base_url}/ged/", spec),
-                        "situation": DEFAULT_VALID_SITUATION,
-                        "constitution": True,
-                    }
-                continue
-            subtypes = (
-                spec["subtypes"].items() if isinstance(spec, dict) else [(None, None)]
+    async def list_type(
+        self, year: int, norm_type: str, spec: Any
+    ) -> AsyncIterator[dict]:
+        if norm_type == "Constituição Estadual":
+            if year == self.years.start:
+                yield {
+                    "year": _CONSTITUTION_YEAR,
+                    "type": norm_type,
+                    "title": "Constituição Estadual do Maranhão",
+                    "document_url": urljoin(f"{self.base_url}/ged/", spec),
+                    "situation": DEFAULT_VALID_SITUATION,
+                    "constitution": True,
+                }
+            return
+        subtypes = (
+            spec["subtypes"].items() if isinstance(spec, dict) else [(None, None)]
+        )
+        norm_id = spec["id"] if isinstance(spec, dict) else spec
+        for subtype, subtype_id in subtypes:
+            state, soup, field, values = await self._search_norms(
+                norm_type, norm_id, year, subtype, subtype_id
             )
-            norm_id = spec["id"] if isinstance(spec, dict) else spec
-            for subtype, subtype_id in subtypes:
-                state, soup, field, values = await self._search_norms(
-                    norm_type, norm_id, year, subtype, subtype_id
-                )
-                if state is None or soup is None:
-                    raise ValueError("Maranhão search did not return form state")
-                effective_type = subtype or norm_type
-                pages = calc_pages(self._get_total_docs(soup), self._rows_per_page)
-                for page in range(1, pages + 1):
-                    if page > 1:
-                        response = await self.http.request(
-                            state.action_url,
-                            method="POST",
-                            data=self._build_page_payload(
-                                state,
-                                norm_id,
-                                year,
-                                page,
-                                subtype_field_name=field,
-                                subtype_values=values,
-                            ),
-                        )
-                        updates = self._parse_partial_response(response.text)
-                        state = self._update_form_state(state, updates)
-                        if "table_resultados" not in updates:
-                            raise ValueError("Maranhão pagination is missing results")
-                        soup = BeautifulSoup(updates["table_resultados"], "lxml")
-                    for ref in self._get_docs_links(soup, effective_type):
-                        yield {
-                            **ref,
-                            "year": year,
-                            "type": effective_type,
-                            "situation": DEFAULT_VALID_SITUATION,
-                            "document_url": ref["pdf_link"],
-                        }
+            if state is None or soup is None:
+                raise ValueError("Maranhão search did not return form state")
+            effective_type = subtype or norm_type
+            pages = calc_pages(self._get_total_docs(soup), self._rows_per_page)
+            for page in range(1, pages + 1):
+                if page > 1:
+                    response = await self.http.request(
+                        state.action_url,
+                        method="POST",
+                        data=self._build_page_payload(
+                            state,
+                            norm_id,
+                            year,
+                            page,
+                            subtype_field_name=field,
+                            subtype_values=values,
+                        ),
+                    )
+                    updates = self._parse_partial_response(response.text)
+                    state = self._update_form_state(state, updates)
+                    if "table_resultados" not in updates:
+                        raise ValueError("Maranhão pagination is missing results")
+                    soup = BeautifulSoup(updates["table_resultados"], "lxml")
+                for ref in self._get_docs_links(soup, effective_type):
+                    yield {
+                        **ref,
+                        "year": year,
+                        "type": effective_type,
+                        "situation": DEFAULT_VALID_SITUATION,
+                        "document_url": ref["_pdf_link"],
+                    }
 
     async def fetch(self, ref: dict) -> Document:
         if ref.get("constitution"):
@@ -510,5 +511,5 @@ class MaranhaoAlemaScraper(BaseScraper):
             pdf = soup.find("object", class_="view-pdf-constituicao")
             if pdf is None or not pdf.get("data"):
                 raise ValueError("Maranhão constitution has no PDF link")
-            ref = {**ref, "pdf_link": urljoin(self.base_url, pdf["data"])}
+            ref = {**ref, "_pdf_link": urljoin(self.base_url, pdf["data"])}
         return await self.fetch_pdf(ref)

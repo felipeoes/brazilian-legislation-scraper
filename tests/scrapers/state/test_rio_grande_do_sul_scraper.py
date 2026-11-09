@@ -1,5 +1,8 @@
 "Parser and metadata regression tests for rio_grande_do_sul_scraper."
 
+import subprocess
+import sys
+
 import pytest
 from bs4 import BeautifulSoup
 from conftest import make_scraper
@@ -114,6 +117,23 @@ class TestCleanRsMarkdown:
         text = "Texto limpo sem URL de rodapé."
         result = scraper._clean_rs_markdown(text)
         assert result == text
+
+    def test_keeps_inline_image_lines(self):
+        scraper = _make_scraper()
+        image = "![](data:image/png;base64,AAAA)"
+        text = f"Art. 1º\n{image}\nhttp://www.al.rs.gov.br/legis  2\nArt. 2º"
+        assert scraper._clean_rs_markdown(text) == f"Art. 1º\n{image}\nArt. 2º"
+
+    def test_multi_megabyte_image_line_is_linear(self):
+        """Embedded base64 images are one huge line; a backtracking regex froze the event loop.
+
+        A subprocess is the only reliable timeout: the regex holds the GIL.
+        """
+        code = (
+            "from src.scrapers.states.rs import RSAlrsScraper as S; "
+            "S._clean_rs_markdown('![](data:,' + 'A' * 1_000_000 + ')')"
+        )
+        subprocess.run([sys.executable, "-c", code], timeout=10, check=True)
 
 
 class TestGetHtmlString:

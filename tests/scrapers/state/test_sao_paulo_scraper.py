@@ -155,14 +155,14 @@ class TestParseDocs:
         docs = scraper._parse_docs_from_soup(soup)
         assert "title" in docs[0]
         assert "summary" in docs[0]
-        assert "html_link" in docs[0]
+        assert "_html_link" in docs[0]
         assert "norm_link" in docs[0]
 
     def test_html_link_is_absolute(self):
         scraper = _make_scraper()
         soup = BeautifulSoup(_make_results_html(1), "lxml")
         docs = scraper._parse_docs_from_soup(soup)
-        assert docs[0]["html_link"].startswith("http")
+        assert docs[0]["_html_link"].startswith("http")
 
     def test_skips_mostrando_row(self):
         html = '<html><body>\n            <table>\n                <tr><td>Mostrando 1-10 de 50</td><td></td></tr>\n                <tr>\n                    <td><span>Lei 001/2020</span>\n                        <a href="/norma/1" class="link_norma">link</a>\n                        <a href="/norma/1/texto">texto</a>\n                    </td>\n                    <td><span>Ementa</span></td>\n                </tr>\n            </table>\n        </body></html>'

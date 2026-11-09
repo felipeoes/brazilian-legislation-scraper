@@ -121,7 +121,7 @@ class SaoPauloAlespScraper(BaseScraper):
                     {
                         "title": title,
                         "summary": summary,
-                        "html_link": html_link,
+                        "_html_link": html_link,
                         "norm_link": norm_link,
                     }
                 )
@@ -129,7 +129,7 @@ class SaoPauloAlespScraper(BaseScraper):
 
     async def _get_docs_links(self, url: str) -> list:
         """Get documents html links from given page.
-        Returns a list of dicts with keys 'title', 'summary', 'html_link', 'norm_link'"""
+        Returns a list of dicts with keys 'title', 'summary', '_html_link', 'norm_link'"""
         soup = (await self.http.request(url)).soup()
         if not soup:
             return []
@@ -192,7 +192,7 @@ class SaoPauloAlespScraper(BaseScraper):
 
     async def fetch(self, doc_info: dict) -> Document | None:
         year = doc_info["year"]
-        doc_html_link = doc_info["html_link"]
+        doc_html_link = doc_info["_html_link"]
         title = doc_info["title"]
         norm_type = self._infer_type(title)
         norm_link = doc_info["norm_link"]
@@ -221,8 +221,6 @@ class SaoPauloAlespScraper(BaseScraper):
             data["text_markdown"] = text_markdown
             data["raw"] = raw
             data["raw_ext"] = content_ext
-            from src.core.document import Document
-
             return Document(**data)
         try:
             soup, mhtml = await self.browser.snapshot(doc_html_link)
@@ -251,8 +249,6 @@ class SaoPauloAlespScraper(BaseScraper):
                 data["text_markdown"] = text_markdown
                 data["raw"] = pdf_content
                 data["raw_ext"] = ".pdf"
-                from src.core.document import Document
-
                 return Document(**data)
         for a in soup.find_all("a"):
             if a.decomposed:
@@ -301,8 +297,6 @@ class SaoPauloAlespScraper(BaseScraper):
         data["text_markdown"] = text_markdown
         data["raw"] = raw
         data["raw_ext"] = content_ext
-        from src.core.document import Document
-
         return Document(**data)
 
     async def list_documents(self, year: int) -> AsyncIterator[dict]:
@@ -326,5 +320,5 @@ class SaoPauloAlespScraper(BaseScraper):
                 "year": year,
                 "situation": DEFAULT_VALID_SITUATION,
                 **ref,
-                "document_url": urljoin(self.base_url, ref["html_link"]),
+                "document_url": urljoin(self.base_url, ref["_html_link"]),
             }

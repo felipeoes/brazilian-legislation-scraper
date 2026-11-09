@@ -69,7 +69,7 @@ class LegislaAMScraper(BaseScraper):
     async def _get_docs_links(self, url: str) -> tuple[list, bool]:
         """Get documents html links from given page.
         Returns a tuple of (docs, reached_end) where docs is a list of dicts
-        with keys 'title', 'summary', 'html_link' and reached_end indicates
+        with keys 'title', 'summary', '_html_link' and reached_end indicates
         there are no more pages."""
         soup = (await self.http.request(url)).soup()
         if not soup:
@@ -95,7 +95,7 @@ class LegislaAMScraper(BaseScraper):
                 {
                     "title": title,
                     "summary": "",
-                    "html_link": html_link,
+                    "_html_link": html_link,
                     "date": date_str,
                 }
             )
@@ -117,7 +117,7 @@ class LegislaAMScraper(BaseScraper):
     async def fetch(self, doc_info: dict) -> Document | None:
         """Get document data from given document dict"""
         doc_info = dict(doc_info)
-        html_link = doc_info.pop("html_link")
+        html_link = doc_info.pop("_html_link")
         url = urljoin(self.base_url, html_link)
         try:
             soup, mhtml = await self.browser.snapshot(url)
@@ -128,33 +128,34 @@ class LegislaAMScraper(BaseScraper):
             raise ValueError("No norm text found in page")
         return await self.fetch_html(doc_info, str(html_content), url, mhtml)
 
-    async def list_documents(self, year: int) -> AsyncIterator[dict]:
-        for norm_type, norm_type_id in self.types.items():
-            if norm_type == "Constituição Estadual":
-                if year == self.years.start:
-                    url = f"{self.base_url}/diario_am/{norm_type_id}"
-                    yield {
-                        "year": 1989,
-                        "type": norm_type,
-                        "title": norm_type,
-                        "document_url": url,
-                        "html_link": url,
-                        "situation": DEFAULT_VALID_SITUATION,
-                    }
-                continue
-            page = 1
-            while True:
-                refs, reached_end = await self._get_docs_links(
-                    self._format_search_url(norm_type_id, year, page)
-                )
-                for ref in refs:
-                    yield {
-                        **ref,
-                        "year": year,
-                        "type": norm_type,
-                        "situation": DEFAULT_VALID_SITUATION,
-                        "document_url": urljoin(self.base_url, ref["html_link"]),
-                    }
-                if reached_end:
-                    break
-                page += 1
+    async def list_type(
+        self, year: int, norm_type: str, norm_type_id: str
+    ) -> AsyncIterator[dict]:
+        if norm_type == "Constituição Estadual":
+            if year == self.years.start:
+                url = f"{self.base_url}/diario_am/{norm_type_id}"
+                yield {
+                    "year": 1989,
+                    "type": norm_type,
+                    "title": norm_type,
+                    "document_url": url,
+                    "_html_link": url,
+                    "situation": DEFAULT_VALID_SITUATION,
+                }
+            return
+        page = 1
+        while True:
+            refs, reached_end = await self._get_docs_links(
+                self._format_search_url(norm_type_id, year, page)
+            )
+            for ref in refs:
+                yield {
+                    **ref,
+                    "year": year,
+                    "type": norm_type,
+                    "situation": DEFAULT_VALID_SITUATION,
+                    "document_url": urljoin(self.base_url, ref["_html_link"]),
+                }
+            if reached_end:
+                break
+            page += 1

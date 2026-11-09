@@ -69,29 +69,30 @@ class SantaCatarinaScraper(BaseScraper):
         doc_info["situation"] = "Não consta"
         return await self.fetch_html(doc_info, html_content, document_url, mhtml)
 
-    async def list_documents(self, year: int) -> AsyncIterator[dict]:
-        for norm_type, path in self.types.items():
-            seen = set()
-            page = 1
-            while True:
-                soup = (
-                    await self.http.request(
-                        f"{self.base_url}/{path}?ano={year}&page={page}"
-                    )
-                ).soup()
-                links = soup.find_all("a", href=re.compile("/ato-normativo/"))
-                new_links = [link for link in links if link.get("href") not in seen]
-                if not new_links:
-                    break
-                for link in new_links:
-                    seen.add(link["href"])
-                    title = link.get_text(strip=True)
-                    if title:
-                        yield {
-                            "year": year,
-                            "type": norm_type,
-                            "title": title,
-                            "document_url": urljoin(self.base_url, link["href"]),
-                            "situation": DEFAULT_VALID_SITUATION,
-                        }
-                page += 1
+    async def list_type(
+        self, year: int, norm_type: str, path: str
+    ) -> AsyncIterator[dict]:
+        seen = set()
+        page = 1
+        while True:
+            soup = (
+                await self.http.request(
+                    f"{self.base_url}/{path}?ano={year}&page={page}"
+                )
+            ).soup()
+            links = soup.find_all("a", href=re.compile("/ato-normativo/"))
+            new_links = [link for link in links if link.get("href") not in seen]
+            if not new_links:
+                break
+            for link in new_links:
+                seen.add(link["href"])
+                title = link.get_text(strip=True)
+                if title:
+                    yield {
+                        "year": year,
+                        "type": norm_type,
+                        "title": title,
+                        "document_url": urljoin(self.base_url, link["href"]),
+                        "situation": DEFAULT_VALID_SITUATION,
+                    }
+            page += 1

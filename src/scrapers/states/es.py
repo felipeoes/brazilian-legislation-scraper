@@ -144,6 +144,18 @@ class ESAlesScraper(BaseScraper):
     def _infer_norm_type(title: str) -> str:
         return infer_type_by_prefix(title, list(TYPES))
 
+    def _resolve_doc_url(self, doc_link: str) -> str | None:
+        """Return the fetchable URL, or None for diary and non-PDF Digital.aspx links."""
+        url = urljoin(self.base_url, doc_link)
+        if url.endswith(".pd"):
+            url += "f"
+        if "Processo2/Digital.aspx" in url:
+            arquivo = parse_qs(urlparse(url).query).get("arquivo", [""])[0]
+            if not arquivo.lower().endswith(".pdf"):
+                return None
+            url = urljoin(self.base_url, "/" + arquivo.lstrip("/"))
+        return None if "/DiariosPDF/" in url else url
+
     def _parse_docs_from_soup(self, soup: BeautifulSoup) -> list[dict]:
         """Parse document entries from a listing page soup."""
         docs = []
@@ -189,6 +201,11 @@ class ESAlesScraper(BaseScraper):
             if doc_link.endswith(".docx"):
                 logger.info(
                     f"Skipping '{title_raw.strip()}' since it is a docx document"
+                )
+                continue
+            if self._resolve_doc_url(doc_link) is None:
+                logger.info(
+                    f"Skipping '{title_raw.strip()}': diary or non-PDF Digital.aspx link"
                 )
                 continue
             docs.append(
@@ -280,20 +297,9 @@ class ESAlesScraper(BaseScraper):
         if inferred_type:
             doc_info["type"] = inferred_type
         summary = doc_info.get("summary", "")
-        url = urljoin(self.base_url, doc_link)
-        if url.endswith(".pd"):
-            url = url + "f"
-        if "Processo2/Digital.aspx" in url:
-            params = parse_qs(urlparse(url).query)
-            arquivo = params.get("arquivo", [""])[0]
-            if arquivo.lower().endswith(".pdf"):
-                url = urljoin(self.base_url, "/" + arquivo.lstrip("/"))
-            else:
-                logger.info(f"Skipping non-PDF Digital.aspx URL: {url}")
-                return None
-        if "/DiariosPDF/" in url:
-            logger.info(f"Skipping diary PDF: {url}")
-            return None
+        url = self._resolve_doc_url(doc_link)
+        if url is None:
+            raise ValueError(f"Unsupported document link: {doc_link}")
         if url.endswith(".pdf"):
             text_markdown, raw, content_ext = await self.download(url)
             cleaned = _clean_markdown(text_markdown, summary)

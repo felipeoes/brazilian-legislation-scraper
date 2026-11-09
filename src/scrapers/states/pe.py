@@ -427,8 +427,6 @@ class PernambucoAlepeScraper(BaseScraper):
                 result[key] = value
         if not result.get("situation"):
             result["situation"] = DEFAULT_VALID_SITUATION
-        from src.core.document import Document
-
         return Document(**result)
 
     async def list_documents(self, year: int) -> AsyncIterator[dict]:

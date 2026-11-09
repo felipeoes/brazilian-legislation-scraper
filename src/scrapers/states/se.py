@@ -157,7 +157,7 @@ class SergipeLegsonScraper(BaseScraper):
             data = (await self.http.request(doc_info["document_url"])).json()
             ref = {
                 **doc_info,
-                "pdf_link": f"{self.base_url}/uploads/constituicao/{data['id']}/atualizado/{data['arquivoAtualizado']}",
+                "_pdf_link": f"{self.base_url}/uploads/constituicao/{data['id']}/atualizado/{data['arquivoAtualizado']}",
             }
             return await self.fetch_pdf(ref)
         doc_info = dict(doc_info)
@@ -184,8 +184,6 @@ class SergipeLegsonScraper(BaseScraper):
                     "raw_ext": ".txt",
                 }
             )
-            from src.core.document import Document
-
             return Document(**doc_info)
         if "files" in data and data["files"]:
             file_data = data["files"][0]
@@ -209,8 +207,6 @@ class SergipeLegsonScraper(BaseScraper):
                             "raw_ext": ".pdf",
                         }
                     )
-                    from src.core.document import Document
-
                     return Document(**doc_info)
         raise ValueError("No API content or extractable PDF found for document")
 
@@ -239,19 +235,24 @@ class SergipeLegsonScraper(BaseScraper):
                 "situation": DEFAULT_VALID_SITUATION,
                 "constitution": True,
             }
-        for norm_type, norm_type_id in self.types.items():
-            pages = calc_pages(await self._get_total_count(norm_type_id, year), 10)
+        async for ref in super().list_documents(year):
+            yield ref
 
-            async def fetch_page(page: int) -> list[dict]:
-                return await self._get_docs_links(
-                    self._format_search_payload(norm_type_id, year, page)
-                )
+    async def list_type(
+        self, year: int, norm_type: str, norm_type_id: int
+    ) -> AsyncIterator[dict]:
+        pages = calc_pages(await self._get_total_count(norm_type_id, year), 10)
 
-            async for ref in self.paginate(fetch_page, pages):
-                yield {
-                    "year": year,
-                    "type": norm_type,
-                    "situation": DEFAULT_VALID_SITUATION,
-                    **ref,
-                    "document_url": f"{self.doc_content_url}?atosIds={ref['doc_id']}",
-                }
+        async def fetch_page(page: int) -> list[dict]:
+            return await self._get_docs_links(
+                self._format_search_payload(norm_type_id, year, page)
+            )
+
+        async for ref in self.paginate(fetch_page, pages):
+            yield {
+                "year": year,
+                "type": norm_type,
+                "situation": DEFAULT_VALID_SITUATION,
+                **ref,
+                "document_url": f"{self.doc_content_url}?atosIds={ref['doc_id']}",
+            }

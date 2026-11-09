@@ -3,7 +3,6 @@
 Covers:
 - TYPES constant: 8 types present, integer IDs
 - Class docstring accessible (__doc__ is not None)
-- _iterate_situations NOT set (SAPLBaseScraper passes situations={})
 - _id_to_type reverse map built correctly
 - inherited SAPL URL formatting includes page_size=100
 - inherited _get_docs_links parsing and missing-attachment reporting
@@ -115,5 +114,5 @@ class TestGetDocsLinks:
         assert doc["id"] == 10
         assert doc["title"] == "Constituição Estadual nº 4"
         assert doc["type"] == scraper._resolve_type_name(10)
-        assert doc["pdf_link"] == "https://sapl.al.pi.leg.br/media/lei.pdf"
+        assert doc["_pdf_link"] == "https://sapl.al.pi.leg.br/media/lei.pdf"
         assert doc["subject"] == ["Constituição"]

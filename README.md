@@ -32,7 +32,7 @@ uv run main.py import-json -s Acre
 
 Names, class names, and the aliases shown by `list` are case insensitive. Omit `--year` to scrape the registered date range. A run returns exit code 1 if any listing, document, or cleanup fails; errors are recorded in SQLite. With no command, the CLI prints usage and exits 2.
 
-Resume checks use the original listing URL and title, even when the fetched document has a different URL or publication year. `--overwrite` removes stored documents and raw files for the selected years before scraping them again. Acre, Amapá, Rio de Janeiro, and ICMBio enumerate their yearless listings once and filter by each document's year. Other sources scrape years sequentially. Constitutions retain their promulgation year.
+Resume checks use the original listing URL and title, even when the fetched document has a different URL or publication year. `--overwrite` re-scrapes the selected years and replaces each stored document as it is saved; nothing is deleted up front, so documents removed from the source stay in the archive. Acre, Amapá, Rio de Janeiro, and ICMBio enumerate their yearless listings once and filter by each document's year. Other sources list years in order through one shared worker queue. Constitutions retain their promulgation year.
 
 ## Configuration
 
@@ -59,9 +59,9 @@ One OCR agent and semaphore are shared across the run. A failed OCR batch reject
 
 Each scraper writes `<archive root>/<SCRAPER>/documents.db` with `documents`, `errors`, and `runs` tables. SQLite uses WAL and atomic transactions. Raw artifacts live under `YEAR/docs/` with fixed-length content-addressed filenames and are written by atomic replacement. An interrupted database write can leave an unreferenced raw file; it cannot replace a previous document's raw content.
 
-`export` streams records to `YEAR/data.jsonl` or `YEAR/data.json`. It includes document metadata, `text_markdown`, source-specific extra fields, and `file_path`; raw bytes and internal resume keys are excluded. The default export directory is `<archive root>/<SCRAPER>/export`. With multiple scrapers and `--out`, each scraper gets a separate subdirectory.
+`export` streams records to `YEAR/data.jsonl` or `YEAR/data.json`. It includes document metadata, `text_markdown`, source-specific extra fields, `file_path`, and the resume key (`ref_url`, `ref_title`) so `import-json` can restore it; raw bytes and listing-only keys starting with `_` are excluded. The default export directory is `<archive root>/<SCRAPER>/export`. With multiple scrapers and `--out`, each scraper gets a separate subdirectory.
 
-`import-json` reads `YEAR/data.json` and `YEAR/shards/*.json` from the selected scraper's archive directory. It validates each record, preserves existing `file_path` values, and never deletes its inputs. Invalid files fail loudly; records committed before the failure remain available, and rerunning safely replaces duplicate keys.
+`import-json` reads `YEAR/data.json` (a list, or the legacy `{"summary", "documents"}` file) and `YEAR/shards/*.json` from the selected scraper's archive directory. It validates each record, preserves existing `file_path` values, and never deletes its inputs. Invalid records are skipped, recorded in the `errors` table, and make the command exit 1; unreadable files fail loudly. Rerunning safely replaces duplicate keys. Legacy Câmara, DF, and Ceará archives were keyed by the fetched URL, not the listing URL that resume uses, so re-scrape those instead of importing them.
 
 ## Architecture
 
@@ -84,7 +84,7 @@ src/scrapers/federal/         Câmara dos Deputados
 src/scrapers/environment/     CONAMA and ICMBio
 ```
 
-Scrapers implement `list_documents(year)` as an async generator of lightweight metadata, and `fetch(ref)` returning a `Document`. Constructors only accept dependencies and set attributes. The base run loop owns persistence, error reporting, and resume; fetch workers never collect whole archives in memory. Each year has a queue capped at twice the worker count. Stateful pagination remains sequential; stateless page requests use bounded batches. HTTP requests and browser navigation share the scraper's rate limiter. Browser pools never exceed their configured page limit.
+Scrapers implement `list_type(year, name, value)` (called once per type, so one failing type doesn't stop the others) or override `list_documents(year)`, both async generators of lightweight metadata, and `fetch(ref)` returning a `Document`. Constructors only accept dependencies and set attributes. The base run loop owns persistence, error reporting, and resume; fetch workers never collect whole archives in memory. One queue capped at twice the worker count serves all years. Stateful pagination remains sequential; stateless page requests use bounded batches. HTTP requests and browser navigation share the scraper's rate limiter. Browser pools never exceed their configured page limit.
 
 Digital PDFs use pymupdf4llm, then PyMuPDF plain text, then optional OCR. CPU-heavy PDF work runs in threads. HTML uses the lxml parser and html-to-markdown, with image sources inlined as base64 data URIs.
 

@@ -177,37 +177,34 @@ class ParanaCVScraper(BaseScraper):
             "raw": mhtml,
             "raw_ext": ".mhtml",
         }
-        from src.core.document import Document
-
         return Document(**result)
 
-    async def list_documents(self, year: int) -> AsyncIterator[dict]:
-        for norm_type, norm_type_id in self.types.items():
-            soup = await self._fetch_search_page(year, norm_type_id)
-            text = soup.get_text()
-            page_match = _RE_TOTAL_PAGES.search(text)
-            records_match = _RE_TOTAL_RECORDS.search(text)
-            if records_match and int(records_match.group(1)) == 0:
-                continue
-            if not page_match:
-                raise ValueError("Could not parse Paraná pagination")
-            records = int(records_match.group(1)) if records_match else None
-            for page in range(1, int(page_match.group(1)) + 1):
-                if page > 1:
-                    soup = await self._fetch_search_page(
-                        year, norm_type_id, page, records
-                    )
-                for ref in self._parse_results_table(soup):
-                    yield {
-                        **ref,
-                        "year": year,
-                        "type": norm_type,
-                        "situation": DEFAULT_VALID_SITUATION,
-                        "document_url": urljoin(
-                            self.base_url,
-                            f"/legislacao/pesquisarAto.do?action=exibir&codAto={ref['id']}",
-                        ),
-                    }
+    async def list_type(
+        self, year: int, norm_type: str, norm_type_id: str
+    ) -> AsyncIterator[dict]:
+        soup = await self._fetch_search_page(year, norm_type_id)
+        text = soup.get_text()
+        page_match = _RE_TOTAL_PAGES.search(text)
+        records_match = _RE_TOTAL_RECORDS.search(text)
+        if records_match and int(records_match.group(1)) == 0:
+            return
+        if not page_match:
+            raise ValueError("Could not parse Paraná pagination")
+        records = int(records_match.group(1)) if records_match else None
+        for page in range(1, int(page_match.group(1)) + 1):
+            if page > 1:
+                soup = await self._fetch_search_page(year, norm_type_id, page, records)
+            for ref in self._parse_results_table(soup):
+                yield {
+                    **ref,
+                    "year": year,
+                    "type": norm_type,
+                    "situation": DEFAULT_VALID_SITUATION,
+                    "document_url": urljoin(
+                        self.base_url,
+                        f"/legislacao/pesquisarAto.do?action=exibir&codAto={ref['id']}",
+                    ),
+                }
 
     @staticmethod
     def _infer_situation(soup: BeautifulSoup) -> str:

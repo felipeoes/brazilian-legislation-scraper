@@ -480,8 +480,6 @@ class CamaraDepScraper(BaseScraper):
                 if not text_markdown or not text_markdown.strip():
                     logger.warning(f"Document text is empty after conversion: {title}")
                     raise ValueError("Document text is empty after conversion")
-            from src.core.document import Document
-
             return Document(
                 year=year,
                 title=title,

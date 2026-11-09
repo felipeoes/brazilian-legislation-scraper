@@ -44,6 +44,14 @@ async def test_long_titles_and_stable_listing_identity(tmp_path):
             assert all("raw" not in row for row in rows)
 
 
+async def test_underscore_listing_fields_are_not_stored(tmp_path):
+    async with Store(tmp_path / "documents.db") as store:
+        await store.save(document(_pdf_link="https://example.org/1.pdf", number="1"))
+        await store.export(tmp_path / "export")
+        row = json.loads((tmp_path / "export/2024/data.jsonl").read_text())
+        assert row["number"] == "1" and "_pdf_link" not in row
+
+
 async def test_failed_insert_preserves_existing_row_and_file(tmp_path):
     async with Store(tmp_path / "documents.db") as store:
         await store.save(document(raw=b"old", raw_ext=".pdf"))
@@ -81,22 +89,44 @@ async def test_import_fails_loudly_without_deleting_inputs(tmp_path):
             await store.import_json(tmp_path)
         assert source.read_text() == "[broken"
         source.write_text(json.dumps([document(file_path="old.pdf").model_dump()]))
-        assert await store.import_json(tmp_path) == 1
+        assert await store.import_json(tmp_path) == (1, 0)
         assert (
             store.connection.execute("SELECT file_path FROM documents").fetchone()[0]
             == "old.pdf"
         )
 
 
-async def test_reset_and_error_runs(tmp_path):
+async def test_export_import_round_trip_keeps_listing_keys(tmp_path):
+    async with Store(tmp_path / "a/documents.db") as store:
+        await store.save(document(), ref_url="listing", ref_title="Listing title")
+        await store.export(tmp_path / "archive", "json")
+    async with Store(tmp_path / "b/documents.db") as store:
+        assert await store.import_json(tmp_path / "archive") == (1, 0)
+        assert await store.keys() == {("listing", "Listing title")}
+        extra = store.connection.execute("SELECT extra FROM documents").fetchone()[0]
+        assert json.loads(extra) == {}
+
+
+async def test_import_reads_legacy_envelope_and_records_invalid_rows(tmp_path):
+    source = tmp_path / "2024/data.json"
+    source.parent.mkdir()
+    rows = [document().model_dump(), {**document(title="Lei 2").model_dump()}]
+    rows[1]["situation"] = ""
+    source.write_text(json.dumps({"summary": {}, "documents": rows}))
+    async with Store(tmp_path / "documents.db") as store:
+        assert await store.import_json(tmp_path) == (1, 1)
+        assert len(await store.keys()) == 1
+        title, message = store.connection.execute(
+            "SELECT title, message FROM errors"
+        ).fetchone()
+        assert title == "Lei 2" and "situation" in message
+
+
+async def test_error_runs(tmp_path):
     async with Store(tmp_path / "documents.db") as store:
         run = await store.start_run("TEST")
         await store.record_error(run_id=run, message="failed", year=2024)
         await store.finish_run(run, 1, 1, {"test": {"requests": 1}})
-        await store.save(document(raw=b"pdf", raw_ext=".pdf"))
-        await store.reset_year(2024)
-        assert await store.keys() == set()
-        assert not (tmp_path / "2024/docs").exists()
         assert store.connection.execute("SELECT errors FROM runs").fetchone()[0] == 1
 
 
@@ -106,21 +136,6 @@ async def test_reset_and_error_runs(tmp_path):
 def test_document_validates_required_text(field):
     with pytest.raises(ValueError):
         document(**{field: " "})
-
-
-async def test_multiple_outputs_rollback_together(tmp_path):
-    async with Store(tmp_path / "documents.db") as store:
-        store.connection.execute(
-            "CREATE TRIGGER fail BEFORE INSERT ON documents WHEN NEW.title = 'second' BEGIN SELECT RAISE(ABORT, 'crash'); END"
-        )
-        with pytest.raises(sqlite3.IntegrityError):
-            await store.save_many(
-                [document(title="first"), document(title="second")],
-                ref_url="listing",
-                ref_title="reference",
-            )
-        assert not await store.has("listing", "reference")
-        assert await store.summary() == []
 
 
 async def test_cancelled_context_entry_closes_open_connection():

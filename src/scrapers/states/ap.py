@@ -145,7 +145,7 @@ class AmapaAlapScraper(BaseScraper):
                     ),
                     "type": doc_type,
                     "situation": "Não consta",
-                    "html_link": view_link["href"] if view_link else None,
+                    "_html_link": view_link["href"] if view_link else None,
                 }
                 docs.append(current_doc)
                 continue
@@ -160,8 +160,8 @@ class AmapaAlapScraper(BaseScraper):
             if consolidated_link:
                 href = str(consolidated_link.get("href", ""))
                 current_doc["consolidated_link"] = href
-                if not current_doc.get("html_link"):
-                    current_doc["html_link"] = self._canonical_doc_link(href)
+                if not current_doc.get("_html_link"):
+                    current_doc["_html_link"] = self._canonical_doc_link(href)
             row_text = self._clean_text(row.get_text(" ", strip=True))
             lower_text = row_text.casefold()
             if lower_text.startswith("alterações:"):
@@ -243,7 +243,7 @@ class AmapaAlapScraper(BaseScraper):
 
     async def fetch(self, doc_info: dict) -> Document | None:
         doc_data = dict(doc_info)
-        html_link = doc_data.get("html_link")
+        html_link = doc_data.get("_html_link")
         consolidated_link = doc_data.get("consolidated_link")
         canonical_link = html_link or self._canonical_doc_link(consolidated_link)
         canonical_url = (
@@ -291,8 +291,6 @@ class AmapaAlapScraper(BaseScraper):
             mhtml = (await self.browser.snapshot(capture_url))[1]
         except Exception as exc:
             raise ValueError(f"MHTML capture failed: {exc}")
-        from src.core.document import Document
-
         return Document(**doc_data, raw=mhtml, raw_ext=".mhtml")
 
     async def list_documents(self, year: int | None) -> AsyncIterator[dict]:
@@ -315,7 +313,7 @@ class AmapaAlapScraper(BaseScraper):
                 **ref,
                 "document_url": urljoin(
                     self.base_url,
-                    ref.get("html_link")
+                    ref.get("_html_link")
                     or self._canonical_doc_link(ref.get("consolidated_link"))
                     or "",
                 ),

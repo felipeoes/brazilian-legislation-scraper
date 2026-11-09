@@ -1,4 +1,5 @@
 from dataclasses import replace
+from datetime import datetime
 from unittest.mock import AsyncMock
 
 import pytest
@@ -14,6 +15,12 @@ def test_selection_aliases_and_unknown_names():
     with pytest.raises(ValueError, match="Unknown"):
         main.select_scrapers(["misspelled"])
     assert len(SCRAPERS) == 30
+
+
+def test_registry_years_and_bahia_rate():
+    bahia = main.select_scrapers(["BA"])[0]
+    assert bahia.rps == 1  # the server returns 500s above 1 request per second
+    assert bahia.years.start == 1891 and bahia.years.stop == datetime.now().year + 1
 
 
 @pytest.mark.parametrize("argv", [[], ["run"], ["run", "--all", "-s", "AC"]])
@@ -47,7 +54,7 @@ async def test_cleanup_failure_sets_exit_one(tmp_path, monkeypatch):
     monkeypatch.setattr(
         main,
         "SCRAPERS",
-        [ScraperSpec(BrokenCleanup, ("bad",), range(2024, 2025), save_dir=tmp_path)],
+        [ScraperSpec(BrokenCleanup, ("bad",), 2024, save_dir=tmp_path)],
     )
     monkeypatch.setattr("src.core.scraper.LOG_DIR", tmp_path)
     assert await main.main(["run", "-s", "bad"]) == 1
@@ -70,3 +77,5 @@ async def test_import_and_export_cli(tmp_path, monkeypatch):
         json.loads((out / "2024/data.jsonl").read_text())["title"] == document().title
     )
     assert source.exists()
+    source.write_text(json.dumps([{**document().model_dump(), "situation": ""}]))
+    assert await main.main(["import-json", "-s", "AC"]) == 1

@@ -426,7 +426,7 @@ class SAPLBaseScraper(BaseScraper):
                 "type": self._resolve_type_name(item.get("tipo")),
                 "year": int(item["ano"]),
                 "document_url": url,
-                "pdf_link": item.get("texto_integral"),
+                "_pdf_link": item.get("texto_integral"),
             }
             refs.append(ref)
         return refs
@@ -448,10 +448,10 @@ class SAPLBaseScraper(BaseScraper):
             yield ref
 
     async def fetch(self, ref: dict) -> Document:
-        if not ref.get("pdf_link"):
+        if not ref.get("_pdf_link"):
             raise ValueError("SAPL API returned no texto_integral attachment")
         errors = []
-        for url in self._build_pdf_fetch_urls(ref["pdf_link"]):
+        for url in self._build_pdf_fetch_urls(ref["_pdf_link"]):
             try:
                 markdown, raw, ext = await self.download(url)
                 markdown = self._clean_sapl_pdf_markdown(
@@ -462,4 +462,5 @@ class SAPLBaseScraper(BaseScraper):
                 )
             except (HttpError, ValueError) as exc:
                 errors.append(exc)
-        raise ExceptionGroup("No SAPL attachment variant succeeded", errors)
+        causes = "; ".join(f"{type(exc).__name__}: {exc}" for exc in errors)
+        raise ValueError(f"No SAPL attachment variant succeeded: {causes}")

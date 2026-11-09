@@ -3,7 +3,6 @@
 Covers:
 - TYPES constant: 11 types present, integer IDs
 - Class docstring accessible (__doc__ is not None)
-- _iterate_situations NOT set (SAPLBaseScraper passes situations={})
 - _id_to_type reverse map built correctly
 - _get_docs_links includes tipo_id field
 

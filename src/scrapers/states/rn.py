@@ -70,7 +70,7 @@ class RNAlrnScraper(BaseScraper):
     ) -> list:
         """Get document links from a listing page.
 
-        Returns a list of dicts with keys 'title', 'year', 'summary', 'pdf_link'.
+        Returns a list of dicts with keys 'title', 'year', 'summary', '_pdf_link'.
         """
         if soup is None:
             response = await self.http.request(url)
@@ -97,7 +97,7 @@ class RNAlrnScraper(BaseScraper):
                 continue
             pdf_link = pdf_link_tag["href"]
             docs.append(
-                {"year": year, "title": title, "summary": "", "pdf_link": pdf_link}
+                {"year": year, "title": title, "summary": "", "_pdf_link": pdf_link}
             )
         return docs
 
@@ -128,5 +128,5 @@ class RNAlrnScraper(BaseScraper):
                 "situation": DEFAULT_VALID_SITUATION,
                 **ref,
                 "type": self._infer_norm_type(ref["title"]),
-                "document_url": urljoin(self.base_url, ref["pdf_link"]),
+                "document_url": urljoin(self.base_url, ref["_pdf_link"]),
             }

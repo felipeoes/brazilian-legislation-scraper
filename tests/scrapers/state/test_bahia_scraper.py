@@ -126,7 +126,7 @@ class TestGetDocsLinks:
         docs = await scraper._get_docs_links("http://example.com")
         assert len(docs) == 2
         assert docs[0]["title"] == "Lei Ordinária 001/2022"
-        assert docs[0]["html_link"] == "/doc/1"
+        assert docs[0]["_html_link"] == "/doc/1"
         assert docs[0]["type"] == "Lei Ordinária"
         assert docs[1]["type"] == "Decreto"
 

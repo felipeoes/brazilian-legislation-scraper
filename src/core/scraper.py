@@ -78,10 +78,22 @@ class BaseScraper:
         pass
 
     async def list_documents(self, year: int | None) -> AsyncIterator[DocRef]:
+        """List each type separately so one failing type doesn't stop the others."""
+        for name, value in self.types.items():
+            try:
+                async for ref in self.list_type(year, name, value):
+                    yield ref
+            except Exception as exc:
+                await self.error({"year": year, "type": name}, exc)
+
+    async def list_type(
+        self, year: int | None, name: str, value: Any
+    ) -> AsyncIterator[DocRef]:
         raise NotImplementedError
         yield
 
-    async def fetch(self, ref: DocRef) -> Document | list[Document] | None:
+    async def fetch(self, ref: DocRef) -> Document | None:
+        """None is recorded as an error; skip unwanted refs while listing instead."""
         raise NotImplementedError
 
     async def error(self, ref: DocRef, exc: Exception) -> None:
@@ -105,13 +117,8 @@ class BaseScraper:
         with logger.contextualize(scraper=self.name):
             try:
                 await self.setup()
-                keys = await self.store.keys()
-                if self.overwrite:
-                    for year in self.years:
-                        await self.store.reset_year(year)
-                    keys = await self.store.keys()
-                for year in [None] if self.yearless else self.years:
-                    await self._run_year(year, keys)
+                # Overwrite re-scrapes everything; each save replaces the old row.
+                await self._scrape(set() if self.overwrite else await self.store.keys())
             except Exception as exc:
                 await self.error({}, exc)
             finally:
@@ -126,25 +133,30 @@ class BaseScraper:
                     usage_scope.reset(token)
         return self._result
 
-    async def _run_year(self, year: int | None, keys: set[tuple[str, str]]) -> None:
+    async def _scrape(self, keys: set[tuple[str, str]]) -> None:
         queue: asyncio.Queue[DocRef | None] = asyncio.Queue(maxsize=self.workers * 2)
         pending: set[tuple[str, str]] = set()
 
         async def produce() -> None:
-            try:
-                async for ref in self.list_documents(year):
-                    ref = dict(ref)
-                    ref.setdefault("year", year)
-                    if self.yearless and ref.get("year") not in self.years:
-                        continue
-                    key = (ref["document_url"], ref["title"])
-                    if key in keys or key in pending:
-                        self._result.skipped += 1
-                        continue
-                    pending.add(key)
-                    await queue.put(ref)
-            except Exception as exc:
-                await self.error({"year": year}, exc)
+            # One queue for all years, so workers never wait at a year boundary.
+            for year in [None] if self.yearless else self.years:
+                try:
+                    async for ref in self.list_documents(year):
+                        ref = dict(ref)
+                        ref.setdefault("year", year)
+                        if ref["year"] is None:
+                            await self.error(ref, ValueError("Listing row has no year"))
+                            continue
+                        if self.yearless and ref["year"] not in self.years:
+                            continue
+                        key = (ref["document_url"], ref["title"])
+                        if key in keys or key in pending:
+                            self._result.skipped += 1
+                            continue
+                        pending.add(key)
+                        await queue.put(ref)
+                except Exception as exc:
+                    await self.error({"year": year}, exc)
             for _ in range(self.workers):
                 await queue.put(None)
 
@@ -152,20 +164,13 @@ class BaseScraper:
             while (ref := (await queue.get())) is not None:
                 key = (ref["document_url"], ref["title"])
                 try:
-                    result = await self.fetch(dict(ref))
-                    docs = (
-                        result
-                        if isinstance(result, list)
-                        else [result]
-                        if result is not None
-                        else []
-                    )
-                    if not docs:
+                    doc = await self.fetch(dict(ref))
+                    if doc is None:
                         raise ValueError("Fetch produced no document")
-                    await self.store.save_many(docs, ref_url=key[0], ref_title=key[1])
-                    self._result.docs += len(docs)
+                    await self.store.save(doc, ref_url=key[0], ref_title=key[1])
+                    self._result.docs += 1
                     keys.add(key)
-                    del result, docs
+                    del doc
                 except Exception as exc:
                     await self.error(ref, exc)
                 finally:
@@ -177,43 +182,31 @@ class BaseScraper:
             for _ in range(self.workers):
                 group.create_task(consume())
 
-    def iter_type_items(self) -> list[tuple[str, Any, str, Any]]:
-        types = (
-            self.types.items()
-            if isinstance(self.types, dict)
-            else ((name, name) for name in self.types)
-        )
-        situations = (
-            self.situations.items()
-            if isinstance(self.situations, dict)
-            else ((name, name) for name in self.situations)
-        )
-        situations = list(situations) or [(DEFAULT_VALID_SITUATION, None)]
-        return [
-            (name, value, situation, sid)
-            for name, value in types
-            for situation, sid in situations
-        ]
-
     async def paginate(
         self,
         fetch_page: Callable[[int], Awaitable[list[DocRef]]],
         total_pages: int,
         start: int = 1,
     ) -> AsyncIterator[DocRef]:
+        """Fetch pages in bounded batches; a failed page is recorded and skipped."""
         for first in range(start, total_pages + 1, self.workers):
             tasks = [
                 asyncio.create_task(fetch_page(page))
                 for page in range(first, min(first + self.workers, total_pages + 1))
             ]
             try:
-                pages = await asyncio.gather(*tasks)
+                pages = await asyncio.gather(*tasks, return_exceptions=True)
             finally:
                 for task in tasks:
                     if not task.done():
                         task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
-            for refs in pages:
+            for page, refs in enumerate(pages, first):
+                if isinstance(refs, Exception):
+                    await self.error({"title": f"listing page {page}"}, refs)
+                    continue
+                if isinstance(refs, BaseException):
+                    raise refs
                 for ref in refs:
                     yield ref
 
@@ -241,7 +234,7 @@ class BaseScraper:
         return await html_to_markdown(html, base_url or self.base_url, fetch_image)
 
     async def fetch_pdf(self, ref: DocRef) -> Document:
-        url = urljoin(self.base_url, ref.get("pdf_link") or ref["document_url"])
+        url = urljoin(self.base_url, ref.get("_pdf_link") or ref["document_url"])
         markdown, raw, ext = await self.download(url)
         return Document(
             **{

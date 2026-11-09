@@ -77,7 +77,6 @@ class BahiaLegislaScraper(BaseScraper):
     base_url = "https://www.legislabahia.ba.gov.br"
     _REVOGADO_RE = re.compile("\\brevogad[ao]\\b", re.IGNORECASE)
     _REVOGADO_MARKER_RE = re.compile("<REVOGAD[AO]>", re.IGNORECASE)
-    _MAX_RPS = 1
 
     def _normalize_type(self, raw_type: str) -> str:
         return normalize_type(raw_type, aliases=_TYPE_LABELS, known_types=self.types)
@@ -190,13 +189,13 @@ class BahiaLegislaScraper(BaseScraper):
             norm_type = self._normalize_type(tds[1].get_text(" ", strip=True))
             if not title:
                 continue
-            docs.append({"title": title, "type": norm_type, "html_link": href})
+            docs.append({"title": title, "type": norm_type, "_html_link": href})
         return docs
 
     async def fetch(self, doc_info: dict) -> Document | None:
         """Get document data from a given document dict."""
         doc_info = dict(doc_info)
-        html_link = doc_info.pop("html_link")
+        html_link = doc_info.pop("_html_link")
         url = urljoin(self.base_url, html_link)
         resp = await self.http.request(url)
         body, _ = (resp.content, resp)
@@ -264,5 +263,5 @@ class BahiaLegislaScraper(BaseScraper):
                 "year": year,
                 "situation": DEFAULT_VALID_SITUATION,
                 **ref,
-                "document_url": urljoin(self.base_url, ref["html_link"]),
+                "document_url": urljoin(self.base_url, ref["_html_link"]),
             }

@@ -61,7 +61,7 @@ class TestGetDocsLinks:
         assert len(docs) == 1
         doc = docs[0]
         assert doc["title"] == "Lei Ordinária nº 1.234, de 15 de março de 2022"
-        assert doc["html_link"] == "/detalhar/999"
+        assert doc["_html_link"] == "/detalhar/999"
         assert doc["summary"] == "Dispõe sobre X."
         assert doc["year"] == "2022"
 
@@ -80,12 +80,12 @@ class TestGetDocsLinks:
 
     @pytest.mark.asyncio
     async def test_year_fallback_on_malformed_title(self):
-        """Should return '0000' instead of raising AttributeError."""
+        """A title without a year yields None so the run records an error."""
         scraper = _make_scraper()
         rows = [("Lei sem data", "/detalhar/42", "Ementa qualquer.")]
         soup = BeautifulSoup(_listing_html("lei_ordinarias", rows), "lxml")
         docs = await scraper._get_docs_links(soup, "lei_ordinarias")
-        assert docs[0]["year"] == "0000"
+        assert docs[0]["year"] is None
 
     @pytest.mark.asyncio
     async def test_emendas_section_parsed_correctly(self):

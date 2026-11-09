@@ -96,7 +96,7 @@ class RondoniaCotelScraper(BaseScraper):
                 "title": title,
                 "situation": "Não consta",
                 "summary": summary,
-                "pdf_link": f"{self.base_url}/Livros/Files/{pdf_href}",
+                "_pdf_link": f"{self.base_url}/Livros/Files/{pdf_href}",
             }
             docs.append(doc)
         return docs
@@ -113,17 +113,22 @@ class RondoniaCotelScraper(BaseScraper):
                 "type": "Constituição Estadual",
                 "title": "Constituição do Estado de Rondônia",
                 "document_url": url,
-                "pdf_link": url,
+                "_pdf_link": url,
                 "situation": DEFAULT_VALID_SITUATION,
             }
-        for norm_type, norm_type_id in self.types.items():
-            for ref in await self._get_docs_links(
-                self._format_search_url(norm_type_id, year)
-            ):
-                yield {
-                    "year": year,
-                    "type": norm_type,
-                    "situation": DEFAULT_VALID_SITUATION,
-                    **ref,
-                    "document_url": ref["pdf_link"],
-                }
+        async for ref in super().list_documents(year):
+            yield ref
+
+    async def list_type(
+        self, year: int, norm_type: str, norm_type_id: str
+    ) -> AsyncIterator[dict]:
+        for ref in await self._get_docs_links(
+            self._format_search_url(norm_type_id, year)
+        ):
+            yield {
+                "year": year,
+                "type": norm_type,
+                "situation": DEFAULT_VALID_SITUATION,
+                **ref,
+                "document_url": ref["_pdf_link"],
+            }

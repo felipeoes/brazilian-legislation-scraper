@@ -278,8 +278,6 @@ class LegislaGoias(BaseScraper):
         if error_msg.lower() in doc_info["text_markdown"].lower():
             logger.warning(f"Invalid doc ID: {doc_id}. Year: {doc_detail['ano']}")
             raise ValueError("Document contains JavaScript error message")
-        from src.core.document import Document
-
         return Document(**doc_info)
 
     async def _fetch_search_page(self, year: int, page: int) -> list[dict]:
